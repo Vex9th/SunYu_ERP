@@ -52,26 +52,37 @@ class FailedLoginLimiter:
     def __init__(self, *, clock: Callable[[], float] | None = None) -> None:
         self._clock = clock or time.monotonic
         self._failures: dict[str, deque[float]] = {}
+        self._in_flight: dict[str, int] = {}
         self._lock = Lock()
 
-    def is_blocked(self, client_host: str) -> bool:
+    def try_start_attempt(self, client_host: str) -> bool:
         with self._lock:
             failures = self._active_failures(client_host, self._clock())
-            return failures is not None and len(failures) >= _MAX_LOGIN_FAILURES
+            failure_count = len(failures) if failures is not None else 0
+            in_flight_count = self._in_flight.get(client_host, 0)
+            if failure_count + in_flight_count >= _MAX_LOGIN_FAILURES:
+                return False
+            self._in_flight[client_host] = in_flight_count + 1
+            return True
 
-    def record_failure(self, client_host: str) -> bool:
+    def finish_failure(self, client_host: str) -> None:
         with self._lock:
             now = self._clock()
+            self._release_attempt(client_host)
             failures = self._active_failures(client_host, now)
             if failures is None:
                 failures = deque()
                 self._failures[client_host] = failures
             failures.append(now)
-            return len(failures) > _MAX_LOGIN_FAILURES
 
-    def reset(self, client_host: str) -> None:
+    def finish_success(self, client_host: str) -> None:
         with self._lock:
+            self._release_attempt(client_host)
             self._failures.pop(client_host, None)
+
+    def cancel_attempt(self, client_host: str) -> None:
+        with self._lock:
+            self._release_attempt(client_host)
 
     def _active_failures(
         self,
@@ -88,6 +99,15 @@ class FailedLoginLimiter:
             self._failures.pop(client_host, None)
             return None
         return failures
+
+    def _release_attempt(self, client_host: str) -> None:
+        in_flight_count = self._in_flight.get(client_host, 0)
+        if in_flight_count <= 0:
+            raise RuntimeError("cannot finish a login attempt that was not started")
+        if in_flight_count == 1:
+            self._in_flight.pop(client_host)
+        else:
+            self._in_flight[client_host] = in_flight_count - 1
 
 
 def create_auth_router(
@@ -135,12 +155,6 @@ def create_auth_router(
         session_secret: str = session_secret_dependency,
     ) -> Response:
         client_host = request.client.host if request.client is not None else "unknown"
-        if login_limiter.is_blocked(client_host):
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Too many login attempts",
-            )
-
         row = connection.execute(
             "SELECT password_hash FROM auth_secret WHERE singleton_id = 1"
         ).fetchone()
@@ -149,20 +163,25 @@ def create_auth_router(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Password is not configured",
             )
-        if not verify_password(row["password_hash"], password):
-            rate_limited = login_limiter.record_failure(client_host)
+        if not login_limiter.try_start_attempt(client_host):
             raise HTTPException(
-                status_code=(
-                    status.HTTP_429_TOO_MANY_REQUESTS
-                    if rate_limited
-                    else status.HTTP_401_UNAUTHORIZED
-                ),
-                detail=(
-                    "Too many login attempts" if rate_limited else "Invalid password"
-                ),
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many login attempts",
             )
 
-        login_limiter.reset(client_host)
+        try:
+            password_matches = verify_password(row["password_hash"], password)
+        except BaseException:
+            login_limiter.cancel_attempt(client_host)
+            raise
+        if not password_matches:
+            login_limiter.finish_failure(client_host)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid password",
+            )
+
+        login_limiter.finish_success(client_host)
         response = Response(status_code=status.HTTP_204_NO_CONTENT)
         response.set_cookie(
             key=SESSION_COOKIE_NAME,

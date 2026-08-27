@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Barrier, Lock
+from threading import Barrier, Event, Lock
 from typing import Any
 
 import pytest
@@ -473,6 +473,79 @@ def test_corrupt_hash_fails_fast_instead_of_becoming_wrong_password(
         client.post("/api/auth/login", json={"password": "123456"})
 
 
+def test_verifier_failure_releases_attempt_reservation(
+    harness: AuthHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_password(harness.database_path)
+    verification_calls = 0
+
+    def fail_once_then_match(password_hash: object, password: object) -> bool:
+        nonlocal verification_calls
+        verification_calls += 1
+        if verification_calls == 1:
+            raise InvalidHashError("corrupt hash")
+        return True
+
+    monkeypatch.setattr(auth, "verify_password", fail_once_then_match)
+
+    with harness.client() as client:
+        with pytest.raises(InvalidHashError, match="corrupt hash"):
+            client.post("/api/auth/login", json={"password": "123456"})
+        retry = client.post("/api/auth/login", json={"password": "123456"})
+
+    assert retry.status_code == 204
+    assert verification_calls == 2
+
+
+def test_concurrent_logins_reserve_only_five_verifier_slots(
+    harness: AuthHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_password(harness.database_path)
+    first_five_entered = Event()
+    release_first_five = Event()
+    counter_lock = Lock()
+    verification_calls = 0
+
+    def controlled_verify(password_hash: object, password: object) -> bool:
+        nonlocal verification_calls
+        with counter_lock:
+            verification_calls += 1
+            call_number = verification_calls
+            if call_number == 5:
+                first_five_entered.set()
+        if call_number <= 5 and not release_first_five.wait(timeout=10):
+            raise TimeoutError("test did not release verifier")
+        return password == "123456"
+
+    monkeypatch.setattr(auth, "verify_password", controlled_verify)
+
+    def login(password: str) -> int:
+        with harness.client("192.0.2.50") as client:
+            return client.post(
+                "/api/auth/login",
+                json={"password": password},
+            ).status_code
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        first_five = [executor.submit(login, "654321") for _ in range(5)]
+        assert first_five_entered.wait(timeout=10)
+        correct_guess = executor.submit(login, "123456")
+        try:
+            correct_status = correct_guess.result(timeout=10)
+            later_wrong = [executor.submit(login, "654321") for _ in range(10)]
+            later_statuses = [future.result(timeout=10) for future in later_wrong]
+        finally:
+            release_first_five.set()
+        first_statuses = [future.result(timeout=10) for future in first_five]
+
+    assert correct_status == 429
+    assert verification_calls == 5
+    assert first_statuses == [401] * 5
+    assert later_statuses == [429] * 10
+
+
 def test_router_dependency_owns_connection_lifetime(tmp_path: Path) -> None:
     database_path = tmp_path / "erp.sqlite3"
     _initialize_database(database_path)
@@ -496,32 +569,20 @@ def test_router_dependency_owns_connection_lifetime(tmp_path: Path) -> None:
         connection.close()
 
 
-def test_limiter_is_thread_safe_under_simultaneous_failures() -> None:
+def test_limiter_atomically_reserves_only_five_simultaneous_attempts() -> None:
     clock = MutableClock()
     limiter = auth.FailedLoginLimiter(clock=clock)
     barrier = Barrier(16)
 
-    def record_failure(_: int) -> None:
+    def try_start_attempt(_: int) -> bool:
         barrier.wait(timeout=10)
-        limiter.record_failure("192.0.2.10")
+        return limiter.try_start_attempt("192.0.2.10")
 
     with ThreadPoolExecutor(max_workers=16) as executor:
-        list(executor.map(record_failure, range(16)))
+        reservations = list(executor.map(try_start_attempt, range(16)))
 
-    assert limiter.is_blocked("192.0.2.10") is True
-
-
-def test_limiter_applies_the_limit_during_simultaneous_failures() -> None:
-    clock = MutableClock()
-    limiter = auth.FailedLoginLimiter(clock=clock)
-    barrier = Barrier(16)
-
-    def record_failure(_: int) -> bool:
-        barrier.wait(timeout=10)
-        return limiter.record_failure("192.0.2.10")
-
-    with ThreadPoolExecutor(max_workers=16) as executor:
-        blocked_results = list(executor.map(record_failure, range(16)))
-
-    assert blocked_results.count(False) == 5
-    assert blocked_results.count(True) == 11
+    assert reservations.count(True) == 5
+    assert reservations.count(False) == 11
+    for _ in range(5):
+        limiter.finish_failure("192.0.2.10")
+    assert limiter.try_start_attempt("192.0.2.10") is False
