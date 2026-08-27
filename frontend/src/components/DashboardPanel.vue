@@ -6,6 +6,7 @@ import type { BackupSettingsPayload, SystemOverview } from '../types'
 const props = defineProps<{
   overview: SystemOverview | null
   loading: boolean
+  overviewError: string | null
   requestError: string | null
   successNotice: string | null
   backupBusy: boolean
@@ -17,6 +18,7 @@ const emit = defineEmits<{
   logout: []
   saveBackup: [settings: BackupSettingsPayload]
   backupNow: []
+  refreshOverview: []
 }>()
 
 const backupForm = reactive({
@@ -123,7 +125,7 @@ function saveBackup(): void {
         </el-menu>
       </el-aside>
 
-      <el-main v-loading="loading">
+      <el-main>
         <el-space direction="vertical" alignment="stretch" fill :size="16">
           <el-alert
             title="项目中心 · 模块建设中"
@@ -149,21 +151,57 @@ function saveBackup(): void {
             :closable="false"
           />
 
+          <el-card v-if="loading && !overview" data-testid="overview-loading" shadow="never">
+            <el-skeleton :rows="5" animated />
+            <el-text type="info">正在读取系统状态</el-text>
+          </el-card>
+
+          <el-card v-else-if="!overview" data-testid="overview-error" shadow="never">
+            <el-result
+              icon="error"
+              title="系统概况读取失败"
+              :sub-title="overviewError ?? '未能读取本地数据与备份状态'"
+            >
+              <template #extra>
+                <el-button
+                  data-testid="overview-retry"
+                  type="primary"
+                  :loading="loading"
+                  :disabled="loading"
+                  @click="emit('refreshOverview')"
+                >
+                  重新读取
+                </el-button>
+              </template>
+            </el-result>
+          </el-card>
+
+          <template v-else>
           <el-row :gutter="16">
             <el-col :xs="24" :lg="12">
               <el-card shadow="never">
                 <template #header>
                   <el-text tag="strong">系统状态</el-text>
                 </template>
-                <el-descriptions v-if="overview" :column="1" border>
+                <el-descriptions data-testid="scheduler-status" :column="1" border>
                   <el-descriptions-item label="数据目录">
                     <el-text>{{ overview.data_directory }}</el-text>
                   </el-descriptions-item>
                   <el-descriptions-item label="SQLite 数据库">
                     <el-text>{{ overview.database_path }}</el-text>
                   </el-descriptions-item>
+                  <el-descriptions-item label="备份调度器">
+                    <el-tag :type="overview.scheduler.alive ? 'success' : 'danger'">
+                      {{ overview.scheduler.alive ? '运行中' : '已停止' }}
+                    </el-tag>
+                  </el-descriptions-item>
+                  <el-descriptions-item label="最近调度错误时间">
+                    {{ overview.scheduler.last_error_at ?? '无' }}
+                  </el-descriptions-item>
+                  <el-descriptions-item label="最近调度错误码">
+                    {{ overview.scheduler.last_error_code ?? '无' }}
+                  </el-descriptions-item>
                 </el-descriptions>
-                <el-empty v-else description="正在读取系统状态" />
               </el-card>
             </el-col>
 
@@ -183,7 +221,7 @@ function saveBackup(): void {
                     </el-button>
                   </el-row>
                 </template>
-                <el-descriptions v-if="overview" :column="1" border>
+                <el-descriptions :column="1" border>
                   <el-descriptions-item label="自动备份">
                     <el-tag :type="overview.backup.enabled ? 'success' : 'info'">
                       {{ backupStatus }}
@@ -301,6 +339,7 @@ function saveBackup(): void {
               </el-button>
             </el-form>
           </el-card>
+          </template>
         </el-space>
       </el-main>
     </el-container>

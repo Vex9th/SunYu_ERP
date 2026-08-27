@@ -2,7 +2,7 @@
 import { ElMessage } from 'element-plus'
 import { onMounted, ref } from 'vue'
 
-import { requestJson, requestVoid } from './api'
+import { ApiError, requestJson, requestVoid } from './api'
 import AuthPanel from './components/AuthPanel.vue'
 import DashboardPanel from './components/DashboardPanel.vue'
 import type {
@@ -16,6 +16,7 @@ import type {
 const appLoading = ref(true)
 const session = ref<SessionState | null>(null)
 const overview = ref<SystemOverview | null>(null)
+const overviewError = ref<string | null>(null)
 const requestError = ref<string | null>(null)
 const authBusy = ref(false)
 const logoutBusy = ref(false)
@@ -28,10 +29,30 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '请求失败，请稍后重试'
 }
 
-async function loadOverview(): Promise<void> {
+function handleSystemRequestError(error: unknown): boolean {
+  if (!(error instanceof ApiError) || error.status !== 401) return false
+  overview.value = null
+  overviewError.value = null
+  successNotice.value = null
+  session.value = { authenticated: false, password_configured: true }
+  requestError.value = errorMessage(error)
+  return true
+}
+
+async function loadOverview(): Promise<boolean> {
+  if (overviewLoading.value) return false
   overviewLoading.value = true
+  overviewError.value = null
+  requestError.value = null
   try {
     overview.value = await requestJson<SystemOverview>('/api/system/overview')
+    return true
+  } catch (error) {
+    overview.value = null
+    if (!handleSystemRequestError(error)) {
+      overviewError.value = errorMessage(error)
+    }
+    return false
   } finally {
     overviewLoading.value = false
   }
@@ -85,6 +106,7 @@ async function logout(): Promise<void> {
   try {
     await requestVoid('/api/auth/logout', { method: 'POST' })
     overview.value = null
+    overviewError.value = null
     session.value = { authenticated: false, password_configured: true }
   } catch (error) {
     requestError.value = errorMessage(error)
@@ -110,7 +132,9 @@ async function saveBackup(settings: BackupSettingsPayload): Promise<void> {
     successNotice.value = '备份设置已保存'
     ElMessage.success(successNotice.value)
   } catch (error) {
-    requestError.value = errorMessage(error)
+    if (!handleSystemRequestError(error)) {
+      requestError.value = errorMessage(error)
+    }
   } finally {
     saveBusy.value = false
   }
@@ -122,11 +146,17 @@ async function backupNow(): Promise<void> {
   requestError.value = null
   successNotice.value = null
   try {
-    await requestJson<BackupCreated>('/api/system/backups', { method: 'POST' })
+    const backup = await requestJson<BackupCreated>('/api/system/backups', { method: 'POST' })
+    if (backup.warning) {
+      ElMessage.warning('备份已完成，但自动清理失败，请检查备份目录')
+    } else {
+      ElMessage.success('备份已完成')
+    }
     await loadOverview()
-    ElMessage.success('备份已完成')
   } catch (error) {
-    requestError.value = errorMessage(error)
+    if (!handleSystemRequestError(error)) {
+      requestError.value = errorMessage(error)
+    }
   } finally {
     backupBusy.value = false
   }
@@ -186,6 +216,7 @@ onMounted(loadSession)
     v-else
     :overview="overview"
     :loading="overviewLoading"
+    :overview-error="overviewError"
     :request-error="requestError"
     :success-notice="successNotice"
     :backup-busy="backupBusy"
@@ -194,5 +225,6 @@ onMounted(loadSession)
     @logout="logout"
     @save-backup="saveBackup"
     @backup-now="backupNow"
+    @refresh-overview="loadOverview"
   />
 </template>

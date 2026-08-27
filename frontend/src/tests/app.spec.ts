@@ -9,6 +9,11 @@ type FetchMock = ReturnType<typeof vi.fn<typeof fetch>>
 const overview = {
   data_directory: 'D:\\SunYu ERP\\Data',
   database_path: 'D:\\SunYu ERP\\Data\\sunyu.sqlite3',
+  scheduler: {
+    alive: true,
+    last_error_at: null,
+    last_error_code: null,
+  },
   backup: {
     enabled: true,
     directory: 'D:\\SynologyDrive\\SunYu ERP Backups',
@@ -207,12 +212,96 @@ describe('App', () => {
     expect(dashboard.text()).toContain('模块建设中')
     expect(dashboard.text()).toContain(overview.data_directory)
     expect(dashboard.text()).toContain(overview.database_path)
+    expect(dashboard.text()).toContain('备份调度器')
+    expect(dashboard.text()).toContain('运行中')
+    expect(dashboard.text()).toContain('无')
     expect(dashboard.text()).toContain('已启用')
     expect(dashboard.text()).toContain(overview.backup.directory)
     expect(dashboard.text()).toContain('24 小时')
     expect(dashboard.text()).toContain('30 天')
     expect(dashboard.text()).toContain('尚未执行')
     expect(wrapper.find('[data-testid="session-secret"]').exists()).toBe(false)
+  })
+
+  it('展示已停止调度器及最近错误信息', async () => {
+    const overviewWithSchedulerError = {
+      ...overview,
+      scheduler: {
+        alive: false,
+        last_error_at: '2026-08-28T06:30:00+08:00',
+        last_error_code: 'cleanup:OSError',
+      },
+    }
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ authenticated: true, password_configured: true }),
+      )
+      .mockResolvedValueOnce(jsonResponse(overviewWithSchedulerError))
+
+    const wrapper = mountApp()
+    await settle()
+
+    const scheduler = wrapper.get('[data-testid="scheduler-status"]')
+    expect(scheduler.text()).toContain('已停止')
+    expect(scheduler.text()).toContain('2026-08-28T06:30:00+08:00')
+    expect(scheduler.text()).toContain('cleanup:OSError')
+  })
+
+  it('会话有效但系统概况失败时显示可重试结果，并防止重复重试', async () => {
+    let resolveRetry!: (response: Response) => void
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ authenticated: true, password_configured: true }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ detail: '系统概况暂时不可用' }, 503))
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveRetry = resolve
+        }),
+      )
+
+    const wrapper = mountApp()
+    await settle()
+
+    expect(wrapper.get('[data-testid="overview-error"]').text()).toContain(
+      '系统概况暂时不可用',
+    )
+    expect(wrapper.text()).not.toContain('正在读取系统状态')
+
+    const retryButton = wrapper.get('[data-testid="overview-retry"]')
+    await retryButton.trigger('click')
+    await retryButton.trigger('click')
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(wrapper.get('[data-testid="overview-loading"]').text()).toContain(
+      '正在读取系统状态',
+    )
+    expect(wrapper.find('[data-testid="overview-retry"]').exists()).toBe(false)
+
+    resolveRetry(jsonResponse(overview))
+    await settle()
+    await settle()
+
+    expect(wrapper.find('[data-testid="overview-error"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="dashboard"]').text()).toContain(
+      overview.database_path,
+    )
+  })
+
+  it('系统概况返回 401 时清理工作台并返回登录页', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ authenticated: true, password_configured: true }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ detail: '登录状态已失效' }, 401))
+
+    const wrapper = mountApp()
+    await settle()
+
+    expect(wrapper.get('[data-testid="auth-title"]').text()).toContain('密码登录')
+    expect(wrapper.get('[data-testid="request-error"]').text()).toContain(
+      '登录状态已失效',
+    )
+    expect(wrapper.find('[data-testid="dashboard"]').exists()).toBe(false)
   })
 
   it('可关闭自动备份并用 null 保存目录', async () => {
@@ -338,6 +427,41 @@ describe('App', () => {
     expect(wrapper.text()).toContain('D:\\NAS\\ERP\\2026-08-27_100000')
   })
 
+  it('保存备份设置返回 401 时清理概况并返回登录页', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ authenticated: true, password_configured: true }),
+      )
+      .mockResolvedValueOnce(jsonResponse(overview))
+      .mockResolvedValueOnce(jsonResponse({ detail: '请重新登录' }, 401))
+
+    const wrapper = mountApp()
+    await settle()
+    await wrapper.get('[data-testid="backup-save"]').trigger('click')
+    await settle()
+
+    expect(wrapper.get('[data-testid="auth-title"]').text()).toContain('密码登录')
+    expect(wrapper.get('[data-testid="request-error"]').text()).toContain('请重新登录')
+    expect(wrapper.find('[data-testid="dashboard"]').exists()).toBe(false)
+  })
+
+  it('保存备份设置的非 401 错误保留在工作台', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ authenticated: true, password_configured: true }),
+      )
+      .mockResolvedValueOnce(jsonResponse(overview))
+      .mockResolvedValueOnce(jsonResponse({ detail: '备份目录不可写' }, 503))
+
+    const wrapper = mountApp()
+    await settle()
+    await wrapper.get('[data-testid="backup-save"]').trigger('click')
+    await settle()
+
+    expect(wrapper.get('[data-testid="dashboard"]').text()).toContain('备份目录不可写')
+    expect(wrapper.find('[data-testid="auth-title"]').exists()).toBe(false)
+  })
+
   it('立即备份期间防止重复提交，成功后刷新系统概况', async () => {
     let resolveBackup!: (response: Response) => void
     const updatedOverview = {
@@ -387,6 +511,156 @@ describe('App', () => {
     expect(fetchMock.mock.calls[3]?.[0]).toBe('/api/system/overview')
     expect(wrapper.text()).toContain('2026-08-28T10:20:30+08:00')
     expect(wrapper.get('[data-testid="last-run-status"]').text()).toContain('成功')
+    expect(document.body.textContent).toContain('备份已完成')
+    expect(document.body.textContent).not.toContain(
+      '备份已完成，但自动清理失败，请检查备份目录',
+    )
+  })
+
+  it('手动备份成功但带 warning 时显示固定中文警告', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ authenticated: true, password_configured: true }),
+      )
+      .mockResolvedValueOnce(jsonResponse(overview))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          path: 'D:\\SynologyDrive\\SunYu ERP Backups\\2026-08-28_103000',
+          created_at: '2026-08-28T10:30:00+08:00',
+          warning: 'Backup created but cleanup failed',
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(overview))
+
+    const wrapper = mountApp()
+    await settle()
+    await wrapper.get('[data-testid="backup-now"]').trigger('click')
+    await settle()
+    await settle()
+
+    expect(document.body.textContent).toContain(
+      '备份已完成，但自动清理失败，请检查备份目录',
+    )
+  })
+
+  it('备份已创建但概况刷新失败时仍立即提示成功并保留重试', async () => {
+    let resolveRefresh!: (response: Response) => void
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ authenticated: true, password_configured: true }),
+      )
+      .mockResolvedValueOnce(jsonResponse(overview))
+      .mockResolvedValueOnce(
+        jsonResponse(
+          {
+            path: 'D:\\SynologyDrive\\SunYu ERP Backups\\2026-08-28_104000',
+            created_at: '2026-08-28T10:40:00+08:00',
+          },
+          201,
+        ),
+      )
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveRefresh = resolve
+        }),
+      )
+
+    const wrapper = mountApp()
+    await settle()
+    await wrapper.get('[data-testid="backup-now"]').trigger('click')
+    await settle()
+
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(document.body.textContent).toContain('备份已完成')
+
+    resolveRefresh(jsonResponse({ detail: '系统概况暂时不可用' }, 503))
+    await settle()
+    await settle()
+
+    expect(document.body.textContent).toContain('备份已完成')
+    expect(wrapper.get('[data-testid="overview-error"]').text()).toContain(
+      '系统概况暂时不可用',
+    )
+    expect(wrapper.find('[data-testid="overview-retry"]').exists()).toBe(true)
+  })
+
+  it('备份已创建但概况刷新返回 401 时仍立即警告并回到登录', async () => {
+    let resolveRefresh!: (response: Response) => void
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ authenticated: true, password_configured: true }),
+      )
+      .mockResolvedValueOnce(jsonResponse(overview))
+      .mockResolvedValueOnce(
+        jsonResponse(
+          {
+            path: 'D:\\SynologyDrive\\SunYu ERP Backups\\2026-08-28_104500',
+            created_at: '2026-08-28T10:45:00+08:00',
+            warning: 'Backup created but cleanup failed',
+          },
+          201,
+        ),
+      )
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveRefresh = resolve
+        }),
+      )
+
+    const wrapper = mountApp()
+    await settle()
+    await wrapper.get('[data-testid="backup-now"]').trigger('click')
+    await settle()
+
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(document.body.textContent).toContain(
+      '备份已完成，但自动清理失败，请检查备份目录',
+    )
+
+    resolveRefresh(jsonResponse({ detail: '会话已过期' }, 401))
+    await settle()
+    await settle()
+
+    expect(document.body.textContent).toContain(
+      '备份已完成，但自动清理失败，请检查备份目录',
+    )
+    expect(wrapper.get('[data-testid="auth-title"]').text()).toContain('密码登录')
+    expect(wrapper.get('[data-testid="request-error"]').text()).toContain('会话已过期')
+  })
+
+  it('立即备份返回 401 时清理概况并返回登录页', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ authenticated: true, password_configured: true }),
+      )
+      .mockResolvedValueOnce(jsonResponse(overview))
+      .mockResolvedValueOnce(jsonResponse({ detail: '会话已过期' }, 401))
+
+    const wrapper = mountApp()
+    await settle()
+    await wrapper.get('[data-testid="backup-now"]').trigger('click')
+    await settle()
+
+    expect(wrapper.get('[data-testid="auth-title"]').text()).toContain('密码登录')
+    expect(wrapper.get('[data-testid="request-error"]').text()).toContain('会话已过期')
+    expect(wrapper.find('[data-testid="dashboard"]').exists()).toBe(false)
+  })
+
+  it('立即备份的非 401 错误保留在工作台', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ authenticated: true, password_configured: true }),
+      )
+      .mockResolvedValueOnce(jsonResponse(overview))
+      .mockResolvedValueOnce(jsonResponse({ detail: '备份操作失败' }, 503))
+
+    const wrapper = mountApp()
+    await settle()
+    await wrapper.get('[data-testid="backup-now"]').trigger('click')
+    await settle()
+
+    expect(wrapper.get('[data-testid="dashboard"]').text()).toContain('备份操作失败')
+    expect(wrapper.find('[data-testid="auth-title"]').exists()).toBe(false)
   })
 
   it('退出期间防止重复提交，完成后回到密码登录页', async () => {
