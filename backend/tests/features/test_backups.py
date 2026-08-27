@@ -4,7 +4,9 @@ import json
 import os
 import shutil
 import sqlite3
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
@@ -461,6 +463,43 @@ def test_corrupt_snapshot_header_fails_quick_check_and_cleans_stage(
     assert list(settings.backup_dir.glob(".incomplete-*")) == []
 
 
+def test_quick_check_uri_encodes_question_hash_unicode_and_space(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = replace(
+        _settings(tmp_path),
+        backup_dir=tmp_path / "NAS ?# 中文" / "Backups",
+    )
+    connection = _connection(settings)
+    real_validate = backup_module._validate_database_snapshot
+
+    def corrupt_then_validate(database_path: Path) -> None:
+        with database_path.open("r+b") as database_file:
+            database_file.write(b"not a sqlite database")
+            database_file.flush()
+            os.fsync(database_file.fileno())
+        real_validate(database_path)
+
+    monkeypatch.setattr(
+        backup_module,
+        "_validate_database_snapshot",
+        corrupt_then_validate,
+    )
+    try:
+        with pytest.raises(sqlite3.DatabaseError):
+            create_backup(connection, settings, now=NOW)
+        status = connection.execute(
+            "SELECT status FROM backup_runs ORDER BY id DESC"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert status == "failed"
+    assert list(settings.backup_dir.glob(".incomplete-*")) == []
+    assert not (tmp_path / "NAS ").exists()
+
+
 def test_publish_that_moves_then_raises_rolls_back_its_owned_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -592,6 +631,68 @@ class _NoOpUpdateConnection:
         self.wrapped.backup(target)
 
 
+class _StatusFaultConnection:
+    def __init__(
+        self,
+        wrapped: sqlite3.Connection,
+        *,
+        select_mode: str = "normal",
+        fail_compensation: bool = False,
+    ) -> None:
+        self.wrapped = wrapped
+        self.select_mode = select_mode
+        self.fail_compensation = fail_compensation
+        self.status_reads = 0
+
+    @property
+    def isolation_level(self) -> None:
+        return None
+
+    @property
+    def in_transaction(self) -> bool:
+        return self.wrapped.in_transaction
+
+    def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+        if "SELECT status FROM backup_runs" in sql:
+            self.status_reads += 1
+            if self.select_mode == "always_fail":
+                raise OSError("status read failed")
+            if self.select_mode == "unknown":
+                return self.wrapped.execute("SELECT 'unknown'")
+            if self.select_mode == "missing":
+                return self.wrapped.execute("SELECT 1 WHERE 0")
+            if self.select_mode == "second_fail" and self.status_reads >= 2:
+                raise OSError("status readback failed")
+        if self.fail_compensation and "status = 'failed'" in sql:
+            raise OSError("compensation update failed")
+        return self.wrapped.execute(sql, parameters)
+
+    def backup(self, target: sqlite3.Connection) -> None:
+        self.wrapped.backup(target)
+
+
+def _raise_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+    primary: BaseException,
+    after_success: Callable[[], None] = lambda: None,
+) -> None:
+    real_record_success = backup_module._record_successful_run
+
+    def write_success_then_fail(
+        connection: sqlite3.Connection,
+        run_id: int,
+    ) -> None:
+        real_record_success(connection, run_id)
+        after_success()
+        raise primary
+
+    monkeypatch.setattr(
+        backup_module,
+        "_record_successful_run",
+        write_success_then_fail,
+    )
+
+
 def test_success_update_rowcount_zero_cannot_return_success(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     connection = _connection(settings)
@@ -628,6 +729,173 @@ def test_failed_update_rowcount_zero_adds_note_without_masking_primary(
         connection.close()
 
     assert any("row" in note for note in (primary.__notes__ or []))
+
+
+def test_success_written_then_status_select_raises_preserves_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    connection = _connection(settings)
+    proxy = cast(
+        sqlite3.Connection,
+        _StatusFaultConnection(connection, select_mode="always_fail"),
+    )
+    primary = KeyboardInterrupt("primary interrupt")
+    _raise_after_success(monkeypatch, primary)
+    try:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            create_backup(proxy, settings, now=NOW)
+        status = connection.execute(
+            "SELECT status FROM backup_runs ORDER BY id DESC"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    target = settings.backup_dir / "2026-01-10_123456"
+    assert raised.value is primary
+    assert status == "success"
+    assert verify_backup(target)["product"] == "SunYu ERP"
+    assert any("status read failed" in note for note in primary.__notes__)
+
+
+def test_success_written_then_unknown_status_preserves_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    connection = _connection(settings)
+    proxy = cast(
+        sqlite3.Connection,
+        _StatusFaultConnection(connection, select_mode="unknown"),
+    )
+    primary = SystemExit("primary exit")
+    _raise_after_success(monkeypatch, primary)
+    try:
+        with pytest.raises(SystemExit) as raised:
+            create_backup(proxy, settings, now=NOW)
+    finally:
+        connection.close()
+
+    target = settings.backup_dir / "2026-01-10_123456"
+    assert raised.value is primary
+    assert target.exists()
+    assert any("unknown" in note for note in primary.__notes__)
+
+
+def test_success_written_then_status_row_missing_preserves_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    connection = _connection(settings)
+    proxy = cast(
+        sqlite3.Connection,
+        _StatusFaultConnection(connection, select_mode="missing"),
+    )
+    primary = OSError("primary failure")
+    _raise_after_success(monkeypatch, primary)
+    try:
+        with pytest.raises(OSError) as raised:
+            create_backup(proxy, settings, now=NOW)
+    finally:
+        connection.close()
+
+    target = settings.backup_dir / "2026-01-10_123456"
+    assert raised.value is primary
+    assert target.exists()
+    assert any("row is missing" in note for note in primary.__notes__)
+
+
+def test_success_with_damaged_target_transitions_failed_before_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    connection = _connection(settings)
+    target = settings.backup_dir / "2026-01-10_123456"
+    primary = OSError("primary failure")
+    _raise_after_success(
+        monkeypatch,
+        primary,
+        lambda: (target / "config.json").write_text("damaged"),
+    )
+    try:
+        with pytest.raises(OSError) as raised:
+            create_backup(connection, settings, now=NOW)
+        status = connection.execute(
+            "SELECT status FROM backup_runs ORDER BY id DESC"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert raised.value is primary
+    assert status == "failed"
+    assert not target.exists()
+
+
+def test_compensation_update_failure_preserves_published_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    connection = _connection(settings)
+    proxy = cast(
+        sqlite3.Connection,
+        _StatusFaultConnection(connection, fail_compensation=True),
+    )
+    target = settings.backup_dir / "2026-01-10_123456"
+    primary = KeyboardInterrupt("primary interrupt")
+    _raise_after_success(
+        monkeypatch,
+        primary,
+        lambda: (target / "config.json").write_text("damaged"),
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            create_backup(proxy, settings, now=NOW)
+        status = connection.execute(
+            "SELECT status FROM backup_runs ORDER BY id DESC"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert raised.value is primary
+    assert status == "success"
+    assert target.exists()
+    assert any("compensation update failed" in note for note in primary.__notes__)
+
+
+def test_compensation_readback_failure_preserves_published_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    connection = _connection(settings)
+    proxy = cast(
+        sqlite3.Connection,
+        _StatusFaultConnection(connection, select_mode="second_fail"),
+    )
+    target = settings.backup_dir / "2026-01-10_123456"
+    primary = SystemExit("primary exit")
+    _raise_after_success(
+        monkeypatch,
+        primary,
+        lambda: (target / "config.json").write_text("damaged"),
+    )
+    try:
+        with pytest.raises(SystemExit) as raised:
+            create_backup(proxy, settings, now=NOW)
+        status = connection.execute(
+            "SELECT status FROM backup_runs ORDER BY id DESC"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert raised.value is primary
+    assert status == "failed"
+    assert target.exists()
+    assert any("status readback failed" in note for note in primary.__notes__)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges on Windows")
@@ -744,6 +1012,51 @@ def test_manifest_entry_count_is_bounded() -> None:
 
     with pytest.raises(ValueError, match="too many"):
         backup_module._validate_manifest(manifest)
+
+
+def test_actual_file_count_limit_aborts_creation_and_cleans_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    project_file = settings.data_dir / "Projects/P-001/design.bin"
+    project_file.parent.mkdir(parents=True)
+    project_file.write_bytes(b"design")
+    connection = _connection(settings)
+    manifest_written = False
+    real_write_manifest = backup_module._write_manifest
+
+    def track_manifest_write(path: Path, manifest: dict[str, object]) -> None:
+        nonlocal manifest_written
+        manifest_written = True
+        real_write_manifest(path, manifest)
+
+    monkeypatch.setattr(backup_module, "_MAX_MANIFEST_ENTRIES", 2)
+    monkeypatch.setattr(backup_module, "_write_manifest", track_manifest_write)
+    try:
+        with pytest.raises(ValueError, match="too many"):
+            create_backup(connection, settings, now=NOW)
+        status = connection.execute(
+            "SELECT status FROM backup_runs ORDER BY id DESC"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert status == "failed"
+    assert not manifest_written
+    assert list(settings.backup_dir.glob(".incomplete-*")) == []
+
+
+def test_actual_file_count_limit_aborts_verify_before_set_keeps_growing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backup_path, _ = _create_valid_backup(tmp_path)
+    (backup_path / "unexpected.txt").write_text("unexpected")
+    monkeypatch.setattr(backup_module, "_MAX_MANIFEST_ENTRIES", 2)
+
+    with pytest.raises(ValueError, match="too many"):
+        verify_backup(backup_path)
 
 
 def test_file_set_mismatch_error_is_bounded(tmp_path: Path) -> None:

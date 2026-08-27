@@ -312,7 +312,8 @@ def _validate_database_snapshot(database_path: Path) -> None:
     primary: BaseException | None = None
     rows: list[tuple[str]] = []
     try:
-        checker = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+        database_uri = database_path.resolve(strict=True).as_uri()
+        checker = sqlite3.connect(f"{database_uri}?mode=ro", uri=True)
         rows = checker.execute("PRAGMA quick_check").fetchall()
         if rows != [("ok",)]:
             raise RuntimeError("staged database quick_check did not return exactly ok")
@@ -352,23 +353,35 @@ def _handle_failed_creation(
     published_identity: _FileIdentity | None,
 ) -> None:
     status = _read_run_status(connection, run_id, primary)
-    preserve_published = False
+    confirmed_failed = status == "failed"
     if status == "success" and published_identity is not None:
-        preserve_published = _owned_backup_is_valid(
+        target_is_valid = _owned_backup_is_valid(
             target,
             published_identity,
             primary,
         )
-    elif status == "running":
-        _record_failed_run(connection, run_id, primary)
-        status = _read_run_status(connection, run_id, primary)
-        if status == "success" and published_identity is not None:
-            preserve_published = _owned_backup_is_valid(
-                target,
-                published_identity,
+        if not target_is_valid:
+            confirmed_failed = _transition_run_to_failed(
+                connection,
+                run_id,
+                "success",
                 primary,
             )
-    if published_identity is not None and not preserve_published:
+    elif status == "success":
+        confirmed_failed = _transition_run_to_failed(
+            connection,
+            run_id,
+            "success",
+            primary,
+        )
+    elif status == "running":
+        confirmed_failed = _transition_run_to_failed(
+            connection,
+            run_id,
+            "running",
+            primary,
+        )
+    if published_identity is not None and confirmed_failed:
         try:
             _remove_owned_backup(target, published_identity)
         except BaseException as cleanup_failure:  # noqa: BLE001
@@ -396,7 +409,33 @@ def _read_run_status(
     if row is None:
         primary.add_note("failed to read backup run status: row is missing")
         return None
-    return str(row[0])
+    status = str(row[0])
+    if status not in {"running", "success", "failed"}:
+        primary.add_note(f"failed to read backup run status: unknown status {status!r}")
+        return None
+    return status
+
+
+def _transition_run_to_failed(
+    connection: sqlite3.Connection,
+    run_id: int,
+    expected_status: str,
+    primary: BaseException,
+) -> bool:
+    if not _record_failed_run(
+        connection,
+        run_id,
+        primary,
+        expected_status=expected_status,
+    ):
+        return False
+    status = _read_run_status(connection, run_id, primary)
+    if status != "failed":
+        primary.add_note(
+            f"failed to confirm backup compensation: status is {status!r}"
+        )
+        return False
+    return True
 
 
 def _owned_backup_is_valid(
@@ -641,26 +680,32 @@ def _record_failed_run(
     connection: sqlite3.Connection,
     run_id: int,
     primary: BaseException,
-) -> None:
+    *,
+    expected_status: str = "running",
+) -> bool:
     try:
         cursor = connection.execute(
             """
             UPDATE backup_runs
             SET finished_at = ?, status = 'failed', error_message = ?
-            WHERE id = ? AND status = 'running'
+            WHERE id = ? AND status = ?
             """,
             (
                 datetime.now(timezone.utc).isoformat(),
                 f"{type(primary).__name__}: backup operation failed",
                 run_id,
+                expected_status,
             ),
         )
         if cursor.rowcount != 1:
             primary.add_note(
                 f"failed to record backup failure: expected 1 row, got {cursor.rowcount}"
             )
+            return False
     except BaseException as record_failure:  # noqa: BLE001
         primary.add_note(f"failed to record backup failure: {record_failure}")
+        return False
+    return True
 
 
 def _remove_stage(stage: Path) -> None:
@@ -780,6 +825,8 @@ def _list_backup_files(root: Path) -> set[str]:
                     if relative != "manifest.json":
                         _validate_manifest_path(relative)
                         files.add(relative)
+                        if len(files) > _MAX_MANIFEST_ENTRIES:
+                            raise ValueError("backup contains too many files")
                 else:
                     raise ValueError(f"backup contains a non-regular file: {path}")
 
