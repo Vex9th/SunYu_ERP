@@ -251,6 +251,22 @@ def test_requires_existing_regular_source(tmp_path: Path, source_kind: str) -> N
         files.store_version(source, tmp_path / "Data", "P-1", "图纸")
 
 
+def test_stable_source_symlink_is_allowed_and_copied(tmp_path: Path) -> None:
+    source_target = tmp_path / "source-target.bin"
+    source_target.write_bytes(b"stable-content")
+    source_link = tmp_path / "source-link.bin"
+    try:
+        source_link.symlink_to(source_target)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlink creation is not available")
+
+    stored = files.store_version(source_link, tmp_path / "Data", "P-1", "图纸")
+
+    assert stored.original_name == "source-link.bin"
+    assert stored.path.read_bytes() == b"stable-content"
+    assert source_target.read_bytes() == b"stable-content"
+
+
 @pytest.mark.parametrize("escape_at", ["Projects", "project", "category"])
 def test_rejects_existing_destination_symlink_escape(
     tmp_path: Path,
@@ -299,53 +315,39 @@ def test_existing_version_is_never_overwritten(tmp_path: Path) -> None:
     assert stored.path.read_bytes() == b"new"
 
 
+@pytest.mark.parametrize("link_kind", ["reservation", "target"])
 @pytest.mark.parametrize("failure_type", [OSError, KeyboardInterrupt, SystemExit])
-def test_reservation_close_failure_cleans_and_reuses_version_one(
+def test_link_created_then_exception_cleans_and_reuses_version_one(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    link_kind: str,
     failure_type: type[BaseException],
 ) -> None:
     source = tmp_path / "source.bin"
     source.write_bytes(b"content")
     data_dir = tmp_path / "Data"
-    original_open = Path.open
+    original_link = os.link
     injection_enabled = True
+    primary = failure_type(f"injected {link_kind} link failure")
 
-    class InterruptAfterClose:
-        def __init__(self, handle: BinaryIO) -> None:
-            self._handle = handle
-
-        @property
-        def closed(self) -> bool:
-            return self._handle.closed
-
-        def close(self) -> None:
-            self._handle.close()
-            raise failure_type("injected reservation close failure")
-
-        def __enter__(self) -> BinaryIO:
-            return self._handle.__enter__()
-
-        def __exit__(self, *args: object) -> bool | None:
-            del args
-            self.close()
-
-    def open_with_close_interruption(
-        path: Path,
-        mode: str = "r",
+    def link_then_fail(
+        source_path: os.PathLike[str],
+        destination_path: os.PathLike[str],
         *args: object,
         **kwargs: object,
-    ) -> BinaryIO | InterruptAfterClose:
-        handle = original_open(path, mode, *args, **kwargs)
-        if injection_enabled and mode == "xb" and path.name.endswith(".reserve"):
-            return InterruptAfterClose(handle)
-        return handle
+    ) -> None:
+        original_link(source_path, destination_path, *args, **kwargs)
+        destination = Path(destination_path)
+        is_reservation = destination.name.endswith(".reserve")
+        if injection_enabled and is_reservation == (link_kind == "reservation"):
+            raise primary
 
-    monkeypatch.setattr(Path, "open", open_with_close_interruption)
+    monkeypatch.setattr(files.os, "link", link_then_fail)
 
-    with pytest.raises(failure_type, match="injected reservation close failure"):
+    with pytest.raises(failure_type) as caught:
         files.store_version(source, data_dir, "P-1", "图纸")
 
+    assert caught.value is primary
     category_dir = data_dir / "Projects" / "P-1" / "图纸"
     assert list((data_dir / "Temp").iterdir()) == []
     assert list(category_dir.iterdir()) == []
@@ -355,6 +357,124 @@ def test_reservation_close_failure_cleans_and_reuses_version_one(
     assert stored.version_number == 1
     assert stored.path.read_bytes() == b"content"
     _assert_no_work_files(data_dir)
+
+
+@pytest.mark.parametrize("link_kind", ["reservation", "target"])
+def test_replaced_link_is_not_deleted_or_overwritten(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    link_kind: str,
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"our-content")
+    data_dir = tmp_path / "Data"
+    original_link = os.link
+    replacement_content = b"other-owner"
+
+    def link_then_replace(
+        source_path: os.PathLike[str],
+        destination_path: os.PathLike[str],
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        original_link(source_path, destination_path, *args, **kwargs)
+        destination = Path(destination_path)
+        is_reservation = destination.name.endswith(".reserve")
+        if is_reservation == (link_kind == "reservation"):
+            destination.unlink()
+            destination.write_bytes(replacement_content)
+
+    monkeypatch.setattr(files.os, "link", link_then_replace)
+
+    with pytest.raises(RuntimeError, match="ownership"):
+        files.store_version(source, data_dir, "P-1", "图纸")
+
+    category_dir = data_dir / "Projects" / "P-1" / "图纸"
+    remaining = list(category_dir.iterdir())
+    assert len(remaining) == 1
+    assert remaining[0].read_bytes() == replacement_content
+    assert list((data_dir / "Temp").iterdir()) == []
+
+
+def test_primary_exception_survives_cleanup_failures_and_all_paths_are_tried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"content")
+    data_dir = tmp_path / "Data"
+    original_link = os.link
+    original_unlink = Path.unlink
+    primary = KeyboardInterrupt("primary link interruption")
+    cleanup = OSError("reservation cleanup failed after unlink")
+    unlink_attempts: list[str] = []
+
+    def link_target_then_interrupt(
+        source_path: os.PathLike[str],
+        destination_path: os.PathLike[str],
+    ) -> None:
+        original_link(source_path, destination_path)
+        if not Path(destination_path).name.endswith(".reserve"):
+            raise primary
+
+    def unlink_with_recorded_failure(
+        path: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        unlink_attempts.append(path.name)
+        original_unlink(path, *args, **kwargs)
+        if path.name.endswith(".reserve"):
+            raise cleanup
+
+    monkeypatch.setattr(files.os, "link", link_target_then_interrupt)
+    monkeypatch.setattr(Path, "unlink", unlink_with_recorded_failure)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        files.store_version(source, data_dir, "P-1", "图纸")
+
+    assert caught.value is primary
+    assert any("reservation cleanup failed" in note for note in primary.__notes__)
+    assert any(name.endswith(".reserve") for name in unlink_attempts)
+    assert any(name.startswith(".upload-") for name in unlink_attempts)
+    assert any("_v000001_" in name for name in unlink_attempts)
+    assert list((data_dir / "Temp").iterdir()) == []
+    assert list((data_dir / "Projects" / "P-1" / "图纸").iterdir()) == []
+
+
+def test_success_cleanup_failure_is_failfast_and_undoes_published_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"content")
+    data_dir = tmp_path / "Data"
+    original_unlink = Path.unlink
+    cleanup = OSError("temp cleanup failed after unlink")
+    injection_enabled = True
+
+    def unlink_temp_then_fail(
+        path: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal injection_enabled
+        original_unlink(path, *args, **kwargs)
+        if injection_enabled and path.name.startswith(".upload-"):
+            injection_enabled = False
+            raise cleanup
+
+    monkeypatch.setattr(Path, "unlink", unlink_temp_then_fail)
+
+    with pytest.raises(OSError) as caught:
+        files.store_version(source, data_dir, "P-1", "图纸")
+
+    assert caught.value is cleanup
+    assert list((data_dir / "Temp").iterdir()) == []
+    category_dir = data_dir / "Projects" / "P-1" / "图纸"
+    assert list(category_dir.iterdir()) == []
+    stored = files.store_version(source, data_dir, "P-1", "图纸")
+    assert stored.version_number == 1
 
 
 def test_file_exists_does_not_delete_another_reservation(tmp_path: Path) -> None:
@@ -439,6 +559,58 @@ def test_copy_failure_cleans_temp_and_version_reservation(
     assert not list((data_dir / "Projects").rglob("*"))
 
 
+def test_staged_fstat_failure_closes_and_removes_mkstemp_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"content")
+    data_dir = tmp_path / "Data"
+    primary = OSError("injected staged fstat failure")
+
+    def fail_fstat(file_descriptor: int) -> os.stat_result:
+        del file_descriptor
+        raise primary
+
+    monkeypatch.setattr(files.os, "fstat", fail_fstat)
+
+    with pytest.raises(OSError) as caught:
+        files.store_version(source, data_dir, "P-1", "图纸")
+
+    assert caught.value is primary
+    assert list((data_dir / "Temp").iterdir()) == []
+
+
+def test_fdopen_primary_survives_close_failure_and_temp_is_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"content")
+    data_dir = tmp_path / "Data"
+    primary = KeyboardInterrupt("injected fdopen failure")
+    cleanup = OSError("injected descriptor close failure")
+    original_close = os.close
+
+    def fail_fdopen(file_descriptor: int, mode: str) -> BinaryIO:
+        del file_descriptor, mode
+        raise primary
+
+    def close_then_fail(file_descriptor: int) -> None:
+        original_close(file_descriptor)
+        raise cleanup
+
+    monkeypatch.setattr(files.os, "fdopen", fail_fdopen)
+    monkeypatch.setattr(files.os, "close", close_then_fail)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        files.store_version(source, data_dir, "P-1", "图纸")
+
+    assert caught.value is primary
+    assert any("descriptor close failed" in note for note in primary.__notes__)
+    assert list((data_dir / "Temp").iterdir()) == []
+
+
 def test_copy_interruption_cleans_temp_without_publishing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -485,27 +657,130 @@ def test_fsync_failure_cleans_temp_and_version_reservation(
     _assert_no_work_files(data_dir)
 
 
-def test_replace_failure_cleans_temp_target_and_reservation(
+@pytest.mark.parametrize("failure_type", [OSError, KeyboardInterrupt, SystemExit])
+def test_flush_failure_cleans_temp_without_publishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"content")
+    data_dir = tmp_path / "Data"
+    primary = failure_type("injected flush failure")
+
+    def fail_flush_and_sync(temporary_file: BinaryIO) -> None:
+        temporary_file.flush()
+        raise primary
+
+    monkeypatch.setattr(files, "_flush_and_sync", fail_flush_and_sync)
+
+    with pytest.raises(failure_type) as caught:
+        files.store_version(source, data_dir, "P-1", "图纸")
+
+    assert caught.value is primary
+    _assert_no_work_files(data_dir)
+
+
+def test_unsupported_hard_link_is_failfast_with_zero_residue(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "source.bin"
     source.write_bytes(b"content")
     data_dir = tmp_path / "Data"
+    primary = OSError("hard links are unsupported")
 
-    def fail_replace(source_path: os.PathLike[str], target_path: os.PathLike[str]) -> None:
-        del source_path, target_path
-        raise OSError("injected replace failure")
+    def fail_link(
+        source_path: os.PathLike[str],
+        destination_path: os.PathLike[str],
+    ) -> None:
+        del source_path, destination_path
+        raise primary
 
-    monkeypatch.setattr(files.os, "replace", fail_replace)
+    monkeypatch.setattr(files.os, "link", fail_link)
 
-    with pytest.raises(OSError, match="injected replace failure"):
+    with pytest.raises(OSError) as caught:
         files.store_version(source, data_dir, "P-1", "图纸")
 
-    assert source.read_bytes() == b"content"
-    _assert_no_work_files(data_dir)
-    category_dir = data_dir / "Projects" / "P-1" / "图纸"
-    assert list(category_dir.iterdir()) == []
+    assert caught.value is primary
+    assert list((data_dir / "Temp").iterdir()) == []
+    assert list((data_dir / "Projects" / "P-1" / "图纸").iterdir()) == []
+
+
+def test_same_size_and_mtime_source_inode_replacement_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"AAAA")
+    initial_stat = source.stat()
+    replacement = tmp_path / "replacement.bin"
+    original_stream_copy = files._stream_copy
+
+    def copy_then_replace_source(
+        source_file: BinaryIO,
+        destination: BinaryIO,
+    ) -> tuple[int, str]:
+        result = original_stream_copy(source_file, destination)
+        replacement.write_bytes(b"BBBB")
+        os.utime(
+            replacement,
+            ns=(initial_stat.st_atime_ns, initial_stat.st_mtime_ns),
+        )
+        try:
+            os.replace(replacement, source)
+        except OSError:
+            pytest.skip("platform cannot replace an open source file")
+        return result
+
+    monkeypatch.setattr(files, "_stream_copy", copy_then_replace_source)
+
+    with pytest.raises(RuntimeError, match="source changed"):
+        files.store_version(source, tmp_path / "Data", "P-1", "图纸")
+
+    _assert_no_work_files(tmp_path / "Data")
+    assert not list((tmp_path / "Data" / "Projects").rglob("*"))
+
+
+def test_category_swapped_to_symlink_during_publish_is_detected_and_cleaned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"content")
+    data_dir = tmp_path / "Data"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    probe = tmp_path / "symlink-probe"
+    try:
+        probe.symlink_to(outside, target_is_directory=True)
+        probe.unlink()
+    except (NotImplementedError, OSError):
+        pytest.skip("symlink creation is not available")
+    original_link = os.link
+    swapped = False
+
+    def swap_category_then_link(
+        source_path: os.PathLike[str],
+        destination_path: os.PathLike[str],
+    ) -> None:
+        nonlocal swapped
+        destination = Path(destination_path)
+        if not swapped:
+            swapped = True
+            category_dir = destination.parent
+            displaced = category_dir.with_name(f"{category_dir.name}-displaced")
+            category_dir.rename(displaced)
+            category_dir.symlink_to(outside, target_is_directory=True)
+        original_link(source_path, destination_path)
+
+    monkeypatch.setattr(files.os, "link", swap_category_then_link)
+
+    with pytest.raises(RuntimeError, match="outside data_dir"):
+        files.store_version(source, data_dir, "P-1", "图纸")
+
+    assert list(outside.iterdir()) == []
+    assert list((data_dir / "Temp").iterdir()) == []
 
 
 def test_source_change_during_copy_fails_without_publishing(
