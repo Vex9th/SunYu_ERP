@@ -10,6 +10,7 @@ from backend.app.core.storage_paths import normalize_project_code
     [
         ("PRJ-001", "PRJ-001"),
         ("  PRJ-001\t", "PRJ-001"),
+        ("CLOCK$", "CLOCK$"),
         ("项" * 40, "项" * 40),
     ],
 )
@@ -80,6 +81,31 @@ def test_normalize_project_code_rejects_unsafe_values(value: str) -> None:
     ],
 )
 def test_normalize_project_code_rejects_superscript_device_names(
+    value: str,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="project_code must be a safe single path segment",
+    ):
+        normalize_project_code(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "CONIN$",
+        "conin$",
+        "ConIn$.txt",
+        "CONOUT$",
+        "conout$",
+        "ConOut$.log",
+        "CON .txt",
+        "PRN .x",
+        "COM1 .log",
+        "LPT¹ .tar.gz",
+    ],
+)
+def test_normalize_project_code_rejects_reserved_device_name_variants(
     value: str,
 ) -> None:
     with pytest.raises(
