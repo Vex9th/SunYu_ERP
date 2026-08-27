@@ -174,6 +174,17 @@ def test_stores_two_versions_with_hash_size_and_data_relative_paths(
     _assert_no_work_files(data_dir)
 
 
+def test_store_version_uses_normalized_project_code(tmp_path: Path) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("safe", encoding="utf-8")
+    data_dir = tmp_path / "Data"
+
+    stored = files.store_version(source, data_dir, "  PRJ-001\t", "图纸")
+
+    assert stored.relative_path.parts[:3] == ("Projects", "PRJ-001", "图纸")
+    assert not (data_dir / "Projects" / "  PRJ-001\t").exists()
+
+
 @pytest.mark.parametrize("content", [b"", b"0123456789" * 30_000])
 def test_streams_empty_and_multiblock_files(tmp_path: Path, content: bytes) -> None:
     source = tmp_path / "payload.bin"
@@ -237,6 +248,21 @@ def test_rejects_unsafe_path_segments(
 
     with pytest.raises(ValueError, match=field):
         files.store_version(source, tmp_path / "Data", **arguments)
+
+    assert not (tmp_path / "Data").exists()
+
+
+def test_project_code_type_error_is_preserved(tmp_path: Path) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("safe", encoding="utf-8")
+
+    with pytest.raises(TypeError, match="project_code must be a string"):
+        files.store_version(
+            source,
+            tmp_path / "Data",
+            123,  # type: ignore[arg-type]
+            "图纸",
+        )
 
     assert not (tmp_path / "Data").exists()
 

@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO
 
+from backend.app.core.storage_paths import normalize_project_code
+
 _COPY_CHUNK_SIZE = 64 * 1024
 _INVALID_WINDOWS_FILENAME_CHARACTERS = frozenset('<>:"/\\|?*')
 _WINDOWS_DEVICE_NAMES = frozenset(
@@ -118,7 +120,7 @@ def store_version(
     external processes do not mutate ``Data/Projects`` or ``Data/Temp`` while
     versions are being stored.
     """
-    _validate_path_segment(project_code, "project_code")
+    project_code = normalize_project_code(project_code)
     _validate_path_segment(category, "category")
     source = Path(source_path)
     initial_source_stat = _require_regular_source(source)
