@@ -22,6 +22,68 @@ _VERSIONED_FILENAME = re.compile(
     r"^\d{8}T\d{12}Z_v(?P<version>\d+)_"
 )
 _FileIdentity = tuple[int, int]
+_BOUND_DIRECTORY_SUPPORTED = hasattr(os, "O_DIRECTORY") and all(
+    function in os.supports_dir_fd
+    for function in (os.open, os.link, os.stat, os.unlink)
+)
+
+
+@dataclass(slots=True)
+class _BoundDirectory:
+    path: Path
+    data_root: Path
+    identity: _FileIdentity
+    directory_fd: int | None = None
+    windows_handle: int | None = None
+
+    def require_current(self) -> None:
+        resolved = self.path.resolve(strict=True)
+        if not resolved.is_relative_to(self.data_root):
+            raise RuntimeError(
+                f"destination directory is outside data_dir: {self.path}"
+            )
+        if _file_identity(resolved.stat()) != self.identity:
+            raise RuntimeError(
+                f"destination directory changed during publish: {self.path}"
+            )
+
+    def names(self) -> list[str]:
+        if self.directory_fd is not None:
+            return os.listdir(self.directory_fd)
+        return os.listdir(self.path)
+
+    def link(self, source: Path, name: str) -> None:
+        if self.directory_fd is not None:
+            os.link(source, name, dst_dir_fd=self.directory_fd)
+            return
+        self.require_current()
+        os.link(source, self.path / name)
+
+    def stat(self, name: str) -> os.stat_result:
+        if self.directory_fd is not None:
+            return os.stat(name, dir_fd=self.directory_fd, follow_symlinks=False)
+        return os.stat(self.path / name, follow_symlinks=False)
+
+    def unlink(self, name: str) -> None:
+        if self.directory_fd is not None:
+            os.unlink(name, dir_fd=self.directory_fd)
+            return
+        os.unlink(self.path / name)
+
+    def open_readonly(self, name: str) -> int:
+        if self.directory_fd is not None:
+            return os.open(name, os.O_RDONLY, dir_fd=self.directory_fd)
+        return os.open(self.path / name, os.O_RDONLY)
+
+    def close(self) -> None:
+        if self.directory_fd is not None:
+            directory_fd = self.directory_fd
+            self.directory_fd = None
+            os.close(directory_fd)
+        if self.windows_handle is not None:
+            windows_handle = self.windows_handle
+            self.windows_handle = None
+            _close_windows_directory_handle(windows_handle)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +130,8 @@ def store_version(
             category_dir,
             sanitized_name,
             created_at,
+            size_bytes,
+            sha256,
         )
         relative_path = target_path.relative_to(data_root)
         return StoredFileVersion(
@@ -167,11 +231,24 @@ def _stage_source(
         except BaseException as primary:
             _close_descriptor_after_failure(primary, file_descriptor)
             raise
-        with temporary_file, source.open("rb") as source_file:
+        source_file: BinaryIO | None = None
+        operation_failure: BaseException | None = None
+        try:
+            source_file = source.open("rb")
             opened_source_stat = os.fstat(source_file.fileno())
             size_bytes, sha256 = _stream_copy(source_file, temporary_file)
             _flush_and_sync(temporary_file)
             final_open_source_stat = os.fstat(source_file.fileno())
+        except BaseException as failure:  # noqa: BLE001 - preserve interrupts
+            operation_failure = failure
+
+        operation_failure = _close_stage_handles(
+            operation_failure,
+            source_file,
+            temporary_file,
+        )
+        if operation_failure is not None:
+            raise operation_failure.with_traceback(operation_failure.__traceback__)
 
         if not _source_is_unchanged(
             source,
@@ -188,6 +265,27 @@ def _stage_source(
             temporary_identity,
         )
         raise
+
+
+def _close_stage_handles(
+    primary: BaseException | None,
+    source_file: BinaryIO | None,
+    temporary_file: BinaryIO,
+) -> BaseException | None:
+    for label, file_handle in (
+        ("source", source_file),
+        ("temporary", temporary_file),
+    ):
+        if file_handle is None:
+            continue
+        try:
+            file_handle.close()
+        except BaseException as close_failure:  # noqa: BLE001 - close every handle
+            if primary is None:
+                primary = close_failure
+            else:
+                primary.add_note(f"{label} close failed: {close_failure}")
+    return primary
 
 
 def _cleanup_new_temporary_after_failure(
@@ -267,6 +365,108 @@ def _source_signature(source_stat: os.stat_result) -> tuple[int, int, int, int, 
     )
 
 
+def _open_bound_directory(data_root: Path, category_dir: Path) -> _BoundDirectory:
+    if os.name == "nt":
+        windows_handle = _open_windows_directory_handle(category_dir)
+        try:
+            category_identity = _file_identity(category_dir.stat())
+        except BaseException as primary:
+            try:
+                _close_windows_directory_handle(windows_handle)
+            except BaseException as close_failure:  # noqa: BLE001 - keep primary
+                primary.add_note(f"directory binding close failed: {close_failure}")
+            raise
+        binding = _BoundDirectory(
+            category_dir,
+            data_root,
+            category_identity,
+            windows_handle=windows_handle,
+        )
+    else:
+        if not _BOUND_DIRECTORY_SUPPORTED:
+            raise RuntimeError(
+                "safe directory-bound file publishing is unsupported on this platform"
+            )
+        flags = os.O_RDONLY | os.O_DIRECTORY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        directory_fd = os.open(category_dir, flags)
+        try:
+            category_identity = _file_identity(os.fstat(directory_fd))
+        except BaseException as primary:
+            try:
+                os.close(directory_fd)
+            except BaseException as close_failure:  # noqa: BLE001 - keep primary
+                primary.add_note(f"directory binding close failed: {close_failure}")
+            raise
+        binding = _BoundDirectory(
+            category_dir,
+            data_root,
+            category_identity,
+            directory_fd=directory_fd,
+        )
+    try:
+        binding.require_current()
+    except BaseException as primary:
+        try:
+            binding.close()
+        except BaseException as close_failure:  # noqa: BLE001 - keep primary
+            primary.add_note(f"directory binding close failed: {close_failure}")
+        raise
+    return binding
+
+
+def _open_windows_directory_handle(category_dir: Path) -> int:
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError as exc:  # pragma: no cover - Windows-only capability guard
+        raise RuntimeError(
+            "safe Windows directory binding is unavailable"
+        ) from exc
+
+    create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    generic_read = 0x80000000
+    share_read = 0x00000001
+    share_write = 0x00000002
+    open_existing = 3
+    backup_semantics = 0x02000000
+    handle = create_file(
+        str(category_dir),
+        generic_read,
+        share_read | share_write,
+        None,
+        open_existing,
+        backup_semantics,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle in (None, invalid_handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return int(handle)
+
+
+def _close_windows_directory_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    if not close_handle(wintypes.HANDLE(handle)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
 def _publish_staged_file(
     temporary_path: Path,
     temporary_identity: _FileIdentity,
@@ -274,134 +474,156 @@ def _publish_staged_file(
     category_dir: Path,
     sanitized_name: str,
     created_at: datetime,
+    expected_size: int,
+    expected_sha256: str,
 ) -> tuple[int, Path]:
-    category_identity = _file_identity(category_dir.stat())
-    version_number = _next_published_version(category_dir)
+    binding = _open_bound_directory(data_root, category_dir)
+    try:
+        result = _publish_in_bound_directory(
+            temporary_path,
+            temporary_identity,
+            binding,
+            sanitized_name,
+            created_at,
+            expected_size,
+            expected_sha256,
+        )
+    except BaseException as primary:
+        try:
+            binding.close()
+        except BaseException as close_failure:  # noqa: BLE001 - keep primary
+            primary.add_note(f"directory binding close failed: {close_failure}")
+        raise
+    try:
+        binding.close()
+    except BaseException as close_failure:
+        _cleanup_after_failure(
+            close_failure,
+            temporary_path,
+            temporary_identity,
+            target=result[1],
+        )
+        raise
+    return result
+
+
+def _publish_in_bound_directory(
+    temporary_path: Path,
+    temporary_identity: _FileIdentity,
+    binding: _BoundDirectory,
+    sanitized_name: str,
+    created_at: datetime,
+    expected_size: int,
+    expected_sha256: str,
+) -> tuple[int, Path]:
+    version_number = _next_bound_version(binding)
     timestamp = created_at.strftime("%Y%m%dT%H%M%S%fZ")
     while True:
-        _require_unchanged_contained_directory(
-            data_root,
-            category_dir,
-            category_identity,
-        )
-        reservation = category_dir / f".version-{version_number:012d}.reserve"
-        target: Path | None = None
+        binding.require_current()
+        reservation_name = f".version-{version_number:012d}.reserve"
+        target_name: str | None = None
         try:
             try:
-                os.link(temporary_path, reservation)
+                binding.link(temporary_path, reservation_name)
             except FileExistsError:
-                if _paths_share_owned_inode(
-                    reservation,
-                    temporary_path,
+                if _bound_name_has_identity(
+                    binding,
+                    reservation_name,
                     temporary_identity,
                 ):
                     raise
                 version_number += 1
                 continue
 
-            _require_owned_contained_link(
-                data_root,
-                temporary_path,
+            _require_bound_name_owned(
+                binding,
+                reservation_name,
                 temporary_identity,
-                reservation,
             )
-            _require_unchanged_contained_directory(
-                data_root,
-                category_dir,
-                category_identity,
-            )
-            target = category_dir / (
+            binding.require_current()
+            target_name = (
                 f"{timestamp}_v{version_number:06d}_{sanitized_name}"
             )
             try:
-                os.link(temporary_path, target)
+                binding.link(temporary_path, target_name)
             except FileExistsError:
-                if _paths_share_owned_inode(
-                    target,
-                    temporary_path,
+                if _bound_name_has_identity(
+                    binding,
+                    target_name,
                     temporary_identity,
                 ):
                     raise
-                _unlink_owned_path(
-                    reservation,
-                    temporary_path,
+                _unlink_bound_owned_name(
+                    binding,
+                    reservation_name,
                     temporary_identity,
                 )
                 version_number += 1
                 continue
 
-            _require_owned_contained_link(
-                data_root,
-                temporary_path,
+            _require_bound_name_owned(
+                binding,
+                target_name,
                 temporary_identity,
-                target,
             )
             _finalize_publication(
                 temporary_path,
                 temporary_identity,
-                reservation,
-                target,
+                binding,
+                reservation_name,
+                target_name,
             )
-            return version_number, target
+            binding.require_current()
+            _require_final_target_integrity(
+                binding,
+                target_name,
+                temporary_identity,
+                expected_size,
+                expected_sha256,
+            )
+            return version_number, binding.path / target_name
         except BaseException as primary:
-            _cleanup_after_failure(
+            _cleanup_bound_after_failure(
                 primary,
+                binding,
                 temporary_path,
                 temporary_identity,
-                reservation,
-                target,
+                reservation_name,
+                target_name,
             )
             raise
 
 
-def _require_unchanged_contained_directory(
-    data_root: Path,
-    directory: Path,
-    expected_identity: _FileIdentity,
-) -> None:
-    resolved = directory.resolve(strict=True)
-    if not resolved.is_relative_to(data_root):
-        raise RuntimeError(f"destination directory is outside data_dir: {directory}")
-    if _file_identity(resolved.stat()) != expected_identity:
-        raise RuntimeError(f"destination directory changed during publish: {directory}")
-
-
-def _require_owned_contained_link(
-    data_root: Path,
-    temporary_path: Path,
+def _require_bound_name_owned(
+    binding: _BoundDirectory,
+    name: str,
     temporary_identity: _FileIdentity,
-    linked_path: Path,
 ) -> None:
-    if not _paths_share_owned_inode(
-        linked_path,
-        temporary_path,
-        temporary_identity,
-    ):
-        raise RuntimeError(f"linked path ownership changed: {linked_path}")
-    resolved = linked_path.resolve(strict=True)
-    if not resolved.is_relative_to(data_root):
-        raise RuntimeError(f"linked path is outside data_dir: {linked_path}")
+    if not _bound_name_has_identity(binding, name, temporary_identity):
+        raise RuntimeError(f"linked path ownership changed: {binding.path / name}")
+    binding.require_current()
 
 
 def _finalize_publication(
     temporary_path: Path,
     temporary_identity: _FileIdentity,
-    reservation: Path,
-    target: Path,
+    binding: _BoundDirectory,
+    reservation_name: str,
+    target_name: str,
 ) -> None:
     failures: list[tuple[str, BaseException]] = []
-    reservation_failed = _capture_cleanup_failure(
+    reservation_failed = _capture_bound_cleanup_failure(
         "reservation",
-        reservation,
-        temporary_path,
+        binding,
+        reservation_name,
         temporary_identity,
         failures,
     )
     if reservation_failed:
-        _capture_cleanup_failure(
+        _capture_bound_cleanup_failure(
             "target rollback",
-            target,
-            temporary_path,
+            binding,
+            target_name,
             temporary_identity,
             failures,
         )
@@ -414,10 +636,10 @@ def _finalize_publication(
         failures,
     )
     if temporary_failed and not reservation_failed:
-        _capture_cleanup_failure(
+        _capture_bound_cleanup_failure(
             "target rollback",
-            target,
-            temporary_path,
+            binding,
+            target_name,
             temporary_identity,
             failures,
         )
@@ -427,6 +649,138 @@ def _finalize_publication(
         for label, failure in failures[1:]:
             primary.add_note(f"{label} cleanup failed: {failure}")
         raise primary
+
+
+def _require_final_target_integrity(
+    binding: _BoundDirectory,
+    target_name: str,
+    temporary_identity: _FileIdentity,
+    expected_size: int,
+    expected_sha256: str,
+) -> None:
+    if not _bound_name_has_identity(binding, target_name, temporary_identity):
+        raise RuntimeError("target ownership or integrity changed before return")
+    target_stat = binding.stat(target_name)
+    if target_stat.st_size != expected_size:
+        raise RuntimeError("target ownership or integrity changed before return")
+
+    file_descriptor = binding.open_readonly(target_name)
+    target_file: BinaryIO | None = None
+    operation_failure: BaseException | None = None
+    try:
+        opened_stat = os.fstat(file_descriptor)
+        digest = hashlib.sha256()
+        target_file = os.fdopen(file_descriptor, "rb")
+        file_descriptor = -1
+        while chunk := target_file.read(_COPY_CHUNK_SIZE):
+            digest.update(chunk)
+    except BaseException as failure:  # noqa: BLE001 - preserve interrupts
+        operation_failure = failure
+
+    operation_failure = _close_target_reader(
+        operation_failure,
+        target_file,
+        file_descriptor,
+    )
+    if operation_failure is not None:
+        raise operation_failure.with_traceback(operation_failure.__traceback__)
+
+    if (
+        _file_identity(opened_stat) != temporary_identity
+        or digest.hexdigest() != expected_sha256
+        or not _bound_name_has_identity(
+            binding,
+            target_name,
+            temporary_identity,
+        )
+    ):
+        raise RuntimeError("target ownership or integrity changed before return")
+
+
+def _close_target_reader(
+    primary: BaseException | None,
+    target_file: BinaryIO | None,
+    file_descriptor: int,
+) -> BaseException | None:
+    try:
+        if target_file is not None:
+            target_file.close()
+        elif file_descriptor >= 0:
+            os.close(file_descriptor)
+    except BaseException as close_failure:  # noqa: BLE001 - keep primary
+        if primary is None:
+            primary = close_failure
+        else:
+            primary.add_note(f"target close failed: {close_failure}")
+    return primary
+
+
+def _cleanup_bound_after_failure(
+    primary: BaseException,
+    binding: _BoundDirectory,
+    temporary_path: Path,
+    temporary_identity: _FileIdentity,
+    reservation_name: str | None,
+    target_name: str | None,
+) -> None:
+    for label, name in (
+        ("target", target_name),
+        ("reservation", reservation_name),
+    ):
+        if name is None:
+            continue
+        try:
+            _unlink_bound_owned_name(binding, name, temporary_identity)
+        except BaseException as cleanup_failure:  # noqa: BLE001 - keep primary
+            primary.add_note(f"{label} cleanup failed: {cleanup_failure}")
+    try:
+        _unlink_owned_path(
+            temporary_path,
+            temporary_path,
+            temporary_identity,
+        )
+    except BaseException as cleanup_failure:  # noqa: BLE001 - keep primary
+        primary.add_note(f"temporary file cleanup failed: {cleanup_failure}")
+
+
+def _capture_bound_cleanup_failure(
+    label: str,
+    binding: _BoundDirectory,
+    name: str,
+    temporary_identity: _FileIdentity,
+    failures: list[tuple[str, BaseException]],
+) -> bool:
+    try:
+        _unlink_bound_owned_name(binding, name, temporary_identity)
+    except BaseException as failure:  # noqa: BLE001 - collect all cleanup failures
+        failures.append((label, failure))
+        return True
+    return False
+
+
+def _unlink_bound_owned_name(
+    binding: _BoundDirectory,
+    name: str,
+    temporary_identity: _FileIdentity,
+) -> None:
+    try:
+        name_stat = binding.stat(name)
+    except FileNotFoundError:
+        return
+    if _file_identity(name_stat) != temporary_identity:
+        return
+    binding.unlink(name)
+
+
+def _bound_name_has_identity(
+    binding: _BoundDirectory,
+    name: str,
+    expected_identity: _FileIdentity,
+) -> bool:
+    try:
+        return _file_identity(binding.stat(name)) == expected_identity
+    except FileNotFoundError:
+        return False
 
 
 def _cleanup_after_failure(
@@ -491,19 +845,6 @@ def _unlink_owned_path(
     path.unlink()
 
 
-def _paths_share_owned_inode(
-    path: Path,
-    temporary_path: Path,
-    temporary_identity: _FileIdentity,
-) -> bool:
-    if not _path_has_identity(temporary_path, temporary_identity):
-        return False
-    try:
-        return path.samefile(temporary_path)
-    except FileNotFoundError:
-        return False
-
-
 def _path_has_identity(path: Path, expected_identity: _FileIdentity) -> bool:
     try:
         return _file_identity(path.stat()) == expected_identity
@@ -515,10 +856,10 @@ def _file_identity(file_stat: os.stat_result) -> _FileIdentity:
     return file_stat.st_dev, file_stat.st_ino
 
 
-def _next_published_version(category_dir: Path) -> int:
+def _next_bound_version(binding: _BoundDirectory) -> int:
     highest_version = 0
-    for candidate in category_dir.iterdir():
-        match = _VERSIONED_FILENAME.match(candidate.name)
+    for name in binding.names():
+        match = _VERSIONED_FILENAME.match(name)
         if match is not None:
             highest_version = max(highest_version, int(match.group("version")))
     return highest_version + 1
