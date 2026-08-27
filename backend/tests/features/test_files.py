@@ -299,6 +299,81 @@ def test_existing_version_is_never_overwritten(tmp_path: Path) -> None:
     assert stored.path.read_bytes() == b"new"
 
 
+@pytest.mark.parametrize("failure_type", [OSError, KeyboardInterrupt, SystemExit])
+def test_reservation_close_failure_cleans_and_reuses_version_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"content")
+    data_dir = tmp_path / "Data"
+    original_open = Path.open
+    injection_enabled = True
+
+    class InterruptAfterClose:
+        def __init__(self, handle: BinaryIO) -> None:
+            self._handle = handle
+
+        @property
+        def closed(self) -> bool:
+            return self._handle.closed
+
+        def close(self) -> None:
+            self._handle.close()
+            raise failure_type("injected reservation close failure")
+
+        def __enter__(self) -> BinaryIO:
+            return self._handle.__enter__()
+
+        def __exit__(self, *args: object) -> bool | None:
+            del args
+            self.close()
+
+    def open_with_close_interruption(
+        path: Path,
+        mode: str = "r",
+        *args: object,
+        **kwargs: object,
+    ) -> BinaryIO | InterruptAfterClose:
+        handle = original_open(path, mode, *args, **kwargs)
+        if injection_enabled and mode == "xb" and path.name.endswith(".reserve"):
+            return InterruptAfterClose(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "open", open_with_close_interruption)
+
+    with pytest.raises(failure_type, match="injected reservation close failure"):
+        files.store_version(source, data_dir, "P-1", "图纸")
+
+    category_dir = data_dir / "Projects" / "P-1" / "图纸"
+    assert list((data_dir / "Temp").iterdir()) == []
+    assert list(category_dir.iterdir()) == []
+
+    injection_enabled = False
+    stored = files.store_version(source, data_dir, "P-1", "图纸")
+    assert stored.version_number == 1
+    assert stored.path.read_bytes() == b"content"
+    _assert_no_work_files(data_dir)
+
+
+def test_file_exists_does_not_delete_another_reservation(tmp_path: Path) -> None:
+    data_dir = tmp_path / "Data"
+    category_dir = data_dir / "Projects" / "P-1" / "图纸"
+    category_dir.mkdir(parents=True)
+    other_reservation = category_dir / ".version-000000000001.reserve"
+    other_reservation.write_bytes(b"owned-by-another-call")
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"content")
+
+    stored = files.store_version(source, data_dir, "P-1", "图纸")
+
+    assert stored.version_number == 2
+    assert other_reservation.read_bytes() == b"owned-by-another-call"
+    other_reservation.unlink()
+    _assert_no_work_files(data_dir)
+
+
 def test_two_threads_get_continuous_unique_versions_with_correct_content(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

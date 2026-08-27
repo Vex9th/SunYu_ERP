@@ -230,28 +230,46 @@ def _reserve_target(
     while True:
         reservation = category_dir / f".version-{version_number:012d}.reserve"
         try:
-            with reservation.open("xb"):
-                pass
+            reservation_handle = reservation.open("xb")
         except FileExistsError:
             version_number += 1
             continue
 
-        timestamp = created_at.strftime("%Y%m%dT%H%M%S%fZ")
-        target = category_dir / (
-            f"{timestamp}_v{version_number:06d}_{sanitized_name}"
-        )
         try:
-            with target.open("xb"):
-                pass
-            reservation.unlink()
+            _close_owned_file(reservation_handle)
+            timestamp = created_at.strftime("%Y%m%dT%H%M%S%fZ")
+            target = category_dir / (
+                f"{timestamp}_v{version_number:06d}_{sanitized_name}"
+            )
+            try:
+                target_handle = target.open("xb")
+            except FileExistsError:
+                version_number += 1
+                continue
+            try:
+                _close_owned_file(target_handle)
+            except BaseException:
+                target.unlink(missing_ok=True)
+                raise
             return version_number, target
-        except FileExistsError:
-            reservation.unlink(missing_ok=True)
-            version_number += 1
-        except BaseException:
-            target.unlink(missing_ok=True)
-            reservation.unlink(missing_ok=True)
-            raise
+        finally:
+            try:
+                if not reservation_handle.closed:
+                    _close_owned_file(reservation_handle)
+            finally:
+                reservation.unlink(missing_ok=True)
+
+
+def _close_owned_file(file_handle: BinaryIO) -> None:
+    try:
+        file_handle.close()
+    except BaseException as failure:
+        if not file_handle.closed:
+            try:
+                file_handle.close()
+            except BaseException as retry_failure:  # noqa: BLE001 - keep original
+                failure.add_note(f"retrying file close failed: {retry_failure}")
+        raise
 
 
 def _next_published_version(category_dir: Path) -> int:
