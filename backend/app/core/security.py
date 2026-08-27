@@ -89,4 +89,11 @@ def is_session_token_valid(session_secret: object, token: object) -> bool:
         )
     except BadData:
         return False
-    return payload == _SESSION_PAYLOAD
+    return (
+        isinstance(payload, dict)
+        and set(payload) == {"v", "authenticated"}
+        and type(payload["v"]) is int
+        and payload["v"] == 1
+        and type(payload["authenticated"]) is bool
+        and payload["authenticated"] is True
+    )
