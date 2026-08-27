@@ -1,3 +1,12 @@
+"""Project file version storage for application-owned Data directories.
+
+Concurrent ``store_version`` calls in this process are supported. While a call is
+running, no external process may create, replace, rename, or delete entries below
+``Data/Projects`` or ``Data/Temp``. Standard cross-platform filesystems do not
+provide an atomic compare-inode-and-unlink operation, so cleanup ownership checks
+are a best-effort guard inside that application-exclusive write boundary.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -103,6 +112,12 @@ def store_version(
     project_code: str,
     category: str,
 ) -> StoredFileVersion:
+    """Copy one source version into an application-owned project directory.
+
+    Calls from multiple threads in this process are safe. The caller must ensure
+    external processes do not mutate ``Data/Projects`` or ``Data/Temp`` while
+    versions are being stored.
+    """
     _validate_path_segment(project_code, "project_code")
     _validate_path_segment(category, "category")
     source = Path(source_path)
@@ -370,18 +385,18 @@ def _open_bound_directory(data_root: Path, category_dir: Path) -> _BoundDirector
         windows_handle = _open_windows_directory_handle(category_dir)
         try:
             category_identity = _file_identity(category_dir.stat())
+            binding = _BoundDirectory(
+                category_dir,
+                data_root,
+                category_identity,
+                windows_handle=windows_handle,
+            )
         except BaseException as primary:
             try:
                 _close_windows_directory_handle(windows_handle)
             except BaseException as close_failure:  # noqa: BLE001 - keep primary
                 primary.add_note(f"directory binding close failed: {close_failure}")
             raise
-        binding = _BoundDirectory(
-            category_dir,
-            data_root,
-            category_identity,
-            windows_handle=windows_handle,
-        )
     else:
         if not _BOUND_DIRECTORY_SUPPORTED:
             raise RuntimeError(
@@ -393,18 +408,18 @@ def _open_bound_directory(data_root: Path, category_dir: Path) -> _BoundDirector
         directory_fd = os.open(category_dir, flags)
         try:
             category_identity = _file_identity(os.fstat(directory_fd))
+            binding = _BoundDirectory(
+                category_dir,
+                data_root,
+                category_identity,
+                directory_fd=directory_fd,
+            )
         except BaseException as primary:
             try:
                 os.close(directory_fd)
             except BaseException as close_failure:  # noqa: BLE001 - keep primary
                 primary.add_note(f"directory binding close failed: {close_failure}")
             raise
-        binding = _BoundDirectory(
-            category_dir,
-            data_root,
-            category_identity,
-            directory_fd=directory_fd,
-        )
     try:
         binding.require_current()
     except BaseException as primary:
@@ -763,6 +778,9 @@ def _unlink_bound_owned_name(
     name: str,
     temporary_identity: _FileIdentity,
 ) -> None:
+    # Data is application-exclusive while publishing. This inode check prevents
+    # cooperative calls from deleting each other's entries; it is not an atomic
+    # defense against an external process swapping the name before unlink.
     try:
         name_stat = binding.stat(name)
     except FileNotFoundError:

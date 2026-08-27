@@ -1050,6 +1050,103 @@ def test_target_read_primary_survives_close_failure_and_rolls_back(
     assert list((data_dir / "Projects" / "P-1" / "图纸").iterdir()) == []
 
 
+@pytest.mark.parametrize("failure_type", [OSError, KeyboardInterrupt, SystemExit])
+def test_bound_directory_constructor_failure_closes_posix_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    data_root = tmp_path / "Data"
+    category_dir = data_root / "Projects" / "P-1" / "图纸"
+    category_dir.mkdir(parents=True)
+    data_root = data_root.resolve(strict=True)
+    category_dir = category_dir.resolve(strict=True)
+    primary = failure_type("bound directory construction failed")
+    close_failure = OSError("directory descriptor close failed")
+    original_open = os.open
+    original_close = os.close
+    opened_descriptors: list[int] = []
+    close_attempts: list[int] = []
+
+    def capture_open(
+        path: os.PathLike[str],
+        flags: int,
+        *args: object,
+        **kwargs: object,
+    ) -> int:
+        descriptor = original_open(path, flags, *args, **kwargs)
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    def fail_construction(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise primary
+
+    def close_then_fail(file_descriptor: int) -> None:
+        close_attempts.append(file_descriptor)
+        original_close(file_descriptor)
+        raise close_failure
+
+    monkeypatch.setattr(files.os, "open", capture_open)
+    monkeypatch.setattr(files.os, "close", close_then_fail)
+    monkeypatch.setattr(files, "_BoundDirectory", fail_construction)
+
+    try:
+        with pytest.raises(failure_type) as caught:
+            files._open_bound_directory(data_root, category_dir)
+
+        assert caught.value is primary
+        assert close_attempts == opened_descriptors
+        assert any("directory binding close failed" in note for note in primary.__notes__)
+        with pytest.raises(OSError):
+            os.fstat(opened_descriptors[0])
+    finally:
+        for file_descriptor in opened_descriptors:
+            try:
+                original_close(file_descriptor)
+            except OSError:
+                pass
+
+
+def test_bound_directory_constructor_failure_closes_windows_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "Data"
+    category_dir = data_root / "Projects" / "P-1" / "图纸"
+    category_dir.mkdir(parents=True)
+    data_root = data_root.resolve(strict=True)
+    category_dir = category_dir.resolve(strict=True)
+    primary = SystemExit("bound directory construction failed")
+    close_failure = OSError("directory handle close failed")
+    windows_handle = 42
+    close_attempts: list[int] = []
+
+    def fail_construction(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise primary
+
+    def close_then_fail(handle: int) -> None:
+        close_attempts.append(handle)
+        raise close_failure
+
+    monkeypatch.setattr(files.os, "name", "nt")
+    monkeypatch.setattr(
+        files,
+        "_open_windows_directory_handle",
+        lambda path: windows_handle,
+    )
+    monkeypatch.setattr(files, "_close_windows_directory_handle", close_then_fail)
+    monkeypatch.setattr(files, "_BoundDirectory", fail_construction)
+
+    with pytest.raises(SystemExit) as caught:
+        files._open_bound_directory(data_root, category_dir)
+
+    assert caught.value is primary
+    assert close_attempts == [windows_handle]
+    assert any("directory binding close failed" in note for note in primary.__notes__)
+
+
 def test_source_change_during_copy_fails_without_publishing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
