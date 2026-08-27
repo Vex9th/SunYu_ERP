@@ -1,0 +1,647 @@
+"""Consistent local backups for the single-process SunYu ERP runtime.
+
+The configured backup directory is a local filesystem directory. A sync client
+may read it, but application code exclusively owns writes to each
+``.incomplete-*`` staging directory while a backup is running.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import stat
+import threading
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path, PurePosixPath
+from typing import IO, Any, BinaryIO, TextIO
+
+from backend.app.core.config import Settings
+
+_PRODUCT = "SunYu ERP"
+_SCHEMA_VERSION = 1
+_COPY_CHUNK_SIZE = 64 * 1024
+_BACKUP_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}$")
+_PUBLISH_LOCK = threading.Lock()
+_FileIdentity = tuple[int, int]
+
+
+def create_backup(
+    connection: sqlite3.Connection,
+    settings: Settings,
+    *,
+    now: datetime | None = None,
+) -> Path:
+    """Create, verify, and atomically publish one application backup."""
+    created_at = _require_aware_datetime(now)
+    if settings.backup_dir is None:
+        raise RuntimeError("backup_dir is not configured")
+    if connection.in_transaction:
+        raise RuntimeError("cannot create a backup inside a database transaction")
+    projects_root = (settings.data_dir / "Projects").resolve()
+    backup_candidate = settings.backup_dir.resolve()
+    if backup_candidate.is_relative_to(projects_root):
+        raise ValueError("backup_dir must not be inside Data/Projects")
+
+    backup_root = _prepare_backup_root(settings.backup_dir)
+    target = backup_root / created_at.strftime("%Y-%m-%d_%H%M%S")
+    started_at = created_at.isoformat()
+    run_id = connection.execute(
+        """
+        INSERT INTO backup_runs (started_at, status, target_path)
+        VALUES (?, 'running', ?)
+        """,
+        (started_at, str(target)),
+    ).lastrowid
+    if run_id is None:
+        raise RuntimeError("backup run did not receive an id")
+
+    stage: Path | None = None
+    published_identity: _FileIdentity | None = None
+    try:
+        _require_target_available(target)
+        stage = backup_root / f".incomplete-{uuid.uuid4().hex}"
+        stage.mkdir()
+        _populate_and_verify_stage(connection, settings, stage, created_at)
+        published_identity = _publish_stage(stage, target)
+        stage = None
+        _record_successful_run(connection, run_id)
+        return target
+    except BaseException as primary:
+        _handle_failed_creation(
+            connection,
+            run_id,
+            primary,
+            stage,
+            target,
+            published_identity,
+        )
+        raise
+
+
+def verify_backup(path: str | Path) -> dict[str, object]:
+    """Validate manifest structure, file set, sizes, hashes, and symlink safety."""
+    root = Path(path)
+    if root.is_symlink():
+        raise ValueError("backup root must not be a symlink")
+    resolved_root = root.resolve(strict=True)
+    if not resolved_root.is_dir():
+        raise ValueError("backup path must be a directory")
+
+    manifest_path = resolved_root / "manifest.json"
+    _require_regular_unsymlinked_file(resolved_root, manifest_path)
+    manifest = _read_manifest(manifest_path)
+    entries = _validate_manifest(manifest)
+
+    actual_files = _list_backup_files(resolved_root)
+    expected_paths = set(entries)
+    if actual_files != expected_paths:
+        missing = sorted(expected_paths - actual_files)
+        unexpected = sorted(actual_files - expected_paths)
+        raise ValueError(
+            f"backup file set mismatch; missing={missing}, unexpected={unexpected}"
+        )
+
+    for relative_path, expected in entries.items():
+        file_path = resolved_root.joinpath(*PurePosixPath(relative_path).parts)
+        size_bytes, sha256 = _hash_verified_file(resolved_root, file_path)
+        if size_bytes != expected["size"] or sha256 != expected["sha256"]:
+            raise ValueError(f"backup file integrity check failed: {relative_path}")
+    return manifest
+
+
+def prune_backups(
+    backup_dir: str | Path,
+    retention_days: int,
+    *,
+    now: datetime | None = None,
+) -> list[Path]:
+    """Delete expired valid managed backups while always retaining two newest."""
+    if isinstance(retention_days, bool) or not isinstance(retention_days, int):
+        raise TypeError("retention_days must be an integer")
+    if not 0 <= retention_days <= 3650:
+        raise ValueError("retention_days must be between 0 and 3650")
+    current_time = _require_aware_datetime(now)
+    root = Path(backup_dir)
+    if root.is_symlink():
+        raise ValueError("backup_dir must be a non-symlink directory")
+    if not root.exists():
+        return []
+    if not root.is_dir():
+        raise ValueError("backup_dir must be a non-symlink directory")
+
+    managed: list[tuple[datetime, Path]] = []
+    for candidate in root.iterdir():
+        if not _BACKUP_NAME.fullmatch(candidate.name):
+            continue
+        try:
+            candidate_stat = candidate.lstat()
+            if not stat.S_ISDIR(candidate_stat.st_mode):
+                continue
+            verify_backup(candidate)
+            timestamp = datetime.strptime(
+                candidate.name,
+                "%Y-%m-%d_%H%M%S",
+            ).replace(tzinfo=current_time.tzinfo)
+        except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
+            continue
+        managed.append((timestamp, candidate))
+
+    managed.sort(key=lambda item: (item[0], item[1].name), reverse=True)
+    cutoff = current_time - timedelta(days=retention_days)
+    removed: list[Path] = []
+    for timestamp, candidate in managed[2:]:
+        if timestamp >= cutoff:
+            continue
+        shutil.rmtree(candidate)
+        removed.append(candidate)
+    return removed
+
+
+def _require_aware_datetime(value: datetime | None) -> datetime:
+    result = datetime.now(timezone.utc) if value is None else value
+    if result.tzinfo is None or result.utcoffset() is None:
+        raise ValueError("now must include timezone information")
+    return result
+
+
+def _prepare_backup_root(path: Path) -> Path:
+    if path.is_symlink():
+        raise ValueError("backup_dir must not be a symlink")
+    path.mkdir(parents=True, exist_ok=True)
+    resolved = path.resolve(strict=True)
+    if not resolved.is_dir():
+        raise ValueError("backup_dir must be a directory")
+    return resolved
+
+
+def _backup_database(connection: sqlite3.Connection, target: Path) -> None:
+    target.parent.mkdir(parents=True)
+    destination: sqlite3.Connection | None = None
+    try:
+        destination = sqlite3.connect(target)
+        connection.backup(destination)
+        destination.close()
+        destination = None
+        _sync_file(target)
+    except BaseException as primary:
+        if destination is not None:
+            try:
+                destination.close()
+            except BaseException as close_failure:  # noqa: BLE001
+                primary.add_note(f"backup database close failed: {close_failure}")
+        raise
+
+
+def _populate_and_verify_stage(
+    connection: sqlite3.Connection,
+    settings: Settings,
+    stage: Path,
+    created_at: datetime,
+) -> None:
+    _backup_database(connection, stage / "database" / "iapm.sqlite")
+    _copy_file(settings.config_path, stage / "config.json")
+    _copy_projects(settings.data_dir, stage / "Projects")
+    manifest = _build_manifest(stage, created_at)
+    _write_manifest(stage / "manifest.json", manifest)
+    verify_backup(stage)
+
+
+def _record_successful_run(connection: sqlite3.Connection, run_id: int) -> None:
+    connection.execute(
+        """
+        UPDATE backup_runs
+        SET finished_at = ?, status = 'success', error_message = NULL
+        WHERE id = ? AND status = 'running'
+        """,
+        (datetime.now(timezone.utc).isoformat(), run_id),
+    )
+
+
+def _handle_failed_creation(
+    connection: sqlite3.Connection,
+    run_id: int,
+    primary: BaseException,
+    stage: Path | None,
+    target: Path,
+    published_identity: _FileIdentity | None,
+) -> None:
+    _record_failed_run(connection, run_id, primary)
+    if published_identity is not None:
+        try:
+            _remove_owned_backup(target, published_identity)
+        except BaseException as cleanup_failure:  # noqa: BLE001
+            primary.add_note(f"published backup cleanup failed: {cleanup_failure}")
+    if stage is not None:
+        try:
+            _remove_stage(stage)
+        except BaseException as cleanup_failure:  # noqa: BLE001
+            primary.add_note(f"backup staging cleanup failed: {cleanup_failure}")
+
+
+def _copy_projects(data_dir: Path, target: Path) -> None:
+    projects = data_dir / "Projects"
+    if projects.is_symlink():
+        raise ValueError("Projects must not be a symlink")
+    if not projects.exists():
+        target.mkdir(parents=True)
+        return
+    if not projects.is_dir():
+        raise ValueError("Projects must be a directory")
+    target.mkdir(parents=True)
+    _copy_directory_contents(projects.resolve(strict=True), target)
+
+
+def _copy_directory_contents(source: Path, target: Path) -> None:
+    with os.scandir(source) as entries:
+        for entry in entries:
+            source_path = Path(entry.path)
+            destination_path = target / entry.name
+            if entry.is_symlink():
+                raise ValueError(f"source tree contains a symlink: {source_path}")
+            if entry.is_dir(follow_symlinks=False):
+                destination_path.mkdir()
+                _copy_directory_contents(source_path, destination_path)
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                raise ValueError(f"source tree contains a non-regular file: {source_path}")
+            _copy_file(source_path, destination_path)
+
+
+def _copy_file(source: Path, target: Path) -> tuple[int, str]:
+    source_stat = source.lstat()
+    if stat.S_ISLNK(source_stat.st_mode):
+        raise ValueError(f"source file must not be a symlink: {source}")
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise ValueError(f"source must be a regular file: {source}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    source_file: BinaryIO | None = None
+    target_file: BinaryIO | None = None
+    primary: BaseException | None = None
+    size_bytes = 0
+    digest = hashlib.sha256()
+    try:
+        source_file = source.open("rb")
+        opened_stat = os.fstat(source_file.fileno())
+        target_file = target.open("xb")
+        while chunk := source_file.read(_COPY_CHUNK_SIZE):
+            target_file.write(chunk)
+            digest.update(chunk)
+            size_bytes += len(chunk)
+        target_file.flush()
+        os.fsync(target_file.fileno())
+        final_stat = os.fstat(source_file.fileno())
+        current_stat = source.stat()
+        if not all(
+            _file_signature(candidate) == _file_signature(source_stat)
+            for candidate in (opened_stat, final_stat, current_stat)
+        ):
+            raise RuntimeError(f"source changed while being copied: {source}")
+    except BaseException as failure:  # noqa: BLE001
+        primary = failure
+
+    primary = _close_files(primary, source_file, target_file)
+    if primary is not None:
+        raise primary.with_traceback(primary.__traceback__)
+    return size_bytes, digest.hexdigest()
+
+
+def _file_signature(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _close_files(
+    primary: BaseException | None,
+    *files: IO[Any] | None,
+) -> BaseException | None:
+    for file_handle in files:
+        if file_handle is None:
+            continue
+        try:
+            file_handle.close()
+        except BaseException as close_failure:  # noqa: BLE001
+            if primary is None:
+                primary = close_failure
+            else:
+                primary.add_note(f"file close failed: {close_failure}")
+    return primary
+
+
+def _build_manifest(stage: Path, created_at: datetime) -> dict[str, object]:
+    files: list[dict[str, object]] = []
+    for relative_path in sorted(_list_backup_files(stage)):
+        file_path = stage.joinpath(*PurePosixPath(relative_path).parts)
+        size_bytes, sha256 = _hash_verified_file(stage, file_path)
+        files.append(
+            {"path": relative_path, "size": size_bytes, "sha256": sha256}
+        )
+    return {
+        "product": _PRODUCT,
+        "schema_version": _SCHEMA_VERSION,
+        "created_at": created_at.isoformat(),
+        "files": files,
+    }
+
+
+def _write_manifest(path: Path, manifest: dict[str, object]) -> None:
+    manifest_file: TextIO | None = None
+    primary: BaseException | None = None
+    try:
+        manifest_file = path.open("x", encoding="utf-8", newline="\n")
+        json.dump(manifest, manifest_file, ensure_ascii=False, indent=2)
+        manifest_file.write("\n")
+        manifest_file.flush()
+        os.fsync(manifest_file.fileno())
+    except BaseException as failure:  # noqa: BLE001
+        primary = failure
+    primary = _close_files(primary, manifest_file)
+    if primary is not None:
+        raise primary.with_traceback(primary.__traceback__)
+
+
+def _read_manifest(path: Path) -> dict[str, object]:
+    manifest_file: TextIO | None = None
+    primary: BaseException | None = None
+    manifest: object = None
+    try:
+        manifest_file = path.open(encoding="utf-8")
+        manifest = json.load(manifest_file)
+    except BaseException as failure:  # noqa: BLE001
+        primary = failure
+    primary = _close_files(primary, manifest_file)
+    if primary is not None:
+        raise primary.with_traceback(primary.__traceback__)
+    if not isinstance(manifest, dict):
+        raise ValueError(  # noqa: TRY004 - malformed external backup data
+            "manifest root must be an object"
+        )
+    return manifest
+
+
+def _publish_stage(stage: Path, target: Path) -> _FileIdentity:
+    stage_identity = _file_identity(stage.lstat())
+    with _PUBLISH_LOCK:
+        _require_target_available_unlocked(target)
+        try:
+            os.rename(stage, target)
+            _sync_directory(target.parent)
+        except BaseException as primary:
+            if _path_has_identity(target, stage_identity):
+                try:
+                    _remove_owned_backup(target, stage_identity)
+                except BaseException as cleanup_failure:  # noqa: BLE001
+                    primary.add_note(
+                        f"partially published backup cleanup failed: {cleanup_failure}"
+                    )
+            raise
+    return stage_identity
+
+
+def _require_target_available(target: Path) -> None:
+    with _PUBLISH_LOCK:
+        _require_target_available_unlocked(target)
+
+
+def _require_target_available_unlocked(target: Path) -> None:
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(f"backup target already exists: {target}")
+
+
+def _remove_owned_backup(path: Path, identity: _FileIdentity) -> None:
+    if not _path_has_identity(path, identity):
+        raise RuntimeError("refusing to remove a backup no longer owned by this run")
+    shutil.rmtree(path)
+
+
+def _path_has_identity(path: Path, identity: _FileIdentity) -> bool:
+    try:
+        return _file_identity(path.lstat()) == identity
+    except FileNotFoundError:
+        return False
+
+
+def _file_identity(value: os.stat_result) -> _FileIdentity:
+    return value.st_dev, value.st_ino
+
+
+def _record_failed_run(
+    connection: sqlite3.Connection,
+    run_id: int,
+    primary: BaseException,
+) -> None:
+    try:
+        connection.execute(
+            """
+            UPDATE backup_runs
+            SET finished_at = ?, status = 'failed', error_message = ?
+            WHERE id = ? AND status = 'running'
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                f"{type(primary).__name__}: backup operation failed",
+                run_id,
+            ),
+        )
+    except BaseException as record_failure:  # noqa: BLE001
+        primary.add_note(f"failed to record backup failure: {record_failure}")
+
+
+def _remove_stage(stage: Path) -> None:
+    if not stage.name.startswith(".incomplete-"):
+        raise ValueError("refusing to remove a non-staging directory")
+    if stage.is_symlink():
+        stage.unlink()
+    elif stage.exists():
+        shutil.rmtree(stage)
+
+
+def _validate_manifest(manifest: object) -> dict[str, dict[str, object]]:
+    raw_files = _validate_manifest_header(manifest)
+    entries: dict[str, dict[str, object]] = {}
+    for raw_entry in raw_files:
+        relative_path, entry = _validate_manifest_file_entry(raw_entry)
+        if relative_path in entries:
+            raise ValueError("manifest contains duplicate file paths")
+        entries[relative_path] = entry
+    if not {"config.json", "database/iapm.sqlite"}.issubset(entries):
+        raise ValueError("manifest is missing required backup files")
+    return entries
+
+
+def _validate_manifest_header(manifest: object) -> list[object]:
+    if not isinstance(manifest, dict):
+        raise ValueError(  # noqa: TRY004 - malformed external backup data
+            "manifest root must be an object"
+        )
+    if set(manifest) != {"product", "schema_version", "created_at", "files"}:
+        raise ValueError("manifest contains missing or unexpected fields")
+    if not isinstance(manifest["product"], str) or manifest["product"] != _PRODUCT:
+        raise ValueError("manifest product is invalid")
+    if (
+        type(manifest["schema_version"]) is not int
+        or manifest["schema_version"] != _SCHEMA_VERSION
+    ):
+        raise ValueError("manifest schema_version is invalid")
+    created_at = manifest["created_at"]
+    if not isinstance(created_at, str):
+        raise ValueError(  # noqa: TRY004 - malformed external backup data
+            "manifest created_at is invalid"
+        )
+    try:
+        parsed_created_at = datetime.fromisoformat(created_at)
+    except ValueError:
+        raise ValueError("manifest created_at is invalid") from None
+    if parsed_created_at.tzinfo is None or parsed_created_at.utcoffset() is None:
+        raise ValueError("manifest created_at must include a timezone")
+
+    raw_files = manifest["files"]
+    if not isinstance(raw_files, list):
+        raise ValueError(  # noqa: TRY004 - malformed external backup data
+            "manifest files must be an array"
+        )
+    return raw_files
+
+
+def _validate_manifest_file_entry(
+    raw_entry: object,
+) -> tuple[str, dict[str, object]]:
+    if not isinstance(raw_entry, dict) or set(raw_entry) != {
+        "path",
+        "size",
+        "sha256",
+    }:
+        raise ValueError("manifest file entry is invalid")
+    relative_path = _validate_manifest_path(raw_entry["path"])
+    size_bytes = raw_entry["size"]
+    sha256 = raw_entry["sha256"]
+    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int):
+        raise ValueError(  # noqa: TRY004 - malformed external backup data
+            "manifest file size is invalid"
+        )
+    if size_bytes < 0:
+        raise ValueError("manifest file size is invalid")
+    if (
+        not isinstance(sha256, str)
+        or len(sha256) != 64
+        or any(character not in "0123456789abcdef" for character in sha256)
+    ):
+        raise ValueError("manifest file sha256 is invalid")
+    return relative_path, {"size": size_bytes, "sha256": sha256}
+
+
+def _validate_manifest_path(value: object) -> str:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise ValueError("manifest file path is invalid")
+    pure_path = PurePosixPath(value)
+    if (
+        pure_path.is_absolute()
+        or value != pure_path.as_posix()
+        or any(part in {"", ".", ".."} for part in pure_path.parts)
+        or value == "manifest.json"
+    ):
+        raise ValueError("manifest file path escapes the backup")
+    return value
+
+
+def _list_backup_files(root: Path) -> set[str]:
+    files: set[str] = set()
+
+    def visit(directory: Path) -> None:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                if entry.is_symlink():
+                    raise ValueError(f"backup contains a symlink: {path}")
+                if entry.is_dir(follow_symlinks=False):
+                    visit(path)
+                elif entry.is_file(follow_symlinks=False):
+                    relative = path.relative_to(root).as_posix()
+                    if relative != "manifest.json":
+                        _validate_manifest_path(relative)
+                        files.add(relative)
+                else:
+                    raise ValueError(f"backup contains a non-regular file: {path}")
+
+    visit(root)
+    return files
+
+
+def _require_regular_unsymlinked_file(root: Path, path: Path) -> None:
+    relative = path.relative_to(root)
+    current = root
+    for part in relative.parts:
+        current = current / part
+        current_stat = current.lstat()
+        if stat.S_ISLNK(current_stat.st_mode):
+            raise ValueError(f"backup contains a symlink: {current}")
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise ValueError(f"backup entry is not a regular file: {path}")
+
+
+def _hash_verified_file(root: Path, path: Path) -> tuple[int, str]:
+    _require_regular_unsymlinked_file(root, path)
+    initial_stat = path.stat()
+    digest = hashlib.sha256()
+    size_bytes = 0
+    source: BinaryIO | None = None
+    primary: BaseException | None = None
+    try:
+        source = path.open("rb")
+        opened_stat = os.fstat(source.fileno())
+        while chunk := source.read(_COPY_CHUNK_SIZE):
+            digest.update(chunk)
+            size_bytes += len(chunk)
+        final_stat = os.fstat(source.fileno())
+    except BaseException as failure:  # noqa: BLE001
+        primary = failure
+    primary = _close_files(primary, source)
+    if primary is not None:
+        raise primary.with_traceback(primary.__traceback__)
+    current_stat = path.stat()
+    if not all(
+        _file_signature(candidate) == _file_signature(initial_stat)
+        for candidate in (opened_stat, final_stat, current_stat)
+    ):
+        raise RuntimeError(f"backup file changed while being verified: {path}")
+    return size_bytes, digest.hexdigest()
+
+
+def _sync_file(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    _sync_and_close_descriptor(descriptor)
+
+
+def _sync_and_close_descriptor(descriptor: int) -> None:
+    primary: BaseException | None = None
+    try:
+        os.fsync(descriptor)
+    except BaseException as failure:  # noqa: BLE001
+        primary = failure
+    try:
+        os.close(descriptor)
+    except BaseException as close_failure:  # noqa: BLE001
+        if primary is None:
+            primary = close_failure
+        else:
+            primary.add_note(f"descriptor close failed: {close_failure}")
+    if primary is not None:
+        raise primary.with_traceback(primary.__traceback__)
+
+
+def _sync_directory(path: Path) -> None:
+    if os.name != "posix":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    _sync_and_close_descriptor(descriptor)

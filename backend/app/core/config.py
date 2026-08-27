@@ -8,7 +8,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _ALLOWED_CONFIG_KEYS = frozenset(
-    {"data_dir", "backup_dir", "host", "port", "session_secret"}
+    {
+        "data_dir",
+        "backup_dir",
+        "backup_interval_hours",
+        "backup_retention_days",
+        "host",
+        "port",
+        "session_secret",
+    }
 )
 _MISSING = object()
 
@@ -18,6 +26,8 @@ class Settings:
     config_path: Path
     data_dir: Path
     backup_dir: Path | None
+    backup_interval_hours: int
+    backup_retention_days: int
     host: str
     port: int
     session_secret: str
@@ -59,6 +69,8 @@ def load_settings(config_path: str | Path) -> Settings:
         config_path=resolved_config_path,
         data_dir=data_dir,
         backup_dir=backup_dir,
+        backup_interval_hours=raw_config.get("backup_interval_hours", 24),
+        backup_retention_days=raw_config.get("backup_retention_days", 30),
         host=host,
         port=port,
         session_secret=session_secret,
@@ -86,11 +98,41 @@ def _validate_config(loaded_config: object) -> dict[str, object]:
     if not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
 
+    _validate_bounded_integer(
+        loaded_config,
+        "backup_interval_hours",
+        default=24,
+        minimum=1,
+        maximum=8760,
+    )
+    _validate_bounded_integer(
+        loaded_config,
+        "backup_retention_days",
+        default=30,
+        minimum=0,
+        maximum=3650,
+    )
+
     session_secret = loaded_config.get("session_secret", _MISSING)
     if session_secret is not _MISSING and not isinstance(session_secret, str):
         raise TypeError("session_secret must be a string")
 
     return loaded_config
+
+
+def _validate_bounded_integer(
+    config: dict[str, object],
+    key: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> None:
+    value = config.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{key} must be an integer")
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{key} must be between {minimum} and {maximum}")
 
 
 def _resolve_directory(name: str, config_dir: Path, value: object) -> Path:

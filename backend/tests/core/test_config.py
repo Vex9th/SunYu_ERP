@@ -29,6 +29,8 @@ def test_settings_has_only_the_declared_frozen_fields(tmp_path: Path) -> None:
         "config_path",
         "data_dir",
         "backup_dir",
+        "backup_interval_hours",
+        "backup_retention_days",
         "host",
         "port",
         "session_secret",
@@ -48,6 +50,8 @@ def test_missing_config_uses_relative_data_default_and_persists_secret(
     assert first.config_path == config_path.resolve()
     assert first.data_dir == (config_path.parent / "Data").resolve()
     assert first.backup_dir is None
+    assert first.backup_interval_hours == 24
+    assert first.backup_retention_days == 30
     assert first.host == "0.0.0.0"
     assert first.port == 8765
     assert len(first.session_secret) >= 32
@@ -203,6 +207,71 @@ def test_non_integer_port_fails_fast(tmp_path: Path, invalid_port: object) -> No
 
     with pytest.raises(TypeError, match="port"):
         load_settings(config_path)
+
+
+@pytest.mark.parametrize(
+    ("key", "invalid_value"),
+    (
+        ("backup_interval_hours", True),
+        ("backup_interval_hours", 24.0),
+        ("backup_interval_hours", "24"),
+        ("backup_retention_days", False),
+        ("backup_retention_days", 30.0),
+        ("backup_retention_days", "30"),
+    ),
+)
+def test_backup_periods_require_strict_integers(
+    tmp_path: Path,
+    key: str,
+    invalid_value: object,
+) -> None:
+    config_path = tmp_path / "config.json"
+    write_config(
+        config_path,
+        **{key: invalid_value, "session_secret": "test-secret"},
+    )
+
+    with pytest.raises(TypeError, match=key):
+        load_settings(config_path)
+
+
+@pytest.mark.parametrize(
+    ("key", "invalid_value"),
+    (
+        ("backup_interval_hours", 0),
+        ("backup_interval_hours", 8761),
+        ("backup_retention_days", -1),
+        ("backup_retention_days", 3651),
+    ),
+)
+def test_backup_periods_reject_out_of_range_values(
+    tmp_path: Path,
+    key: str,
+    invalid_value: int,
+) -> None:
+    config_path = tmp_path / "config.json"
+    write_config(
+        config_path,
+        **{key: invalid_value, "session_secret": "test-secret"},
+    )
+
+    with pytest.raises(ValueError, match=key):
+        load_settings(config_path)
+
+
+def test_configured_backup_periods_are_loaded(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    write_config(
+        config_path,
+        backup_interval_hours=12,
+        backup_retention_days=90,
+        session_secret="test-secret",
+    )
+
+    settings = load_settings(config_path)
+
+    assert settings.backup_interval_hours == 12
+    assert settings.backup_retention_days == 90
 
 
 @pytest.mark.parametrize("invalid_port", (0, 65536))
