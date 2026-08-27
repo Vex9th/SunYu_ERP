@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
+from threading import Barrier
+from typing import cast
 
 import pytest
 
@@ -270,6 +273,36 @@ def test_ledger_version_missing_from_directory_is_reported_as_drift(
         connection.close()
 
 
+def test_applied_versions_must_be_a_continuous_filename_prefix(
+    tmp_path: Path,
+) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_migration(
+        migrations_dir,
+        "001_added_later.sql",
+        "CREATE TABLE must_not_exist (value TEXT);",
+    )
+    _write_migration(migrations_dir, "002_existing.sql", "SELECT 1;")
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    try:
+        connection.execute(_ledger_sql())
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?, ?)",
+            ("002_existing", "2026-01-01T00:00:00+00:00"),
+        )
+
+        with pytest.raises(_migration_error(), match="migration drift"):
+            _apply_migrations()(connection, migrations_dir)
+
+        assert not _table_exists(connection, "must_not_exist")
+        assert [
+            row["version"]
+            for row in connection.execute("SELECT version FROM schema_migrations")
+        ] == ["002_existing"]
+    finally:
+        connection.close()
+
+
 def test_migration_must_create_ledger_before_version_is_recorded(
     tmp_path: Path,
 ) -> None:
@@ -435,4 +468,122 @@ def test_rejects_bom_outside_start_before_executing_migration(tmp_path: Path) ->
         assert not _table_exists(connection, "schema_migrations")
         assert not _table_exists(connection, "must_not_exist")
     finally:
+        connection.close()
+
+
+def test_concurrent_runners_apply_each_version_only_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_migration(
+        migrations_dir,
+        "001_once.sql",
+        _ledger_sql()
+        + """
+            CREATE TABLE execution_log (value TEXT NOT NULL);
+            INSERT INTO execution_log VALUES ('once');
+        """,
+    )
+    database_path = tmp_path / "erp.sqlite3"
+    initialized = connect_database(database_path)
+    initialized.close()
+
+    module = import_module("backend.app.core.migrations")
+    original_read = module._read_applied_versions
+    initial_reads = Barrier(2)
+
+    def synchronize_initial_reads(connection: sqlite3.Connection) -> set[str]:
+        versions = original_read(connection)
+        if not connection.in_transaction:
+            initial_reads.wait(timeout=5)
+        return versions
+
+    monkeypatch.setattr(module, "_read_applied_versions", synchronize_initial_reads)
+
+    def run_migrations() -> list[str]:
+        connection = connect_database(database_path)
+        try:
+            return module.apply_migrations(connection, migrations_dir)
+        finally:
+            connection.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(run_migrations) for _ in range(2)]
+        results = [future.result(timeout=10) for future in futures]
+
+    assert sorted(results) == [[], ["001_once"]]
+    observer = connect_database(database_path)
+    try:
+        assert observer.execute("SELECT COUNT(*) FROM execution_log").fetchone()[0] == 1
+        assert observer.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 1
+    finally:
+        observer.close()
+
+
+def test_begin_immediate_lock_error_has_migration_context(tmp_path: Path) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_migration(migrations_dir, "001_locked.sql", _ledger_sql())
+    database_path = tmp_path / "erp.sqlite3"
+    holder = connect_database(database_path)
+    contender = connect_database(database_path)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        contender.execute("PRAGMA busy_timeout=0")
+
+        with pytest.raises(
+            _migration_error(),
+            match="001_locked.*BEGIN IMMEDIATE",
+        ) as raised:
+            _apply_migrations()(contender, migrations_dir)
+
+        assert isinstance(raised.value.__cause__, sqlite3.OperationalError)
+        assert "locked" in str(raised.value.__cause__)
+        assert not contender.in_transaction
+    finally:
+        holder.rollback()
+        contender.close()
+        holder.close()
+
+
+class _RollbackFailingConnection:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+
+    @property
+    def in_transaction(self) -> bool:
+        return self.connection.in_transaction
+
+    def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+        return self.connection.execute(sql, parameters)
+
+    def commit(self) -> None:
+        self.connection.commit()
+
+    def rollback(self) -> None:
+        raise RuntimeError("injected rollback failure")
+
+
+def test_rollback_failure_preserves_original_migration_cause(tmp_path: Path) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_migration(
+        migrations_dir,
+        "001_broken.sql",
+        _ledger_sql()
+        + "INSERT INTO table_that_does_not_exist VALUES ('original failure');",
+    )
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    proxy = cast(sqlite3.Connection, _RollbackFailingConnection(connection))
+    try:
+        with pytest.raises(_migration_error()) as raised:
+            _apply_migrations()(proxy, migrations_dir)
+
+        assert "001_broken" in str(raised.value)
+        assert "table_that_does_not_exist" in str(raised.value)
+        assert "rollback" in str(raised.value)
+        assert "injected rollback failure" in str(raised.value)
+        assert isinstance(raised.value.__cause__, sqlite3.OperationalError)
+        assert "table_that_does_not_exist" in str(raised.value.__cause__)
+    finally:
+        connection.rollback()
         connection.close()

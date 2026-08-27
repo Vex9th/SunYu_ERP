@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NoReturn
 
 _TRANSACTION_KEYWORDS = frozenset(
     {"BEGIN", "COMMIT", "END", "RELEASE", "ROLLBACK", "SAVEPOINT"}
@@ -28,6 +29,12 @@ def apply_migrations(
     if missing_versions:
         missing = ", ".join(missing_versions)
         raise MigrationError(f"migration drift: applied versions are missing: {missing}")
+    ordered_versions = [path.stem for path in migrations]
+    expected_prefix = set(ordered_versions[: len(applied_versions)])
+    if applied_versions != expected_prefix:
+        raise MigrationError(
+            "migration drift: applied versions are not a continuous filename prefix"
+        )
 
     applied_now: list[str] = []
     for migration_path in migrations:
@@ -35,8 +42,8 @@ def apply_migrations(
         if version in applied_versions:
             continue
         statements = _read_statements(migration_path)
-        _apply_one(connection, version, statements)
-        applied_now.append(version)
+        if _apply_one(connection, version, statements):
+            applied_now.append(version)
 
     return applied_now
 
@@ -188,9 +195,18 @@ def _apply_one(
     connection: sqlite3.Connection,
     version: str,
     statements: list[str],
-) -> None:
-    connection.execute("BEGIN IMMEDIATE")
+) -> bool:
     try:
+        connection.execute("BEGIN IMMEDIATE")
+    except sqlite3.Error as exc:
+        raise MigrationError(
+            f"migration {version} could not start BEGIN IMMEDIATE: {exc}"
+        ) from exc
+
+    try:
+        if version in _read_applied_versions(connection):
+            connection.commit()
+            return False
         for statement in statements:
             connection.execute(statement)
         if not _ledger_exists(connection):
@@ -202,10 +218,24 @@ def _apply_one(
             (version, datetime.now(timezone.utc).isoformat()),
         )
         connection.commit()
-    except BaseException as exc:
+        return True
+    except (MigrationError, sqlite3.Error) as exc:
+        _raise_after_rollback(connection, version, exc)
+
+
+def _raise_after_rollback(
+    connection: sqlite3.Connection,
+    version: str,
+    failure: MigrationError | sqlite3.Error,
+) -> NoReturn:
+    try:
         connection.rollback()
-        if isinstance(exc, MigrationError):
-            raise
-        if isinstance(exc, Exception):
-            raise MigrationError(f"migration {version} failed: {exc}") from exc
-        raise
+    except Exception as rollback_failure:  # noqa: BLE001 - report adapter failures
+        raise MigrationError(
+            f"migration {version} failed: {failure}; "
+            f"rollback failed: {rollback_failure}"
+        ) from failure
+
+    if isinstance(failure, MigrationError):
+        raise failure
+    raise MigrationError(f"migration {version} failed: {failure}") from failure
