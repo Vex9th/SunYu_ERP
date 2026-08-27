@@ -6,6 +6,7 @@ import secrets
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 
 _ALLOWED_CONFIG_KEYS = frozenset(
     {
@@ -19,6 +20,7 @@ _ALLOWED_CONFIG_KEYS = frozenset(
     }
 )
 _MISSING = object()
+_CONFIG_LOCK = RLock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,13 +37,64 @@ class Settings:
 
 def load_settings(config_path: str | Path) -> Settings:
     resolved_config_path = Path(config_path).resolve()
-    if resolved_config_path.exists():
-        with resolved_config_path.open(encoding="utf-8") as config_file:
-            loaded_config = json.load(config_file)
-    else:
-        loaded_config = {}
+    with _CONFIG_LOCK:
+        return _load_settings(resolved_config_path)
 
-    raw_config = _validate_config(loaded_config)
+
+def update_backup_settings(
+    config_path: str | Path,
+    *,
+    directory: str | None,
+    interval_hours: int,
+    retention_days: int,
+) -> Settings:
+    resolved_config_path = Path(config_path).resolve()
+    with _CONFIG_LOCK:
+        raw_config = _validate_config(_read_config(resolved_config_path))
+        raw_config.update(
+            {
+                "backup_dir": directory,
+                "backup_interval_hours": interval_hours,
+                "backup_retention_days": retention_days,
+            }
+        )
+        raw_config = _validate_config(raw_config)
+        _ensure_session_secret(raw_config)
+        settings = _settings_from_config(resolved_config_path, raw_config)
+        _write_json_atomically(resolved_config_path, raw_config)
+        return settings
+
+
+def _load_settings(resolved_config_path: Path) -> Settings:
+    raw_config = _validate_config(_read_config(resolved_config_path))
+    should_write = _ensure_session_secret(raw_config)
+    settings = _settings_from_config(resolved_config_path, raw_config)
+    if should_write:
+        _write_json_atomically(resolved_config_path, raw_config)
+    return settings
+
+
+def _read_config(config_path: Path) -> object:
+    if not config_path.exists():
+        return {}
+    with config_path.open(encoding="utf-8") as config_file:
+        return json.load(config_file)
+
+
+def _ensure_session_secret(config: dict[str, object]) -> bool:
+    session_secret = config.get("session_secret", _MISSING)
+    if session_secret is _MISSING or (
+        isinstance(session_secret, str) and not session_secret.strip()
+    ):
+        config["session_secret"] = secrets.token_urlsafe(32)
+        return True
+    return False
+
+
+def _settings_from_config(
+    resolved_config_path: Path,
+    raw_config: dict[str, object],
+) -> Settings:
     host = raw_config.get("host", "0.0.0.0")
     port = raw_config.get("port", 8765)
     config_dir = resolved_config_path.parent
@@ -57,13 +110,9 @@ def load_settings(config_path: str | Path) -> Settings:
         else None
     )
 
-    session_secret = raw_config.get("session_secret", _MISSING)
-    if session_secret is _MISSING or (
-        isinstance(session_secret, str) and not session_secret.strip()
-    ):
-        session_secret = secrets.token_urlsafe(32)
-        raw_config["session_secret"] = session_secret
-        _write_json_atomically(resolved_config_path, raw_config)
+    session_secret = raw_config["session_secret"]
+    if not isinstance(session_secret, str) or not session_secret:
+        raise RuntimeError("session_secret was not initialized")
 
     return Settings(
         config_path=resolved_config_path,

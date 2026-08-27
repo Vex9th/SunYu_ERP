@@ -25,6 +25,15 @@ _MAX_LOGIN_FAILURES = 5
 _LOGIN_FAILURE_WINDOW_SECONDS = 5 * 60
 
 
+def require_authenticated_session(request: Request, session_secret: str) -> None:
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not is_session_token_valid(session_secret, token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+        )
+
+
 async def _read_password(request: Request) -> str:
     try:
         payload: Any = await request.json()
@@ -211,11 +220,16 @@ def create_auth_router(
     @router.get("/session")
     def get_session(
         request: Request,
+        connection: sqlite3.Connection = connection_dependency,
         session_secret: str = session_secret_dependency,
     ) -> dict[str, bool]:
         token = request.cookies.get(SESSION_COOKIE_NAME)
+        password_configured = connection.execute(
+            "SELECT 1 FROM auth_secret WHERE singleton_id = 1"
+        ).fetchone()
         return {
             "authenticated": is_session_token_valid(session_secret, token),
+            "password_configured": password_configured is not None,
         }
 
     return router

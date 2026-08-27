@@ -282,7 +282,10 @@ def test_session_reports_false_without_cookie(harness: AuthHarness) -> None:
         response = client.get("/api/auth/session")
 
     assert response.status_code == 200
-    assert response.json() == {"authenticated": False}
+    assert response.json() == {
+        "authenticated": False,
+        "password_configured": False,
+    }
 
 
 def test_session_reports_true_for_valid_login_cookie(harness: AuthHarness) -> None:
@@ -296,7 +299,10 @@ def test_session_reports_true_for_valid_login_cookie(harness: AuthHarness) -> No
         response = client.get("/api/auth/session")
 
     assert response.status_code == 200
-    assert response.json() == {"authenticated": True}
+    assert response.json() == {
+        "authenticated": True,
+        "password_configured": True,
+    }
 
 
 @pytest.mark.parametrize("mutation", ["append", "replace"])
@@ -314,7 +320,10 @@ def test_session_rejects_tampered_cookie(
         client.cookies.set(security.SESSION_COOKIE_NAME, token)
         response = client.get("/api/auth/session")
 
-    assert response.json() == {"authenticated": False}
+    assert response.json() == {
+        "authenticated": False,
+        "password_configured": False,
+    }
 
 
 def test_session_rejects_expired_cookie_without_sleep(harness: AuthHarness) -> None:
@@ -327,7 +336,10 @@ def test_session_rejects_expired_cookie_without_sleep(harness: AuthHarness) -> N
         client.cookies.set(security.SESSION_COOKIE_NAME, token)
         response = client.get("/api/auth/session")
 
-    assert response.json() == {"authenticated": False}
+    assert response.json() == {
+        "authenticated": False,
+        "password_configured": False,
+    }
 
 
 @pytest.mark.parametrize(
@@ -356,7 +368,10 @@ def test_session_rejects_signed_but_wrong_payload(
         client.cookies.set(security.SESSION_COOKIE_NAME, token)
         response = client.get("/api/auth/session")
 
-    assert response.json() == {"authenticated": False}
+    assert response.json() == {
+        "authenticated": False,
+        "password_configured": False,
+    }
 
 
 def test_logout_clears_cookie_and_session(harness: AuthHarness) -> None:
@@ -375,7 +390,10 @@ def test_logout_clears_cookie_and_session(harness: AuthHarness) -> None:
     assert "SameSite=lax" in cookie
     assert "Path=/" in cookie
     assert "Secure" not in cookie
-    assert session.json() == {"authenticated": False}
+    assert session.json() == {
+        "authenticated": False,
+        "password_configured": True,
+    }
 
 
 def test_sixth_failed_login_is_rate_limited(harness: AuthHarness) -> None:
@@ -549,7 +567,12 @@ def test_concurrent_logins_reserve_only_five_verifier_slots(
 def test_router_dependency_owns_connection_lifetime(tmp_path: Path) -> None:
     database_path = tmp_path / "erp.sqlite3"
     _initialize_database(database_path)
-    connection = connect_database(database_path)
+    connection = sqlite3.connect(
+        database_path,
+        isolation_level=None,
+        check_same_thread=False,
+    )
+    connection.row_factory = sqlite3.Row
 
     def get_connection() -> sqlite3.Connection:
         return connection

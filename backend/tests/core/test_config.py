@@ -274,6 +274,91 @@ def test_configured_backup_periods_are_loaded(tmp_path: Path) -> None:
     assert settings.backup_retention_days == 90
 
 
+def test_backup_settings_update_is_atomic_and_preserves_runtime_keys(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.json"
+    write_config(
+        config_path,
+        data_dir="RuntimeData",
+        host="127.0.0.1",
+        port=9000,
+        session_secret="secret-that-must-be-preserved",
+    )
+
+    settings = config_module.update_backup_settings(
+        config_path,
+        directory="Synology/ERP",
+        interval_hours=12,
+        retention_days=90,
+    )
+
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))
+    assert persisted == {
+        "data_dir": "RuntimeData",
+        "host": "127.0.0.1",
+        "port": 9000,
+        "session_secret": "secret-that-must-be-preserved",
+        "backup_dir": "Synology/ERP",
+        "backup_interval_hours": 12,
+        "backup_retention_days": 90,
+    }
+    assert settings.backup_dir == (tmp_path / "Synology/ERP").resolve()
+    assert settings.session_secret == "secret-that-must-be-preserved"
+
+
+def test_backup_settings_update_can_disable_directory(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    write_config(
+        config_path,
+        backup_dir="old-backups",
+        session_secret="secret-that-must-be-preserved",
+    )
+
+    settings = config_module.update_backup_settings(
+        config_path,
+        directory=None,
+        interval_hours=24,
+        retention_days=30,
+    )
+
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))
+    assert persisted["backup_dir"] is None
+    assert settings.backup_dir is None
+    assert settings.session_secret == "secret-that-must-be-preserved"
+
+
+def test_backup_settings_update_failure_preserves_original_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    write_config(
+        config_path,
+        backup_dir="old-backups",
+        session_secret="secret-that-must-be-preserved",
+    )
+    original = config_path.read_bytes()
+    failure = OSError("injected config fsync failure")
+
+    def fail_fsync(_: int) -> None:
+        raise failure
+
+    monkeypatch.setattr(config_module.os, "fsync", fail_fsync)
+
+    with pytest.raises(OSError) as raised:
+        config_module.update_backup_settings(
+            config_path,
+            directory="new-backups",
+            interval_hours=12,
+            retention_days=60,
+        )
+
+    assert raised.value is failure
+    assert config_path.read_bytes() == original
+    assert list(tmp_path.glob(f".{config_path.name}.*.tmp")) == []
+
+
 @pytest.mark.parametrize("invalid_port", (0, 65536))
 def test_out_of_range_port_fails_fast(
     tmp_path: Path,
