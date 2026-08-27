@@ -564,6 +564,47 @@ class _RollbackFailingConnection:
         raise RuntimeError("injected rollback failure")
 
 
+class _InterruptingConnection:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        interrupt_after: str,
+        *,
+        fail_rollback: bool = False,
+    ) -> None:
+        self.connection = connection
+        self.interrupt_after = interrupt_after
+        self.fail_rollback = fail_rollback
+        self.failure = KeyboardInterrupt(f"interrupted after {interrupt_after}")
+        self.interrupted = False
+
+    @property
+    def in_transaction(self) -> bool:
+        return self.connection.in_transaction
+
+    def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+        cursor = self.connection.execute(sql, parameters)
+        normalized_sql = sql.lstrip().upper()
+        should_interrupt = (
+            self.interrupt_after == "begin" and normalized_sql == "BEGIN IMMEDIATE"
+        ) or (
+            self.interrupt_after == "first_ddl"
+            and normalized_sql.startswith("CREATE TABLE SCHEMA_MIGRATIONS")
+        )
+        if should_interrupt and not self.interrupted:
+            self.interrupted = True
+            raise self.failure
+        return cursor
+
+    def commit(self) -> None:
+        self.connection.commit()
+
+    def rollback(self) -> None:
+        if self.fail_rollback:
+            raise RuntimeError("injected interrupt rollback failure")
+        self.connection.rollback()
+
+
 def test_rollback_failure_preserves_original_migration_cause(tmp_path: Path) -> None:
     migrations_dir = tmp_path / "migrations"
     _write_migration(
@@ -584,6 +625,73 @@ def test_rollback_failure_preserves_original_migration_cause(tmp_path: Path) -> 
         assert "injected rollback failure" in str(raised.value)
         assert isinstance(raised.value.__cause__, sqlite3.OperationalError)
         assert "table_that_does_not_exist" in str(raised.value.__cause__)
+    finally:
+        connection.rollback()
+        connection.close()
+
+
+def test_keyboard_interrupt_after_begin_rolls_back_and_keeps_original_type(
+    tmp_path: Path,
+) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_migration(migrations_dir, "001_interrupted.sql", _ledger_sql())
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    adapter = _InterruptingConnection(connection, "begin")
+    proxy = cast(sqlite3.Connection, adapter)
+    try:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            _apply_migrations()(proxy, migrations_dir)
+
+        assert raised.value is adapter.failure
+        assert not connection.in_transaction
+        assert not _table_exists(connection, "schema_migrations")
+    finally:
+        connection.rollback()
+        connection.close()
+
+
+def test_keyboard_interrupt_after_first_ddl_rolls_back_schema(
+    tmp_path: Path,
+) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_migration(
+        migrations_dir,
+        "001_interrupted.sql",
+        _ledger_sql() + "CREATE TABLE must_not_exist (value TEXT);",
+    )
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    adapter = _InterruptingConnection(connection, "first_ddl")
+    proxy = cast(sqlite3.Connection, adapter)
+    try:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            _apply_migrations()(proxy, migrations_dir)
+
+        assert raised.value is adapter.failure
+        assert not connection.in_transaction
+        assert not _table_exists(connection, "schema_migrations")
+        assert not _table_exists(connection, "must_not_exist")
+    finally:
+        connection.rollback()
+        connection.close()
+
+
+def test_keyboard_interrupt_keeps_type_when_rollback_also_fails(
+    tmp_path: Path,
+) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_migration(migrations_dir, "001_interrupted.sql", _ledger_sql())
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    adapter = _InterruptingConnection(connection, "begin", fail_rollback=True)
+    proxy = cast(sqlite3.Connection, adapter)
+    try:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            _apply_migrations()(proxy, migrations_dir)
+
+        assert raised.value is adapter.failure
+        assert any(
+            "rollback failed: injected interrupt rollback failure" in note
+            for note in raised.value.__notes__
+        )
     finally:
         connection.rollback()
         connection.close()

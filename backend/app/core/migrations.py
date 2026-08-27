@@ -198,10 +198,14 @@ def _apply_one(
 ) -> bool:
     try:
         connection.execute("BEGIN IMMEDIATE")
-    except sqlite3.Error as exc:
-        raise MigrationError(
-            f"migration {version} could not start BEGIN IMMEDIATE: {exc}"
-        ) from exc
+    except BaseException as exc:
+        if connection.in_transaction:
+            _raise_after_rollback(connection, version, exc)
+        if isinstance(exc, sqlite3.Error):
+            raise MigrationError(
+                f"migration {version} could not start BEGIN IMMEDIATE: {exc}"
+            ) from exc
+        raise
 
     try:
         if version in _read_applied_versions(connection):
@@ -219,23 +223,28 @@ def _apply_one(
         )
         connection.commit()
         return True
-    except (MigrationError, sqlite3.Error) as exc:
+    except BaseException as exc:  # noqa: BLE001 - rollback before re-raising signals
         _raise_after_rollback(connection, version, exc)
 
 
 def _raise_after_rollback(
     connection: sqlite3.Connection,
     version: str,
-    failure: MigrationError | sqlite3.Error,
+    failure: BaseException,
 ) -> NoReturn:
     try:
         connection.rollback()
     except Exception as rollback_failure:  # noqa: BLE001 - report adapter failures
-        raise MigrationError(
-            f"migration {version} failed: {failure}; "
-            f"rollback failed: {rollback_failure}"
-        ) from failure
+        if isinstance(failure, Exception):
+            raise MigrationError(
+                f"migration {version} failed: {failure}; "
+                f"rollback failed: {rollback_failure}"
+            ) from failure
+        failure.add_note(f"rollback failed: {rollback_failure}")
+        raise failure
 
     if isinstance(failure, MigrationError):
         raise failure
-    raise MigrationError(f"migration {version} failed: {failure}") from failure
+    if isinstance(failure, sqlite3.Error):
+        raise MigrationError(f"migration {version} failed: {failure}") from failure
+    raise failure
