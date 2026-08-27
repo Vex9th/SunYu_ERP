@@ -175,7 +175,17 @@ class BackupScheduler:
             if now is not None and settings is not None:
                 interval = timedelta(hours=settings.backup_interval_hours)
                 self._retry_not_before = now + min(_MAX_RETRY_DELAY, interval)
-            self._record_error(failure_category, primary_failure, now)
+            error_code = f"{failure_category}:{type(primary_failure).__name__}"
+            if close_failure is not None:
+                primary_failure.add_note(
+                    "database connection close failed: "
+                    f"{type(close_failure).__name__}"
+                )
+                error_code += (
+                    ";connection_close:"
+                    f"{type(close_failure).__name__}"
+                )
+            self._record_error_code(error_code, now)
             return False
         if ran_backup:
             self._retry_not_before = None

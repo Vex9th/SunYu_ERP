@@ -874,6 +874,46 @@ def test_scheduler_close_failure_is_observable_without_recreating_backup(
     assert calls == [NOW]
 
 
+def test_scheduler_preserves_primary_and_close_failures_without_error_text(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = _settings(tmp_path)
+    connection = _database(settings)
+    connection.close()
+    primary = RuntimeError("private backup failure")
+
+    def connection_factory(path: str | Path) -> _CloseFailConnection:
+        return _CloseFailConnection(connect_database(path))
+
+    def fail_backup(
+        _: sqlite3.Connection,
+        __: Settings,
+        ___: datetime,
+    ) -> system_module.BackupJobResult:
+        raise primary
+
+    scheduler = system_module.BackupScheduler(
+        system_module.SettingsStore(settings),
+        connection_factory=connection_factory,
+        runner=fail_backup,
+        clock=MutableClock(),
+    )
+
+    assert scheduler.run_cycle() is False
+
+    snapshot = scheduler.snapshot()
+    captured = capsys.readouterr()
+    assert primary.__notes__ == ["database connection close failed: OSError"]
+    assert snapshot["last_error_code"] == (
+        "backup:RuntimeError;connection_close:OSError"
+    )
+    assert "private backup failure" not in captured.out
+    assert "private backup failure" not in captured.err
+    assert "private close failure" not in captured.out
+    assert "private close failure" not in captured.err
+
+
 def test_scheduler_waiter_failure_is_observable_without_error_text(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
