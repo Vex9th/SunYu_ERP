@@ -154,7 +154,15 @@ def test_foundation_migration_creates_required_tables_and_constraints(
     tmp_path: Path,
 ) -> None:
     project_root = Path(__file__).resolve().parents[3]
-    migrations_dir = project_root / "backend" / "migrations"
+    foundation_sql = (
+        project_root / "backend" / "migrations" / "001_foundation.sql"
+    ).read_text(encoding="utf-8")
+    migrations_dir = tmp_path / "migrations"
+    _write_migration(
+        migrations_dir,
+        "001_foundation.sql",
+        foundation_sql,
+    )
     connection = connect_database(tmp_path / "erp.sqlite3")
     try:
         assert _apply_migrations()(connection, migrations_dir) == ["001_foundation"]
