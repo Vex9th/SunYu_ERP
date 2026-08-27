@@ -9,6 +9,7 @@ _WINDOWS_DEVICE_NAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
     | {f"COM{number}" for number in range(1, 10)}
     | {f"LPT{number}" for number in range(1, 10)}
+    | {f"{prefix}{number}" for prefix in ("COM", "LPT") for number in "¹²³"}
 )
 _MAX_PROJECT_CODE_UTF8_BYTES = 120
 

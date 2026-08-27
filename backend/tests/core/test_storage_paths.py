@@ -62,6 +62,33 @@ def test_normalize_project_code_rejects_unsafe_values(value: str) -> None:
         normalize_project_code(value)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "COM¹",
+        "COM²",
+        "COM³",
+        "LPT¹",
+        "LPT²",
+        "LPT³",
+        "com¹.txt",
+        "Com².log",
+        "cOM³.tar.gz",
+        "lpt¹.txt",
+        "Lpt².log",
+        "lPT³.tar.gz",
+    ],
+)
+def test_normalize_project_code_rejects_superscript_device_names(
+    value: str,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="project_code must be a safe single path segment",
+    ):
+        normalize_project_code(value)
+
+
 def test_normalize_project_code_rejects_non_string() -> None:
     with pytest.raises(TypeError, match="project_code must be a string"):
         normalize_project_code(123)  # type: ignore[arg-type]
