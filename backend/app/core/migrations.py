@@ -7,6 +7,7 @@ from pathlib import Path
 _TRANSACTION_KEYWORDS = frozenset(
     {"BEGIN", "COMMIT", "END", "RELEASE", "ROLLBACK", "SAVEPOINT"}
 )
+_UTF8_BOM = "\ufeff"
 
 
 class MigrationError(RuntimeError):
@@ -121,6 +122,10 @@ def _read_statements(migration_path: Path) -> list[str]:
                 f"transaction control is not allowed in migration "
                 f"{migration_path.name}: {keyword}"
             )
+    if _UTF8_BOM in script[1:]:
+        raise MigrationError(
+            f"BOM is only allowed at script start: {migration_path.name}"
+        )
     return statements
 
 
@@ -150,8 +155,13 @@ def _is_only_comments_and_whitespace(sql: str) -> bool:
 def _leading_keyword(sql: str) -> str:
     index = 0
     length = len(sql)
+    skipped_bom = False
     while index < length:
         if sql[index].isspace():
+            index += 1
+            continue
+        if sql[index] == _UTF8_BOM and not skipped_bom:
+            skipped_bom = True
             index += 1
             continue
         if sql.startswith("--", index):

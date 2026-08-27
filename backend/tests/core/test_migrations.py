@@ -344,3 +344,95 @@ def test_rejects_transaction_control_before_executing_migration(
         assert not _table_exists(connection, "must_not_exist")
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("transaction_sql", ["BEGIN;", "COMMIT;", "ROLLBACK;"])
+def test_rejects_bom_prefixed_transaction_control_before_any_statement(
+    tmp_path: Path,
+    transaction_sql: str,
+) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_migration(
+        migrations_dir,
+        "001_unsafe.sql",
+        _ledger_sql()
+        + """
+            CREATE TABLE leaked (value TEXT NOT NULL);
+            INSERT INTO leaked VALUES ('must not persist');
+        """
+        + "\ufeff"
+        + transaction_sql
+        + """
+            INSERT INTO table_that_does_not_exist VALUES ('failure');
+        """,
+    )
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    try:
+        with pytest.raises(_migration_error(), match="transaction control"):
+            _apply_migrations()(connection, migrations_dir)
+
+        assert not connection.in_transaction
+        assert not _table_exists(connection, "schema_migrations")
+        assert not _table_exists(connection, "leaked")
+    finally:
+        connection.close()
+
+
+def test_allows_trigger_body_transaction_keywords(tmp_path: Path) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_migration(
+        migrations_dir,
+        "001_trigger.sql",
+        _ledger_sql()
+        + """
+            CREATE TABLE source_events (value TEXT NOT NULL);
+            CREATE TABLE audit_events (value TEXT NOT NULL);
+            CREATE TRIGGER record_source_event
+            AFTER INSERT ON source_events
+            BEGIN
+                INSERT INTO audit_events VALUES (NEW.value);
+            END;
+            INSERT INTO source_events VALUES ('recorded');
+        """,
+    )
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    try:
+        assert _apply_migrations()(connection, migrations_dir) == ["001_trigger"]
+        assert connection.execute("SELECT value FROM audit_events").fetchone()[0] == (
+            "recorded"
+        )
+    finally:
+        connection.close()
+
+
+def test_allows_single_bom_at_start_of_script(tmp_path: Path) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_migration(
+        migrations_dir,
+        "001_bom.sql",
+        "\ufeff" + _ledger_sql() + "CREATE TABLE bom_supported (value TEXT);",
+    )
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    try:
+        assert _apply_migrations()(connection, migrations_dir) == ["001_bom"]
+        assert _table_exists(connection, "bom_supported")
+    finally:
+        connection.close()
+
+
+def test_rejects_bom_outside_start_before_executing_migration(tmp_path: Path) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_migration(
+        migrations_dir,
+        "001_invalid_bom.sql",
+        _ledger_sql() + "\ufeffCREATE TABLE must_not_exist (value TEXT);",
+    )
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    try:
+        with pytest.raises(_migration_error(), match="BOM.*start"):
+            _apply_migrations()(connection, migrations_dir)
+
+        assert not _table_exists(connection, "schema_migrations")
+        assert not _table_exists(connection, "must_not_exist")
+    finally:
+        connection.close()
