@@ -359,6 +359,59 @@ def test_backup_settings_update_failure_preserves_original_file(
     assert list(tmp_path.glob(f".{config_path.name}.*.tmp")) == []
 
 
+def test_backup_settings_update_strips_directory_before_persisting(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.json"
+    write_config(config_path, session_secret="test-secret")
+
+    settings = config_module.update_backup_settings(
+        config_path,
+        directory="  Synology/ERP  ",
+        interval_hours=12,
+        retention_days=60,
+    )
+
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))
+    assert persisted["backup_dir"] == "Synology/ERP"
+    assert settings.backup_dir == (tmp_path / "Synology/ERP").resolve()
+
+
+def test_load_rejects_backup_directory_inside_projects(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    write_config(
+        config_path,
+        data_dir="Data",
+        backup_dir="Data/Projects/Backups",
+        session_secret="test-secret",
+    )
+
+    with pytest.raises(ValueError, match="Data/Projects"):
+        load_settings(config_path)
+
+
+def test_update_rejects_backup_directory_inside_projects_without_writing(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.json"
+    write_config(
+        config_path,
+        data_dir="Data",
+        session_secret="test-secret",
+    )
+    original = config_path.read_bytes()
+
+    with pytest.raises(ValueError, match="Data/Projects"):
+        config_module.update_backup_settings(
+            config_path,
+            directory="Data/Projects/Backups",
+            interval_hours=12,
+            retention_days=60,
+        )
+
+    assert config_path.read_bytes() == original
+
+
 @pytest.mark.parametrize("invalid_port", (0, 65536))
 def test_out_of_range_port_fails_fast(
     tmp_path: Path,

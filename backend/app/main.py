@@ -15,6 +15,7 @@ from backend.app.features.auth import create_auth_router
 from backend.app.features.backups import create_backup, prune_backups
 from backend.app.features.system import (
     BackupCreator,
+    BackupJobResult,
     BackupPruner,
     BackupScheduler,
     SettingsStore,
@@ -44,10 +45,18 @@ def create_app(
         settings.data_dir.mkdir(parents=True, exist_ok=True)
         database_path = settings.data_dir / "iapm.sqlite"
         connection = connect_database(database_path)
+        migration_failure: BaseException | None = None
         try:
             apply_migrations(connection, _MIGRATIONS_DIR)
+        except BaseException as failure:
+            migration_failure = failure
+            raise
         finally:
-            connection.close()
+            _cleanup_preserving_primary(
+                connection.close,
+                primary=migration_failure,
+                label="database connection close",
+            )
 
         settings_store = SettingsStore(settings)
         application.state.settings = settings_store
@@ -56,7 +65,7 @@ def create_app(
             scheduled_connection: sqlite3.Connection,
             scheduled_settings: Settings,
             now: datetime,
-        ) -> Path:
+        ) -> BackupJobResult:
             return run_backup_job(
                 scheduled_connection,
                 scheduled_settings,
@@ -71,11 +80,19 @@ def create_app(
             runner=scheduled_backup_runner,
         )
         application.state.backup_scheduler = scheduler
-        scheduler.start()
+        lifespan_failure: BaseException | None = None
         try:
+            scheduler.start()
             yield
+        except BaseException as failure:
+            lifespan_failure = failure
+            raise
         finally:
-            scheduler.stop()
+            _cleanup_preserving_primary(
+                scheduler.stop,
+                primary=lifespan_failure,
+                label="backup scheduler stop",
+            )
 
     application = FastAPI(title="SunYu ERP", lifespan=lifespan)
 
@@ -83,9 +100,22 @@ def create_app(
         store: SettingsStore = request.app.state.settings
         return store.get()
 
-    def replace_settings(settings: Settings) -> None:
+    def update_settings(
+        *,
+        directory: str | None,
+        interval_hours: int,
+        retention_days: int,
+    ) -> Settings:
         store: SettingsStore = application.state.settings
-        store.replace(settings)
+        return store.update_backup(
+            directory=directory,
+            interval_hours=interval_hours,
+            retention_days=retention_days,
+        )
+
+    def get_scheduler_snapshot(request: Request) -> dict[str, object]:
+        scheduler: BackupScheduler = request.app.state.backup_scheduler
+        return scheduler.snapshot()
 
     def get_session_secret(request: Request) -> str:
         return get_settings(request).session_secret
@@ -93,17 +123,26 @@ def create_app(
     def get_connection(request: Request) -> Iterator[sqlite3.Connection]:
         settings = get_settings(request)
         connection = connect_database(settings.data_dir / "iapm.sqlite")
+        request_failure: BaseException | None = None
         try:
             yield connection
+        except BaseException as failure:
+            request_failure = failure
+            raise
         finally:
-            connection.close()
+            _cleanup_preserving_primary(
+                connection.close,
+                primary=request_failure,
+                label="database connection close",
+            )
 
     application.include_router(create_auth_router(get_connection, get_session_secret))
     application.include_router(
         create_system_router(
             get_connection,
             get_settings,
-            replace_settings,
+            update_settings,
+            get_scheduler_snapshot,
             backup_creator=backup_creator,
             backup_pruner=backup_pruner,
         )
@@ -114,6 +153,20 @@ def create_app(
         return {"status": "ok"}
 
     return application
+
+
+def _cleanup_preserving_primary(
+    cleanup: Callable[[], None],
+    *,
+    primary: BaseException | None,
+    label: str,
+) -> None:
+    try:
+        cleanup()
+    except BaseException as failure:
+        if primary is None:
+            raise
+        primary.add_note(f"{label} failed: {type(failure).__name__}")
 
 
 app = create_app()

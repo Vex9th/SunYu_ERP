@@ -51,9 +51,12 @@ def update_backup_settings(
     resolved_config_path = Path(config_path).resolve()
     with _CONFIG_LOCK:
         raw_config = _validate_config(_read_config(resolved_config_path))
+        normalized_directory = (
+            directory.strip() if isinstance(directory, str) else directory
+        )
         raw_config.update(
             {
-                "backup_dir": directory,
+                "backup_dir": normalized_directory,
                 "backup_interval_hours": interval_hours,
                 "backup_retention_days": retention_days,
             }
@@ -109,6 +112,9 @@ def _settings_from_config(
         if backup_value is not None
         else None
     )
+    projects_dir = (data_dir / "Projects").resolve()
+    if backup_dir is not None and backup_dir.is_relative_to(projects_dir):
+        raise ValueError("backup_dir must not be inside Data/Projects")
 
     session_secret = raw_config["session_secret"]
     if not isinstance(session_secret, str) or not session_secret:
