@@ -7,6 +7,8 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -64,6 +66,18 @@ def _create_valid_backup(tmp_path: Path, *, now: datetime = NOW) -> tuple[Path, 
         connection.close()
 
 
+def _set_manifest_time(backup_path: Path, created_at: datetime) -> None:
+    manifest_path = backup_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["created_at"] = created_at.isoformat()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _copy_managed_backup(template: Path, target: Path, created_at: datetime) -> None:
+    shutil.copytree(template, target)
+    _set_manifest_time(target, created_at)
+
+
 def test_create_backup_copies_consistent_database_config_and_projects(
     tmp_path: Path,
 ) -> None:
@@ -93,8 +107,16 @@ def test_create_backup_copies_consistent_database_config_and_projects(
             assert copied.execute("SELECT value FROM backup_probe").fetchone()[0] == (
                 "WAL 中的数据"
             )
+            copied_run = copied.execute(
+                "SELECT status, finished_at FROM backup_runs ORDER BY id DESC"
+            ).fetchone()
+            assert copied_run[0] == "success"
+            assert copied_run[1] is not None
         finally:
             copied.close()
+        assert {path.name for path in (backup_path / "database").iterdir()} == {
+            "iapm.sqlite"
+        }
         manifest = verify_backup(backup_path)
         assert manifest["product"] == "SunYu ERP"
         assert manifest["schema_version"] == 1
@@ -125,6 +147,31 @@ def test_create_backup_preserves_an_empty_projects_directory(tmp_path: Path) -> 
     verify_backup(backup_path)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission contract")
+def test_created_backup_tree_uses_private_modes_without_chmod_existing_root(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    project_file = settings.data_dir / "Projects/P-001/nested/design.bin"
+    project_file.parent.mkdir(parents=True)
+    project_file.write_bytes(b"design")
+    settings.backup_dir.mkdir(parents=True)
+    settings.backup_dir.chmod(0o755)
+    connection = _connection(settings)
+    try:
+        backup_path = create_backup(connection, settings, now=NOW)
+    finally:
+        connection.close()
+
+    assert settings.backup_dir.stat().st_mode & 0o777 == 0o755
+    directories = [backup_path, *(path for path in backup_path.rglob("*") if path.is_dir())]
+    files = [path for path in backup_path.rglob("*") if path.is_file()]
+    assert directories
+    assert files
+    assert all(path.stat().st_mode & 0o777 == 0o700 for path in directories)
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in files)
+
+
 def test_create_backup_requires_an_enabled_backup_directory(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     settings = Settings(
@@ -143,6 +190,25 @@ def test_create_backup_requires_an_enabled_backup_directory(tmp_path: Path) -> N
             create_backup(connection, settings, now=NOW)
     finally:
         connection.close()
+
+
+def test_non_autocommit_connection_fails_before_writes_or_stage_creation(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    seed = _connection(settings)
+    seed.close()
+    connection = sqlite3.connect(settings.data_dir / "iapm.sqlite")
+    try:
+        before = connection.execute("SELECT COUNT(*) FROM backup_runs").fetchone()[0]
+        with pytest.raises(RuntimeError, match="autocommit"):
+            create_backup(connection, settings, now=NOW)
+        after = connection.execute("SELECT COUNT(*) FROM backup_runs").fetchone()[0]
+    finally:
+        connection.close()
+
+    assert before == after == 0
+    assert not settings.backup_dir.exists()
 
 
 def test_backup_directory_cannot_be_inside_projects_source(tmp_path: Path) -> None:
@@ -280,6 +346,31 @@ def test_cleanup_failure_is_not_allowed_to_mask_primary(
     assert any("cleanup failed" in note for note in (primary.__notes__ or []))
 
 
+def test_stage_name_collision_never_deletes_preexisting_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    settings.backup_dir.mkdir(parents=True)
+    existing_stage = settings.backup_dir / ".incomplete-fixed"
+    existing_stage.mkdir()
+    marker = existing_stage / "owned-by-other.txt"
+    marker.write_text("keep")
+    monkeypatch.setattr(
+        backup_module.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="fixed"),
+    )
+    connection = _connection(settings)
+    try:
+        with pytest.raises(FileExistsError):
+            create_backup(connection, settings, now=NOW)
+    finally:
+        connection.close()
+
+    assert marker.read_text() == "keep"
+
+
 def test_fsync_failure_is_not_masked_by_descriptor_close_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -337,6 +428,39 @@ def test_each_creation_stage_failure_cleans_stage_and_records_failed(
     assert list(settings.backup_dir.glob(".incomplete-*")) == []
 
 
+def test_corrupt_snapshot_header_fails_quick_check_and_cleans_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    connection = _connection(settings)
+    real_validate = backup_module._validate_database_snapshot
+
+    def corrupt_then_validate(database_path: Path) -> None:
+        with database_path.open("r+b") as database_file:
+            database_file.write(b"not a sqlite database")
+            database_file.flush()
+            os.fsync(database_file.fileno())
+        real_validate(database_path)
+
+    monkeypatch.setattr(
+        backup_module,
+        "_validate_database_snapshot",
+        corrupt_then_validate,
+    )
+    try:
+        with pytest.raises(sqlite3.DatabaseError):
+            create_backup(connection, settings, now=NOW)
+        status = connection.execute(
+            "SELECT status FROM backup_runs ORDER BY id DESC"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert status == "failed"
+    assert list(settings.backup_dir.glob(".incomplete-*")) == []
+
+
 def test_publish_that_moves_then_raises_rolls_back_its_owned_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -366,6 +490,10 @@ class _SuccessUpdateFailingConnection:
     def __init__(self, wrapped: sqlite3.Connection, failure: BaseException) -> None:
         self.wrapped = wrapped
         self.failure = failure
+
+    @property
+    def isolation_level(self) -> None:
+        return None
 
     @property
     def in_transaction(self) -> bool:
@@ -402,6 +530,104 @@ def test_success_status_failure_rolls_back_published_backup(
     assert raised.value is primary
     assert run["status"] == "failed"
     assert not (settings.backup_dir / "2026-01-10_123456").exists()
+
+
+@pytest.mark.parametrize("failure_type", (OSError, KeyboardInterrupt, SystemExit))
+def test_success_written_then_primary_raised_preserves_owned_valid_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    settings = _settings(tmp_path)
+    connection = _connection(settings)
+    primary = failure_type("raised after success update")
+    real_record_success = backup_module._record_successful_run
+
+    def write_success_then_fail(
+        target_connection: sqlite3.Connection,
+        run_id: int,
+    ) -> None:
+        real_record_success(target_connection, run_id)
+        raise primary
+
+    monkeypatch.setattr(
+        backup_module,
+        "_record_successful_run",
+        write_success_then_fail,
+    )
+    try:
+        with pytest.raises(failure_type) as raised:
+            create_backup(connection, settings, now=NOW)
+        status = connection.execute(
+            "SELECT status FROM backup_runs ORDER BY id DESC"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    backup_path = settings.backup_dir / "2026-01-10_123456"
+    assert raised.value is primary
+    assert status == "success"
+    assert verify_backup(backup_path)["product"] == "SunYu ERP"
+
+
+class _NoOpUpdateConnection:
+    def __init__(self, wrapped: sqlite3.Connection, marker: str) -> None:
+        self.wrapped = wrapped
+        self.marker = marker
+
+    @property
+    def isolation_level(self) -> None:
+        return None
+
+    @property
+    def in_transaction(self) -> bool:
+        return self.wrapped.in_transaction
+
+    def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+        if self.marker in sql:
+            return self.wrapped.execute("SELECT 1")
+        return self.wrapped.execute(sql, parameters)
+
+    def backup(self, target: sqlite3.Connection) -> None:
+        self.wrapped.backup(target)
+
+
+def test_success_update_rowcount_zero_cannot_return_success(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    connection = _connection(settings)
+    proxy = cast(
+        sqlite3.Connection,
+        _NoOpUpdateConnection(connection, "status = 'success'"),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="success"):
+            create_backup(proxy, settings, now=NOW)
+        status = connection.execute(
+            "SELECT status FROM backup_runs ORDER BY id DESC"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert status == "failed"
+    assert not (settings.backup_dir / "2026-01-10_123456").exists()
+
+
+def test_failed_update_rowcount_zero_adds_note_without_masking_primary(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    connection = _connection(settings)
+    proxy = cast(
+        sqlite3.Connection,
+        _NoOpUpdateConnection(connection, "status = 'failed'"),
+    )
+    primary = KeyboardInterrupt("original")
+    try:
+        backup_module._record_failed_run(proxy, 999, primary)
+    finally:
+        connection.close()
+
+    assert any("row" in note for note in (primary.__notes__ or []))
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges on Windows")
@@ -498,17 +724,84 @@ def test_verify_backup_rejects_boolean_schema_and_file_size(tmp_path: Path) -> N
         verify_backup(backup_path)
 
 
+def test_verify_backup_rejects_manifest_larger_than_limit(tmp_path: Path) -> None:
+    backup_path, _ = _create_valid_backup(tmp_path)
+    manifest_path = backup_path / "manifest.json"
+    with manifest_path.open("ab") as manifest_file:
+        manifest_file.write(b" " * (backup_module._MAX_MANIFEST_BYTES + 1))
+
+    with pytest.raises(ValueError, match="too large"):
+        verify_backup(backup_path)
+
+
+def test_manifest_entry_count_is_bounded() -> None:
+    manifest = {
+        "product": "SunYu ERP",
+        "schema_version": 1,
+        "created_at": NOW.isoformat(),
+        "files": [{}] * (backup_module._MAX_MANIFEST_ENTRIES + 1),
+    }
+
+    with pytest.raises(ValueError, match="too many"):
+        backup_module._validate_manifest(manifest)
+
+
+def test_file_set_mismatch_error_is_bounded(tmp_path: Path) -> None:
+    backup_path, _ = _create_valid_backup(tmp_path)
+    for index in range(20):
+        (backup_path / f"unexpected-{index:02}.txt").write_text("unexpected")
+
+    with pytest.raises(ValueError, match="unexpected_count=20") as raised:
+        verify_backup(backup_path)
+
+    message = str(raised.value)
+    assert "unexpected-00.txt" in message
+    assert "unexpected-09.txt" in message
+    assert "unexpected-10.txt" not in message
+
+
+def test_final_name_must_match_manifest_created_at_and_prune_keeps_mismatch(
+    tmp_path: Path,
+) -> None:
+    template, settings = _create_valid_backup(tmp_path)
+    mismatch = settings.backup_dir / "2026-01-01_000000"
+    template.rename(mismatch)
+    with pytest.raises(ValueError, match="name"):
+        verify_backup(mismatch)
+
+    _copy_managed_backup(
+        mismatch,
+        settings.backup_dir / "2026-01-09_000000",
+        datetime(2026, 1, 9, tzinfo=timezone.utc),
+    )
+    _copy_managed_backup(
+        mismatch,
+        settings.backup_dir / "2026-01-08_000000",
+        datetime(2026, 1, 8, tzinfo=timezone.utc),
+    )
+
+    removed = prune_backups(settings.backup_dir, retention_days=0, now=NOW)
+
+    assert mismatch not in removed
+    assert mismatch.exists()
+
+
 def test_prune_deletes_only_expired_managed_backups_and_keeps_latest_two(
     tmp_path: Path,
 ) -> None:
     template, settings = _create_valid_backup(tmp_path)
-    template.rename(settings.backup_dir / "2026-01-09_000000")
+    newest = settings.backup_dir / "2026-01-09_000000"
+    template.rename(newest)
+    _set_manifest_time(newest, datetime(2026, 1, 9, tzinfo=timezone.utc))
     for name in (
         "2026-01-01_000000",
         "2026-01-02_000000",
         "2026-01-03_000000",
     ):
-        shutil.copytree(settings.backup_dir / "2026-01-09_000000", settings.backup_dir / name)
+        timestamp = datetime.strptime(name, "%Y-%m-%d_%H%M%S").replace(
+            tzinfo=timezone.utc
+        )
+        _copy_managed_backup(newest, settings.backup_dir / name, timestamp)
     unrelated = settings.backup_dir / "my-photos"
     unrelated.mkdir()
     incomplete = settings.backup_dir / ".incomplete-abandoned"
@@ -536,10 +829,13 @@ def test_prune_keeps_future_backup_and_never_reduces_valid_backups_below_two(
     tmp_path: Path,
 ) -> None:
     template, settings = _create_valid_backup(tmp_path)
-    template.rename(settings.backup_dir / "2026-02-01_000000")
-    shutil.copytree(
-        settings.backup_dir / "2026-02-01_000000",
+    future = settings.backup_dir / "2026-02-01_000000"
+    template.rename(future)
+    _set_manifest_time(future, datetime(2026, 2, 1, tzinfo=timezone.utc))
+    _copy_managed_backup(
+        future,
         settings.backup_dir / "2025-01-01_000000",
+        datetime(2025, 1, 1, tzinfo=timezone.utc),
     )
 
     assert prune_backups(settings.backup_dir, retention_days=0, now=NOW) == []
@@ -547,6 +843,98 @@ def test_prune_keeps_future_backup_and_never_reduces_valid_backups_below_two(
         "2025-01-01_000000",
         "2026-02-01_000000",
     }
+
+
+def test_two_concurrent_prunes_do_not_race_or_report_missing_files(
+    tmp_path: Path,
+) -> None:
+    template, settings = _create_valid_backup(tmp_path)
+    newest = settings.backup_dir / "2026-01-09_000000"
+    template.rename(newest)
+    _set_manifest_time(newest, datetime(2026, 1, 9, tzinfo=timezone.utc))
+    for day in (1, 2, 3):
+        target = settings.backup_dir / f"2026-01-0{day}_000000"
+        _copy_managed_backup(
+            newest,
+            target,
+            datetime(2026, 1, day, tzinfo=timezone.utc),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda _: prune_backups(
+                    settings.backup_dir,
+                    retention_days=0,
+                    now=NOW,
+                ),
+                range(2),
+            )
+        )
+
+    assert {path.name for result in results for path in result} == {
+        "2026-01-01_000000",
+        "2026-01-02_000000",
+    }
+
+
+def test_prune_waits_for_publish_and_success_recording(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    seed = _connection(settings)
+    seed.close()
+    success_entered = Event()
+    release_success = Event()
+    prune_started = Event()
+    prune_inspected_final = Event()
+    real_record_success = backup_module._record_successful_run
+    real_verify = backup_module.verify_backup
+
+    def pause_before_success(
+        connection: sqlite3.Connection,
+        run_id: int,
+    ) -> None:
+        success_entered.set()
+        assert release_success.wait(timeout=5)
+        real_record_success(connection, run_id)
+
+    def create_one() -> Path:
+        connection = connect_database(settings.data_dir / "iapm.sqlite")
+        try:
+            return create_backup(connection, settings, now=NOW)
+        finally:
+            connection.close()
+
+    def prune_one() -> list[Path]:
+        prune_started.set()
+        return prune_backups(settings.backup_dir, retention_days=0, now=NOW)
+
+    def track_final_verification(path: str | Path) -> dict[str, object]:
+        if Path(path).name == "2026-01-10_123456":
+            prune_inspected_final.set()
+        return real_verify(path)
+
+    monkeypatch.setattr(
+        backup_module,
+        "_record_successful_run",
+        pause_before_success,
+    )
+    monkeypatch.setattr(backup_module, "verify_backup", track_final_verification)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        create_future = executor.submit(create_one)
+        assert success_entered.wait(timeout=5)
+        prune_future = executor.submit(prune_one)
+        assert prune_started.wait(timeout=5)
+        assert not prune_inspected_final.wait(timeout=0.1)
+        assert not prune_future.done()
+        release_success.set()
+        backup_path = create_future.result(timeout=5)
+        assert prune_future.result(timeout=5) == []
+
+    assert backup_path.exists()
+    assert verify_backup(backup_path)["product"] == "SunYu ERP"
 
 
 def test_prune_rejects_invalid_arguments(tmp_path: Path) -> None:
