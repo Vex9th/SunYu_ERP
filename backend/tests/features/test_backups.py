@@ -399,6 +399,27 @@ def test_fsync_failure_is_not_masked_by_descriptor_close_failure(
     assert any("close failed" in note for note in (primary.__notes__ or []))
 
 
+def test_sync_file_opens_a_writable_binary_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "sync.bin"
+    opened: list[tuple[Path, int]] = []
+
+    def record_open(opened_path: Path, flags: int) -> int:
+        opened.append((opened_path, flags))
+        return 42
+
+    monkeypatch.setattr(backup_module.os, "open", record_open)
+    monkeypatch.setattr(backup_module.os, "fsync", lambda _: None)
+    monkeypatch.setattr(backup_module.os, "close", lambda _: None)
+
+    backup_module._sync_file(path)
+
+    expected_flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+    assert opened == [(path, expected_flags)]
+
+
 @pytest.mark.parametrize(
     "function_name",
     ("_copy_file", "_copy_projects", "_write_manifest", "verify_backup", "_publish_stage"),
@@ -463,13 +484,27 @@ def test_corrupt_snapshot_header_fails_quick_check_and_cleans_stage(
     assert list(settings.backup_dir.glob(".incomplete-*")) == []
 
 
-def test_quick_check_uri_encodes_question_hash_unicode_and_space(
+def test_read_only_database_uri_encodes_question_hash_unicode_and_space(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "NAS ?# 中文 空格" / "iapm.sqlite"
+
+    database_uri = backup_module._read_only_database_uri(database_path)
+
+    assert database_uri.endswith("?mode=ro")
+    assert "%3F" in database_uri
+    assert "%23" in database_uri
+    assert "%20" in database_uri
+    assert "%E4%B8%AD%E6%96%87" in database_uri
+
+
+def test_quick_check_uri_handles_hash_unicode_and_space_on_filesystem(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = replace(
         _settings(tmp_path),
-        backup_dir=tmp_path / "NAS ?# 中文" / "Backups",
+        backup_dir=tmp_path / "NAS # 中文 空格" / "Backups",
     )
     connection = _connection(settings)
     real_validate = backup_module._validate_database_snapshot
@@ -497,7 +532,6 @@ def test_quick_check_uri_encodes_question_hash_unicode_and_space(
 
     assert status == "failed"
     assert list(settings.backup_dir.glob(".incomplete-*")) == []
-    assert not (tmp_path / "NAS ").exists()
 
 
 def test_publish_that_moves_then_raises_rolls_back_its_owned_target(

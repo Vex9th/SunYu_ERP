@@ -312,8 +312,8 @@ def _validate_database_snapshot(database_path: Path) -> None:
     primary: BaseException | None = None
     rows: list[tuple[str]] = []
     try:
-        database_uri = database_path.resolve(strict=True).as_uri()
-        checker = sqlite3.connect(f"{database_uri}?mode=ro", uri=True)
+        database_uri = _read_only_database_uri(database_path.resolve(strict=True))
+        checker = sqlite3.connect(database_uri, uri=True)
         rows = checker.execute("PRAGMA quick_check").fetchall()
         if rows != [("ok",)]:
             raise RuntimeError("staged database quick_check did not return exactly ok")
@@ -329,6 +329,10 @@ def _validate_database_snapshot(database_path: Path) -> None:
                 primary.add_note(f"database verifier close failed: {close_failure}")
     if primary is not None:
         raise primary.with_traceback(primary.__traceback__)
+
+
+def _read_only_database_uri(database_path: Path) -> str:
+    return f"{database_path.as_uri()}?mode=ro"
 
 
 def _record_successful_run(connection: sqlite3.Connection, run_id: int) -> None:
@@ -875,7 +879,7 @@ def _hash_verified_file(root: Path, path: Path) -> tuple[int, str]:
 
 
 def _sync_file(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
+    descriptor = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
     _sync_and_close_descriptor(descriptor)
 
 
