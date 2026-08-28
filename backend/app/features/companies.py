@@ -182,15 +182,12 @@ def create_companies_router(
     ) -> Response:
         try:
             with transaction(connection):
-                if not _company_exists(connection, company_id):
-                    raise _company_not_found()
-                referenced = connection.execute(
-                    "SELECT 1 FROM projects WHERE company_id = ? LIMIT 1",
+                cursor = connection.execute(
+                    "DELETE FROM companies WHERE id = ?",
                     (company_id,),
-                ).fetchone()
-                if referenced is not None:
-                    raise _company_referenced()
-                connection.execute("DELETE FROM companies WHERE id = ?", (company_id,))
+                )
+                if cursor.rowcount != 1:
+                    raise _company_not_found()
         except sqlite3.IntegrityError:
             raise _company_referenced() from None
         except sqlite3.Error:
@@ -349,23 +346,41 @@ async def _read_payload(
 ) -> NormalizedPayload:
     try:
         payload: Any = await request.json()
-    except (UnicodeError, ValueError):
+    except (RecursionError, UnicodeError, ValueError):
         raise _invalid_payload(detail) from None
     if not isinstance(payload, dict) or set(payload) != set(fields):
         raise _invalid_payload(detail)
 
-    name = payload["name"]
-    if not isinstance(name, str) or not (normalized_name := name.strip()):
-        raise _invalid_payload(detail)
+    normalized_name = _normalize_text(payload["name"], required=True, detail=detail)
     normalized: NormalizedPayload = {"name": normalized_name}
     for field in fields[1:]:
         value = payload[field]
         if value is None:
             normalized[field] = None
-        elif isinstance(value, str):
-            normalized[field] = value.strip() or None
         else:
+            normalized[field] = _normalize_text(value, required=False, detail=detail)
+    return normalized
+
+
+def _normalize_text(
+    value: object,
+    *,
+    required: bool,
+    detail: str,
+) -> str | None:
+    if not isinstance(value, str):
+        raise _invalid_payload(detail)
+    normalized = value.strip()
+    if not normalized:
+        if required:
             raise _invalid_payload(detail)
+        return None
+    if "\x00" in normalized:
+        raise _invalid_payload(detail)
+    try:
+        normalized.encode("utf-8")
+    except UnicodeEncodeError:
+        raise _invalid_payload(detail) from None
     return normalized
 
 

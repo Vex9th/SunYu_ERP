@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -109,6 +110,7 @@ def _build_harness(
     tmp_path: Path,
     *,
     commit_failure: sqlite3.Error | None = None,
+    inject_project_before_company_delete: bool = False,
 ) -> CompaniesHarness:
     database_path = tmp_path / "erp.sqlite3"
     connection = connect_database(database_path)
@@ -131,14 +133,18 @@ def _build_harness(
 
     def get_connection() -> Iterator[sqlite3.Connection]:
         owned = connect_database(database_path)
-        exposed = (
-            owned
-            if commit_failure is None
-            else cast(
+        if commit_failure is not None:
+            exposed = cast(
                 sqlite3.Connection,
                 _CommitFailingConnection(owned, commit_failure),
             )
-        )
+        elif inject_project_before_company_delete:
+            exposed = cast(
+                sqlite3.Connection,
+                _ProjectRaceConnection(owned, database_path),
+            )
+        else:
+            exposed = owned
         try:
             yield exposed
         finally:
@@ -419,6 +425,33 @@ def test_delete_company_rejects_every_project_reference_without_changes(
     assert detail.json()["contacts"] == [contact]
 
 
+def test_delete_company_maps_concurrent_project_reference_to_atomic_409(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(
+        tmp_path,
+        inject_project_before_company_delete=True,
+    )
+    with harness.client() as client:
+        company = _create_company(client)
+        contact = _create_contact(client, company["id"])
+        response = client.delete(f"/api/companies/{company['id']}")
+        detail = client.get(f"/api/companies/{company['id']}")
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Company is referenced by projects"}
+    assert detail.status_code == 200
+    assert detail.json()["contacts"] == [contact]
+    connection = connect_database(harness.database_path)
+    try:
+        project = connection.execute(
+            "SELECT company_id, status FROM projects"
+        ).fetchone()
+        assert dict(project) == {"company_id": company["id"], "status": "active"}
+    finally:
+        connection.close()
+
+
 def test_duplicate_company_name_is_case_insensitive_and_unchanged(
     harness: CompaniesHarness,
 ) -> None:
@@ -525,6 +558,86 @@ def test_contact_writes_reject_invalid_payload_with_fixed_detail(
     assert response.status_code == 422
     assert response.json() == {"detail": "Invalid contact payload"}
     assert "private" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("resource", "field"),
+    [
+        *(("company", field) for field in _company_payload()),
+        *(("contact", field) for field in _contact_payload()),
+    ],
+)
+@pytest.mark.parametrize("invalid_text", ["\ud800", "\x00"])
+@pytest.mark.parametrize("method", ["post", "put"])
+def test_text_fields_reject_values_sqlite_cannot_store_safely(
+    harness: CompaniesHarness,
+    resource: str,
+    field: str,
+    invalid_text: str,
+    method: str,
+) -> None:
+    with harness.client(raise_server_exceptions=False) as client:
+        if resource == "company":
+            company = _create_company(client) if method == "put" else None
+            path = (
+                "/api/companies"
+                if company is None
+                else f"/api/companies/{company['id']}"
+            )
+            payload = _company_payload()
+            detail = "Invalid company payload"
+        else:
+            company = _create_company(client)
+            contact = (
+                _create_contact(client, company["id"]) if method == "put" else None
+            )
+            path = (
+                f"/api/companies/{company['id']}/contacts"
+                if contact is None
+                else f"/api/companies/{company['id']}/contacts/{contact['id']}"
+            )
+            payload = _contact_payload()
+            detail = "Invalid contact payload"
+        payload[field] = invalid_text
+        response = client.request(
+            method,
+            path,
+            content=json.dumps(payload, ensure_ascii=True).encode("ascii"),
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": detail}
+    assert "ud800" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "detail"),
+    [
+        ("post", "/api/companies", "Invalid company payload"),
+        ("put", "/api/companies/1", "Invalid company payload"),
+        ("post", "/api/companies/1/contacts", "Invalid contact payload"),
+        ("put", "/api/companies/1/contacts/1", "Invalid contact payload"),
+    ],
+)
+def test_deeply_nested_json_has_fixed_422(
+    harness: CompaniesHarness,
+    method: str,
+    path: str,
+    detail: str,
+) -> None:
+    nested = "[" * 10_000 + "0" + "]" * 10_000
+
+    with harness.client(raise_server_exceptions=False) as client:
+        response = client.request(
+            method,
+            path,
+            content=(f'{{"name":{nested}}}').encode(),
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": detail}
 
 
 @pytest.mark.parametrize(
@@ -763,6 +876,47 @@ class _CommitFailingConnection:
 
     def commit(self) -> None:
         raise self._failure
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+class _ProjectRaceConnection:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        database_path: Path,
+    ) -> None:
+        self._connection = connection
+        self._database_path = database_path
+        self._injected = False
+
+    def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+        normalized_sql = " ".join(sql.split()).upper()
+        if not self._injected and normalized_sql.startswith(
+            "DELETE FROM COMPANIES WHERE ID = ?"
+        ):
+            company_id = cast(tuple[int], parameters)[0]
+            competitor = connect_database(self._database_path)
+            try:
+                competitor.execute(
+                    """
+                    INSERT INTO projects
+                        (project_code, company_id, name, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"RACE-{company_id}",
+                        company_id,
+                        "并发项目",
+                        NOW.isoformat(),
+                        NOW.isoformat(),
+                    ),
+                )
+            finally:
+                competitor.close()
+            self._injected = True
+        return self._connection.execute(sql, parameters)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._connection, name)
