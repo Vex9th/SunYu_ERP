@@ -8,7 +8,12 @@ config.json
 *.db
 *.db-*
 *.sqlite
+*.sqlite-*
 *.sqlite3
+*.sqlite3-*
+/secrets/
+/customer-data/
+/CustomerData/
 
 # Python
 __pycache__/

@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.staticfiles import StaticFiles
 
 from backend.app.core.config import Settings, load_settings
 from backend.app.core.database import connect_database
@@ -33,12 +34,17 @@ _MIGRATIONS_DIR = _PROJECT_ROOT / "backend" / "migrations"
 def create_app(
     *,
     config_path: str | Path | None = None,
+    migrations_dir: str | Path | None = None,
+    frontend_dist: str | Path | None = None,
     backup_creator: BackupCreator = create_backup,
     backup_pruner: BackupPruner = prune_backups,
     scheduler_factory: Callable[..., BackupScheduler] = BackupScheduler,
 ) -> FastAPI:
     selected_config_path = (
         _DEFAULT_CONFIG_PATH if config_path is None else Path(config_path)
+    )
+    selected_migrations_dir = (
+        _MIGRATIONS_DIR if migrations_dir is None else Path(migrations_dir)
     )
 
     @asynccontextmanager
@@ -49,7 +55,7 @@ def create_app(
         connection = connect_database(database_path)
         migration_failure: BaseException | None = None
         try:
-            apply_migrations(connection, _MIGRATIONS_DIR)
+            apply_migrations(connection, selected_migrations_dir)
         except BaseException as failure:
             migration_failure = failure
             raise
@@ -155,6 +161,13 @@ def create_app(
     @application.get("/api/health")
     def get_health() -> dict[str, str]:
         return {"status": "ok"}
+
+    if frontend_dist is not None:
+        application.mount(
+            "/",
+            StaticFiles(directory=Path(frontend_dist), html=True),
+            name="frontend",
+        )
 
     return application
 

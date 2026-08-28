@@ -12,6 +12,8 @@ from fastapi.testclient import TestClient
 from backend.app import main as main_module
 from backend.app.core.database import connect_database
 
+PROJECT_MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
+
 
 def _write_config(config_path: Path, **overrides: object) -> None:
     config = {
@@ -25,6 +27,23 @@ def _write_config(config_path: Path, **overrides: object) -> None:
 def _login(client: TestClient) -> None:
     assert client.post("/api/auth/setup", json={"password": "123456"}).status_code == 204
     assert client.post("/api/auth/login", json={"password": "123456"}).status_code == 204
+
+
+def _write_frontend_dist(frontend_dist: Path) -> None:
+    (frontend_dist / "assets").mkdir(parents=True)
+    (frontend_dist / "api").mkdir()
+    (frontend_dist / "index.html").write_text(
+        '<!doctype html><div id="app">SunYu ERP Release</div>',
+        encoding="utf-8",
+    )
+    (frontend_dist / "assets" / "app.js").write_text(
+        'console.log("release asset")',
+        encoding="utf-8",
+    )
+    (frontend_dist / "api" / "health").write_text(
+        "static content must not shadow API",
+        encoding="utf-8",
+    )
 
 
 def test_create_app_defers_config_and_database_writes_until_lifespan(
@@ -43,6 +62,116 @@ def test_create_app_defers_config_and_database_writes_until_lifespan(
     assert response.json() == {"status": "ok"}
     assert config_path.is_file()
     assert (tmp_path / "Data" / "iapm.sqlite").is_file()
+
+
+def test_create_app_only_serves_frontend_when_dist_is_explicit(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.json"
+    application = main_module.create_app(
+        config_path=config_path,
+        migrations_dir=PROJECT_MIGRATIONS_DIR,
+    )
+
+    with TestClient(application) as client:
+        assert client.get("/").status_code == 404
+        assert client.get("/api/health").json() == {"status": "ok"}
+
+
+def test_create_app_serves_release_home_assets_and_keeps_api_priority(
+    tmp_path: Path,
+) -> None:
+    release_root = tmp_path / "发布 包 含中文"
+    frontend_dist = release_root / "只读资源" / "frontend" / "dist"
+    _write_frontend_dist(frontend_dist)
+    application = main_module.create_app(
+        config_path=release_root / "可写目录" / "config.json",
+        migrations_dir=PROJECT_MIGRATIONS_DIR,
+        frontend_dist=frontend_dist,
+    )
+
+    with TestClient(application) as client:
+        home = client.get("/")
+        asset = client.get("/assets/app.js")
+        health = client.get("/api/health")
+        session = client.get("/api/auth/session")
+
+    assert home.status_code == 200
+    assert "SunYu ERP Release" in home.text
+    assert asset.status_code == 200
+    assert asset.text == 'console.log("release asset")'
+    assert health.status_code == 200
+    assert health.json() == {"status": "ok"}
+    assert session.status_code == 200
+    assert session.json() == {
+        "authenticated": False,
+        "password_configured": False,
+    }
+
+
+def test_release_app_restart_preserves_config_database_and_login(
+    tmp_path: Path,
+) -> None:
+    release_root = tmp_path / "SunYu ERP 中文目录"
+    frontend_dist = release_root / "resources" / "frontend" / "dist"
+    _write_frontend_dist(frontend_dist)
+    config_path = release_root / "writable" / "config.json"
+
+    first_application = main_module.create_app(
+        config_path=config_path,
+        migrations_dir=PROJECT_MIGRATIONS_DIR,
+        frontend_dist=frontend_dist,
+    )
+    with TestClient(first_application) as client:
+        assert client.post(
+            "/api/auth/setup",
+            json={"password": "654321"},
+        ).status_code == 204
+
+    first_config = config_path.read_text(encoding="utf-8")
+    database_path = config_path.parent / "Data" / "iapm.sqlite"
+    assert database_path.is_file()
+
+    second_application = main_module.create_app(
+        config_path=config_path,
+        migrations_dir=PROJECT_MIGRATIONS_DIR,
+        frontend_dist=frontend_dist,
+    )
+    with TestClient(second_application) as client:
+        assert client.post(
+            "/api/auth/login",
+            json={"password": "654321"},
+        ).status_code == 204
+        assert client.get("/").status_code == 200
+
+    assert config_path.read_text(encoding="utf-8") == first_config
+
+
+def test_create_app_passes_explicit_migrations_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migrations_dir = tmp_path / "只读 迁移资源"
+    captured: list[Path] = []
+
+    def capture_migrations(
+        connection: sqlite3.Connection,
+        selected_dir: str | Path,
+    ) -> list[str]:
+        captured.append(Path(selected_dir))
+        return []
+
+    monkeypatch.setattr(main_module, "apply_migrations", capture_migrations)
+    application = main_module.create_app(
+        config_path=tmp_path / "可写 根" / "config.json",
+        migrations_dir=migrations_dir,
+        scheduler_factory=lambda **_: _LifecycleProbeScheduler(),
+    )
+
+    with TestClient(application) as client:
+        assert client.get("/api/health").status_code == 200
+
+    assert captured == [migrations_dir]
 
 
 def test_lifespan_applies_migrations_and_closes_every_owned_connection(

@@ -1,0 +1,209 @@
+name: Windows Release
+
+'on':
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python x64
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: .python-version
+          architecture: x64
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install backend dependencies
+        run: python -m pip install --requirement requirements-dev.txt
+
+      - name: Test backend
+        run: python -m pytest
+
+      - name: Lint backend
+        run: python -m ruff check .
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Test frontend
+        working-directory: frontend
+        run: npm test
+
+      - name: Type-check frontend
+        working-directory: frontend
+        run: npm run typecheck
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Build single-file executable
+        run: pyinstaller --clean --noconfirm SunYu_ERP.spec
+
+      - name: Smoke-test packaged executable and persistence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $smokeRoot = Join-Path $env:RUNNER_TEMP 'SunYu ERP 中文 Smoke'
+          New-Item -ItemType Directory -Path $smokeRoot -Force | Out-Null
+          Copy-Item 'dist\SunYu_ERP.exe' (Join-Path $smokeRoot 'SunYu_ERP.exe')
+          $executable = Join-Path $smokeRoot 'SunYu_ERP.exe'
+          $healthUrl = 'http://127.0.0.1:8765/api/health'
+
+          function Start-SunYuProcess([string] $suffix) {
+            return Start-Process -FilePath $executable `
+              -WorkingDirectory $smokeRoot `
+              -RedirectStandardOutput (Join-Path $smokeRoot "stdout-$suffix.log") `
+              -RedirectStandardError (Join-Path $smokeRoot "stderr-$suffix.log") `
+              -PassThru
+          }
+
+          function Wait-SunYuHealth([System.Diagnostics.Process] $process) {
+            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+              if ($process.HasExited) {
+                Get-Content (Join-Path $smokeRoot 'stderr-*.log') -ErrorAction SilentlyContinue
+                throw "SunYu_ERP.exe exited before becoming healthy: $($process.ExitCode)"
+              }
+              try {
+                $health = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 2
+                if ($health.status -eq 'ok') {
+                  return
+                }
+              } catch {
+                Start-Sleep -Seconds 1
+              }
+            }
+            throw 'SunYu_ERP.exe did not become healthy within 60 seconds'
+          }
+
+          function Stop-SunYuProcess([System.Diagnostics.Process] $process) {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+              Wait-Process -Id $process.Id -ErrorAction SilentlyContinue
+            }
+          }
+
+          $first = Start-SunYuProcess 'first'
+          try {
+            Wait-SunYuHealth $first
+            $home = Invoke-WebRequest -Uri 'http://127.0.0.1:8765/' -UseBasicParsing
+            if ($home.StatusCode -ne 200 -or $home.Content -notmatch '<div id="app">') {
+              throw 'Packaged frontend index was not served'
+            }
+            $assetMatch = [regex]::Match(
+              $home.Content,
+              '(?:src|href)="(?<path>/assets/[^"]+)"'
+            )
+            if (-not $assetMatch.Success) {
+              throw 'Packaged frontend index contains no asset URL'
+            }
+            $asset = Invoke-WebRequest `
+              -Uri ("http://127.0.0.1:8765" + $assetMatch.Groups['path'].Value) `
+              -UseBasicParsing
+            if ($asset.StatusCode -ne 200 -or $asset.Content.Length -le 0) {
+              throw 'Packaged frontend asset was not served'
+            }
+            if (-not (Test-Path (Join-Path $smokeRoot 'config.json'))) {
+              throw 'First start did not create config.json beside the executable'
+            }
+            if (-not (Test-Path (Join-Path $smokeRoot 'Data\iapm.sqlite'))) {
+              throw 'First start did not create Data\iapm.sqlite beside the executable'
+            }
+          } finally {
+            Stop-SunYuProcess $first
+          }
+
+          $configPath = Join-Path $smokeRoot 'config.json'
+          $databasePath = Join-Path $smokeRoot 'Data\iapm.sqlite'
+          $configBeforeRestart = Get-Content $configPath -Raw
+          python -c 'import sqlite3, sys; connection = sqlite3.connect(sys.argv[1]); connection.execute("INSERT OR REPLACE INTO system_settings (key, value_json, updated_at) VALUES (?, ?, ?)", ("release_smoke", "persisted", "now")); connection.commit(); connection.close()' $databasePath
+
+          $second = Start-SunYuProcess 'second'
+          try {
+            Wait-SunYuHealth $second
+          } finally {
+            Stop-SunYuProcess $second
+          }
+
+          if ((Get-Content $configPath -Raw) -ne $configBeforeRestart) {
+            throw 'Restart unexpectedly rewrote config.json'
+          }
+          $marker = python -c 'import sqlite3, sys; connection = sqlite3.connect(sys.argv[1]); print(connection.execute("SELECT value_json FROM system_settings WHERE key = ?", ("release_smoke",)).fetchone()[0]); connection.close()' $databasePath
+          if ($marker.Trim() -ne 'persisted') {
+            throw 'Restart did not preserve SQLite data'
+          }
+
+      - name: Package release zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'SunYu ERP Package'
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item 'dist\SunYu_ERP.exe' $stage
+          Copy-Item 'start.bat' $stage
+          Copy-Item 'README.md' $stage
+          Copy-Item 'LICENSE' $stage
+          Copy-Item 'config.example.json' $stage
+
+          $zipPath = Join-Path $PWD 'SunYu_ERP-windows-x64.zip'
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -Force
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            $actual = @($archive.Entries | ForEach-Object { $_.FullName })
+          } finally {
+            $archive.Dispose()
+          }
+          $required = @(
+            'SunYu_ERP.exe',
+            'start.bat',
+            'README.md',
+            'LICENSE',
+            'config.example.json'
+          )
+          if (@(Compare-Object $required $actual).Count -ne 0) {
+            throw "Unexpected release zip contents: $($actual -join ', ')"
+          }
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: SunYu_ERP-windows-x64
+          path: SunYu_ERP-windows-x64.zip
+          if-no-files-found: error
+
+      - name: Create GitHub Release for tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${{ github.ref_name }}"
+          "SunYu_ERP-windows-x64.zip"
+          --verify-tag
+          --generate-notes
+          --title "SunYu ERP ${{ github.ref_name }}"
