@@ -473,6 +473,16 @@ def test_project_rejects_invalid_project_code(
         _insert_project(business_schema, project_code=project_code)
 
 
+@pytest.mark.parametrize("control", [chr(codepoint) for codepoint in range(0x7F, 0xA0)])
+def test_project_rejects_c1_control_characters(
+    business_schema: sqlite3.Connection,
+    control: str,
+) -> None:
+    _insert_company(business_schema)
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_project(business_schema, project_code=f"A{control}B")
+
+
 @pytest.mark.parametrize(
     ("columns", "values"),
     [

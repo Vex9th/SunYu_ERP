@@ -161,6 +161,9 @@ CREATE TABLE projects (
             AND project_code NOT GLOB (
                 '*[' || char(1) || '-' || char(31) || ']*'
             )
+            AND project_code NOT GLOB (
+                '*[' || char(127) || '-' || char(159) || ']*'
+            )
             AND instr(project_code, '<') = 0
             AND instr(project_code, '>') = 0
             AND instr(project_code, ':') = 0
