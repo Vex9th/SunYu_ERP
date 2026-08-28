@@ -56,6 +56,7 @@ const companyDeleteVisible = ref(false)
 const companyDeleteTarget = ref<CompanySummary | null>(null)
 const contactDeleteVisible = ref(false)
 const contactDeleteTarget = ref<Contact | null>(null)
+let companyLoadVersion = 0
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '请求失败，请稍后重试'
@@ -107,22 +108,20 @@ function contactPayload(): ContactPayload | null {
 }
 
 async function loadCompanies(): Promise<void> {
-  if (loading.value) return
+  const version = ++companyLoadVersion
   loading.value = true
   listError.value = null
   try {
-    companies.value = await requestJson<CompanySummary[]>('/api/companies')
+    const response = await requestJson<CompanySummary[]>('/api/companies')
+    if (version === companyLoadVersion) companies.value = response
   } catch (error) {
+    const isSessionError = handleSessionError(error)
+    if (version !== companyLoadVersion) return
     companies.value = []
-    if (!handleSessionError(error)) listError.value = errorMessage(error)
+    if (!isSessionError) listError.value = errorMessage(error)
   } finally {
-    loading.value = false
+    if (version === companyLoadVersion) loading.value = false
   }
-}
-
-async function initialLoad(): Promise<void> {
-  loading.value = false
-  await loadCompanies()
 }
 
 function resetCompanyForm(): void {
@@ -333,7 +332,7 @@ async function deleteContact(): Promise<void> {
   }
 }
 
-onMounted(initialLoad)
+onMounted(loadCompanies)
 </script>
 
 <template>

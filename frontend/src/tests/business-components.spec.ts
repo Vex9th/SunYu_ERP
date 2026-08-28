@@ -325,6 +325,65 @@ describe('CompanyCenter', () => {
     await wrapper.get('[data-testid="contact-edit-11"]').trigger('click')
     expect(wrapper.find('[data-testid="contact-action-error"]').exists()).toBe(false)
   })
+
+  it('初始公司 GET 未完成时新建成功，旧结果不得覆盖刷新列表', async () => {
+    let resolveInitial!: (response: Response) => void
+    let companyGets = 0
+    const newCompany = { ...company, id: 2, name: '新建公司', contact_count: 0 }
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      if (url === '/api/companies' && method === 'GET') {
+        companyGets += 1
+        if (companyGets === 1) {
+          return new Promise<Response>((resolve) => { resolveInitial = resolve })
+        }
+        return jsonResponse([newCompany])
+      }
+      if (url === '/api/companies' && method === 'POST') {
+        return jsonResponse({ ...newCompany, contacts: [] }, 201)
+      }
+      throw new Error(`unexpected ${method} ${url}`)
+    })
+
+    const wrapper = mountComponent(CompanyCenter)
+    await wrapper.get('[data-testid="company-create-open"]').trigger('click')
+    await wrapper.get('[data-testid="company-name"]').setValue('新建公司')
+    await wrapper.get('[data-testid="company-save"]').trigger('click')
+    await settle()
+    expect(companyGets).toBe(2)
+    expect(wrapper.text()).toContain('新建公司')
+
+    resolveInitial(jsonResponse([]))
+    await settle()
+    expect(wrapper.text()).toContain('新建公司')
+    expect(wrapper.find('[data-testid="companies-empty"]').exists()).toBe(false)
+  })
+
+  it('旧代公司列表迟到 401 仍上报会话过期', async () => {
+    let resolveInitial!: (response: Response) => void
+    let companyGets = 0
+    const newCompany = { ...company, id: 2, name: '新建公司', contact_count: 0 }
+    fetchMock.mockImplementation(async (input, init) => {
+      const method = init?.method ?? 'GET'
+      if (method === 'GET') {
+        companyGets += 1
+        if (companyGets === 1) return new Promise<Response>((resolve) => { resolveInitial = resolve })
+        return jsonResponse([newCompany])
+      }
+      return jsonResponse({ ...newCompany, contacts: [] }, 201)
+    })
+    const wrapper = mountComponent(CompanyCenter)
+    await wrapper.get('[data-testid="company-create-open"]').trigger('click')
+    await wrapper.get('[data-testid="company-name"]').setValue('新建公司')
+    await wrapper.get('[data-testid="company-save"]').trigger('click')
+    await settle()
+
+    resolveInitial(jsonResponse({ detail: '旧列表会话已过期' }, 401))
+    await settle()
+    expect(wrapper.emitted('session-expired')).toEqual([['旧列表会话已过期']])
+    expect(wrapper.text()).toContain('新建公司')
+  })
 })
 
 describe('ProjectCenter', () => {
@@ -452,14 +511,18 @@ describe('ProjectCenter', () => {
     })
     const wrapper = mountComponent(ProjectCenter)
     await settle()
-    expect(wrapper.get('[data-testid="projects-error"]').text()).toContain('项目列表暂时失败')
+    expect(wrapper.get('[data-testid="projects-loading"]').isVisible()).toBe(true)
+    expect(wrapper.find('[data-testid="projects-error"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="projects-retry"]').exists()).toBe(false)
 
     resolveCompany(jsonResponse({ detail: '迟到的会话过期' }, 401))
     await settle()
     expect(wrapper.emitted('session-expired')).toEqual([['迟到的会话过期']])
+    expect(wrapper.get('[data-testid="projects-error"]').text()).toContain('项目列表暂时失败')
+    expect(wrapper.get('[data-testid="projects-retry"]').isVisible()).toBe(true)
   })
 
-  it('重试新数据先到时，旧代迟到结果不得覆盖', async () => {
+  it('旧代整轮结束后重试原子提交新项目和公司', async () => {
     let resolveOldCompany!: (response: Response) => void
     let projectCalls = 0
     let companyCalls = 0
@@ -482,12 +545,12 @@ describe('ProjectCenter', () => {
 
     const wrapper = mountComponent(ProjectCenter)
     await settle()
-    await wrapper.get('[data-testid="projects-retry"]').trigger('click')
-    await settle()
-    expect(wrapper.text()).toContain('SY-NEW')
-    expect(wrapper.text()).toContain('新公司')
-
+    expect(wrapper.get('[data-testid="projects-loading"]').isVisible()).toBe(true)
     resolveOldCompany(jsonResponse([{ ...company, contact_count: 0 }]))
+    await settle()
+    expect(wrapper.get('[data-testid="projects-error"]').text()).toContain('旧代项目失败')
+
+    await wrapper.get('[data-testid="projects-retry"]').trigger('click')
     await settle()
     expect(wrapper.text()).toContain('SY-NEW')
     expect(wrapper.text()).toContain('新公司')

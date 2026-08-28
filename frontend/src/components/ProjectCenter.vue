@@ -65,10 +65,6 @@ async function loadData(): Promise<void> {
       handleSessionError(error)
       sessionErrorReported = true
     }
-    if (version === loadVersion) {
-      loading.value = false
-      if (!isSessionError) listError.value = errorMessage(error)
-    }
     throw error
   }
   const [projectResult, companyResult] = await Promise.allSettled([
