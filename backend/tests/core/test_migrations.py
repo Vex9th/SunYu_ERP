@@ -593,6 +593,58 @@ def test_unicode_identity_udf_is_deterministic_and_migration_scoped(
         connection.close()
 
 
+def test_unicode_identity_collision_uses_sqlite_error_code_not_message(
+    tmp_path: Path,
+) -> None:
+    module = import_module("backend.app.core.migrations")
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    collision = sqlite3.IntegrityError("localized unique constraint message")
+    collision.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_UNIQUE
+    collision.sqlite_errorname = "SQLITE_CONSTRAINT_UNIQUE"
+    try:
+        with pytest.raises(
+            module.MigrationError,
+            match="Unicode project code identity collision",
+        ) as raised:
+            module._raise_after_rollback(
+                connection,
+                "004_project_code_identity",
+                collision,
+            )
+
+        assert raised.value.__cause__ is collision
+        assert "localized unique constraint message" not in str(raised.value)
+        assert "projects_with_identity" not in str(raised.value)
+    finally:
+        connection.close()
+
+
+def test_004_integrity_error_without_sqlite_code_remains_generic(
+    tmp_path: Path,
+) -> None:
+    module = import_module("backend.app.core.migrations")
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    failure = sqlite3.IntegrityError("synthetic integrity failure")
+    assert not hasattr(failure, "sqlite_errorcode")
+    try:
+        with pytest.raises(
+            module.MigrationError,
+            match=(
+                "migration 004_project_code_identity failed: "
+                "synthetic integrity failure"
+            ),
+        ) as raised:
+            module._raise_after_rollback(
+                connection,
+                "004_project_code_identity",
+                failure,
+            )
+
+        assert raised.value.__cause__ is failure
+    finally:
+        connection.close()
+
+
 def test_begin_immediate_lock_error_has_migration_context(tmp_path: Path) -> None:
     migrations_dir = tmp_path / "migrations"
     _write_migration(migrations_dir, "001_locked.sql", _ledger_sql())

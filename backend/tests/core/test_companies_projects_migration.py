@@ -443,6 +443,11 @@ def test_unicode_identity_collision_rolls_back_schema_data_and_ledger(
             apply_migrations(connection, staged_migrations)
 
         assert isinstance(raised.value.__cause__, sqlite3.IntegrityError)
+        assert (
+            raised.value.__cause__.sqlite_errorcode
+            == sqlite3.SQLITE_CONSTRAINT_UNIQUE
+        )
+        assert "projects_with_identity" not in str(raised.value)
         assert not connection.in_transaction
         assert [
             row["version"]

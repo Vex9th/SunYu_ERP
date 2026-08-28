@@ -305,7 +305,8 @@ def _raise_after_rollback(
     if (
         version == _PROJECT_CODE_IDENTITY_MIGRATION
         and isinstance(failure, sqlite3.IntegrityError)
-        and "projects_with_identity.project_code_key" in str(failure)
+        and getattr(failure, "sqlite_errorcode", None)
+        == sqlite3.SQLITE_CONSTRAINT_UNIQUE
     ):
         raise MigrationError(
             f"migration {version} failed: Unicode project code identity collision"
