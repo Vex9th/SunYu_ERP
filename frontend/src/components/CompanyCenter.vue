@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { onMounted, reactive, ref, watch } from 'vue'
 
 import { ApiError, requestJson, requestVoid } from '../api'
 import type {
@@ -40,6 +40,12 @@ const detailError = ref<string | null>(null)
 const detail = ref<CompanyDetail | null>(null)
 const selectedDetailCompanyId = ref<number | null>(null)
 let detailLoadVersion = 0
+let companyDialogVersion = 0
+let companyMutationVersion = 0
+let contactDialogVersion = 0
+let contactMutationVersion = 0
+let companyDeleteVersion = 0
+let contactDeleteVersion = 0
 
 const contactDialogVisible = ref(false)
 const editingContactId = ref<number | null>(null)
@@ -136,6 +142,9 @@ function resetCompanyForm(): void {
 }
 
 function openCompanyCreate(): void {
+  companyDialogVersion += 1
+  companyMutationVersion += 1
+  companyBusy.value = false
   actionError.value = null
   editingCompanyId.value = null
   resetCompanyForm()
@@ -143,6 +152,9 @@ function openCompanyCreate(): void {
 }
 
 function openCompanyEdit(company: CompanySummary): void {
+  companyDialogVersion += 1
+  companyMutationVersion += 1
+  companyBusy.value = false
   actionError.value = null
   editingCompanyId.value = company.id
   companyForm.name = company.name
@@ -160,23 +172,37 @@ async function saveCompany(): Promise<void> {
   if (companyBusy.value) return
   const payload = companyPayload()
   if (!payload) return
+  const dialogVersion = companyDialogVersion
+  const mutationVersion = ++companyMutationVersion
+  const companyId = editingCompanyId.value
   companyBusy.value = true
   actionError.value = null
   try {
-    const path = editingCompanyId.value === null
+    const path = companyId === null
       ? '/api/companies'
-      : `/api/companies/${editingCompanyId.value}`
+      : `/api/companies/${companyId}`
     await requestJson<CompanyDetail>(path, {
-      method: editingCompanyId.value === null ? 'POST' : 'PUT',
+      method: companyId === null ? 'POST' : 'PUT',
       body: payload,
     })
-    companyDialogVisible.value = false
+    if (dialogVersion === companyDialogVersion) companyDialogVisible.value = false
     await loadCompanies()
   } catch (error) {
-    if (!handleSessionError(error)) actionError.value = errorMessage(error)
+    const isSessionError = handleSessionError(error)
+    if (!isSessionError && dialogVersion === companyDialogVersion) {
+      actionError.value = errorMessage(error)
+    }
   } finally {
-    companyBusy.value = false
+    if (mutationVersion === companyMutationVersion) companyBusy.value = false
   }
+}
+
+function beforeCompanyClose(done: () => void): void {
+  if (!companyBusy.value) done()
+}
+
+function beforeDetailClose(done: () => void): void {
+  if (!contactBusy.value) done()
 }
 
 async function loadDetail(companyId: number): Promise<void> {
@@ -227,6 +253,9 @@ function resetContactForm(): void {
 }
 
 function openContactCreate(): void {
+  contactDialogVersion += 1
+  contactMutationVersion += 1
+  contactBusy.value = false
   actionError.value = null
   editingContactId.value = null
   resetContactForm()
@@ -234,6 +263,9 @@ function openContactCreate(): void {
 }
 
 function openContactEdit(selected: Contact): void {
+  contactDialogVersion += 1
+  contactMutationVersion += 1
+  contactBusy.value = false
   actionError.value = null
   editingContactId.value = selected.id
   contactForm.name = selected.name
@@ -249,15 +281,8 @@ function beforeContactClose(done: () => void): void {
   if (!contactBusy.value) done()
 }
 
-function clearContactDialogState(): void {
-  actionError.value = null
-  contactValidationError.value = null
-}
-
-async function refreshDetailAndSummary(): Promise<void> {
-  if (!detail.value) return
-  const companyId = detail.value.id
-  await loadDetail(companyId)
+async function refreshDetailAndSummary(companyId: number, refreshDetail: boolean): Promise<void> {
+  if (refreshDetail && selectedDetailCompanyId.value === companyId) await loadDetail(companyId)
   await loadCompanies()
 }
 
@@ -265,27 +290,37 @@ async function saveContact(): Promise<void> {
   if (contactBusy.value || !detail.value) return
   const payload = contactPayload()
   if (!payload) return
+  const dialogVersion = contactDialogVersion
+  const mutationVersion = ++contactMutationVersion
   contactBusy.value = true
   actionError.value = null
   const companyId = detail.value.id
+  const contactId = editingContactId.value
   try {
-    const path = editingContactId.value === null
+    const path = contactId === null
       ? `/api/companies/${companyId}/contacts`
-      : `/api/companies/${companyId}/contacts/${editingContactId.value}`
+      : `/api/companies/${companyId}/contacts/${contactId}`
     await requestJson<Contact>(path, {
-      method: editingContactId.value === null ? 'POST' : 'PUT',
+      method: contactId === null ? 'POST' : 'PUT',
       body: payload,
     })
-    contactDialogVisible.value = false
-    await refreshDetailAndSummary()
+    const isCurrentDialog = dialogVersion === contactDialogVersion
+    if (isCurrentDialog) contactDialogVisible.value = false
+    await refreshDetailAndSummary(companyId, isCurrentDialog)
   } catch (error) {
-    if (!handleSessionError(error)) actionError.value = errorMessage(error)
+    const isSessionError = handleSessionError(error)
+    if (!isSessionError && dialogVersion === contactDialogVersion) {
+      actionError.value = errorMessage(error)
+    }
   } finally {
-    contactBusy.value = false
+    if (mutationVersion === contactMutationVersion) contactBusy.value = false
   }
 }
 
 function openCompanyDelete(company: CompanySummary): void {
+  companyDeleteVersion += 1
+  companyMutationVersion += 1
+  companyBusy.value = false
   companyDeleteTarget.value = company
   companyDeleteVisible.value = true
   actionError.value = null
@@ -293,21 +328,29 @@ function openCompanyDelete(company: CompanySummary): void {
 
 async function deleteCompany(): Promise<void> {
   if (companyBusy.value || !companyDeleteTarget.value) return
+  const dialogVersion = companyDeleteVersion
+  const mutationVersion = ++companyMutationVersion
+  const companyId = companyDeleteTarget.value.id
   companyBusy.value = true
   actionError.value = null
   try {
-    await requestVoid(`/api/companies/${companyDeleteTarget.value.id}`, { method: 'DELETE' })
-    companyDeleteVisible.value = false
-    companyDeleteTarget.value = null
+    await requestVoid(`/api/companies/${companyId}`, { method: 'DELETE' })
+    if (dialogVersion === companyDeleteVersion) companyDeleteVisible.value = false
     await loadCompanies()
   } catch (error) {
-    if (!handleSessionError(error)) actionError.value = errorMessage(error)
+    const isSessionError = handleSessionError(error)
+    if (!isSessionError && dialogVersion === companyDeleteVersion) {
+      actionError.value = errorMessage(error)
+    }
   } finally {
-    companyBusy.value = false
+    if (mutationVersion === companyMutationVersion) companyBusy.value = false
   }
 }
 
 function openContactDelete(selected: Contact): void {
+  contactDeleteVersion += 1
+  contactMutationVersion += 1
+  contactBusy.value = false
   contactDeleteTarget.value = selected
   contactDeleteVisible.value = true
   actionError.value = null
@@ -315,22 +358,69 @@ function openContactDelete(selected: Contact): void {
 
 async function deleteContact(): Promise<void> {
   if (contactBusy.value || !detail.value || !contactDeleteTarget.value) return
+  const dialogVersion = contactDeleteVersion
+  const mutationVersion = ++contactMutationVersion
+  const companyId = detail.value.id
+  const contactId = contactDeleteTarget.value.id
   contactBusy.value = true
   actionError.value = null
   try {
     await requestVoid(
-      `/api/companies/${detail.value.id}/contacts/${contactDeleteTarget.value.id}`,
+      `/api/companies/${companyId}/contacts/${contactId}`,
       { method: 'DELETE' },
     )
-    contactDeleteVisible.value = false
-    contactDeleteTarget.value = null
-    await refreshDetailAndSummary()
+    const isCurrentDialog = dialogVersion === contactDeleteVersion
+    if (isCurrentDialog) contactDeleteVisible.value = false
+    await refreshDetailAndSummary(companyId, isCurrentDialog)
   } catch (error) {
-    if (!handleSessionError(error)) actionError.value = errorMessage(error)
+    const isSessionError = handleSessionError(error)
+    if (!isSessionError && dialogVersion === contactDeleteVersion) {
+      actionError.value = errorMessage(error)
+    }
   } finally {
-    contactBusy.value = false
+    if (mutationVersion === contactMutationVersion) contactBusy.value = false
   }
 }
+
+function beforeCompanyDeleteClose(done: () => void): void {
+  if (!companyBusy.value) done()
+}
+
+function beforeContactDeleteClose(done: () => void): void {
+  if (!contactBusy.value) done()
+}
+
+watch(companyDialogVisible, (visible) => {
+  if (visible) return
+  companyDialogVersion += 1
+  companyMutationVersion += 1
+  companyBusy.value = false
+})
+
+watch(contactDialogVisible, (visible) => {
+  if (visible) return
+  contactDialogVersion += 1
+  contactMutationVersion += 1
+  contactBusy.value = false
+  actionError.value = null
+  contactValidationError.value = null
+})
+
+watch(companyDeleteVisible, (visible) => {
+  if (visible) return
+  companyDeleteVersion += 1
+  companyMutationVersion += 1
+  companyBusy.value = false
+  companyDeleteTarget.value = null
+})
+
+watch(contactDeleteVisible, (visible) => {
+  if (visible) return
+  contactDeleteVersion += 1
+  contactMutationVersion += 1
+  contactBusy.value = false
+  contactDeleteTarget.value = null
+})
 
 onMounted(loadCompanies)
 </script>
@@ -395,7 +485,17 @@ onMounted(loadCompanies)
       </el-table>
     </el-card>
 
-    <el-drawer v-model="companyDialogVisible" :teleported="false" :title="editingCompanyId === null ? '新增公司' : '编辑公司'" size="520px">
+    <el-drawer
+      v-model="companyDialogVisible"
+      data-testid="company-form-drawer"
+      :teleported="false"
+      :title="editingCompanyId === null ? '新增公司' : '编辑公司'"
+      size="min(92vw, 520px)"
+      :before-close="beforeCompanyClose"
+      :close-on-click-modal="!companyBusy"
+      :close-on-press-escape="!companyBusy"
+      :show-close="!companyBusy"
+    >
       <el-alert v-if="actionError" :title="actionError" type="error" show-icon :closable="false" />
       <el-alert v-if="companyValidationError" :title="companyValidationError" type="error" show-icon :closable="false" />
       <el-form label-position="top" @submit.prevent="saveCompany">
@@ -410,7 +510,18 @@ onMounted(loadCompanies)
       </el-form>
     </el-drawer>
 
-    <el-drawer v-model="detailVisible" data-testid="company-detail-drawer" :teleported="false" title="客户详情" size="720px" @close="closeDetail">
+    <el-drawer
+      v-model="detailVisible"
+      data-testid="company-detail-drawer"
+      :teleported="false"
+      title="客户详情"
+      size="min(94vw, 720px)"
+      :before-close="beforeDetailClose"
+      :close-on-click-modal="!contactBusy"
+      :close-on-press-escape="!contactBusy"
+      :show-close="!contactBusy"
+      @close="closeDetail"
+    >
       <el-alert v-if="actionError" :title="actionError" type="error" show-icon :closable="false" />
       <el-skeleton v-if="detailLoading" :rows="6" animated />
       <el-result v-else-if="detailError" data-testid="company-detail-error" icon="error" title="详情读取失败" :sub-title="detailError">
@@ -450,12 +561,11 @@ onMounted(loadCompanies)
       data-testid="contact-dialog"
       :teleported="false"
       :title="editingContactId === null ? '新增联系人' : '编辑联系人'"
-      width="520px"
+      width="min(92vw, 520px)"
       :before-close="beforeContactClose"
       :close-on-click-modal="!contactBusy"
       :close-on-press-escape="!contactBusy"
       :show-close="!contactBusy"
-      @closed="clearContactDialogState"
     >
       <el-alert v-if="actionError" data-testid="contact-action-error" :title="actionError" type="error" show-icon :closable="false" />
       <el-alert v-if="contactValidationError" :title="contactValidationError" type="error" show-icon :closable="false" />
@@ -469,20 +579,40 @@ onMounted(loadCompanies)
       </el-form>
     </el-dialog>
 
-    <el-dialog v-model="companyDeleteVisible" data-testid="company-delete-dialog" :teleported="false" title="确认删除公司" width="460px">
+    <el-dialog
+      v-model="companyDeleteVisible"
+      data-testid="company-delete-dialog"
+      :teleported="false"
+      title="确认删除公司"
+      width="min(92vw, 460px)"
+      :before-close="beforeCompanyDeleteClose"
+      :close-on-click-modal="!companyBusy"
+      :close-on-press-escape="!companyBusy"
+      :show-close="!companyBusy"
+    >
       <el-alert v-if="actionError" :title="actionError" type="error" show-icon :closable="false" />
       <el-alert :title="`即将删除「${companyDeleteTarget?.name ?? ''}」及其联系人。`" type="warning" show-icon :closable="false" />
       <template #footer>
-        <el-button @click="companyDeleteVisible = false">取消</el-button>
+        <el-button :disabled="companyBusy" @click="companyDeleteVisible = false">取消</el-button>
         <el-button data-testid="company-delete-confirm" type="danger" :loading="companyBusy" :disabled="companyBusy" @click="deleteCompany">确认删除</el-button>
       </template>
     </el-dialog>
 
-    <el-dialog v-model="contactDeleteVisible" :teleported="false" title="确认删除联系人" width="460px">
+    <el-dialog
+      v-model="contactDeleteVisible"
+      data-testid="contact-delete-dialog"
+      :teleported="false"
+      title="确认删除联系人"
+      width="min(92vw, 460px)"
+      :before-close="beforeContactDeleteClose"
+      :close-on-click-modal="!contactBusy"
+      :close-on-press-escape="!contactBusy"
+      :show-close="!contactBusy"
+    >
       <el-alert v-if="actionError" :title="actionError" type="error" show-icon :closable="false" />
       <el-text>即将删除「{{ contactDeleteTarget?.name }}」。</el-text>
       <template #footer>
-        <el-button @click="contactDeleteVisible = false">取消</el-button>
+        <el-button :disabled="contactBusy" @click="contactDeleteVisible = false">取消</el-button>
         <el-button data-testid="contact-delete-confirm" type="danger" :loading="contactBusy" :disabled="contactBusy" @click="deleteContact">确认删除</el-button>
       </template>
     </el-dialog>

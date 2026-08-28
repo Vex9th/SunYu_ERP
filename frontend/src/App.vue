@@ -18,59 +18,86 @@ const session = ref<SessionState | null>(null)
 const overview = ref<SystemOverview | null>(null)
 const overviewError = ref<string | null>(null)
 const requestError = ref<string | null>(null)
+const systemRequestError = ref<string | null>(null)
 const authBusy = ref(false)
 const logoutBusy = ref(false)
 const overviewLoading = ref(false)
 const backupBusy = ref(false)
 const saveBusy = ref(false)
 const successNotice = ref<string | null>(null)
+let sessionEpoch = 0
+let overviewRequestVersion = 0
+let backupOperationVersion = 0
+let saveOperationVersion = 0
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '请求失败，请稍后重试'
 }
 
-function handleSystemRequestError(error: unknown): boolean {
-  if (!(error instanceof ApiError) || error.status !== 401) return false
+function setSession(nextSession: SessionState): void {
+  sessionEpoch += 1
+  overviewRequestVersion += 1
+  backupOperationVersion += 1
+  saveOperationVersion += 1
+  overviewLoading.value = false
+  backupBusy.value = false
+  saveBusy.value = false
+  session.value = nextSession
+}
+
+function clearWorkspaceState(): void {
   overview.value = null
   overviewError.value = null
+  systemRequestError.value = null
   successNotice.value = null
-  session.value = { authenticated: false, password_configured: true }
+}
+
+function handleSystemRequestError(error: unknown, expectedEpoch = sessionEpoch): boolean {
+  if (!(error instanceof ApiError) || error.status !== 401) return false
+  if (expectedEpoch !== sessionEpoch) return true
+  clearWorkspaceState()
+  setSession({ authenticated: false, password_configured: true })
   requestError.value = errorMessage(error)
   return true
 }
 
 function handleSessionExpired(message: string): void {
-  overview.value = null
-  overviewError.value = null
-  successNotice.value = null
-  session.value = { authenticated: false, password_configured: true }
+  clearWorkspaceState()
+  setSession({ authenticated: false, password_configured: true })
   requestError.value = message
 }
 
 async function loadOverview(): Promise<boolean> {
-  if (overviewLoading.value) return false
+  if (!session.value?.authenticated) return false
+  const expectedEpoch = sessionEpoch
+  const requestVersion = ++overviewRequestVersion
   overviewLoading.value = true
   overviewError.value = null
-  requestError.value = null
   try {
-    overview.value = await requestJson<SystemOverview>('/api/system/overview')
+    const response = await requestJson<SystemOverview>('/api/system/overview')
+    if (expectedEpoch !== sessionEpoch || requestVersion !== overviewRequestVersion) return false
+    overview.value = response
     return true
   } catch (error) {
+    if (expectedEpoch !== sessionEpoch || requestVersion !== overviewRequestVersion) return false
     overview.value = null
-    if (!handleSystemRequestError(error)) {
+    if (!handleSystemRequestError(error, expectedEpoch)) {
       overviewError.value = errorMessage(error)
     }
     return false
   } finally {
-    overviewLoading.value = false
+    if (expectedEpoch === sessionEpoch && requestVersion === overviewRequestVersion) {
+      overviewLoading.value = false
+    }
   }
 }
 
 async function loadSession(): Promise<void> {
   requestError.value = null
   try {
-    session.value = await requestJson<SessionState>('/api/auth/session')
-    if (session.value.authenticated) {
+    const response = await requestJson<SessionState>('/api/auth/session')
+    setSession(response)
+    if (response.authenticated) {
       await loadOverview()
     }
   } catch (error) {
@@ -89,15 +116,16 @@ async function authenticate(password: string): Promise<void> {
   if (!session.value || authBusy.value) return
   authBusy.value = true
   requestError.value = null
+  systemRequestError.value = null
   successNotice.value = null
   const requiresSetup = !session.value.password_configured
   try {
     if (requiresSetup) {
       await requestVoid('/api/auth/setup', { method: 'POST', body: { password } })
-      session.value = { authenticated: false, password_configured: true }
+      setSession({ authenticated: false, password_configured: true })
     }
     await requestVoid('/api/auth/login', { method: 'POST', body: { password } })
-    session.value = { authenticated: true, password_configured: true }
+    setSession({ authenticated: true, password_configured: true })
     await loadOverview()
   } catch (error) {
     requestError.value = errorMessage(error)
@@ -110,14 +138,16 @@ async function logout(): Promise<void> {
   if (logoutBusy.value) return
   logoutBusy.value = true
   requestError.value = null
+  systemRequestError.value = null
   successNotice.value = null
+  const expectedEpoch = sessionEpoch
   try {
     await requestVoid('/api/auth/logout', { method: 'POST' })
-    overview.value = null
-    overviewError.value = null
-    session.value = { authenticated: false, password_configured: true }
+    if (expectedEpoch !== sessionEpoch) return
+    clearWorkspaceState()
+    setSession({ authenticated: false, password_configured: true })
   } catch (error) {
-    requestError.value = errorMessage(error)
+    if (expectedEpoch === sessionEpoch) requestError.value = errorMessage(error)
   } finally {
     logoutBusy.value = false
   }
@@ -125,14 +155,17 @@ async function logout(): Promise<void> {
 
 async function saveBackup(settings: BackupSettingsPayload): Promise<void> {
   if (!overview.value || saveBusy.value) return
+  const expectedEpoch = sessionEpoch
+  const operationVersion = ++saveOperationVersion
   saveBusy.value = true
-  requestError.value = null
+  systemRequestError.value = null
   successNotice.value = null
   try {
     const backup = await requestJson<BackupSettingsResponse>(
       '/api/system/backup-settings',
       { method: 'PUT', body: settings },
     )
+    if (expectedEpoch !== sessionEpoch || !overview.value) return
     overview.value = {
       ...overview.value,
       backup: { ...backup, last_run: overview.value.backup.last_run },
@@ -140,21 +173,27 @@ async function saveBackup(settings: BackupSettingsPayload): Promise<void> {
     successNotice.value = '备份设置已保存'
     ElMessage.success(successNotice.value)
   } catch (error) {
-    if (!handleSystemRequestError(error)) {
-      requestError.value = errorMessage(error)
+    if (expectedEpoch !== sessionEpoch) return
+    if (!handleSystemRequestError(error, expectedEpoch)) {
+      systemRequestError.value = errorMessage(error)
     }
   } finally {
-    saveBusy.value = false
+    if (expectedEpoch === sessionEpoch && operationVersion === saveOperationVersion) {
+      saveBusy.value = false
+    }
   }
 }
 
 async function backupNow(): Promise<void> {
   if (backupBusy.value) return
+  const expectedEpoch = sessionEpoch
+  const operationVersion = ++backupOperationVersion
   backupBusy.value = true
-  requestError.value = null
+  systemRequestError.value = null
   successNotice.value = null
   try {
     const backup = await requestJson<BackupCreated>('/api/system/backups', { method: 'POST' })
+    if (expectedEpoch !== sessionEpoch) return
     if (backup.warning) {
       ElMessage.warning('备份已完成，但自动清理失败，请检查备份目录')
     } else {
@@ -162,11 +201,14 @@ async function backupNow(): Promise<void> {
     }
     await loadOverview()
   } catch (error) {
-    if (!handleSystemRequestError(error)) {
-      requestError.value = errorMessage(error)
+    if (expectedEpoch !== sessionEpoch) return
+    if (!handleSystemRequestError(error, expectedEpoch)) {
+      systemRequestError.value = errorMessage(error)
     }
   } finally {
-    backupBusy.value = false
+    if (expectedEpoch === sessionEpoch && operationVersion === backupOperationVersion) {
+      backupBusy.value = false
+    }
   }
 }
 
@@ -226,6 +268,7 @@ onMounted(loadSession)
     :loading="overviewLoading"
     :overview-error="overviewError"
     :request-error="requestError"
+    :system-request-error="systemRequestError"
     :success-notice="successNotice"
     :backup-busy="backupBusy"
     :save-busy="saveBusy"

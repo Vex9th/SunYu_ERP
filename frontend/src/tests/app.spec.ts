@@ -708,6 +708,82 @@ describe('App', () => {
     expect(wrapper.get('[data-testid="scheduler-status"]').isVisible()).toBe(false)
   })
 
+  it('进入项目仪表台再返回时保留归档筛选和列表', async () => {
+    const archivedProject = {
+      id: 31,
+      project_code: 'SY-ARCHIVED',
+      company_id: 1,
+      name: '已归档装配线',
+      description: null,
+      status: 'archived',
+      archive_reason: '客户计划调整',
+      archived_at: '2026-08-28T08:00:00Z',
+      created_at: '2026-08-20T08:00:00Z',
+      updated_at: '2026-08-28T08:00:00Z',
+      company_name: '苏州客户',
+    }
+    const dashboardCompany = {
+      id: 1,
+      name: '苏州客户',
+      taxpayer_id: null,
+      registered_address: null,
+      registered_phone: null,
+      bank_name: null,
+      bank_account: null,
+      notes: null,
+      created_at: '2026-08-20T08:00:00Z',
+      updated_at: '2026-08-20T08:00:00Z',
+    }
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ authenticated: true, password_configured: true }))
+      .mockResolvedValueOnce(jsonResponse(overview))
+    businessFetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/companies') return jsonResponse([])
+      if (path === '/api/projects?status=active') return jsonResponse([])
+      if (path === '/api/projects?status=archived') return jsonResponse([archivedProject])
+      if (path === '/api/projects/SY-ARCHIVED/dashboard') {
+        return jsonResponse({
+          project: archivedProject,
+          company: dashboardCompany,
+          contacts: [],
+          documents: { document_count: 0, version_count: 0, categories: [] },
+        })
+      }
+      throw new Error(`unexpected ${path}`)
+    })
+
+    const wrapper = mountApp()
+    await settle()
+    await wrapper.get('[data-testid="project-filter"] input[value="archived"]').setValue(true)
+    await settle()
+    expect(wrapper.text()).toContain('已归档装配线')
+
+    await wrapper.get('[data-testid="project-dashboard-SY-ARCHIVED"]').trigger('click')
+    await settle()
+    expect(wrapper.get('[data-testid="project-dashboard-back"]').isVisible()).toBe(true)
+    await wrapper.get('[data-testid="project-dashboard-back"]').trigger('click')
+    await settle()
+
+    expect(wrapper.get('[data-testid="project-filter"] input[value="archived"]').element).toHaveProperty('checked', true)
+    expect(wrapper.text()).toContain('已归档装配线')
+    expect(businessFetchMock.mock.calls.filter(([path]) =>
+      path === '/api/projects?status=archived')).toHaveLength(1)
+  })
+
+  it('390px 工作台使用顶部导航栅格而非固定侧栏', async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ authenticated: true, password_configured: true }))
+      .mockResolvedValueOnce(jsonResponse(overview))
+    const wrapper = mountApp()
+    await settle()
+
+    expect(wrapper.get('[data-testid="nav-column"]').classes()).toContain('el-col-xs-24')
+    expect(wrapper.get('[data-testid="nav-column"]').classes()).toContain('el-col-sm-6')
+    expect(wrapper.get('[data-testid="content-column"]').classes()).toContain('el-col-xs-24')
+    expect(wrapper.find('aside[style*="220px"]').exists()).toBe(false)
+  })
+
   it('任意业务 API 返回 401 时清空工作台并回到登录页', async () => {
     fetchMock
       .mockResolvedValueOnce(
@@ -728,6 +804,192 @@ describe('App', () => {
     expect(wrapper.get('[data-testid="auth-title"]').text()).toContain('密码登录')
     expect(wrapper.get('[data-testid="request-error"]').text()).toContain('业务会话已失效')
     expect(wrapper.find('[data-testid="dashboard"]').exists()).toBe(false)
+  })
+
+  it.each(['success', 'unauthorized'] as const)(
+    '旧会话 overview 迟到 %s 不得影响重新登录的新会话',
+    async (oldOutcome) => {
+      let resolveOldOverview!: (response: Response) => void
+      let overviewCalls = 0
+      const newOverview = {
+        ...overview,
+        data_directory: 'D:\\SunYu ERP\\New Session Data',
+        database_path: 'D:\\SunYu ERP\\New Session Data\\iapm.sqlite',
+      }
+      fetchMock.mockImplementation(async (input) => {
+        const path = String(input)
+        if (path === '/api/auth/session') {
+          return jsonResponse({ authenticated: true, password_configured: true })
+        }
+        if (path === '/api/system/overview') {
+          overviewCalls += 1
+          if (overviewCalls === 1) return jsonResponse(overview)
+          if (overviewCalls === 2) {
+            return new Promise<Response>((resolve) => { resolveOldOverview = resolve })
+          }
+          return jsonResponse(newOverview)
+        }
+        if (path === '/api/system/backups') {
+          return jsonResponse({ path: 'D:\\Backups\\one', created_at: '2026-08-28T12:00:00Z' }, 201)
+        }
+        if (path === '/api/auth/login') return emptyResponse()
+        throw new Error(`unexpected ${path}`)
+      })
+      let projectLoads = 0
+      businessFetchMock.mockImplementation(async (input) => {
+        const path = String(input)
+        if (path.startsWith('/api/projects')) {
+          projectLoads += 1
+          if (projectLoads === 2) {
+            return jsonResponse({ detail: 'Authentication required' }, 401)
+          }
+        }
+        return jsonResponse([])
+      })
+
+      const wrapper = mountApp()
+      await settle()
+      await wrapper.get('[data-testid="nav-system"]').trigger('click')
+      await wrapper.get('[data-testid="backup-now"]').trigger('click')
+      await settle()
+      expect(overviewCalls).toBe(2)
+
+      await wrapper.get('[data-testid="nav-projects"]').trigger('click')
+      await settle()
+      expect(wrapper.get('[data-testid="auth-title"]').text()).toContain('密码登录')
+
+      await wrapper.get('[data-testid="login-password"]').setValue('123456')
+      await wrapper.get('[data-testid="auth-submit"]').trigger('click')
+      await settle()
+      expect(overviewCalls).toBe(3)
+      await wrapper.get('[data-testid="nav-system"]').trigger('click')
+      expect(wrapper.get('[data-testid="scheduler-status"]').text()).toContain(
+        newOverview.database_path,
+      )
+
+      resolveOldOverview(
+        oldOutcome === 'success'
+          ? jsonResponse({ ...overview, database_path: 'D:\\Old\\stale.sqlite' })
+          : jsonResponse({ detail: 'Authentication required' }, 401),
+      )
+      await settle()
+      await settle()
+      expect(wrapper.find('[data-testid="auth-title"]').exists()).toBe(false)
+      expect(wrapper.get('[data-testid="scheduler-status"]').text()).toContain(
+        newOverview.database_path,
+      )
+      expect(wrapper.text()).not.toContain('D:\\Old\\stale.sqlite')
+    },
+  )
+
+  it.each([
+    {
+      name: '立即备份',
+      selector: 'backup-now',
+      path: '/api/system/backups',
+      response: {
+        path: 'D:\\Backups\\new-session',
+        created_at: '2026-08-28T13:00:00Z',
+      },
+    },
+    {
+      name: '保存备份设置',
+      selector: 'backup-save',
+      path: '/api/system/backup-settings',
+      response: {
+        enabled: true,
+        directory: overview.backup.directory,
+        interval_hours: overview.backup.interval_hours,
+        retention_days: overview.backup.retention_days,
+      },
+    },
+  ])('旧会话$name不得锁住或误解锁新会话操作', async ({ selector, path, response }) => {
+    const operationResolvers: Array<(response: Response) => void> = []
+    let expireBusinessSession = false
+    fetchMock.mockImplementation(async (input) => {
+      const requestPath = String(input)
+      if (requestPath === '/api/auth/session') {
+        return jsonResponse({ authenticated: true, password_configured: true })
+      }
+      if (requestPath === '/api/auth/login') return emptyResponse()
+      if (requestPath === '/api/system/overview') return jsonResponse(overview)
+      if (requestPath === path) {
+        return new Promise<Response>((resolve) => operationResolvers.push(resolve))
+      }
+      throw new Error(`unexpected ${requestPath}`)
+    })
+    businessFetchMock.mockImplementation(async (input) => {
+      const requestPath = String(input)
+      if (expireBusinessSession && requestPath.startsWith('/api/projects')) {
+        expireBusinessSession = false
+        return jsonResponse({ detail: 'Authentication required' }, 401)
+      }
+      return jsonResponse([])
+    })
+
+    const wrapper = mountApp()
+    await settle()
+    await wrapper.get('[data-testid="nav-system"]').trigger('click')
+    await wrapper.get(`[data-testid="${selector}"]`).trigger('click')
+    expect(operationResolvers).toHaveLength(1)
+
+    expireBusinessSession = true
+    await wrapper.get('[data-testid="nav-projects"]').trigger('click')
+    await settle()
+    expect(wrapper.get('[data-testid="auth-title"]').text()).toContain('密码登录')
+
+    await wrapper.get('[data-testid="login-password"]').setValue('123456')
+    await wrapper.get('[data-testid="auth-submit"]').trigger('click')
+    await settle()
+    await wrapper.get('[data-testid="nav-system"]').trigger('click')
+    const currentButton = wrapper.get(`[data-testid="${selector}"]`)
+    expect(currentButton.attributes('disabled')).toBeUndefined()
+
+    await currentButton.trigger('click')
+    expect(operationResolvers).toHaveLength(2)
+    expect(currentButton.attributes('disabled')).toBeDefined()
+
+    operationResolvers[0]?.(jsonResponse(response))
+    await settle()
+    expect(currentButton.attributes('disabled')).toBeDefined()
+
+    operationResolvers[1]?.(jsonResponse(response))
+    await settle()
+    await settle()
+    expect(currentButton.attributes('disabled')).toBeUndefined()
+  })
+
+  it('全局操作错误在项目页也可见', async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ authenticated: true, password_configured: true }))
+      .mockResolvedValueOnce(jsonResponse(overview))
+      .mockResolvedValueOnce(jsonResponse({ detail: '退出服务暂时不可用' }, 503))
+    const wrapper = mountApp()
+    await settle()
+
+    await wrapper.get('[data-testid="logout"]').trigger('click')
+    await settle()
+    expect(wrapper.get('[data-testid="request-error"]').isVisible()).toBe(true)
+    expect(wrapper.get('[data-testid="request-error"]').text()).toContain('退出服务暂时不可用')
+    expect(wrapper.get('[data-testid="projects-empty"]').isVisible()).toBe(true)
+  })
+
+  it('备份专属错误只在系统页展示', async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ authenticated: true, password_configured: true }))
+      .mockResolvedValueOnce(jsonResponse(overview))
+      .mockResolvedValueOnce(jsonResponse({ detail: 'Backup operation failed' }, 503))
+    const wrapper = mountApp()
+    await settle()
+    await wrapper.get('[data-testid="nav-system"]').trigger('click')
+    await wrapper.get('[data-testid="backup-now"]').trigger('click')
+    await settle()
+    expect(wrapper.get('[data-testid="system-request-error"]').isVisible()).toBe(true)
+    expect(wrapper.get('[data-testid="system-request-error"]').text()).toContain('备份操作失败')
+
+    await wrapper.get('[data-testid="nav-projects"]').trigger('click')
+    expect(wrapper.get('[data-testid="system-request-error"]').isVisible()).toBe(false)
+    expect(wrapper.find('[data-testid="request-error"]').exists()).toBe(false)
   })
 
   it('退出期间防止重复提交，完成后回到密码登录页', async () => {

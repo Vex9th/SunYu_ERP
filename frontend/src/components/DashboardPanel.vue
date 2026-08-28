@@ -11,6 +11,7 @@ const props = defineProps<{
   loading: boolean
   overviewError: string | null
   requestError: string | null
+  systemRequestError: string | null
   successNotice: string | null
   backupBusy: boolean
   saveBusy: boolean
@@ -113,14 +114,14 @@ function openProjectDashboard(projectCode: string): void {
 <template>
   <el-container data-testid="dashboard" direction="vertical">
     <el-header>
-      <el-row justify="space-between" align="middle">
-        <el-col :span="16">
+      <el-row justify="space-between" align="middle" :gutter="12">
+        <el-col :xs="24" :sm="16">
           <el-space>
             <el-tag type="warning" effect="dark">SY</el-tag>
             <el-text tag="strong" size="large">SunYu ERP · 经营工作台</el-text>
           </el-space>
         </el-col>
-        <el-col :span="8">
+        <el-col :xs="24" :sm="8">
           <el-row justify="end">
             <el-button
               data-testid="logout"
@@ -135,8 +136,8 @@ function openProjectDashboard(projectCode: string): void {
       </el-row>
     </el-header>
 
-    <el-container>
-      <el-aside width="220px">
+    <el-row :gutter="16">
+      <el-col data-testid="nav-column" :xs="24" :sm="6" :lg="4">
         <el-menu :default-active="selectedPage" @select="selectPage">
           <el-menu-item data-testid="nav-projects" index="projects">项目中心</el-menu-item>
           <el-menu-item data-testid="nav-companies" index="companies">客户与联系人</el-menu-item>
@@ -144,9 +145,18 @@ function openProjectDashboard(projectCode: string): void {
           <el-menu-item index="inventory" disabled>库存</el-menu-item>
           <el-menu-item index="purchasing" disabled>采购</el-menu-item>
         </el-menu>
-      </el-aside>
+      </el-col>
 
-      <el-main>
+      <el-col data-testid="content-column" :xs="24" :sm="18" :lg="20">
+        <el-main>
+        <el-alert
+          v-if="requestError"
+          data-testid="request-error"
+          :title="requestError"
+          type="error"
+          show-icon
+          :closable="false"
+        />
         <ProjectDashboard
           v-if="dashboardProjectCode"
           :project-code="dashboardProjectCode"
@@ -154,12 +164,13 @@ function openProjectDashboard(projectCode: string): void {
           @session-expired="emit('session-expired', $event)"
         />
         <ProjectCenter
-          v-else-if="selectedPage === 'projects'"
+          v-if="selectedPage === 'projects'"
+          v-show="!dashboardProjectCode"
           @open-dashboard="openProjectDashboard"
           @session-expired="emit('session-expired', $event)"
         />
         <CompanyCenter
-          v-else-if="selectedPage === 'companies'"
+          v-if="selectedPage === 'companies'"
           @session-expired="emit('session-expired', $event)"
         />
         <el-space
@@ -170,9 +181,9 @@ function openProjectDashboard(projectCode: string): void {
           :size="16"
         >
           <el-alert
-            v-if="requestError"
-            data-testid="request-error"
-            :title="requestError"
+            v-if="systemRequestError"
+            data-testid="system-request-error"
+            :title="systemRequestError"
             type="error"
             show-icon
             :closable="false"
@@ -375,7 +386,8 @@ function openProjectDashboard(projectCode: string): void {
           </el-card>
           </template>
         </el-space>
-      </el-main>
-    </el-container>
+        </el-main>
+      </el-col>
+    </el-row>
   </el-container>
 </template>

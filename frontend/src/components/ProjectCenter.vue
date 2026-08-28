@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { onMounted, reactive, ref, watch } from 'vue'
 
 import { ApiError, requestJson } from '../api'
 import type {
@@ -37,6 +37,10 @@ const archiveDialogVisible = ref(false)
 const archiveTarget = ref<ProjectSummary | null>(null)
 const archiveReason = ref('')
 let loadVersion = 0
+let projectDialogVersion = 0
+let projectMutationVersion = 0
+let archiveDialogVersion = 0
+let archiveMutationVersion = 0
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '请求失败，请稍后重试'
@@ -88,6 +92,9 @@ async function loadData(): Promise<void> {
 }
 
 function openProjectCreate(): void {
+  projectDialogVersion += 1
+  projectMutationVersion += 1
+  projectBusy.value = false
   actionError.value = null
   projectValidationError.value = null
   projectForm.project_code = ''
@@ -117,20 +124,32 @@ async function saveProject(): Promise<void> {
   if (projectBusy.value) return
   const payload = projectPayload()
   if (!payload) return
+  const dialogVersion = projectDialogVersion
+  const mutationVersion = ++projectMutationVersion
   projectBusy.value = true
   actionError.value = null
   try {
     await requestJson<Project>('/api/projects', { method: 'POST', body: payload })
-    projectDialogVisible.value = false
+    if (dialogVersion === projectDialogVersion) projectDialogVisible.value = false
     await loadData()
   } catch (error) {
-    if (!handleSessionError(error)) actionError.value = errorMessage(error)
+    const isSessionError = handleSessionError(error)
+    if (!isSessionError && dialogVersion === projectDialogVersion) {
+      actionError.value = errorMessage(error)
+    }
   } finally {
-    projectBusy.value = false
+    if (mutationVersion === projectMutationVersion) projectBusy.value = false
   }
 }
 
+function beforeProjectClose(done: () => void): void {
+  if (!projectBusy.value) done()
+}
+
 function openArchive(selected: ProjectSummary): void {
+  archiveDialogVersion += 1
+  archiveMutationVersion += 1
+  archiveBusy.value = false
   archiveTarget.value = selected
   archiveReason.value = ''
   actionError.value = null
@@ -139,26 +158,50 @@ function openArchive(selected: ProjectSummary): void {
 
 async function archiveProject(): Promise<void> {
   if (archiveBusy.value || !archiveTarget.value) return
+  const dialogVersion = archiveDialogVersion
+  const mutationVersion = ++archiveMutationVersion
+  const projectCode = archiveTarget.value.project_code
   archiveBusy.value = true
   actionError.value = null
   try {
     await requestJson<Project>(
-      `/api/projects/${encodeURIComponent(archiveTarget.value.project_code)}/archive`,
+      `/api/projects/${encodeURIComponent(projectCode)}/archive`,
       { method: 'POST', body: { reason: optional(archiveReason.value) } },
     )
-    archiveDialogVisible.value = false
-    archiveTarget.value = null
+    if (dialogVersion === archiveDialogVersion) archiveDialogVisible.value = false
     await loadData()
   } catch (error) {
-    if (!handleSessionError(error)) actionError.value = errorMessage(error)
+    const isSessionError = handleSessionError(error)
+    if (!isSessionError && dialogVersion === archiveDialogVersion) {
+      actionError.value = errorMessage(error)
+    }
   } finally {
-    archiveBusy.value = false
+    if (mutationVersion === archiveMutationVersion) archiveBusy.value = false
   }
+}
+
+function beforeArchiveClose(done: () => void): void {
+  if (!archiveBusy.value) done()
 }
 
 function statusLabel(status: ProjectSummary['status']): string {
   return status === 'active' ? '在建' : '已归档'
 }
+
+watch(projectDialogVisible, (visible) => {
+  if (visible) return
+  projectDialogVersion += 1
+  projectMutationVersion += 1
+  projectBusy.value = false
+})
+
+watch(archiveDialogVisible, (visible) => {
+  if (visible) return
+  archiveDialogVersion += 1
+  archiveMutationVersion += 1
+  archiveBusy.value = false
+  archiveTarget.value = null
+})
 
 onMounted(loadData)
 </script>
@@ -209,7 +252,17 @@ onMounted(loadData)
       </el-space>
     </el-card>
 
-    <el-dialog v-model="projectDialogVisible" :teleported="false" title="新建项目" width="560px">
+    <el-dialog
+      v-model="projectDialogVisible"
+      data-testid="project-form-dialog"
+      :teleported="false"
+      title="新建项目"
+      width="min(92vw, 560px)"
+      :before-close="beforeProjectClose"
+      :close-on-click-modal="!projectBusy"
+      :close-on-press-escape="!projectBusy"
+      :show-close="!projectBusy"
+    >
       <el-alert v-if="actionError" :title="actionError" type="error" show-icon :closable="false" />
       <el-alert v-if="projectValidationError" :title="projectValidationError" type="error" show-icon :closable="false" />
       <el-alert v-if="companies.length === 0" title="请先在「客户与联系人」中录入公司" type="warning" show-icon :closable="false" />
@@ -226,7 +279,17 @@ onMounted(loadData)
       </el-form>
     </el-dialog>
 
-    <el-dialog v-model="archiveDialogVisible" :teleported="false" title="归档项目" width="500px">
+    <el-dialog
+      v-model="archiveDialogVisible"
+      data-testid="archive-dialog"
+      :teleported="false"
+      title="归档项目"
+      width="min(92vw, 500px)"
+      :before-close="beforeArchiveClose"
+      :close-on-click-modal="!archiveBusy"
+      :close-on-press-escape="!archiveBusy"
+      :show-close="!archiveBusy"
+    >
       <el-alert v-if="actionError" :title="actionError" type="error" show-icon :closable="false" />
       <el-alert :title="`归档后项目仍可查看，项目编号为 ${archiveTarget?.project_code ?? ''}。`" type="warning" show-icon :closable="false" />
       <el-form label-position="top" @submit.prevent="archiveProject">

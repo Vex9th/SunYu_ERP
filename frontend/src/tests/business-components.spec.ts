@@ -384,6 +384,46 @@ describe('CompanyCenter', () => {
     expect(wrapper.emitted('session-expired')).toEqual([['旧列表会话已过期']])
     expect(wrapper.text()).toContain('新建公司')
   })
+
+  it('公司保存迟到时不得关闭或污染后来打开的公司表单', async () => {
+    let resolveSave!: (response: Response) => void
+    const companyB = { ...company, id: 2, name: '昆山 B 公司', contact_count: 0 }
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      if (url === '/api/companies' && method === 'GET') {
+        return jsonResponse([{ ...company, contact_count: 0 }, companyB])
+      }
+      if (url === '/api/companies/1' && method === 'PUT') {
+        return new Promise<Response>((resolve) => { resolveSave = resolve })
+      }
+      throw new Error(`unexpected ${method} ${url}`)
+    })
+    const wrapper = mountComponent(CompanyCenter)
+    await settle()
+    await wrapper.get('[data-testid="company-edit-1"]').trigger('click')
+    await wrapper.get('[data-testid="company-name"]').setValue('A 公司已修改')
+    await wrapper.get('[data-testid="company-save"]').trigger('click')
+    expect(wrapper.find('[data-testid="company-form-drawer"] .el-drawer__close-btn').exists()).toBe(false)
+
+    wrapper.findAllComponents({ name: 'ElDrawer' })[0]?.vm.$emit('update:modelValue', false)
+    await wrapper.get('[data-testid="company-edit-2"]').trigger('click')
+    await settle()
+    expect((wrapper.get('[data-testid="company-name"]').element as HTMLInputElement).value).toBe('昆山 B 公司')
+
+    resolveSave(jsonResponse({ ...company, name: 'A 公司已修改', contacts: [] }))
+    await settle()
+    expect(wrapper.get('[data-testid="company-form-drawer"]').isVisible()).toBe(true)
+    expect((wrapper.get('[data-testid="company-name"]').element as HTMLInputElement).value).toBe('昆山 B 公司')
+  })
+
+  it('公司与联系人弹层使用窄屏安全宽度', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse([{ ...company, contact_count: 0 }]))
+    const wrapper = mountComponent(CompanyCenter)
+    await settle()
+    await wrapper.get('[data-testid="company-create-open"]').trigger('click')
+    expect(wrapper.get('[data-testid="company-form-drawer"]').attributes('style')).toContain('min(92vw, 520px)')
+  })
 })
 
 describe('ProjectCenter', () => {
@@ -417,15 +457,12 @@ describe('ProjectCenter', () => {
     ]))
     expect(wrapper.text()).toContain('在建')
 
-    const filter = wrapper.getComponent({ name: 'ElRadioGroup' })
-    filter.vm.$emit('update:modelValue', 'archived')
-    filter.vm.$emit('change', 'archived')
+    await wrapper.get('[data-testid="project-filter"] input[value="archived"]').setValue(true)
     await settle()
     expect(fetchMock.mock.calls.some(([url]) => url === '/api/projects?status=archived')).toBe(true)
     expect(wrapper.text()).toContain('已归档')
 
-    filter.vm.$emit('update:modelValue', 'all')
-    filter.vm.$emit('change', 'all')
+    await wrapper.get('[data-testid="project-filter"] input[value="all"]').setValue(true)
     await settle()
     expect(fetchMock.mock.calls.some(([url]) => url === '/api/projects?status=all')).toBe(true)
   })
@@ -455,7 +492,14 @@ describe('ProjectCenter', () => {
     await wrapper.get('[data-testid="project-create-open"]').trigger('click')
     await wrapper.get('[data-testid="project-code"]').setValue(' SY-2026-002 ')
     await wrapper.get('[data-testid="project-name"]').setValue(' 新项目 ')
-    wrapper.getComponent({ name: 'ElSelect' }).vm.$emit('update:modelValue', 1)
+    await wrapper.get('[data-testid="project-company"]').trigger('click')
+    await settle()
+    const companyOption = Array.from(
+      document.body.querySelectorAll<HTMLElement>('.el-select-dropdown__item'),
+    ).find((item) => item.textContent?.includes(company.name))
+    expect(companyOption).toBeDefined()
+    companyOption?.click()
+    await settle()
     await wrapper.get('[data-testid="project-description"]').setValue('   ')
     await wrapper.get('[data-testid="project-save"]').trigger('click')
     await settle()
@@ -555,6 +599,49 @@ describe('ProjectCenter', () => {
     expect(wrapper.text()).toContain('SY-NEW')
     expect(wrapper.text()).toContain('新公司')
     expect(wrapper.text()).not.toContain('旧代项目失败')
+  })
+
+  it('新建项目迟到成功不得关闭后来重新打开的表单', async () => {
+    let resolveCreate!: (response: Response) => void
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      if (url === '/api/companies') return jsonResponse([{ ...company, contact_count: 0 }])
+      if (url === '/api/projects?status=active') return jsonResponse([])
+      if (url === '/api/projects' && method === 'POST') {
+        return new Promise<Response>((resolve) => { resolveCreate = resolve })
+      }
+      throw new Error(`unexpected ${method} ${url}`)
+    })
+    const wrapper = mountComponent(ProjectCenter)
+    await settle()
+    await wrapper.get('[data-testid="project-create-open"]').trigger('click')
+    await wrapper.get('[data-testid="project-code"]').setValue('SY-LATE')
+    await wrapper.get('[data-testid="project-name"]').setValue('迟到项目')
+    await wrapper.get('[data-testid="project-company"]').trigger('click')
+    await settle()
+    const option = document.body.querySelector<HTMLElement>('.el-select-dropdown__item')
+    option?.click()
+    await wrapper.get('[data-testid="project-save"]').trigger('click')
+    expect(wrapper.find('[data-testid="project-form-dialog"] .el-dialog__headerbtn').exists()).toBe(false)
+
+    wrapper.findAllComponents({ name: 'ElDialog' })[0]?.vm.$emit('update:modelValue', false)
+    await wrapper.get('[data-testid="project-create-open"]').trigger('click')
+    expect((wrapper.get('[data-testid="project-code"]').element as HTMLInputElement).value).toBe('')
+
+    resolveCreate(jsonResponse({ ...project, project_code: 'SY-LATE', name: '迟到项目' }, 201))
+    await settle()
+    expect(wrapper.get('[data-testid="project-form-dialog"]').isVisible()).toBe(true)
+    expect((wrapper.get('[data-testid="project-code"]').element as HTMLInputElement).value).toBe('')
+  })
+
+  it('项目弹层使用窄屏安全宽度', async () => {
+    fetchMock.mockImplementation(async (input) =>
+      String(input) === '/api/companies' ? jsonResponse([]) : jsonResponse([]))
+    const wrapper = mountComponent(ProjectCenter)
+    await settle()
+    await wrapper.get('[data-testid="project-create-open"]').trigger('click')
+    expect(wrapper.get('[data-testid="project-form-dialog"]').attributes('style')).toContain('min(92vw, 560px)')
   })
 })
 
