@@ -177,6 +177,7 @@ def test_run_starts_children_in_independent_process_groups(
             platform_name=platform_name,
             executable_finder=executables.get,
             path_exists=lambda _: True,
+            signal_registrar=lambda _signum, _handler: None,
         )
     )
 
@@ -298,6 +299,7 @@ def test_run_cleans_first_child_when_second_child_fails_to_start() -> None:
                 process_group_killer=lambda pgid, sig: group_signals.append(
                     (pgid, sig)
                 ),
+                signal_registrar=lambda _signum, _handler: None,
             )
         )
 
