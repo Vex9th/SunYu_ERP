@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,36 @@ def test_file_connection_applies_required_sqlite_settings(
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
     finally:
         connection.close()
+
+
+def test_connection_can_be_used_and_closed_from_dependency_worker_thread(
+    tmp_path: Path,
+) -> None:
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    closed = False
+
+    def exercise_connection() -> tuple[str, int, str, int]:
+        connection.execute("CREATE TABLE probe (value TEXT NOT NULL)")
+        with transaction(connection):
+            connection.execute("INSERT INTO probe VALUES ('worker')")
+        row = connection.execute("SELECT value FROM probe").fetchone()
+        settings = (
+            connection.execute("PRAGMA foreign_keys").fetchone()[0],
+            connection.execute("PRAGMA journal_mode").fetchone()[0],
+            connection.execute("PRAGMA busy_timeout").fetchone()[0],
+        )
+        assert connection.row_factory is sqlite3.Row
+        connection.close()
+        return row["value"], settings[0], settings[1], settings[2]
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(exercise_connection).result(timeout=10)
+        closed = True
+        assert result == ("worker", 1, "wal", 5000)
+    finally:
+        if not closed:
+            connection.close()
 
 
 def test_transaction_commits_successful_changes(tmp_path: Path) -> None:
@@ -81,10 +112,13 @@ def test_nested_transaction_fails_without_committing_outer_transaction(
         with transaction(connection):
             connection.execute("INSERT INTO entries VALUES ('outer')")
 
-            with pytest.raises(
-                RuntimeError,
-                match="Nested transactions",
-            ), transaction(connection):
+            with (
+                pytest.raises(
+                    RuntimeError,
+                    match="Nested transactions",
+                ),
+                transaction(connection),
+            ):
                 pass
 
             assert connection.in_transaction

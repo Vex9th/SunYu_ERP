@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from backend.app.core.security import (
     SESSION_COOKIE_NAME,
     create_session_token,
 )
+from backend.app.features import companies as companies_module
 from backend.app.features.companies import create_companies_router
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -111,6 +113,8 @@ def _build_harness(
     *,
     commit_failure: sqlite3.Error | None = None,
     inject_project_before_company_delete: bool = False,
+    inject_concurrent_write_before: str | None = None,
+    execute_failure: tuple[str, sqlite3.Error] | None = None,
 ) -> CompaniesHarness:
     database_path = tmp_path / "erp.sqlite3"
     connection = connect_database(database_path)
@@ -142,6 +146,20 @@ def _build_harness(
             exposed = cast(
                 sqlite3.Connection,
                 _ProjectRaceConnection(owned, database_path),
+            )
+        elif inject_concurrent_write_before is not None:
+            exposed = cast(
+                sqlite3.Connection,
+                _ConcurrentWriteConnection(
+                    owned,
+                    database_path,
+                    inject_concurrent_write_before,
+                ),
+            )
+        elif execute_failure is not None:
+            exposed = cast(
+                sqlite3.Connection,
+                _ExecuteFailingConnection(owned, *execute_failure),
             )
         else:
             exposed = owned
@@ -448,6 +466,62 @@ def test_delete_company_maps_concurrent_project_reference_to_atomic_409(
             "SELECT company_id, status FROM projects"
         ).fetchone()
         assert dict(project) == {"company_id": company["id"], "status": "active"}
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "replace_company",
+        "create_contact",
+        "replace_contact",
+        "delete_contact",
+    ],
+)
+def test_writes_do_not_upgrade_a_stale_read_snapshot(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    sql_prefixes = {
+        "replace_company": "UPDATE COMPANIES SET",
+        "create_contact": "INSERT INTO CONTACTS",
+        "replace_contact": "UPDATE CONTACTS SET",
+        "delete_contact": "DELETE FROM CONTACTS",
+    }
+    harness = _build_harness(
+        tmp_path,
+        inject_concurrent_write_before=sql_prefixes[operation],
+    )
+    with harness.client() as client:
+        company = _create_company(client)
+        if operation == "replace_company":
+            response = client.put(
+                f"/api/companies/{company['id']}",
+                json=_company_payload("并发更新公司"),
+            )
+            assert response.status_code == 200
+            assert response.json()["name"] == "并发更新公司"
+        elif operation == "create_contact":
+            response = client.post(
+                f"/api/companies/{company['id']}/contacts",
+                json=_contact_payload(),
+            )
+            assert response.status_code == 201
+        else:
+            contact = _create_contact(client, company["id"])
+            path = f"/api/companies/{company['id']}/contacts/{contact['id']}"
+            if operation == "replace_contact":
+                response = client.put(path, json=_contact_payload("并发更新联系人"))
+                assert response.status_code == 200
+                assert response.json()["name"] == "并发更新联系人"
+            else:
+                response = client.delete(path)
+                assert response.status_code == 204
+
+    connection = connect_database(harness.database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 2
     finally:
         connection.close()
 
@@ -827,24 +901,217 @@ def test_missing_company_and_contact_resources_return_fixed_404(
         assert response.json() == {"detail": "Contact not found"}
 
 
-def test_commit_failure_rolls_back_and_hides_sqlite_detail(tmp_path: Path) -> None:
+def test_unexpected_database_failure_logs_diagnostics_without_client_leak(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    failure = _missing_table_error()
     harness = _build_harness(
         tmp_path,
-        commit_failure=sqlite3.OperationalError("private database path /secret.db"),
+        commit_failure=failure,
     )
+    caplog.set_level(logging.ERROR, logger=companies_module.__name__)
 
     with harness.client(raise_server_exceptions=False) as client:
         response = client.post("/api/companies", json=_company_payload())
 
     assert response.status_code == 500
     assert response.json() == {"detail": "Company operation failed"}
-    assert "private" not in response.text
-    assert "/secret.db" not in response.text
+    assert "private_secret_table" not in response.text
+    records = [
+        record
+        for record in caplog.records
+        if record.name == companies_module.__name__ and record.levelno == logging.ERROR
+    ]
+    assert len(records) == 1
+    assert records[0].getMessage() == (
+        "Company database operation failed "
+        "(sqlite_errorcode=1, sqlite_errorname=SQLITE_ERROR)"
+    )
+    assert records[0].exc_info is not None
     connection = connect_database(harness.database_path)
     try:
         assert connection.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 0
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize(
+    ("path", "sql_prefix"),
+    [
+        ("/api/companies", "SELECT COMPANIES.ID,"),
+        ("/api/companies/1", "SELECT ID, NAME,"),
+    ],
+)
+def test_unexpected_read_failure_logs_and_returns_fixed_500(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    path: str,
+    sql_prefix: str,
+) -> None:
+    harness = _build_harness(
+        tmp_path,
+        execute_failure=(sql_prefix, _missing_table_error()),
+    )
+    caplog.set_level(logging.ERROR, logger=companies_module.__name__)
+
+    with harness.client(raise_server_exceptions=False) as client:
+        response = client.get(path)
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Company operation failed"}
+    assert "private_secret_table" not in response.text
+    records = [
+        record
+        for record in caplog.records
+        if record.name == companies_module.__name__ and record.levelno == logging.ERROR
+    ]
+    assert len(records) == 1
+    assert records[0].getMessage() == (
+        "Company database operation failed "
+        "(sqlite_errorcode=1, sqlite_errorname=SQLITE_ERROR)"
+    )
+    assert records[0].exc_info is not None
+
+
+@pytest.mark.parametrize("project_status", ["active", "archived"])
+def test_expected_integrity_conflicts_do_not_log_errors(
+    harness: CompaniesHarness,
+    caplog: pytest.LogCaptureFixture,
+    project_status: str,
+) -> None:
+    caplog.set_level(logging.ERROR, logger=companies_module.__name__)
+    with harness.client() as client:
+        company = _create_company(client)
+        duplicate = client.post(
+            "/api/companies",
+            json=_company_payload(company["name"].swapcase()),
+        )
+        missing_company = client.post(
+            "/api/companies/999/contacts",
+            json=_contact_payload(),
+        )
+    connection = connect_database(harness.database_path)
+    try:
+        archived_at = NOW.isoformat() if project_status == "archived" else None
+        connection.execute(
+            """
+            INSERT INTO projects
+                (project_code, company_id, name, status, archived_at,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"EXPECTED-{project_status}",
+                company["id"],
+                "预期项目引用",
+                project_status,
+                archived_at,
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+    finally:
+        connection.close()
+    with harness.client() as client:
+        referenced = client.delete(f"/api/companies/{company['id']}")
+
+    assert duplicate.status_code == 409
+    assert missing_company.status_code == 404
+    assert referenced.status_code == 409
+    assert not [
+        record
+        for record in caplog.records
+        if record.name == companies_module.__name__ and record.levelno >= logging.ERROR
+    ]
+
+
+def test_non_foreign_key_delete_integrity_error_logs_and_returns_fixed_500(
+    harness: CompaniesHarness,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with harness.client() as client:
+        company = _create_company(client)
+    connection = connect_database(harness.database_path)
+    try:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_company_delete
+            BEFORE DELETE ON companies
+            BEGIN
+                SELECT RAISE(ABORT, 'private trigger detail');
+            END
+            """
+        )
+    finally:
+        connection.close()
+    caplog.set_level(logging.ERROR, logger=companies_module.__name__)
+
+    with harness.client() as client:
+        response = client.delete(f"/api/companies/{company['id']}")
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Company operation failed"}
+    assert "private trigger detail" not in response.text
+    records = [
+        record
+        for record in caplog.records
+        if record.name == companies_module.__name__ and record.levelno == logging.ERROR
+    ]
+    assert len(records) == 1
+    assert "sqlite_errorcode=1811" in records[0].getMessage()
+    assert "sqlite_errorname=SQLITE_CONSTRAINT_TRIGGER" in records[0].getMessage()
+    assert records[0].exc_info is not None
+    with harness.client() as client:
+        detail = client.get(f"/api/companies/{company['id']}")
+    assert detail.status_code == 200
+
+
+def test_project_reference_confirmation_failure_logs_the_confirmation_error(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    harness = _build_harness(
+        tmp_path,
+        execute_failure=(
+            "SELECT 1 FROM PROJECTS WHERE COMPANY_ID = ? LIMIT 1",
+            _missing_table_error(),
+        ),
+    )
+    with harness.client() as client:
+        company = _create_company(client)
+    connection = connect_database(harness.database_path)
+    try:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_company_confirmation
+            BEFORE DELETE ON companies
+            BEGIN
+                SELECT RAISE(ABORT, 'force project confirmation');
+            END
+            """
+        )
+    finally:
+        connection.close()
+    caplog.set_level(logging.ERROR, logger=companies_module.__name__)
+
+    with harness.client() as client:
+        response = client.delete(f"/api/companies/{company['id']}")
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Company operation failed"}
+    assert "private_secret_table" not in response.text
+    records = [
+        record
+        for record in caplog.records
+        if record.name == companies_module.__name__ and record.levelno == logging.ERROR
+    ]
+    assert len(records) == 1
+    assert records[0].getMessage() == (
+        "Company database operation failed "
+        "(sqlite_errorcode=1, sqlite_errorname=SQLITE_ERROR)"
+    )
+    assert records[0].exc_info is not None
 
 
 def test_responses_do_not_disclose_secrets_or_paths(harness: CompaniesHarness) -> None:
@@ -879,6 +1146,17 @@ class _CommitFailingConnection:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._connection, name)
+
+
+def _missing_table_error() -> sqlite3.OperationalError:
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute("SELECT * FROM private_secret_table")
+    except sqlite3.OperationalError as failure:
+        return failure
+    finally:
+        connection.close()
+    raise AssertionError("missing table probe unexpectedly succeeded")
 
 
 class _ProjectRaceConnection:
@@ -916,6 +1194,61 @@ class _ProjectRaceConnection:
             finally:
                 competitor.close()
             self._injected = True
+        return self._connection.execute(sql, parameters)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+class _ConcurrentWriteConnection:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        database_path: Path,
+        write_prefix: str,
+    ) -> None:
+        self._connection = connection
+        self._database_path = database_path
+        self._write_prefix = write_prefix
+        self._injected = False
+
+    def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+        normalized_sql = " ".join(sql.split()).upper()
+        if not self._injected and normalized_sql.startswith(self._write_prefix):
+            competitor = connect_database(self._database_path)
+            try:
+                marker = f"并发公司-{id(self)}"
+                competitor.execute(
+                    """
+                    INSERT INTO companies (name, created_at, updated_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (marker, NOW.isoformat(), NOW.isoformat()),
+                )
+            finally:
+                competitor.close()
+            self._injected = True
+        return self._connection.execute(sql, parameters)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+class _ExecuteFailingConnection:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        sql_prefix: str,
+        failure: sqlite3.Error,
+    ) -> None:
+        self._connection = connection
+        self._sql_prefix = sql_prefix
+        self._failure = failure
+
+    def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+        normalized_sql = " ".join(sql.split()).upper()
+        if normalized_sql.startswith(self._sql_prefix):
+            raise self._failure
         return self._connection.execute(sql, parameters)
 
     def __getattr__(self, name: str) -> Any:

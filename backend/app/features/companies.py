@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -10,6 +11,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from backend.app.core.config import Settings
 from backend.app.core.database import transaction
 from backend.app.features.auth import require_authenticated_session
+
+logger = logging.getLogger(__name__)
 
 _COMPANY_FIELDS = (
     "name",
@@ -68,26 +71,29 @@ def create_companies_router(
         _: None = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> list[dict[str, object]]:
-        rows = connection.execute(
-            """
-            SELECT
-                companies.id,
-                companies.name,
-                companies.taxpayer_id,
-                companies.registered_address,
-                companies.registered_phone,
-                companies.bank_name,
-                companies.bank_account,
-                companies.notes,
-                companies.created_at,
-                companies.updated_at,
-                COUNT(contacts.id) AS contact_count
-            FROM companies
-            LEFT JOIN contacts ON contacts.company_id = companies.id
-            GROUP BY companies.id
-            ORDER BY companies.name COLLATE NOCASE, companies.id
-            """
-        ).fetchall()
+        try:
+            rows = connection.execute(
+                """
+                SELECT
+                    companies.id,
+                    companies.name,
+                    companies.taxpayer_id,
+                    companies.registered_address,
+                    companies.registered_phone,
+                    companies.bank_name,
+                    companies.bank_account,
+                    companies.notes,
+                    companies.created_at,
+                    companies.updated_at,
+                    COUNT(contacts.id) AS contact_count
+                FROM companies
+                LEFT JOIN contacts ON contacts.company_id = companies.id
+                GROUP BY companies.id
+                ORDER BY companies.name COLLATE NOCASE, companies.id
+                """
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise _unexpected_database_failure("Company", exc) from None
         return [
             _row_response(row, (*_COMPANY_RESPONSE_FIELDS, "contact_count"))
             for row in rows
@@ -120,9 +126,9 @@ def create_companies_router(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="Company name already exists",
                 ) from None
-            raise _operation_failed("Company") from None
-        except sqlite3.Error:
-            raise _operation_failed("Company") from None
+            raise _unexpected_database_failure("Company", exc) from None
+        except sqlite3.Error as exc:
+            raise _unexpected_database_failure("Company", exc) from None
         return response
 
     @router.get("/{company_id}")
@@ -131,7 +137,10 @@ def create_companies_router(
         company_id: int = company_id_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
-        response = _company_detail(connection, company_id)
+        try:
+            response = _company_detail(connection, company_id)
+        except sqlite3.Error as exc:
+            raise _unexpected_database_failure("Company", exc) from None
         if response is None:
             raise _company_not_found()
         return response
@@ -146,9 +155,7 @@ def create_companies_router(
         timestamp = _timestamp(now)
         try:
             with transaction(connection):
-                if not _company_exists(connection, company_id):
-                    raise _company_not_found()
-                connection.execute(
+                cursor = connection.execute(
                     """
                     UPDATE companies
                     SET name = ?, taxpayer_id = ?, registered_address = ?,
@@ -162,6 +169,8 @@ def create_companies_router(
                         company_id,
                     ),
                 )
+                if cursor.rowcount != 1:
+                    raise _company_not_found()
                 response = _company_detail(connection, company_id)
         except sqlite3.IntegrityError as exc:
             if _is_unique_constraint(exc):
@@ -169,9 +178,9 @@ def create_companies_router(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="Company name already exists",
                 ) from None
-            raise _operation_failed("Company") from None
-        except sqlite3.Error:
-            raise _operation_failed("Company") from None
+            raise _unexpected_database_failure("Company", exc) from None
+        except sqlite3.Error as exc:
+            raise _unexpected_database_failure("Company", exc) from None
         return response
 
     @router.delete("/{company_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -188,10 +197,23 @@ def create_companies_router(
                 )
                 if cursor.rowcount != 1:
                     raise _company_not_found()
-        except sqlite3.IntegrityError:
-            raise _company_referenced() from None
-        except sqlite3.Error:
-            raise _operation_failed("Company") from None
+        except sqlite3.IntegrityError as exc:
+            try:
+                is_project_reference = _is_project_reference_failure(
+                    connection,
+                    company_id,
+                    exc,
+                )
+            except sqlite3.Error as confirmation_exc:
+                raise _unexpected_database_failure(
+                    "Company",
+                    confirmation_exc,
+                ) from None
+            if is_project_reference:
+                raise _company_referenced() from None
+            raise _unexpected_database_failure("Company", exc) from None
+        except sqlite3.Error as exc:
+            raise _unexpected_database_failure("Company", exc) from None
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @router.post(
@@ -207,8 +229,6 @@ def create_companies_router(
         timestamp = _timestamp(now)
         try:
             with transaction(connection):
-                if not _company_exists(connection, company_id):
-                    raise _company_not_found()
                 cursor = connection.execute(
                     """
                     INSERT INTO contacts
@@ -225,8 +245,12 @@ def create_companies_router(
                 )
                 contact_id = _last_insert_id(cursor)
                 response = _contact_response(connection, company_id, contact_id)
-        except sqlite3.Error:
-            raise _operation_failed("Contact") from None
+        except sqlite3.IntegrityError as exc:
+            if _is_foreign_key_constraint(exc):
+                raise _company_not_found() from None
+            raise _unexpected_database_failure("Contact", exc) from None
+        except sqlite3.Error as exc:
+            raise _unexpected_database_failure("Contact", exc) from None
         if response is None:
             raise _operation_failed("Contact")
         return response
@@ -242,12 +266,7 @@ def create_companies_router(
         timestamp = _timestamp(now)
         try:
             with transaction(connection):
-                if not _company_exists(connection, company_id):
-                    raise _contact_not_found()
-                existing = _contact_response(connection, company_id, contact_id)
-                if existing is None:
-                    raise _contact_not_found()
-                connection.execute(
+                cursor = connection.execute(
                     """
                     UPDATE contacts
                     SET name = ?, phone = ?, email = ?, position = ?, notes = ?,
@@ -261,9 +280,13 @@ def create_companies_router(
                         company_id,
                     ),
                 )
+                if cursor.rowcount != 1:
+                    raise _contact_not_found()
                 response = _contact_response(connection, company_id, contact_id)
-        except sqlite3.Error:
-            raise _operation_failed("Contact") from None
+        except sqlite3.IntegrityError as exc:
+            raise _unexpected_database_failure("Contact", exc) from None
+        except sqlite3.Error as exc:
+            raise _unexpected_database_failure("Contact", exc) from None
         if response is None:
             raise _operation_failed("Contact")
         return response
@@ -280,16 +303,16 @@ def create_companies_router(
     ) -> Response:
         try:
             with transaction(connection):
-                if not _company_exists(connection, company_id):
-                    raise _contact_not_found()
                 cursor = connection.execute(
                     "DELETE FROM contacts WHERE id = ? AND company_id = ?",
                     (contact_id, company_id),
                 )
                 if cursor.rowcount != 1:
                     raise _contact_not_found()
-        except sqlite3.Error:
-            raise _operation_failed("Contact") from None
+        except sqlite3.IntegrityError as exc:
+            raise _unexpected_database_failure("Contact", exc) from None
+        except sqlite3.Error as exc:
+            raise _unexpected_database_failure("Contact", exc) from None
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     return router
@@ -439,16 +462,6 @@ def _contact_response(
     return _row_response(row, _CONTACT_RESPONSE_FIELDS)
 
 
-def _company_exists(connection: sqlite3.Connection, company_id: int) -> bool:
-    return (
-        connection.execute(
-            "SELECT 1 FROM companies WHERE id = ?",
-            (company_id,),
-        ).fetchone()
-        is not None
-    )
-
-
 def _row_response(
     row: sqlite3.Row,
     fields: tuple[str, ...],
@@ -487,6 +500,31 @@ def _is_unique_constraint(failure: sqlite3.IntegrityError) -> bool:
     )
 
 
+def _is_foreign_key_constraint(failure: sqlite3.IntegrityError) -> bool:
+    return (
+        getattr(failure, "sqlite_errorcode", None)
+        == sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
+    )
+
+
+def _is_project_reference_failure(
+    connection: sqlite3.Connection,
+    company_id: int,
+    failure: sqlite3.IntegrityError,
+) -> bool:
+    if _is_foreign_key_constraint(failure):
+        return True
+    if getattr(failure, "sqlite_errorcode", None) != sqlite3.SQLITE_CONSTRAINT_TRIGGER:
+        return False
+    return (
+        connection.execute(
+            "SELECT 1 FROM projects WHERE company_id = ? LIMIT 1",
+            (company_id,),
+        ).fetchone()
+        is not None
+    )
+
+
 def _invalid_payload(detail: str) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -520,3 +558,16 @@ def _operation_failed(subject: str) -> HTTPException:
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail=f"{subject} operation failed",
     )
+
+
+def _unexpected_database_failure(
+    subject: str,
+    failure: sqlite3.Error,
+) -> HTTPException:
+    logger.exception(
+        "%s database operation failed (sqlite_errorcode=%s, sqlite_errorname=%s)",
+        subject,
+        getattr(failure, "sqlite_errorcode", None),
+        getattr(failure, "sqlite_errorname", None),
+    )
+    return _operation_failed(subject)

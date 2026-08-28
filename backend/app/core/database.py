@@ -12,6 +12,7 @@ def connect_database(database_path: str | Path) -> sqlite3.Connection:
         Path(database_path),
         timeout=5.0,
         isolation_level=None,
+        check_same_thread=False,
     )
     try:
         connection.row_factory = sqlite3.Row
