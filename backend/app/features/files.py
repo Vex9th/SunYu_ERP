@@ -564,6 +564,15 @@ def _publish_in_bound_directory(
                 reservation_name,
                 temporary_identity,
             )
+            next_version = _next_bound_version(binding)
+            if next_version > version_number:
+                _unlink_bound_owned_name(
+                    binding,
+                    reservation_name,
+                    temporary_identity,
+                )
+                version_number = next_version
+                continue
             binding.require_current()
             target_name = (
                 f"{timestamp}_v{version_number:06d}_{sanitized_name}"
@@ -590,12 +599,6 @@ def _publish_in_bound_directory(
                 target_name,
                 temporary_identity,
             )
-            _release_reservation_for_validation(
-                temporary_identity,
-                binding,
-                reservation_name,
-                target_name,
-            )
             binding.require_current()
             _require_final_target_integrity(
                 binding,
@@ -608,6 +611,7 @@ def _publish_in_bound_directory(
                 temporary_path,
                 temporary_identity,
                 binding,
+                reservation_name,
                 target_name,
             )
             return version_number, binding.path / target_name
@@ -633,40 +637,11 @@ def _require_bound_name_owned(
     binding.require_current()
 
 
-def _release_reservation_for_validation(
-    temporary_identity: _FileIdentity,
-    binding: _BoundDirectory,
-    reservation_name: str,
-    target_name: str,
-) -> None:
-    failures: list[tuple[str, BaseException]] = []
-    reservation_failed = _capture_bound_cleanup_failure(
-        "reservation",
-        binding,
-        reservation_name,
-        temporary_identity,
-        failures,
-    )
-    if reservation_failed:
-        _capture_bound_cleanup_failure(
-            "target rollback",
-            binding,
-            target_name,
-            temporary_identity,
-            failures,
-        )
-
-    if failures:
-        primary = failures[0][1]
-        for label, failure in failures[1:]:
-            primary.add_note(f"{label} cleanup failed: {failure}")
-        raise primary
-
-
 def _complete_publication(
     temporary_path: Path,
     temporary_identity: _FileIdentity,
     binding: _BoundDirectory,
+    reservation_name: str,
     target_name: str,
 ) -> None:
     failures: list[tuple[str, BaseException]] = []
@@ -677,7 +652,24 @@ def _complete_publication(
         temporary_identity,
         failures,
     )
+    target_rollback_attempted = False
     if temporary_failed:
+        _capture_bound_cleanup_failure(
+            "target rollback",
+            binding,
+            target_name,
+            temporary_identity,
+            failures,
+        )
+        target_rollback_attempted = True
+    reservation_failed = _capture_bound_cleanup_failure(
+        "reservation",
+        binding,
+        reservation_name,
+        temporary_identity,
+        failures,
+    )
+    if reservation_failed and not target_rollback_attempted:
         _capture_bound_cleanup_failure(
             "target rollback",
             binding,

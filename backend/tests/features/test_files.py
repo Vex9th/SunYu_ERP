@@ -7,7 +7,7 @@ import sqlite3
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event, Lock
 from types import SimpleNamespace
 from typing import BinaryIO, Self, cast
 
@@ -589,8 +589,10 @@ def test_success_cleanup_failure_is_failfast_and_undoes_published_target(
     source.write_bytes(b"content")
     data_dir = tmp_path / "Data"
     original_unlink = Path.unlink
+    original_bound_unlink = files._BoundDirectory.unlink
     cleanup = OSError("temp cleanup failed after unlink")
     injection_enabled = True
+    bound_cleanup_order: list[str] = []
 
     def unlink_temp_then_fail(
         path: Path,
@@ -603,7 +605,15 @@ def test_success_cleanup_failure_is_failfast_and_undoes_published_target(
             injection_enabled = False
             raise cleanup
 
+    def record_bound_unlink(
+        binding: files._BoundDirectory,
+        name: str,
+    ) -> None:
+        bound_cleanup_order.append(name)
+        original_bound_unlink(binding, name)
+
     monkeypatch.setattr(Path, "unlink", unlink_temp_then_fail)
+    monkeypatch.setattr(files._BoundDirectory, "unlink", record_bound_unlink)
 
     with pytest.raises(OSError) as caught:
         files.store_version(source, data_dir, "P-1", "图纸")
@@ -612,6 +622,50 @@ def test_success_cleanup_failure_is_failfast_and_undoes_published_target(
     assert list((data_dir / "Temp").iterdir()) == []
     category_dir = data_dir / "Projects" / "P-1" / "图纸"
     assert list(category_dir.iterdir()) == []
+    assert "_v000001_" in bound_cleanup_order[0]
+    assert bound_cleanup_order[1].endswith(".reserve")
+    stored = files.store_version(source, data_dir, "P-1", "图纸")
+    assert stored.version_number == 1
+
+
+def test_reservation_cleanup_failure_after_integrity_rolls_back_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"content")
+    data_dir = tmp_path / "Data"
+    original_unlink = files._BoundDirectory.unlink
+    cleanup = OSError("reservation cleanup failed after unlink")
+    injection_enabled = True
+    bound_cleanup_order: list[str] = []
+
+    def unlink_reservation_then_fail(
+        binding: files._BoundDirectory,
+        name: str,
+    ) -> None:
+        nonlocal injection_enabled
+        bound_cleanup_order.append(name)
+        original_unlink(binding, name)
+        if injection_enabled and name.endswith(".reserve"):
+            injection_enabled = False
+            raise cleanup
+
+    monkeypatch.setattr(
+        files._BoundDirectory,
+        "unlink",
+        unlink_reservation_then_fail,
+    )
+
+    with pytest.raises(OSError) as caught:
+        files.store_version(source, data_dir, "P-1", "图纸")
+
+    assert caught.value is cleanup
+    _assert_no_work_files(data_dir)
+    category_dir = data_dir / "Projects" / "P-1" / "图纸"
+    assert list(category_dir.iterdir()) == []
+    assert bound_cleanup_order[0].endswith(".reserve")
+    assert "_v000001_" in bound_cleanup_order[1]
     stored = files.store_version(source, data_dir, "P-1", "图纸")
     assert stored.version_number == 1
 
@@ -645,14 +699,49 @@ def test_two_threads_get_continuous_unique_versions_with_correct_content(
     left_source.write_bytes(b"left-content")
     right_source.write_bytes(b"right-content")
     barrier = Barrier(2)
+    reservation_released = Event()
+    state_lock = Lock()
+    scan_count = 0
+    reservation_attempt_count = 0
     original_next_version = files._next_bound_version
+    original_link = files._BoundDirectory.link
+    original_unlink = files._BoundDirectory.unlink
 
     def synchronized_scan(binding: files._BoundDirectory) -> int:
+        nonlocal scan_count
         version = original_next_version(binding)
-        barrier.wait(timeout=10)
+        with state_lock:
+            scan_count += 1
+            current_scan = scan_count
+        if current_scan <= 2:
+            barrier.wait(timeout=10)
         return version
 
+    def delay_stale_reservation_attempt(
+        binding: files._BoundDirectory,
+        source: Path,
+        name: str,
+    ) -> None:
+        nonlocal reservation_attempt_count
+        if name.endswith(".reserve"):
+            with state_lock:
+                reservation_attempt_count += 1
+                current_attempt = reservation_attempt_count
+            if current_attempt == 2:
+                assert reservation_released.wait(timeout=10)
+        original_link(binding, source, name)
+
+    def observe_reservation_release(
+        binding: files._BoundDirectory,
+        name: str,
+    ) -> None:
+        original_unlink(binding, name)
+        if name.endswith(".reserve"):
+            reservation_released.set()
+
     monkeypatch.setattr(files, "_next_bound_version", synchronized_scan)
+    monkeypatch.setattr(files._BoundDirectory, "link", delay_stale_reservation_attempt)
+    monkeypatch.setattr(files._BoundDirectory, "unlink", observe_reservation_release)
 
     def store(source: Path) -> files.StoredFileVersion:
         return files.store_version(source, data_dir, "P-1", "设计")
@@ -1115,11 +1204,14 @@ def test_temporary_anchor_is_retained_until_final_integrity_check(
         nonlocal integrity_checked
         temporary_files = list((data_dir / "Temp").iterdir())
         assert len(temporary_files) == 1
+        reservations = list(binding.path.glob(".version-*.reserve"))
+        assert len(reservations) == 1
         assert files._path_has_identity(
             temporary_files[0],
             temporary_identity,
         )
         assert temporary_files[0].samefile(binding.path / target_name)
+        assert temporary_files[0].samefile(reservations[0])
         integrity_checked = True
         original_require_integrity(
             binding,
@@ -1150,32 +1242,37 @@ def test_target_replaced_before_final_integrity_is_not_reported_as_success(
     source.write_bytes(b"our-content")
     data_dir = tmp_path / "Data"
     other_content = b""
-    original_release_reservation = files._release_reservation_for_validation
+    original_require_integrity = files._require_final_target_integrity
 
-    def release_reservation_then_replace(
-        temporary_identity: tuple[int, int],
+    def replace_target_then_require_integrity(
         binding: files._BoundDirectory,
-        reservation_name: str,
         target_name: str,
+        temporary_identity: tuple[int, int],
+        expected_size: int,
+        expected_sha256: str,
     ) -> None:
-        original_release_reservation(
-            temporary_identity,
-            binding,
-            reservation_name,
-            target_name,
-        )
         temporary_files = list((data_dir / "Temp").iterdir())
         assert len(temporary_files) == 1
+        reservations = list(binding.path.glob(".version-*.reserve"))
+        assert len(reservations) == 1
         target = binding.path / target_name
         assert temporary_files[0].samefile(target)
+        assert temporary_files[0].samefile(reservations[0])
         target.unlink()
         target.write_bytes(other_content)
         assert not temporary_files[0].samefile(target)
+        original_require_integrity(
+            binding,
+            target_name,
+            temporary_identity,
+            expected_size,
+            expected_sha256,
+        )
 
     monkeypatch.setattr(
         files,
-        "_release_reservation_for_validation",
-        release_reservation_then_replace,
+        "_require_final_target_integrity",
+        replace_target_then_require_integrity,
     )
 
     with pytest.raises(RuntimeError, match="target.*integrity|ownership"):
@@ -1210,11 +1307,12 @@ def test_target_replaced_during_final_directory_check_is_rejected(
             if not candidate.name.startswith(".")
         ]
         reservations = list(binding.path.glob(".version-*.reserve"))
-        if published and not reservations and not replacement_done:
+        if published and reservations and not replacement_done:
             replacement_done = True
             temporary_files = list((data_dir / "Temp").iterdir())
             assert len(temporary_files) == 1
             assert temporary_files[0].samefile(published[0])
+            assert temporary_files[0].samefile(reservations[0])
             published[0].unlink()
             published[0].write_bytes(other_content)
             assert not temporary_files[0].samefile(published[0])
