@@ -372,7 +372,14 @@ def _source_is_unchanged(
     return len(signatures) == 1 and stat.S_ISREG(final_path_stat.st_mode)
 
 
-def _source_signature(source_stat: os.stat_result) -> tuple[int, int, int, int, int]:
+def _source_signature(source_stat: os.stat_result) -> tuple[int, ...]:
+    if os.name == "nt":
+        return (
+            source_stat.st_dev,
+            source_stat.st_ino,
+            source_stat.st_size,
+            source_stat.st_mtime_ns,
+        )
     return (
         source_stat.st_dev,
         source_stat.st_ino,

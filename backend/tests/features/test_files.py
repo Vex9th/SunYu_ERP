@@ -8,7 +8,8 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
-from typing import BinaryIO, Self
+from types import SimpleNamespace
+from typing import BinaryIO, Self, cast
 
 import pytest
 from fastapi import FastAPI
@@ -284,7 +285,11 @@ def test_unicode_equivalent_project_cannot_become_second_storage_owner(
     ]
 
 
-@pytest.mark.parametrize("content", [b"", b"0123456789" * 30_000])
+@pytest.mark.parametrize(
+    "content",
+    [b"", b"0123456789" * 30_000],
+    ids=["empty", "multiblock"],
+)
 def test_streams_empty_and_multiblock_files(tmp_path: Path, content: bytes) -> None:
     source = tmp_path / "payload.bin"
     source.write_bytes(content)
@@ -950,6 +955,46 @@ def test_same_size_and_mtime_source_inode_replacement_is_rejected(
     assert not list((tmp_path / "Data" / "Projects").rglob("*"))
 
 
+def test_windows_source_signature_ignores_unstable_change_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial = cast(
+        os.stat_result,
+        SimpleNamespace(
+            st_dev=11, st_ino=22, st_ctime_ns=200, st_size=4, st_mtime_ns=100
+        ),
+    )
+    later = cast(
+        os.stat_result,
+        SimpleNamespace(
+            st_dev=11, st_ino=22, st_ctime_ns=201, st_size=4, st_mtime_ns=100
+        ),
+    )
+    monkeypatch.setattr(files.os, "name", "nt")
+
+    assert files._source_signature(initial) == files._source_signature(later)
+
+
+def test_posix_source_signature_detects_change_time_difference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial = cast(
+        os.stat_result,
+        SimpleNamespace(
+            st_dev=11, st_ino=22, st_ctime_ns=200, st_size=4, st_mtime_ns=100
+        ),
+    )
+    later = cast(
+        os.stat_result,
+        SimpleNamespace(
+            st_dev=11, st_ino=22, st_ctime_ns=201, st_size=4, st_mtime_ns=100
+        ),
+    )
+    monkeypatch.setattr(files.os, "name", "posix")
+
+    assert files._source_signature(initial) != files._source_signature(later)
+
+
 def test_category_swapped_to_symlink_during_publish_is_detected_and_cleaned(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -985,8 +1030,14 @@ def test_category_swapped_to_symlink_during_publish_is_detected_and_cleaned(
 
     monkeypatch.setattr(files.os, "link", swap_category_then_link)
 
-    with pytest.raises(RuntimeError, match="outside data_dir"):
-        files.store_version(source, data_dir, "P-1", "图纸")
+    if os.name == "nt":
+        with pytest.raises(PermissionError):
+            files.store_version(source, data_dir, "P-1", "图纸")
+        category_dir = data_dir / "Projects" / "P-1" / "图纸"
+        assert list(category_dir.iterdir()) == []
+    else:
+        with pytest.raises(RuntimeError, match="outside data_dir"):
+            files.store_version(source, data_dir, "P-1", "图纸")
 
     assert list(outside.iterdir()) == []
     assert list((data_dir / "Temp").iterdir()) == []
@@ -1028,11 +1079,18 @@ def test_category_rebound_after_reservation_leaves_no_old_directory_link(
 
     monkeypatch.setattr(files.os, "link", rebind_before_target_link)
 
-    with pytest.raises(RuntimeError, match="outside data_dir|changed"):
-        files.store_version(source, data_dir, "P-1", "图纸")
-
-    assert displaced is not None
-    assert list(displaced.iterdir()) == []
+    if os.name == "nt":
+        with pytest.raises(PermissionError):
+            files.store_version(source, data_dir, "P-1", "图纸")
+        assert displaced is not None
+        assert not displaced.exists()
+        category_dir = data_dir / "Projects" / "P-1" / "图纸"
+        assert list(category_dir.iterdir()) == []
+    else:
+        with pytest.raises(RuntimeError, match="outside data_dir|changed"):
+            files.store_version(source, data_dir, "P-1", "图纸")
+        assert displaced is not None
+        assert list(displaced.iterdir()) == []
     assert list(outside.iterdir()) == []
     assert list((data_dir / "Temp").iterdir()) == []
 
@@ -1232,6 +1290,7 @@ def test_target_read_primary_survives_close_failure_and_rolls_back(
     assert list((data_dir / "Projects" / "P-1" / "图纸").iterdir()) == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX directory descriptors")
 @pytest.mark.parametrize("failure_type", [OSError, KeyboardInterrupt, SystemExit])
 def test_bound_directory_constructor_failure_closes_posix_fd(
     tmp_path: Path,
