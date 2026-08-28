@@ -140,12 +140,12 @@ jobs:
           $first = Start-SunYuProcess 'first'
           try {
             Wait-SunYuHealth $first
-            $home = Invoke-WebRequest -Uri 'http://127.0.0.1:8765/' -UseBasicParsing
-            if ($home.StatusCode -ne 200 -or $home.Content -notmatch '<div id="app">') {
+            $indexResponse = Invoke-WebRequest -Uri 'http://127.0.0.1:8765/' -UseBasicParsing
+            if ($indexResponse.StatusCode -ne 200 -or $indexResponse.Content -notmatch '<div id="app">') {
               throw 'Packaged frontend index was not served'
             }
             $assetMatch = [regex]::Match(
-              $home.Content,
+              $indexResponse.Content,
               '(?:src|href)="(?<path>/assets/[^"]+)"'
             )
             if (-not $assetMatch.Success) {

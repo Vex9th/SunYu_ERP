@@ -37,6 +37,15 @@ def test_windows_smoke_keeps_the_restarted_process_alive() -> None:
     assert second_start < second_alive < second_stop
 
 
+def test_windows_smoke_does_not_shadow_powershell_home_variable() -> None:
+    workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "$home" not in workflow.lower()
+    assert "$indexResponse = Invoke-WebRequest" in workflow
+    assert "$indexResponse.StatusCode" in workflow
+    assert "$indexResponse.Content" in workflow
+
+
 def test_public_boundary_ignores_structured_log_directory() -> None:
     ignore_rules = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
 
