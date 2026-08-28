@@ -5,10 +5,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn
 
+from backend.app.core.storage_paths import project_code_identity
+
 _TRANSACTION_KEYWORDS = frozenset(
     {"BEGIN", "COMMIT", "END", "RELEASE", "ROLLBACK", "SAVEPOINT"}
 )
 _UTF8_BOM = "\ufeff"
+_PROJECT_CODE_IDENTITY_MIGRATION = "004_project_code_identity"
+_PROJECT_CODE_IDENTITY_FUNCTION = "project_code_identity"
 
 
 class MigrationError(RuntimeError):
@@ -42,7 +46,15 @@ def apply_migrations(
         if version in applied_versions:
             continue
         statements = _read_statements(migration_path)
-        if _apply_one(connection, version, statements):
+        if version == _PROJECT_CODE_IDENTITY_MIGRATION:
+            applied = _apply_project_code_identity_migration(
+                connection,
+                version,
+                statements,
+            )
+        else:
+            applied = _apply_one(connection, version, statements)
+        if applied:
             applied_now.append(version)
 
     return applied_now
@@ -227,6 +239,51 @@ def _apply_one(
         _raise_after_rollback(connection, version, exc)
 
 
+def _apply_project_code_identity_migration(
+    connection: sqlite3.Connection,
+    version: str,
+    statements: list[str],
+) -> bool:
+    try:
+        connection.create_function(
+            _PROJECT_CODE_IDENTITY_FUNCTION,
+            1,
+            project_code_identity,
+            deterministic=True,
+        )
+    except sqlite3.Error as exc:
+        raise MigrationError(
+            f"migration {version} could not register project code identity: {exc}"
+        ) from exc
+
+    primary: BaseException | None = None
+    try:
+        return _apply_one(connection, version, statements)
+    except BaseException as failure:
+        primary = failure
+        raise
+    finally:
+        try:
+            connection.create_function(
+                _PROJECT_CODE_IDENTITY_FUNCTION,
+                1,
+                None,
+            )
+        except BaseException as cleanup_failure:
+            if primary is not None:
+                primary.add_note(
+                    "project code identity UDF cleanup failed: "
+                    f"{type(cleanup_failure).__name__}"
+                )
+            elif isinstance(cleanup_failure, sqlite3.Error):
+                raise MigrationError(
+                    f"migration {version} could not remove project code identity UDF: "
+                    f"{cleanup_failure}"
+                ) from cleanup_failure
+            else:
+                raise
+
+
 def _raise_after_rollback(
     connection: sqlite3.Connection,
     version: str,
@@ -245,6 +302,14 @@ def _raise_after_rollback(
 
     if isinstance(failure, MigrationError):
         raise failure
+    if (
+        version == _PROJECT_CODE_IDENTITY_MIGRATION
+        and isinstance(failure, sqlite3.IntegrityError)
+        and "projects_with_identity.project_code_key" in str(failure)
+    ):
+        raise MigrationError(
+            f"migration {version} failed: Unicode project code identity collision"
+        ) from failure
     if isinstance(failure, sqlite3.Error):
         raise MigrationError(f"migration {version} failed: {failure}") from failure
     raise failure

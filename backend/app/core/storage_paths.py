@@ -34,3 +34,9 @@ def normalize_project_code(value: str) -> str:
     ):
         raise ValueError("project_code must be a safe single path segment")
     return normalized
+
+
+def project_code_identity(value: str) -> str:
+    """Return the internal cross-platform identity for a project code."""
+    normalized = normalize_project_code(value)
+    return unicodedata.normalize("NFC", normalized).casefold()

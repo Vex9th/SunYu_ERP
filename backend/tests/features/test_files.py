@@ -4,16 +4,23 @@ import hashlib
 import os
 import re
 import sqlite3
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
 from typing import BinaryIO, Self
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+from backend.app.core.config import Settings
 from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
+from backend.app.core.security import SESSION_COOKIE_NAME, create_session_token
+from backend.app.core.storage_paths import project_code_identity
 from backend.app.features import files
+from backend.app.features.projects import create_projects_router
 
 
 def _migrations_dir() -> Path:
@@ -38,6 +45,7 @@ def test_documents_migration_creates_tables_and_enforces_constraints(
             "001_foundation",
             "002_documents",
             "003_companies_projects",
+            "004_project_code_identity",
         ]
         assert {
             row["name"]
@@ -187,6 +195,93 @@ def test_store_version_uses_normalized_project_code(tmp_path: Path) -> None:
 
     assert stored.relative_path.parts[:3] == ("Projects", "PRJ-001", "图纸")
     assert not (data_dir / "Projects" / "  PRJ-001\t").exists()
+
+
+def test_unicode_equivalent_project_cannot_become_second_storage_owner(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "erp.sqlite3"
+    connection = connect_database(database_path)
+    try:
+        apply_migrations(connection, _migrations_dir())
+        connection.execute(
+            """
+            INSERT INTO companies (id, name, created_at, updated_at)
+            VALUES (1, '示例公司', 'now', 'now')
+            """
+        )
+    finally:
+        connection.close()
+
+    settings = Settings(
+        config_path=tmp_path / "config.json",
+        data_dir=tmp_path / "Data",
+        backup_dir=None,
+        backup_interval_hours=24,
+        backup_retention_days=30,
+        host="127.0.0.1",
+        port=8765,
+        session_secret="test-session-secret-with-at-least-32-bytes",
+    )
+
+    def get_connection() -> Iterator[sqlite3.Connection]:
+        owned = connect_database(database_path)
+        try:
+            yield owned
+        finally:
+            owned.close()
+
+    app = FastAPI()
+    app.include_router(create_projects_router(get_connection, lambda: settings))
+    stored_code = "Å"
+    equivalent_code = "A\u030a"
+    identity = project_code_identity(stored_code)
+    assert identity == project_code_identity(equivalent_code)
+    payload = {
+        "project_code": stored_code,
+        "company_id": 1,
+        "name": "现有项目",
+        "description": None,
+    }
+    with TestClient(app) as client:
+        client.cookies.set(
+            SESSION_COOKIE_NAME,
+            create_session_token(settings.session_secret),
+        )
+        created = client.post("/api/projects", json=payload)
+        duplicate = client.post(
+            "/api/projects",
+            json={**payload, "project_code": equivalent_code, "name": "等价项目"},
+        )
+
+    assert created.status_code == 201
+    registered_code = created.json()["project_code"]
+    assert registered_code == stored_code
+    assert duplicate.status_code == 409
+    assert duplicate.json() == {"detail": "Project code already exists"}
+
+    connection = connect_database(database_path)
+    try:
+        registered = connection.execute(
+            "SELECT project_code, project_code_key FROM projects"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert [tuple(row) for row in registered] == [(registered_code, identity)]
+
+    source = tmp_path / "drawing.dwg"
+    source.write_bytes(b"registered-project-only")
+    stored = files.store_version(
+        source,
+        settings.data_dir,
+        registered_code,
+        "图纸",
+    )
+
+    assert stored.relative_path.parts[:3] == ("Projects", registered_code, "图纸")
+    assert [path.name for path in (settings.data_dir / "Projects").iterdir()] == [
+        registered_code
+    ]
 
 
 @pytest.mark.parametrize("content", [b"", b"0123456789" * 30_000])

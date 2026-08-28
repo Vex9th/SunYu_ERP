@@ -20,6 +20,7 @@ from backend.app.core.security import (
     SESSION_COOKIE_NAME,
     create_session_token,
 )
+from backend.app.core.storage_paths import project_code_identity
 from backend.app.features import companies as companies_module
 from backend.app.features.companies import create_companies_router
 
@@ -413,15 +414,18 @@ def test_delete_company_rejects_every_project_reference_without_changes(
     connection = connect_database(harness.database_path)
     try:
         archived_at = NOW.isoformat() if project_status == "archived" else None
+        project_code = f"P-{project_status}"
         connection.execute(
             """
             INSERT INTO projects
-                (project_code, company_id, name, status, archived_at,
+                (project_code, project_code_key, company_id, name,
+                 status, archived_at,
                  created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                f"P-{project_status}",
+                project_code,
+                project_code_identity(project_code),
                 company["id"],
                 "测试项目",
                 project_status,
@@ -994,15 +998,18 @@ def test_expected_integrity_conflicts_do_not_log_errors(
     connection = connect_database(harness.database_path)
     try:
         archived_at = NOW.isoformat() if project_status == "archived" else None
+        project_code = f"EXPECTED-{project_status}"
         connection.execute(
             """
             INSERT INTO projects
-                (project_code, company_id, name, status, archived_at,
+                (project_code, project_code_key, company_id, name,
+                 status, archived_at,
                  created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                f"EXPECTED-{project_status}",
+                project_code,
+                project_code_identity(project_code),
                 company["id"],
                 "预期项目引用",
                 project_status,
@@ -1177,14 +1184,17 @@ class _ProjectRaceConnection:
             company_id = cast(tuple[int], parameters)[0]
             competitor = connect_database(self._database_path)
             try:
+                project_code = f"RACE-{company_id}"
                 competitor.execute(
                     """
                     INSERT INTO projects
-                        (project_code, company_id, name, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
+                        (project_code, project_code_key, company_id, name,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        f"RACE-{company_id}",
+                        project_code,
+                        project_code_identity(project_code),
                         company_id,
                         "并发项目",
                         NOW.isoformat(),

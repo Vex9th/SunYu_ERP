@@ -2,7 +2,31 @@ from __future__ import annotations
 
 import pytest
 
+from backend.app.core import storage_paths
 from backend.app.core.storage_paths import normalize_project_code
+
+
+def test_storage_paths_exposes_project_code_identity() -> None:
+    assert hasattr(storage_paths, "project_code_identity")
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    [
+        ("PRJ-Ä", "prj-ä", "prj-ä"),
+        ("Å", "A\u030a", "å"),
+        ("  PRJ-001\t", "prj-001", "prj-001"),
+    ],
+)
+def test_project_code_identity_normalizes_unicode_and_case(
+    left: str,
+    right: str,
+    expected: str,
+) -> None:
+    identity = storage_paths.project_code_identity
+
+    assert identity(left) == expected
+    assert identity(right) == expected
 
 
 @pytest.mark.parametrize(

@@ -81,6 +81,7 @@ def test_lifespan_applies_migrations_and_closes_every_owned_connection(
         "001_foundation",
         "002_documents",
         "003_companies_projects",
+        "004_project_code_identity",
     }
 
 

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
 from threading import Barrier
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -528,6 +528,69 @@ def test_concurrent_runners_apply_each_version_only_once(
         )
     finally:
         observer.close()
+
+
+class _FunctionTrackingConnection:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+        self.function_calls: list[tuple[str, int, object, bool]] = []
+
+    def create_function(
+        self,
+        name: str,
+        num_params: int,
+        function: Any,
+        *,
+        deterministic: bool = False,
+    ) -> None:
+        self.function_calls.append((name, num_params, function, deterministic))
+        self.connection.create_function(
+            name,
+            num_params,
+            function,
+            deterministic=deterministic,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.connection, name)
+
+
+def test_unicode_identity_udf_is_deterministic_and_migration_scoped(
+    tmp_path: Path,
+) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_migration(
+        migrations_dir,
+        "004_project_code_identity.sql",
+        _ledger_sql()
+        + """
+            CREATE TABLE migrated_identity (value TEXT NOT NULL);
+            INSERT INTO migrated_identity
+            VALUES (project_code_identity('Å'));
+        """,
+    )
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    tracked = _FunctionTrackingConnection(connection)
+    proxy = cast(sqlite3.Connection, tracked)
+    try:
+        assert _apply_migrations()(proxy, migrations_dir) == [
+            "004_project_code_identity"
+        ]
+        assert (
+            connection.execute("SELECT value FROM migrated_identity").fetchone()[0]
+            == "å"
+        )
+        assert len(tracked.function_calls) == 2
+        registered = tracked.function_calls[0]
+        assert registered[:2] == ("project_code_identity", 1)
+        assert callable(registered[2])
+        assert registered[3] is True
+        removed = tracked.function_calls[1]
+        assert removed == ("project_code_identity", 1, None, False)
+        with pytest.raises(sqlite3.OperationalError):
+            connection.execute("SELECT project_code_identity('PRJ-001')")
+    finally:
+        connection.close()
 
 
 def test_begin_immediate_lock_error_has_migration_context(tmp_path: Path) -> None:

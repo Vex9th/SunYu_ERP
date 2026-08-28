@@ -10,7 +10,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from backend.app.core.config import Settings
 from backend.app.core.database import transaction
-from backend.app.core.storage_paths import normalize_project_code
+from backend.app.core.storage_paths import (
+    normalize_project_code,
+    project_code_identity,
+)
 from backend.app.features.auth import require_authenticated_session
 
 logger = logging.getLogger(__name__)
@@ -150,12 +153,14 @@ def create_projects_router(
                 cursor = connection.execute(
                     """
                     INSERT INTO projects
-                        (project_code, company_id, name, description,
+                        (project_code, project_code_key, company_id,
+                         name, description,
                          created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         payload["project_code"],
+                        payload["project_code_key"],
                         payload["company_id"],
                         payload["name"],
                         payload["description"],
@@ -192,12 +197,12 @@ def create_projects_router(
                     UPDATE projects
                     SET status = 'archived', archive_reason = ?,
                         archived_at = ?, updated_at = ?
-                    WHERE project_code = ? COLLATE NOCASE
+                    WHERE project_code_key = ?
                       AND status = 'active'
                     """,
                     (payload["reason"], timestamp, timestamp, project_code),
                 )
-                response = _project_by_code(connection, project_code)
+                response = _project_by_key(connection, project_code)
                 if response is None:
                     raise _project_not_found()
         except sqlite3.IntegrityError as exc:
@@ -214,7 +219,7 @@ def create_projects_router(
     ) -> dict[str, object]:
         try:
             with transaction(connection):
-                project = _project_by_code(connection, project_code)
+                project = _project_by_key(connection, project_code)
                 if project is None:
                     raise _project_not_found()
                 company = _company_by_id(connection, int(project["company_id"]))
@@ -224,7 +229,10 @@ def create_projects_router(
                     connection,
                     int(project["company_id"]),
                 )
-                documents = _document_summary(connection, project_code)
+                documents = _document_summary(
+                    connection,
+                    str(project["project_code"]),
+                )
         except sqlite3.Error as exc:
             raise _unexpected_database_failure(exc) from None
         return {
@@ -273,6 +281,7 @@ async def _read_project_payload(request: Request) -> ProjectPayload:
     )
     return {
         "project_code": project_code,
+        "project_code_key": project_code_identity(project_code),
         "company_id": company_id,
         "name": name,
         "description": description,
@@ -311,7 +320,8 @@ def _read_project_status(request: Request) -> str:
 
 
 def _read_path_project_code(project_code: str) -> str:
-    return _normalize_project_code(project_code, detail="Invalid project code")
+    normalized = _normalize_project_code(project_code, detail="Invalid project code")
+    return project_code_identity(normalized)
 
 
 def _normalize_project_code(value: object, *, detail: str) -> str:
@@ -364,9 +374,9 @@ def _project_by_id(
     return _row_response(row, _PROJECT_RESPONSE_FIELDS)
 
 
-def _project_by_code(
+def _project_by_key(
     connection: sqlite3.Connection,
-    project_code: str,
+    project_code_key: str,
 ) -> dict[str, object] | None:
     row = connection.execute(
         """
@@ -374,9 +384,9 @@ def _project_by_code(
             id, project_code, company_id, name, description, status,
             archive_reason, archived_at, created_at, updated_at
         FROM projects
-        WHERE project_code = ? COLLATE NOCASE
+        WHERE project_code_key = ?
         """,
-        (project_code,),
+        (project_code_key,),
     ).fetchone()
     if row is None:
         return None

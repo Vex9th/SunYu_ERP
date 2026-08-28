@@ -7,11 +7,16 @@ from pathlib import Path
 import pytest
 
 from backend.app.core.database import connect_database
-from backend.app.core.migrations import apply_migrations
+from backend.app.core.migrations import MigrationError, apply_migrations
+from backend.app.core.storage_paths import project_code_identity
 
 
 def _migrations_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "migrations"
+
+
+def test_unicode_project_identity_migration_exists() -> None:
+    assert (_migrations_dir() / "004_project_code_identity.sql").is_file()
 
 
 @pytest.fixture
@@ -22,6 +27,7 @@ def business_schema(tmp_path: Path) -> Iterator[sqlite3.Connection]:
             "001_foundation",
             "002_documents",
             "003_companies_projects",
+            "004_project_code_identity",
         ]
         yield connection
     finally:
@@ -43,6 +49,14 @@ def _insert_company(
     )
 
 
+def _copy_migration(staged_dir: Path, filename: str) -> None:
+    staged_dir.mkdir(exist_ok=True)
+    (staged_dir / filename).write_text(
+        (_migrations_dir() / filename).read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+
 def _insert_project(
     connection: sqlite3.Connection,
     *,
@@ -52,15 +66,27 @@ def _insert_project(
     status: str = "active",
 ) -> None:
     archived_at = "2026-08-28T00:00:00+00:00" if status == "archived" else None
+    try:
+        project_code_key = project_code_identity(project_code)
+    except (TypeError, ValueError):
+        project_code_key = f"invalid-test-key-{project_id}"
     connection.execute(
         """
         INSERT INTO projects
-            (id, project_code, company_id, name, status, archived_at,
+            (id, project_code, project_code_key, company_id, name,
+             status, archived_at,
              created_at, updated_at)
-        VALUES (?, ?, ?, '示例项目', ?, ?,
+        VALUES (?, ?, ?, ?, '示例项目', ?, ?,
                 '2026-08-28T00:00:00+00:00', '2026-08-28T00:00:00+00:00')
         """,
-        (project_id, project_code, company_id, status, archived_at),
+        (
+            project_id,
+            project_code,
+            project_code_key,
+            company_id,
+            status,
+            archived_at,
+        ),
     )
 
 
@@ -101,6 +127,7 @@ def test_business_migration_creates_exact_columns(
         "projects": [
             ("id", "INTEGER", 0, None, 1),
             ("project_code", "TEXT", 1, None, 0),
+            ("project_code_key", "TEXT", 1, None, 0),
             ("company_id", "INTEGER", 1, None, 0),
             ("name", "TEXT", 1, None, 0),
             ("description", "TEXT", 0, None, 0),
@@ -130,6 +157,7 @@ def test_business_migration_creates_required_indexes(
 ) -> None:
     expected_indexes = {
         "idx_contacts_company": [("company_id", 0), ("id", 0)],
+        "idx_projects_project_code_key": [("project_code_key", 0)],
         "idx_projects_company": [("company_id", 0), ("id", 0)],
         "idx_projects_status_created": [
             ("status", 0),
@@ -148,6 +176,16 @@ def test_business_migration_creates_required_indexes(
             if row["key"]
         ]
         assert actual == expected
+
+    identity_index = business_schema.execute("PRAGMA index_list('projects')").fetchall()
+    assert (
+        next(
+            row
+            for row in identity_index
+            if row["name"] == "idx_projects_project_code_key"
+        )["unique"]
+        == 1
+    )
 
 
 def test_business_migration_configures_foreign_key_delete_actions(
@@ -239,6 +277,205 @@ def test_business_migration_upgrades_existing_documents_without_rewriting_them(
             VALUES ('NEW-ORPHAN', '合同', '未注册项目合同', '2026-08-28T01:00:00+00:00')
             """
         )
+    finally:
+        connection.close()
+
+
+def test_unicode_identity_migration_backfills_and_preserves_existing_state(
+    tmp_path: Path,
+) -> None:
+    staged_migrations = tmp_path / "migrations"
+    for filename in (
+        "001_foundation.sql",
+        "002_documents.sql",
+        "003_companies_projects.sql",
+    ):
+        _copy_migration(staged_migrations, filename)
+
+    database_path = tmp_path / "erp.sqlite3"
+    connection = connect_database(database_path)
+    try:
+        assert apply_migrations(connection, staged_migrations) == [
+            "001_foundation",
+            "002_documents",
+            "003_companies_projects",
+        ]
+        _insert_company(connection, company_id=7, name="迁移公司")
+        original_project = (
+            11,
+            "PRJ-Ä",
+            7,
+            "迁移项目",
+            "保留描述",
+            "archived",
+            "保留原因",
+            "2026-08-28T03:00:00+00:00",
+            "2026-08-28T01:00:00+00:00",
+            "2026-08-28T03:00:00+00:00",
+        )
+        connection.execute(
+            """
+            INSERT INTO projects
+                (id, project_code, company_id, name, description, status,
+                 archive_reason, archived_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            original_project,
+        )
+        original_document = (
+            19,
+            "ORPHAN-004",
+            "合同",
+            "孤立合同",
+            "2026-08-28T02:00:00+00:00",
+        )
+        connection.execute(
+            "INSERT INTO documents VALUES (?, ?, ?, ?, ?)",
+            original_document,
+        )
+
+        _copy_migration(staged_migrations, "004_project_code_identity.sql")
+        assert apply_migrations(connection, staged_migrations) == [
+            "004_project_code_identity"
+        ]
+
+        migrated = connection.execute(
+            """
+            SELECT id, project_code, project_code_key, company_id, name,
+                   description, status, archive_reason, archived_at,
+                   created_at, updated_at
+            FROM projects
+            """
+        ).fetchone()
+        assert tuple(migrated) == (
+            original_project[0],
+            original_project[1],
+            project_code_identity(original_project[1]),
+            *original_project[2:],
+        )
+        assert tuple(connection.execute("SELECT * FROM documents").fetchone()) == (
+            original_document
+        )
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert (
+            connection.execute("PRAGMA foreign_key_list('projects')").fetchall()[0][
+                "on_delete"
+            ]
+            == "RESTRICT"
+        )
+        index = next(
+            row
+            for row in connection.execute("PRAGMA index_list('projects')")
+            if row["name"] == "idx_projects_project_code_key"
+        )
+        assert index["unique"] == 1
+        assert [
+            (row["name"], row["coll"])
+            for row in connection.execute(
+                "PRAGMA index_xinfo('idx_projects_project_code_key')"
+            )
+            if row["key"]
+        ] == [("project_code_key", "BINARY")]
+        schema_sql = " ".join(
+            row["sql"] or ""
+            for row in connection.execute(
+                "SELECT sql FROM sqlite_master WHERE tbl_name = 'projects'"
+            )
+        )
+        assert "project_code_identity" not in schema_sql
+        with pytest.raises(sqlite3.OperationalError):
+            connection.execute("SELECT project_code_identity('PRJ-001')")
+    finally:
+        connection.close()
+
+    raw = sqlite3.connect(database_path)
+    try:
+        assert raw.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        raw.execute(
+            """
+            INSERT INTO documents
+                (project_code, category, logical_name, created_at)
+            VALUES ('POST-004-ORPHAN', '图纸', '孤立图纸', 'now')
+            """
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+
+def test_unicode_identity_collision_rolls_back_schema_data_and_ledger(
+    tmp_path: Path,
+) -> None:
+    staged_migrations = tmp_path / "migrations"
+    for filename in (
+        "001_foundation.sql",
+        "002_documents.sql",
+        "003_companies_projects.sql",
+    ):
+        _copy_migration(staged_migrations, filename)
+
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    try:
+        assert len(apply_migrations(connection, staged_migrations)) == 3
+        _insert_company(connection)
+        for project_id, project_code in ((1, "PRJ-Ä"), (2, "prj-ä")):
+            connection.execute(
+                """
+                INSERT INTO projects
+                    (id, project_code, company_id, name, created_at, updated_at)
+                VALUES (?, ?, 1, ?, 'created', 'updated')
+                """,
+                (project_id, project_code, f"项目 {project_id}"),
+            )
+        before_rows = [
+            tuple(row)
+            for row in connection.execute("SELECT * FROM projects ORDER BY id")
+        ]
+        before_schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'projects'"
+        ).fetchone()[0]
+
+        _copy_migration(staged_migrations, "004_project_code_identity.sql")
+        with pytest.raises(
+            MigrationError,
+            match="Unicode project code identity collision",
+        ) as raised:
+            apply_migrations(connection, staged_migrations)
+
+        assert isinstance(raised.value.__cause__, sqlite3.IntegrityError)
+        assert not connection.in_transaction
+        assert [
+            row["version"]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ] == [
+            "001_foundation",
+            "002_documents",
+            "003_companies_projects",
+        ]
+        assert (
+            connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'projects'"
+            ).fetchone()[0]
+            == before_schema
+        )
+        assert "project_code_key" not in {
+            row["name"] for row in connection.execute("PRAGMA table_info('projects')")
+        }
+        assert [
+            tuple(row)
+            for row in connection.execute("SELECT * FROM projects ORDER BY id")
+        ] == before_rows
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'projects_with_identity'"
+            ).fetchone()
+            is None
+        )
+        assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        with pytest.raises(sqlite3.OperationalError):
+            connection.execute("SELECT project_code_identity('PRJ-001')")
     finally:
         connection.close()
 
@@ -511,8 +748,8 @@ def test_project_rejects_invalid_text_or_archive_state(
 ) -> None:
     _insert_company(business_schema)
     placeholders = ", ".join("?" for _ in values)
-    required_columns = "project_code, company_id"
-    required_values = "'PRJ-001', 1"
+    required_columns = "project_code, project_code_key, company_id"
+    required_values = "'PRJ-001', 'prj-001', 1"
     if columns != "name":
         required_columns += ", name"
         required_values += ", '示例项目'"
@@ -532,8 +769,9 @@ def test_project_defaults_to_active(business_schema: sqlite3.Connection) -> None
     business_schema.execute(
         """
         INSERT INTO projects
-            (project_code, company_id, name, description, created_at, updated_at)
-        VALUES ('PRJ-001', 1, '示例项目', ' 有效描述 ', 'now', 'now')
+            (project_code, project_code_key, company_id, name, description,
+             created_at, updated_at)
+        VALUES ('PRJ-001', 'prj-001', 1, '示例项目', ' 有效描述 ', 'now', 'now')
         """
     )
     assert (
@@ -551,9 +789,9 @@ def test_project_optional_text_may_retain_surrounding_whitespace(
     business_schema.execute(
         """
         INSERT INTO projects
-            (project_code, company_id, name, description, status,
+            (project_code, project_code_key, company_id, name, description, status,
              archive_reason, archived_at, created_at, updated_at)
-        VALUES ('PRJ-001', 1, '归档项目', '\t 有效描述 \n', 'archived',
+        VALUES ('PRJ-001', 'prj-001', 1, '归档项目', '\t 有效描述 \n', 'archived',
                 '\r 有效原因 \t', 'now', 'now', 'now')
         """
     )

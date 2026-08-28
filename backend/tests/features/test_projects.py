@@ -316,6 +316,45 @@ def test_duplicate_project_code_is_case_insensitive_and_unchanged(
 
 
 @pytest.mark.parametrize(
+    ("stored_code", "equivalent_code"),
+    [
+        ("PRJ-Ä", "prj-ä"),
+        ("Å", "A\u030a"),
+    ],
+)
+def test_unicode_equivalent_project_codes_conflict_and_resolve_same_project(
+    harness: ProjectsHarness,
+    stored_code: str,
+    equivalent_code: str,
+) -> None:
+    company_id = _insert_company(harness)
+    with harness.client() as client:
+        original = _create_project(
+            client,
+            stored_code,
+            company_id=company_id,
+        )
+        duplicate = client.post(
+            "/api/projects",
+            json=_project_payload(equivalent_code, company_id=company_id),
+        )
+        dashboard = client.get(f"/api/projects/{equivalent_code}/dashboard")
+        archived = client.post(
+            f"/api/projects/{equivalent_code}/archive",
+            json={"reason": "等价编号归档"},
+        )
+
+    assert duplicate.status_code == 409
+    assert duplicate.json() == {"detail": "Project code already exists"}
+    assert dashboard.status_code == 200
+    assert dashboard.json()["project"] == original
+    assert archived.status_code == 200
+    assert archived.json()["project_code"] == stored_code
+    assert archived.json()["archive_reason"] == "等价编号归档"
+    assert "project_code_key" not in duplicate.text + dashboard.text + archived.text
+
+
+@pytest.mark.parametrize(
     "payload",
     [
         {},
@@ -837,6 +876,38 @@ def test_concurrent_duplicate_creation_has_one_201_and_one_409(
         rows = connection.execute("SELECT project_code FROM projects").fetchall()
         assert len(rows) == 1
         assert rows[0]["project_code"].casefold() == "race-a"
+    finally:
+        connection.close()
+
+
+def test_concurrent_unicode_equivalent_creation_has_one_201_and_one_409(
+    tmp_path: Path,
+) -> None:
+    barrier = threading.Barrier(2)
+    harness = _build_harness(
+        tmp_path,
+        dml_barrier=("INSERT INTO PROJECTS", barrier),
+    )
+    company_id = _insert_company(harness)
+
+    def create(code: str) -> tuple[int, dict[str, Any]]:
+        with harness.client() as client:
+            response = client.post(
+                "/api/projects",
+                json=_project_payload(code, company_id=company_id),
+            )
+            return response.status_code, cast(dict[str, Any], response.json())
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(create, ("Å", "A\u030a")))
+
+    assert sorted(status_code for status_code, _ in results) == [201, 409]
+    assert next(body for code, body in results if code == 409) == {
+        "detail": "Project code already exists"
+    }
+    connection = connect_database(harness.database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 1
     finally:
         connection.close()
 
