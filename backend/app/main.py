@@ -13,6 +13,7 @@ from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
 from backend.app.features.auth import create_auth_router
 from backend.app.features.backups import create_backup, prune_backups
+from backend.app.features.companies import create_companies_router
 from backend.app.features.system import (
     BackupCreator,
     BackupJobResult,
@@ -137,6 +138,7 @@ def create_app(
             )
 
     application.include_router(create_auth_router(get_connection, get_session_secret))
+    application.include_router(create_companies_router(get_connection, get_settings))
     application.include_router(
         create_system_router(
             get_connection,

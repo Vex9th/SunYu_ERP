@@ -122,6 +122,22 @@ def test_authentication_flow_guards_system_routes_and_reports_setup_state(
     assert after_logout.status_code == 401
 
 
+def test_create_app_mounts_authenticated_companies_router(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    application = main_module.create_app(config_path=config_path)
+
+    with TestClient(application) as client:
+        unauthenticated = client.get("/api/companies")
+        _login(client)
+        authenticated = client.get("/api/companies")
+
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.json() == {"detail": "Authentication required"}
+    assert authenticated.status_code == 200
+    assert authenticated.json() == []
+
+
 def test_partially_started_scheduler_is_stopped_without_masking_start_failure(
     tmp_path: Path,
 ) -> None:
