@@ -420,6 +420,66 @@ def test_sync_file_opens_a_writable_binary_descriptor(
     assert opened == [(path, expected_flags)]
 
 
+def test_windows_file_signature_ignores_unstable_change_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial = cast(
+        os.stat_result,
+        SimpleNamespace(
+            st_dev=11,
+            st_ino=22,
+            st_mode=0o100600,
+            st_ctime_ns=200,
+            st_size=4,
+            st_mtime_ns=100,
+        ),
+    )
+    later = cast(
+        os.stat_result,
+        SimpleNamespace(
+            st_dev=11,
+            st_ino=22,
+            st_mode=0o100600,
+            st_ctime_ns=201,
+            st_size=4,
+            st_mtime_ns=100,
+        ),
+    )
+    monkeypatch.setattr(backup_module.os, "name", "nt")
+
+    assert backup_module._file_signature(initial) == backup_module._file_signature(later)
+
+
+def test_posix_file_signature_detects_change_time_difference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial = cast(
+        os.stat_result,
+        SimpleNamespace(
+            st_dev=11,
+            st_ino=22,
+            st_mode=0o100600,
+            st_ctime_ns=200,
+            st_size=4,
+            st_mtime_ns=100,
+        ),
+    )
+    later = cast(
+        os.stat_result,
+        SimpleNamespace(
+            st_dev=11,
+            st_ino=22,
+            st_mode=0o100600,
+            st_ctime_ns=201,
+            st_size=4,
+            st_mtime_ns=100,
+        ),
+    )
+    monkeypatch.setattr(backup_module.os, "name", "posix")
+
+    assert backup_module._file_signature(initial) != backup_module._file_signature(later)
+
+
 @pytest.mark.parametrize(
     "function_name",
     ("_copy_file", "_copy_projects", "_write_manifest", "verify_backup", "_publish_stage"),

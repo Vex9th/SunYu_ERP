@@ -552,7 +552,15 @@ def _copy_file(source: Path, target: Path) -> tuple[int, str]:
     return size_bytes, digest.hexdigest()
 
 
-def _file_signature(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+def _file_signature(value: os.stat_result) -> tuple[int, ...]:
+    if os.name == "nt":
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_size,
+            value.st_mtime_ns,
+        )
     return (
         value.st_dev,
         value.st_ino,
