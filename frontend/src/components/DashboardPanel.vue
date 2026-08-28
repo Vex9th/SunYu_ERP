@@ -2,6 +2,9 @@
 import { computed, reactive, ref, watch } from 'vue'
 
 import type { BackupSettingsPayload, SystemOverview } from '../types'
+import CompanyCenter from './CompanyCenter.vue'
+import ProjectCenter from './ProjectCenter.vue'
+import ProjectDashboard from './ProjectDashboard.vue'
 
 const props = defineProps<{
   overview: SystemOverview | null
@@ -19,7 +22,13 @@ const emit = defineEmits<{
   saveBackup: [settings: BackupSettingsPayload]
   backupNow: []
   refreshOverview: []
+  'session-expired': [message: string]
 }>()
+
+type WorkspacePage = 'projects' | 'companies' | 'system'
+
+const selectedPage = ref<WorkspacePage>('projects')
+const dashboardProjectCode = ref<string | null>(null)
 
 const backupForm = reactive({
   enabled: false,
@@ -88,6 +97,17 @@ function saveBackup(): void {
     retention_days: backupForm.retentionDays,
   })
 }
+
+function selectPage(index: string): void {
+  if (index !== 'projects' && index !== 'companies' && index !== 'system') return
+  selectedPage.value = index
+  dashboardProjectCode.value = null
+}
+
+function openProjectDashboard(projectCode: string): void {
+  selectedPage.value = 'projects'
+  dashboardProjectCode.value = projectCode
+}
 </script>
 
 <template>
@@ -117,24 +137,38 @@ function saveBackup(): void {
 
     <el-container>
       <el-aside width="220px">
-        <el-menu default-active="projects">
-          <el-menu-item index="projects">项目中心</el-menu-item>
-          <el-menu-item index="contacts" disabled>联系人</el-menu-item>
+        <el-menu :default-active="selectedPage" @select="selectPage">
+          <el-menu-item data-testid="nav-projects" index="projects">项目中心</el-menu-item>
+          <el-menu-item data-testid="nav-companies" index="companies">客户与联系人</el-menu-item>
+          <el-menu-item data-testid="nav-system" index="system">系统与备份</el-menu-item>
           <el-menu-item index="inventory" disabled>库存</el-menu-item>
           <el-menu-item index="purchasing" disabled>采购</el-menu-item>
         </el-menu>
       </el-aside>
 
       <el-main>
-        <el-space direction="vertical" alignment="stretch" fill :size="16">
-          <el-alert
-            title="项目中心 · 模块建设中"
-            description="当前阶段先保证登录、本地数据目录与备份可靠；项目、联系人、库存和采购业务将在后续阶段接入。"
-            type="warning"
-            show-icon
-            :closable="false"
-          />
-
+        <ProjectDashboard
+          v-if="dashboardProjectCode"
+          :project-code="dashboardProjectCode"
+          @back="dashboardProjectCode = null"
+          @session-expired="emit('session-expired', $event)"
+        />
+        <ProjectCenter
+          v-else-if="selectedPage === 'projects'"
+          @open-dashboard="openProjectDashboard"
+          @session-expired="emit('session-expired', $event)"
+        />
+        <CompanyCenter
+          v-else-if="selectedPage === 'companies'"
+          @session-expired="emit('session-expired', $event)"
+        />
+        <el-space
+          v-show="selectedPage === 'system' && !dashboardProjectCode"
+          direction="vertical"
+          alignment="stretch"
+          fill
+          :size="16"
+        >
           <el-alert
             v-if="requestError"
             data-testid="request-error"

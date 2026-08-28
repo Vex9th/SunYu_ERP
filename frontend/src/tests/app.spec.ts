@@ -47,10 +47,18 @@ async function settle(): Promise<void> {
 
 describe('App', () => {
   let fetchMock: FetchMock
+  let businessFetchMock: FetchMock
 
   beforeEach(() => {
     fetchMock = vi.fn<typeof fetch>()
-    vi.stubGlobal('fetch', fetchMock)
+    businessFetchMock = vi.fn<typeof fetch>().mockImplementation(async () => jsonResponse([]))
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (input, init) => {
+      const path = String(input)
+      if (path.startsWith('/api/projects') || path.startsWith('/api/companies')) {
+        return businessFetchMock(input, init)
+      }
+      return fetchMock(input, init)
+    }))
   })
 
   afterEach(() => {
@@ -197,7 +205,7 @@ describe('App', () => {
     expect(wrapper.get('[data-testid="request-error"]').text()).toContain('密码错误')
   })
 
-  it('认证后展示本地数据与备份状态，不伪装未完成模块', async () => {
+  it('认证后默认展示真实项目中心并保留系统与备份页', async () => {
     fetchMock
       .mockResolvedValueOnce(
         jsonResponse({ authenticated: true, password_configured: true }),
@@ -209,7 +217,16 @@ describe('App', () => {
 
     const dashboard = wrapper.get('[data-testid="dashboard"]')
     expect(dashboard.text()).toContain('项目中心')
-    expect(dashboard.text()).toContain('模块建设中')
+    expect(dashboard.text()).not.toContain('模块建设中')
+    expect(dashboard.get('[data-testid="projects-empty"]').text()).toContain('暂无在建项目')
+    expect(dashboard.get('[data-testid="nav-companies"]').text()).toContain('客户与联系人')
+    expect(dashboard.get('[data-testid="nav-system"]').text()).toContain('系统与备份')
+    expect(dashboard.get('[data-testid="projects-empty"]').isVisible()).toBe(true)
+    expect(dashboard.get('[data-testid="scheduler-status"]').isVisible()).toBe(false)
+
+    await dashboard.get('[data-testid="nav-system"]').trigger('click')
+    expect(dashboard.get('[data-testid="scheduler-status"]').isVisible()).toBe(true)
+    expect(dashboard.get('[data-testid="backup-now"]').isVisible()).toBe(true)
     expect(dashboard.text()).toContain(overview.data_directory)
     expect(dashboard.text()).toContain(overview.database_path)
     expect(dashboard.text()).toContain('备份调度器')
@@ -661,6 +678,56 @@ describe('App', () => {
 
     expect(wrapper.get('[data-testid="dashboard"]').text()).toContain('备份操作失败')
     expect(wrapper.find('[data-testid="auth-title"]').exists()).toBe(false)
+  })
+
+  it('可在项目、客户和系统三个真实工作页之间切换', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ authenticated: true, password_configured: true }),
+      )
+      .mockResolvedValueOnce(jsonResponse(overview))
+
+    const wrapper = mountApp()
+    await settle()
+    expect(wrapper.get('[data-testid="projects-empty"]').isVisible()).toBe(true)
+    expect(wrapper.get('[data-testid="scheduler-status"]').isVisible()).toBe(false)
+
+    await wrapper.get('[data-testid="nav-companies"]').trigger('click')
+    await settle()
+    expect(wrapper.get('[data-testid="companies-empty"]').isVisible()).toBe(true)
+    expect(wrapper.find('[data-testid="projects-empty"]').exists()).toBe(false)
+
+    await wrapper.get('[data-testid="nav-system"]').trigger('click')
+    expect(wrapper.get('[data-testid="scheduler-status"]').isVisible()).toBe(true)
+    expect(wrapper.get('[data-testid="scheduler-status"]').text()).toContain('运行中')
+    expect(wrapper.find('[data-testid="companies-empty"]').exists()).toBe(false)
+
+    await wrapper.get('[data-testid="nav-projects"]').trigger('click')
+    await settle()
+    expect(wrapper.get('[data-testid="projects-empty"]').isVisible()).toBe(true)
+    expect(wrapper.get('[data-testid="scheduler-status"]').isVisible()).toBe(false)
+  })
+
+  it('任意业务 API 返回 401 时清空工作台并回到登录页', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ authenticated: true, password_configured: true }),
+      )
+      .mockResolvedValueOnce(jsonResponse(overview))
+    businessFetchMock.mockImplementation(async (input) => {
+      if (String(input).startsWith('/api/projects')) {
+        return jsonResponse({ detail: '业务会话已失效' }, 401)
+      }
+      return jsonResponse([])
+    })
+
+    const wrapper = mountApp()
+    await settle()
+    await settle()
+
+    expect(wrapper.get('[data-testid="auth-title"]').text()).toContain('密码登录')
+    expect(wrapper.get('[data-testid="request-error"]').text()).toContain('业务会话已失效')
+    expect(wrapper.find('[data-testid="dashboard"]').exists()).toBe(false)
   })
 
   it('退出期间防止重复提交，完成后回到密码登录页', async () => {

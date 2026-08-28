@@ -26,6 +26,20 @@ describe('API client', () => {
     })
   })
 
+  it('支持 DELETE 请求且不发送空请求体', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await requestVoid('/api/companies/7', { method: 'DELETE' })
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/companies/7', {
+      method: 'DELETE',
+      credentials: 'same-origin',
+    })
+  })
+
   it('将 FastAPI detail 转为可读错误', async () => {
     vi.stubGlobal(
       'fetch',

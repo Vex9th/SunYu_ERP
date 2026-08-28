@@ -39,6 +39,14 @@ function handleSystemRequestError(error: unknown): boolean {
   return true
 }
 
+function handleSessionExpired(message: string): void {
+  overview.value = null
+  overviewError.value = null
+  successNotice.value = null
+  session.value = { authenticated: false, password_configured: true }
+  requestError.value = message
+}
+
 async function loadOverview(): Promise<boolean> {
   if (overviewLoading.value) return false
   overviewLoading.value = true
@@ -226,5 +234,6 @@ onMounted(loadSession)
     @save-backup="saveBackup"
     @backup-now="backupNow"
     @refresh-overview="loadOverview"
+    @session-expired="handleSessionExpired"
   />
 </template>

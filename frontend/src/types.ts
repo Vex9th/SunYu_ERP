@@ -45,3 +45,100 @@ export interface BackupCreated {
   created_at: string
   warning?: string
 }
+
+export interface Company {
+  id: number
+  name: string
+  taxpayer_id: string | null
+  registered_address: string | null
+  registered_phone: string | null
+  bank_name: string | null
+  bank_account: string | null
+  notes: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface CompanySummary extends Company {
+  contact_count: number
+}
+
+export interface Contact {
+  id: number
+  company_id: number
+  name: string
+  phone: string | null
+  email: string | null
+  position: string | null
+  notes: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface CompanyDetail extends Company {
+  contacts: Contact[]
+}
+
+export interface CompanyPayload {
+  name: string
+  taxpayer_id: string | null
+  registered_address: string | null
+  registered_phone: string | null
+  bank_name: string | null
+  bank_account: string | null
+  notes: string | null
+}
+
+export interface ContactPayload {
+  name: string
+  phone: string | null
+  email: string | null
+  position: string | null
+  notes: string | null
+}
+
+export type ProjectStatus = 'active' | 'archived'
+export type ProjectFilter = ProjectStatus | 'all'
+
+export interface Project {
+  id: number
+  project_code: string
+  company_id: number
+  name: string
+  description: string | null
+  status: ProjectStatus
+  archive_reason: string | null
+  archived_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface ProjectSummary extends Project {
+  company_name: string
+}
+
+export interface ProjectPayload {
+  project_code: string
+  company_id: number
+  name: string
+  description: string | null
+}
+
+export interface DocumentCategorySummary {
+  category: string
+  document_count: number
+  version_count: number
+}
+
+export interface DocumentSummary {
+  document_count: number
+  version_count: number
+  categories: DocumentCategorySummary[]
+}
+
+export interface ProjectDashboardData {
+  project: Project
+  company: Company
+  contacts: Contact[]
+  documents: DocumentSummary
+}
