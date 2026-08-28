@@ -101,10 +101,40 @@ jobs:
           }
 
           function Stop-SunYuProcess([System.Diagnostics.Process] $process) {
-            if (-not $process.HasExited) {
-              Stop-Process -Id $process.Id -Force
-              Wait-Process -Id $process.Id -ErrorAction SilentlyContinue
+            $process.Refresh()
+            if ($process.HasExited) {
+              return
             }
+
+            & taskkill.exe /PID $process.Id /T /F | Out-Null
+            $taskkillExitCode = $LASTEXITCODE
+            $process.Refresh()
+            if ($taskkillExitCode -ne 0 -and -not $process.HasExited) {
+              throw "Failed to terminate SunYu_ERP.exe process tree: $taskkillExitCode"
+            }
+            Wait-Process -Id $process.Id -Timeout 15 -ErrorAction SilentlyContinue
+            $process.Refresh()
+            if (-not $process.HasExited) {
+              throw 'SunYu_ERP.exe process tree did not stop within 15 seconds'
+            }
+          }
+
+          function Wait-SunYuStopped {
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              $client = [System.Net.Sockets.TcpClient]::new()
+              try {
+                $client.Connect('127.0.0.1', 8765)
+                if (-not $client.Connected) {
+                  return
+                }
+              } catch [System.Net.Sockets.SocketException] {
+                return
+              } finally {
+                $client.Dispose()
+              }
+              Start-Sleep -Milliseconds 500
+            }
+            throw 'Port 8765 remained reachable after process-tree termination'
           }
 
           $first = Start-SunYuProcess 'first'
@@ -136,6 +166,7 @@ jobs:
           } finally {
             Stop-SunYuProcess $first
           }
+          Wait-SunYuStopped
 
           $configPath = Join-Path $smokeRoot 'config.json'
           $databasePath = Join-Path $smokeRoot 'Data\iapm.sqlite'
@@ -145,9 +176,14 @@ jobs:
           $second = Start-SunYuProcess 'second'
           try {
             Wait-SunYuHealth $second
+            $second.Refresh()
+            if ($second.HasExited) {
+              throw 'Restarted SunYu_ERP.exe exited immediately after health check'
+            }
           } finally {
             Stop-SunYuProcess $second
           }
+          Wait-SunYuStopped
 
           if ((Get-Content $configPath -Raw) -ne $configBeforeRestart) {
             throw 'Restart unexpectedly rewrote config.json'

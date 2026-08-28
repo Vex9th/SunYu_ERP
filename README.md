@@ -11,7 +11,7 @@
 - 登录认证；
 - 公司与联系人管理；
 - 项目建档、归档和项目仪表台；
-- 项目文件版本存储；
+- 项目文件版本底层存储（API 和上传界面尚未接入）；
 - 本机配置、SQLite 数据库迁移和备份；
 - Vue 生产构建由 FastAPI 同源提供；
 - Windows x64 单文件 EXE 的 GitHub Actions 构建、启动和重启冒烟测试。
@@ -61,9 +61,12 @@ Release 默认监听 `0.0.0.0:8765`。如需修改监听地址、端口或备份
 
 ```bash
 python -m venv .venv
+source .venv/bin/activate
 python -m pip install --requirement requirements-dev.txt
 npm --prefix frontend ci
 ```
+
+Windows PowerShell 使用 `.venv\Scripts\Activate.ps1` 激活虚拟环境；Windows CMD 使用 `.venv\Scripts\activate.bat`。
 
 日常开发仍使用：
 
