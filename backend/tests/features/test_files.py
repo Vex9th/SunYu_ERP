@@ -1037,7 +1037,54 @@ def test_category_rebound_after_reservation_leaves_no_old_directory_link(
     assert list((data_dir / "Temp").iterdir()) == []
 
 
-def test_target_replaced_after_finalize_is_not_reported_as_success(
+def test_temporary_anchor_is_retained_until_final_integrity_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"our-content")
+    data_dir = tmp_path / "Data"
+    original_require_integrity = files._require_final_target_integrity
+    integrity_checked = False
+
+    def require_integrity_with_anchor(
+        binding: files._BoundDirectory,
+        target_name: str,
+        temporary_identity: tuple[int, int],
+        expected_size: int,
+        expected_sha256: str,
+    ) -> None:
+        nonlocal integrity_checked
+        temporary_files = list((data_dir / "Temp").iterdir())
+        assert len(temporary_files) == 1
+        assert files._path_has_identity(
+            temporary_files[0],
+            temporary_identity,
+        )
+        assert temporary_files[0].samefile(binding.path / target_name)
+        integrity_checked = True
+        original_require_integrity(
+            binding,
+            target_name,
+            temporary_identity,
+            expected_size,
+            expected_sha256,
+        )
+
+    monkeypatch.setattr(
+        files,
+        "_require_final_target_integrity",
+        require_integrity_with_anchor,
+    )
+
+    stored = files.store_version(source, data_dir, "P-1", "图纸")
+
+    assert integrity_checked
+    assert stored.path.read_bytes() == b"our-content"
+    assert list((data_dir / "Temp").iterdir()) == []
+
+
+def test_target_replaced_before_final_integrity_is_not_reported_as_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1045,27 +1092,33 @@ def test_target_replaced_after_finalize_is_not_reported_as_success(
     source.write_bytes(b"our-content")
     data_dir = tmp_path / "Data"
     other_content = b""
-    original_finalize = files._finalize_publication
+    original_release_reservation = files._release_reservation_for_validation
 
-    def finalize_then_replace(
-        temporary_path: Path,
+    def release_reservation_then_replace(
         temporary_identity: tuple[int, int],
         binding: files._BoundDirectory,
         reservation_name: str,
         target_name: str,
     ) -> None:
-        original_finalize(
-            temporary_path,
+        original_release_reservation(
             temporary_identity,
             binding,
             reservation_name,
             target_name,
         )
+        temporary_files = list((data_dir / "Temp").iterdir())
+        assert len(temporary_files) == 1
         target = binding.path / target_name
+        assert temporary_files[0].samefile(target)
         target.unlink()
         target.write_bytes(other_content)
+        assert not temporary_files[0].samefile(target)
 
-    monkeypatch.setattr(files, "_finalize_publication", finalize_then_replace)
+    monkeypatch.setattr(
+        files,
+        "_release_reservation_for_validation",
+        release_reservation_then_replace,
+    )
 
     with pytest.raises(RuntimeError, match="target.*integrity|ownership"):
         files.store_version(source, data_dir, "P-1", "图纸")
@@ -1101,8 +1154,12 @@ def test_target_replaced_during_final_directory_check_is_rejected(
         reservations = list(binding.path.glob(".version-*.reserve"))
         if published and not reservations and not replacement_done:
             replacement_done = True
+            temporary_files = list((data_dir / "Temp").iterdir())
+            assert len(temporary_files) == 1
+            assert temporary_files[0].samefile(published[0])
             published[0].unlink()
             published[0].write_bytes(other_content)
+            assert not temporary_files[0].samefile(published[0])
 
     monkeypatch.setattr(
         files._BoundDirectory,

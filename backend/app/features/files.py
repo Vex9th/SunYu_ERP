@@ -583,8 +583,7 @@ def _publish_in_bound_directory(
                 target_name,
                 temporary_identity,
             )
-            _finalize_publication(
-                temporary_path,
+            _release_reservation_for_validation(
                 temporary_identity,
                 binding,
                 reservation_name,
@@ -597,6 +596,12 @@ def _publish_in_bound_directory(
                 temporary_identity,
                 expected_size,
                 expected_sha256,
+            )
+            _complete_publication(
+                temporary_path,
+                temporary_identity,
+                binding,
+                target_name,
             )
             return version_number, binding.path / target_name
         except BaseException as primary:
@@ -621,8 +626,7 @@ def _require_bound_name_owned(
     binding.require_current()
 
 
-def _finalize_publication(
-    temporary_path: Path,
+def _release_reservation_for_validation(
     temporary_identity: _FileIdentity,
     binding: _BoundDirectory,
     reservation_name: str,
@@ -645,6 +649,20 @@ def _finalize_publication(
             failures,
         )
 
+    if failures:
+        primary = failures[0][1]
+        for label, failure in failures[1:]:
+            primary.add_note(f"{label} cleanup failed: {failure}")
+        raise primary
+
+
+def _complete_publication(
+    temporary_path: Path,
+    temporary_identity: _FileIdentity,
+    binding: _BoundDirectory,
+    target_name: str,
+) -> None:
+    failures: list[tuple[str, BaseException]] = []
     temporary_failed = _capture_cleanup_failure(
         "temporary file",
         temporary_path,
@@ -652,7 +670,7 @@ def _finalize_publication(
         temporary_identity,
         failures,
     )
-    if temporary_failed and not reservation_failed:
+    if temporary_failed:
         _capture_bound_cleanup_failure(
             "target rollback",
             binding,
