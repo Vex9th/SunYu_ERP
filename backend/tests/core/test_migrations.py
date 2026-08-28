@@ -50,6 +50,56 @@ def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
+def _project_migrations_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "migrations"
+
+
+def _connect_business_schema(tmp_path: Path) -> sqlite3.Connection:
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    assert _apply_migrations()(connection, _project_migrations_dir()) == [
+        "001_foundation",
+        "002_documents",
+        "003_companies_projects",
+    ]
+    return connection
+
+
+def _insert_company(
+    connection: sqlite3.Connection,
+    *,
+    company_id: int = 1,
+    name: str = "示例公司",
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO companies (id, name, created_at, updated_at)
+        VALUES (?, ?, '2026-08-28T00:00:00+00:00', '2026-08-28T00:00:00+00:00')
+        """,
+        (company_id, name),
+    )
+
+
+def _insert_project(
+    connection: sqlite3.Connection,
+    *,
+    project_id: int = 1,
+    company_id: int = 1,
+    project_code: str = "PRJ-001",
+    status: str = "active",
+) -> None:
+    archived_at = "2026-08-28T00:00:00+00:00" if status == "archived" else None
+    connection.execute(
+        """
+        INSERT INTO projects
+            (id, project_code, company_id, name, status, archived_at,
+             created_at, updated_at)
+        VALUES (?, ?, ?, '示例项目', ?, ?,
+                '2026-08-28T00:00:00+00:00', '2026-08-28T00:00:00+00:00')
+        """,
+        (project_id, project_code, company_id, status, archived_at),
+    )
+
+
 def test_applies_migrations_in_filename_order_and_records_utc_time(
     tmp_path: Path,
 ) -> None:
@@ -190,6 +240,418 @@ def test_foundation_migration_creates_required_tables_and_constraints(
                 VALUES ('2026-01-01T00:00:00Z', 'unknown', '/backup')
                 """
             )
+    finally:
+        connection.close()
+
+
+def test_business_migration_creates_exact_columns(tmp_path: Path) -> None:
+    connection = _connect_business_schema(tmp_path)
+    try:
+        assert {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        } >= {"companies", "contacts", "projects"}
+
+        expected_columns = {
+            "companies": [
+                ("id", "INTEGER", 0, None, 1),
+                ("name", "TEXT", 1, None, 0),
+                ("taxpayer_id", "TEXT", 0, None, 0),
+                ("registered_address", "TEXT", 0, None, 0),
+                ("registered_phone", "TEXT", 0, None, 0),
+                ("bank_name", "TEXT", 0, None, 0),
+                ("bank_account", "TEXT", 0, None, 0),
+                ("notes", "TEXT", 0, None, 0),
+                ("created_at", "TEXT", 1, None, 0),
+                ("updated_at", "TEXT", 1, None, 0),
+            ],
+            "contacts": [
+                ("id", "INTEGER", 0, None, 1),
+                ("company_id", "INTEGER", 1, None, 0),
+                ("name", "TEXT", 1, None, 0),
+                ("phone", "TEXT", 0, None, 0),
+                ("email", "TEXT", 0, None, 0),
+                ("position", "TEXT", 0, None, 0),
+                ("notes", "TEXT", 0, None, 0),
+                ("created_at", "TEXT", 1, None, 0),
+                ("updated_at", "TEXT", 1, None, 0),
+            ],
+            "projects": [
+                ("id", "INTEGER", 0, None, 1),
+                ("project_code", "TEXT", 1, None, 0),
+                ("company_id", "INTEGER", 1, None, 0),
+                ("name", "TEXT", 1, None, 0),
+                ("description", "TEXT", 0, None, 0),
+                ("status", "TEXT", 1, "'active'", 0),
+                ("archive_reason", "TEXT", 0, None, 0),
+                ("archived_at", "TEXT", 0, None, 0),
+                ("created_at", "TEXT", 1, None, 0),
+                ("updated_at", "TEXT", 1, None, 0),
+            ],
+        }
+        for table, expected in expected_columns.items():
+            actual = [
+                (
+                    row["name"],
+                    row["type"],
+                    row["notnull"],
+                    row["dflt_value"],
+                    row["pk"],
+                )
+                for row in connection.execute(f"PRAGMA table_info('{table}')")
+            ]
+            assert actual == expected
+    finally:
+        connection.close()
+
+
+def test_business_migration_creates_required_indexes(tmp_path: Path) -> None:
+    connection = _connect_business_schema(tmp_path)
+    try:
+        expected_indexes = {
+            "idx_contacts_company": [("company_id", 0), ("id", 0)],
+            "idx_projects_company": [("company_id", 0), ("id", 0)],
+            "idx_projects_status_created": [
+                ("status", 0),
+                ("created_at", 1),
+                ("id", 1),
+            ],
+        }
+        for index_name, expected in expected_indexes.items():
+            assert connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+                (index_name,),
+            ).fetchone()
+            actual = [
+                (row["name"], row["desc"])
+                for row in connection.execute(f"PRAGMA index_xinfo('{index_name}')")
+                if row["key"]
+            ]
+            assert actual == expected
+    finally:
+        connection.close()
+
+
+def test_business_migration_configures_foreign_key_delete_actions(
+    tmp_path: Path,
+) -> None:
+    connection = _connect_business_schema(tmp_path)
+    try:
+        assert [
+            (row["table"], row["from"], row["to"], row["on_delete"])
+            for row in connection.execute("PRAGMA foreign_key_list('contacts')")
+        ] == [("companies", "company_id", "id", "CASCADE")]
+        assert [
+            (row["table"], row["from"], row["to"], row["on_delete"])
+            for row in connection.execute("PRAGMA foreign_key_list('projects')")
+        ] == [("companies", "company_id", "id", "RESTRICT")]
+    finally:
+        connection.close()
+
+
+def test_company_name_is_case_insensitively_unique(tmp_path: Path) -> None:
+    connection = _connect_business_schema(tmp_path)
+    try:
+        _insert_company(connection, name="Acme")
+
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_company(connection, company_id=2, name="ACME")
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("columns", "values"),
+    [
+        ("name", ("",)),
+        ("name", (" 示例公司",)),
+        ("taxpayer_id", (" ",)),
+        ("taxpayer_id", (" TAX-1 ",)),
+        ("registered_address", (" ",)),
+        ("registered_address", (" 地址 ",)),
+        ("registered_phone", (" ",)),
+        ("registered_phone", (" 123 ",)),
+        ("bank_name", (" ",)),
+        ("bank_name", (" 银行 ",)),
+        ("bank_account", (" ",)),
+        ("bank_account", (" 001 ",)),
+        ("notes", ("   ",)),
+    ],
+)
+def test_company_rejects_untrimmed_or_empty_values(
+    tmp_path: Path,
+    columns: str,
+    values: tuple[str],
+) -> None:
+    connection = _connect_business_schema(tmp_path)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            if columns == "name":
+                connection.execute(
+                    """
+                    INSERT INTO companies (name, created_at, updated_at)
+                    VALUES (?, 'now', 'now')
+                    """,
+                    values,
+                )
+            else:
+                connection.execute(
+                    f"""
+                    INSERT INTO companies
+                        (name, {columns}, created_at, updated_at)
+                    VALUES ('示例公司', ?, 'now', 'now')
+                    """,
+                    values,
+                )
+    finally:
+        connection.close()
+
+
+def test_company_notes_may_retain_surrounding_whitespace(tmp_path: Path) -> None:
+    connection = _connect_business_schema(tmp_path)
+    try:
+        connection.execute(
+            """
+            INSERT INTO companies (name, notes, created_at, updated_at)
+            VALUES ('示例公司', ' 有效备注 ', 'now', 'now')
+            """
+        )
+    finally:
+        connection.close()
+
+
+def test_contacts_allow_duplicate_names_within_company(tmp_path: Path) -> None:
+    connection = _connect_business_schema(tmp_path)
+    try:
+        _insert_company(connection)
+        for contact_id in (1, 2):
+            connection.execute(
+                """
+                INSERT INTO contacts
+                    (id, company_id, name, created_at, updated_at)
+                VALUES (?, 1, '同名联系人', 'now', 'now')
+                """,
+                (contact_id,),
+            )
+
+        assert connection.execute("SELECT COUNT(*) FROM contacts").fetchone()[0] == 2
+    finally:
+        connection.close()
+
+
+def test_contacts_are_deleted_with_company(tmp_path: Path) -> None:
+    connection = _connect_business_schema(tmp_path)
+    try:
+        _insert_company(connection)
+        connection.execute(
+            """
+            INSERT INTO contacts (company_id, name, created_at, updated_at)
+            VALUES (1, '联系人', 'now', 'now')
+            """
+        )
+
+        connection.execute("DELETE FROM companies WHERE id = 1")
+
+        assert connection.execute("SELECT COUNT(*) FROM contacts").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("name", ""),
+        ("name", " 联系人 "),
+        ("phone", " "),
+        ("phone", " 123 "),
+        ("email", " "),
+        ("email", " a@example.com "),
+        ("position", " "),
+        ("position", " 经理 "),
+        ("notes", "   "),
+    ],
+)
+def test_contact_rejects_untrimmed_or_empty_values(
+    tmp_path: Path,
+    column: str,
+    value: str,
+) -> None:
+    connection = _connect_business_schema(tmp_path)
+    try:
+        _insert_company(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            if column == "name":
+                connection.execute(
+                    """
+                    INSERT INTO contacts
+                        (company_id, name, created_at, updated_at)
+                    VALUES (1, ?, 'now', 'now')
+                    """,
+                    (value,),
+                )
+            else:
+                connection.execute(
+                    f"""
+                    INSERT INTO contacts
+                        (company_id, name, {column}, created_at, updated_at)
+                    VALUES (1, '联系人', ?, 'now', 'now')
+                    """,
+                    (value,),
+                )
+    finally:
+        connection.close()
+
+
+def test_contact_notes_may_retain_surrounding_whitespace(tmp_path: Path) -> None:
+    connection = _connect_business_schema(tmp_path)
+    try:
+        _insert_company(connection)
+        connection.execute(
+            """
+            INSERT INTO contacts
+                (company_id, name, notes, created_at, updated_at)
+            VALUES (1, '联系人', ' 有效备注 ', 'now', 'now')
+            """
+        )
+    finally:
+        connection.close()
+
+
+def test_project_code_is_case_insensitively_unique(tmp_path: Path) -> None:
+    connection = _connect_business_schema(tmp_path)
+    try:
+        _insert_company(connection)
+        _insert_project(connection, project_code="prj-001")
+
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_project(connection, project_id=2, project_code="PRJ-001")
+    finally:
+        connection.close()
+
+
+def test_project_code_allows_120_utf8_bytes(tmp_path: Path) -> None:
+    connection = _connect_business_schema(tmp_path)
+    try:
+        _insert_company(connection)
+        _insert_project(connection, project_code="a" * 120)
+        _insert_project(connection, project_id=2, project_code="项" * 40)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "project_code",
+    ["", " ", " PRJ-001", "PRJ-001 ", ".", "..", "A/B", "A\\B", "a" * 121, "项" * 41],
+)
+def test_project_rejects_invalid_project_code(
+    tmp_path: Path,
+    project_code: str,
+) -> None:
+    connection = _connect_business_schema(tmp_path)
+    try:
+        _insert_company(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_project(connection, project_code=project_code)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("columns", "values"),
+    [
+        ("name", ("",)),
+        ("name", (" 示例项目",)),
+        ("description", ("   ",)),
+        ("status", ("paused",)),
+        ("archive_reason", ("仅归档原因",)),
+        ("archived_at", ("2026-08-28T00:00:00+00:00",)),
+        ("status, archived_at", ("archived", None)),
+        ("status, archive_reason, archived_at", ("archived", "   ", "now")),
+    ],
+)
+def test_project_rejects_invalid_text_or_archive_state(
+    tmp_path: Path,
+    columns: str,
+    values: tuple[str | None, ...],
+) -> None:
+    connection = _connect_business_schema(tmp_path)
+    try:
+        _insert_company(connection)
+        placeholders = ", ".join("?" for _ in values)
+        required_columns = "project_code, company_id"
+        required_values = "'PRJ-001', 1"
+        if columns != "name":
+            required_columns += ", name"
+            required_values += ", '示例项目'"
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                f"""
+                INSERT INTO projects
+                    ({required_columns}, {columns}, created_at, updated_at)
+                VALUES ({required_values}, {placeholders}, 'now', 'now')
+                """,
+                values,
+            )
+    finally:
+        connection.close()
+
+
+def test_project_defaults_to_active(tmp_path: Path) -> None:
+    connection = _connect_business_schema(tmp_path)
+    try:
+        _insert_company(connection)
+        connection.execute(
+            """
+            INSERT INTO projects
+                (project_code, company_id, name, description, created_at, updated_at)
+            VALUES ('PRJ-001', 1, '示例项目', ' 有效描述 ', 'now', 'now')
+            """
+        )
+        assert (
+            connection.execute(
+                "SELECT status FROM projects WHERE project_code = 'PRJ-001'"
+            ).fetchone()[0]
+            == "active"
+        )
+    finally:
+        connection.close()
+
+
+def test_project_optional_text_may_retain_surrounding_whitespace(
+    tmp_path: Path,
+) -> None:
+    connection = _connect_business_schema(tmp_path)
+    try:
+        _insert_company(connection)
+        connection.execute(
+            """
+            INSERT INTO projects
+                (project_code, company_id, name, description, status,
+                 archive_reason, archived_at, created_at, updated_at)
+            VALUES ('PRJ-001', 1, '归档项目', ' 有效描述 ', 'archived',
+                    ' 有效原因 ', 'now', 'now', 'now')
+            """
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("status", ["active", "archived"])
+def test_company_delete_is_restricted_by_projects(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    connection = _connect_business_schema(tmp_path)
+    try:
+        _insert_company(connection)
+        _insert_project(connection, status=status)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM companies WHERE id = 1")
+
+        assert connection.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 1
     finally:
         connection.close()
 

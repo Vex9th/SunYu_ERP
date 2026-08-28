@@ -77,7 +77,11 @@ def test_lifespan_applies_migrations_and_closes_every_owned_connection(
         }
     finally:
         verifier.close()
-    assert versions == {"001_foundation", "002_documents"}
+    assert versions == {
+        "001_foundation",
+        "002_documents",
+        "003_companies_projects",
+    }
 
 
 def test_authentication_flow_guards_system_routes_and_reports_setup_state(

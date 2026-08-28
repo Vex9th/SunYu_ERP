@@ -37,6 +37,7 @@ def test_documents_migration_creates_tables_and_enforces_constraints(
         assert apply_migrations(connection, _migrations_dir()) == [
             "001_foundation",
             "002_documents",
+            "003_companies_projects",
         ]
         assert {
             row["name"]
@@ -45,6 +46,9 @@ def test_documents_migration_creates_tables_and_enforces_constraints(
             )
         } >= {"documents", "document_versions"}
 
+        assert connection.execute("PRAGMA foreign_key_list(documents)").fetchall() == []
+
+        # Documents may be uploaded before the corresponding project is registered.
         connection.execute(
             """
             INSERT INTO documents
