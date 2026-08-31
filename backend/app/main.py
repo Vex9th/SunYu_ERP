@@ -17,9 +17,14 @@ from backend.app.features.auth import create_auth_router
 from backend.app.features.backups import create_backup, prune_backups
 from backend.app.features.commercial import create_commercial_router
 from backend.app.features.companies import create_companies_router
+from backend.app.features.dashboards import create_dashboards_router
+from backend.app.features.delivery import create_delivery_router
 from backend.app.features.documents import create_documents_router
 from backend.app.features.inventory import create_inventory_router
 from backend.app.features.procurement import create_procurement_router
+from backend.app.features.procurement_extensions import (
+    create_procurement_extensions_router,
+)
 from backend.app.features.project_stages import create_project_stages_router
 from backend.app.features.projects import create_projects_router
 from backend.app.features.site_operations import create_site_operations_router
@@ -162,11 +167,16 @@ def create_app(
         create_project_stages_router(get_connection, get_settings)
     )
     application.include_router(create_procurement_router(get_connection, get_settings))
+    application.include_router(
+        create_procurement_extensions_router(get_connection, get_settings)
+    )
     application.include_router(create_inventory_router(get_connection, get_settings))
     application.include_router(create_workforce_router(get_connection, get_settings))
     application.include_router(
         create_site_operations_router(get_connection, get_settings)
     )
+    application.include_router(create_delivery_router(get_connection, get_settings))
+    application.include_router(create_dashboards_router(get_connection, get_settings))
     application.include_router(
         create_system_router(
             get_connection,

@@ -53,6 +53,8 @@ def test_documents_migration_creates_tables_and_enforces_constraints(
             "008_procurement_inventory",
             "009_workforce_delivery",
             "010_site_report_events",
+            "011_procurement_audit",
+            "012_delivery_events",
         ]
         assert {
             row["name"]

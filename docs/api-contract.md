@@ -13,17 +13,19 @@
 
 接口前缀统一为 `/api`。除健康检查和认证接口外，全部使用登录后的 HttpOnly Session Cookie。
 
-### 1.1 当前真实可接入范围（2026-08-29）
+### 1.1 当前真实可接入范围（2026-08-31）
 
 除第 3 节原有接口外，当前后端已经实现并挂载以下子集：
 
 - 项目阶段：阶段列表、计划修改、带幂等键的状态流转；
-- 采购：官方 `.xlsx` 模板、采购清单与采购行、清单确认、采购单与确认、到货、项目采购概览；
+- 项目经营：文件版本、报价、合同、三段收款、项目仪表台与总仪表台；
+- 采购：官方 `.xlsx` 模板、上传预检与确认、采购清单与采购行、采购单、付款、到货、进项票、反冲审计、项目采购概览和隐藏成本报价单；
 - 库存：库存物品、期初库存、库存调整、不可变流水、项目领用；
 - 人员：施工员、停用、项目排单、当日上工查询和批量原子提交；
-- 现场：施工日报确认与纠错审计、人员垫资、分次报销和作废。
+- 现场：施工日报确认与纠错审计、人员垫资、分次报销和作废；
+- 交付：图纸会签、调试、工程变更、验收、质保、发票、售后和交付汇总。
 
-本节只说明实现进度，不改变后文冻结的完整契约。Excel 上传预检/确认、供应商付款/发票、隐藏成本报价单、单条上工维护、完整仪表台及 P2 接口仍是规划状态，前端必须继续显示“演示数据”。
+本节只说明实现进度，不改变后文冻结的完整契约。当前仅“单条上工新增、编辑和作废”仍为规划；实际页面使用批量上工接口提交当天施工员，不得把上述已实现接口继续显示为“演示数据”。
 
 ## 2. 全局约定
 
@@ -249,7 +251,7 @@ API 的 `title` 映射现有数据库列 `documents.logical_name`，不新增第
 
 任何分母为 0 时比例返回 `null`，不能除零或显示 100%。待分配到账可以降低项目总未收，但不得静默计入任一合同的回款比例。
 
-### 4.6 总仪表台和项目仪表台
+### 4.6 总仪表台和项目仪表台（已实现）
 
 | Method | Path | 请求/响应 |
 |---|---|---|
@@ -549,7 +551,7 @@ interface GlobalDashboard {
 
 ## 5. P1：采购与库存
 
-### 5.1 采购清单与 Excel 导入
+### 5.1 采购清单与 Excel 导入（已实现）
 
 采购清单状态：`draft | confirmed | superseded`。采购单状态：`draft | confirmed | partially_received | received | cancelled`。
 
@@ -579,7 +581,7 @@ interface GlobalDashboard {
 
 Excel 限制：`.xlsx`、最大 20 MB、最多 10,000 条数据行；预检不写正式采购数据和库存；确认必须全有或全无。物料自动匹配只做规范化后的精确匹配，模糊匹配必须由用户确认。
 
-### 5.2 采购单、付款、到货与进项票
+### 5.2 采购单、付款、到货与进项票（已实现）
 
 | Method | Path | 请求/响应 |
 |---|---|---|
@@ -623,7 +625,7 @@ P1 不允许超付款、超到货或超开票；超下单必须填写原因。�
 
 项目领用 `lines`：`inventory_item_id`、`procurement_line_id`（可空）、`quantity`。若填写采购行，它必须属于当前项目；实际出库成本始终由库存流水计算，前端不提交成本。
 
-### 5.4 隐藏成本价的报价单
+### 5.4 隐藏成本价的报价单（已实现）
 
 | Method | Path | 请求/响应 |
 |---|---|---|
@@ -689,7 +691,7 @@ P1 不允许超付款、超到货或超开票；超下单必须填写原因。�
 
 ## 7. P2：调试、验收、发票与售后
 
-### 7.1 图纸会签、调试和技术变更
+### 7.1 图纸会签、调试和技术变更（已实现）
 
 | Method | Path | 请求/响应 |
 |---|---|---|
@@ -705,7 +707,7 @@ P1 不允许超付款、超到货或超开票；超下单必须填写原因。�
 
 会签状态：`pending | confirmed | not_required`。调试状态：`planned | in_progress | blocked | completed | cancelled`。变更状态：`proposed | approved | rejected | implemented | cancelled`。变更来源：`commissioning | customer_request | site_condition | technical_agreement | other`。`issues`、`next_action` 都是可空文本。变更的预估成本只进入预测，不冒充已发生成本。
 
-### 7.2 验收和质保
+### 7.2 验收和质保（已实现）
 
 验收类型：`pre_acceptance | final | reinspection`。验收状态：`scheduled | passed | passed_with_punch | failed | cancelled`。质保状态 `not_started | active | expiring | expired` 由日期实时计算，不由前端提交。
 
@@ -719,7 +721,7 @@ P1 不允许超付款、超到货或超开票；超下单必须填写原因。�
 
 最终验收通过和质保创建必须处于同一事务。`ends_on` 按日历月计算，遇到短月取月末；`days_remaining=0` 表示今天到期，1 至 30 天为 `expiring`。
 
-### 7.3 发票和售后
+### 7.3 发票和售后（已实现）
 
 发票类型：`contract_payment | additional_work | warranty_service | other`。发票状态：`planned | requested | recorded | void`。售后保障方式：`warranty | paid | goodwill`。售后状态：`open | in_progress | completed | cancelled`。
 

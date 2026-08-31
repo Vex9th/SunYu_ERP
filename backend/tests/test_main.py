@@ -109,6 +109,13 @@ def test_create_app_registers_first_business_vertical_slice_routes() -> None:
         "/api/projects/{project_code}/procurement-lists",
         "/api/projects/{project_code}/purchase-orders",
         "/api/projects/{project_code}/procurement-overview",
+        "/api/projects/{project_code}/procurement-imports/preview",
+        "/api/projects/{project_code}/procurement-imports/{import_id}/confirm",
+        "/api/projects/{project_code}/purchase-orders/{order_id}/supplier-payments",
+        "/api/projects/{project_code}/purchase-orders/{order_id}/supplier-invoices",
+        "/api/projects/{project_code}/goods-receipts/{receipt_id}/reverse",
+        "/api/projects/{project_code}/procurement-lists/{list_id}/quote-exports",
+        "/api/projects/{project_code}/quote-exports/{export_id}/download",
         "/api/inventory/items",
         "/api/inventory/adjustments",
         "/api/projects/{project_code}/inventory-issues",
@@ -137,6 +144,15 @@ def test_create_app_registers_first_business_vertical_slice_routes() -> None:
         "/api/projects/{project_code}/receipts",
         "/api/projects/{project_code}/receipts/{receipt_id}",
         "/api/projects/{project_code}/receipts/{receipt_id}/void",
+        "/api/dashboard",
+        "/api/projects/{project_code}/drawing-signoffs",
+        "/api/projects/{project_code}/commissioning-sessions",
+        "/api/projects/{project_code}/engineering-changes",
+        "/api/projects/{project_code}/acceptances",
+        "/api/projects/{project_code}/warranty",
+        "/api/projects/{project_code}/invoices",
+        "/api/projects/{project_code}/after-sales",
+        "/api/projects/{project_code}/delivery-summary",
     }
 
     assert expected_paths <= paths.keys()
@@ -281,6 +297,8 @@ def test_lifespan_applies_migrations_and_closes_every_owned_connection(
         "008_procurement_inventory",
         "009_workforce_delivery",
         "010_site_report_events",
+        "011_procurement_audit",
+        "012_delivery_events",
     }
 
 
