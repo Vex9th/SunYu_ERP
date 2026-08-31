@@ -78,6 +78,31 @@ def test_create_app_only_serves_frontend_when_dist_is_explicit(
         assert client.get("/api/health").json() == {"status": "ok"}
 
 
+def test_create_app_registers_first_business_vertical_slice_routes() -> None:
+    application = main_module.create_app()
+    paths = application.openapi()["paths"]
+
+    expected_paths = {
+        "/api/projects/{project_code}/stages",
+        "/api/projects/{project_code}/stages/{stage_code}",
+        "/api/projects/{project_code}/stages/{stage_code}/transition",
+        "/api/procurement/import-template.xlsx",
+        "/api/projects/{project_code}/procurement-lists",
+        "/api/projects/{project_code}/purchase-orders",
+        "/api/projects/{project_code}/procurement-overview",
+        "/api/inventory/items",
+        "/api/inventory/adjustments",
+        "/api/projects/{project_code}/inventory-issues",
+        "/api/workers",
+        "/api/workers/{worker_id}",
+        "/api/projects/{project_code}/crew-assignments",
+        "/api/projects/{project_code}/labor-entries",
+        "/api/projects/{project_code}/labor-entries/batch",
+    }
+
+    assert expected_paths <= paths.keys()
+
+
 def test_create_app_serves_release_home_assets_and_keeps_api_priority(
     tmp_path: Path,
 ) -> None:
@@ -211,6 +236,11 @@ def test_lifespan_applies_migrations_and_closes_every_owned_connection(
         "002_documents",
         "003_companies_projects",
         "004_project_code_identity",
+        "005_project_workflow_documents",
+        "006_commercial_finance",
+        "007_dashboard_indexes",
+        "008_procurement_inventory",
+        "009_workforce_delivery",
     }
 
 

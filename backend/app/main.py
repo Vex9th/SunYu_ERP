@@ -15,6 +15,9 @@ from backend.app.core.migrations import apply_migrations
 from backend.app.features.auth import create_auth_router
 from backend.app.features.backups import create_backup, prune_backups
 from backend.app.features.companies import create_companies_router
+from backend.app.features.inventory import create_inventory_router
+from backend.app.features.procurement import create_procurement_router
+from backend.app.features.project_stages import create_project_stages_router
 from backend.app.features.projects import create_projects_router
 from backend.app.features.system import (
     BackupCreator,
@@ -25,6 +28,7 @@ from backend.app.features.system import (
     create_system_router,
     run_backup_job,
 )
+from backend.app.features.workforce import create_workforce_router
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_CONFIG_PATH = _PROJECT_ROOT / "config.json"
@@ -147,6 +151,12 @@ def create_app(
     application.include_router(create_auth_router(get_connection, get_session_secret))
     application.include_router(create_companies_router(get_connection, get_settings))
     application.include_router(create_projects_router(get_connection, get_settings))
+    application.include_router(
+        create_project_stages_router(get_connection, get_settings)
+    )
+    application.include_router(create_procurement_router(get_connection, get_settings))
+    application.include_router(create_inventory_router(get_connection, get_settings))
+    application.include_router(create_workforce_router(get_connection, get_settings))
     application.include_router(
         create_system_router(
             get_connection,

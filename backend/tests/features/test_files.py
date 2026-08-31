@@ -47,6 +47,11 @@ def test_documents_migration_creates_tables_and_enforces_constraints(
             "002_documents",
             "003_companies_projects",
             "004_project_code_identity",
+            "005_project_workflow_documents",
+            "006_commercial_finance",
+            "007_dashboard_indexes",
+            "008_procurement_inventory",
+            "009_workforce_delivery",
         ]
         assert {
             row["name"]
@@ -76,7 +81,12 @@ def test_documents_migration_creates_tables_and_enforces_constraints(
             "2026-08-28T00:00:00+00:00",
         )
         connection.execute(
-            "INSERT INTO document_versions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO document_versions
+                (id, document_id, version_number, original_filename,
+                 stored_relative_path, size_bytes, sha256, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             valid_version,
         )
 
@@ -122,7 +132,12 @@ def test_documents_migration_creates_tables_and_enforces_constraints(
             values[4] = f"unique/{column}/{invalid_value}"
             with pytest.raises(sqlite3.IntegrityError):
                 connection.execute(
-                    "INSERT INTO document_versions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    """
+                    INSERT INTO document_versions
+                        (id, document_id, version_number, original_filename,
+                         stored_relative_path, size_bytes, sha256, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
                     values,
                 )
         with pytest.raises(sqlite3.IntegrityError):
