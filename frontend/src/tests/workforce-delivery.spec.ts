@@ -12,10 +12,14 @@ async function settle(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
-function mountComponent(component: object, projectCode = 'SY-2026-001'): VueWrapper {
+function mountComponent(
+  component: object,
+  projectCode = 'SY-2026-001',
+  repository: MockWorkforceRepository = useDemoBusinessContext().workforce,
+): VueWrapper {
   return mount(component, {
     attachTo: document.body,
-    props: { projectCode },
+    props: { projectCode, repository },
     global: { plugins: [ElementPlus] },
   })
 }
@@ -204,7 +208,7 @@ describe('P1 Workforce 演示边界', () => {
     const wrapper = mountComponent(WorkforceCenter)
     await settle()
 
-    expect(wrapper.get('[data-testid="workforce-center"]').text()).toContain('演示数据')
+    expect(wrapper.get('[data-testid="workforce-center"]').text()).toContain('实时数据')
     expect(wrapper.text()).toContain('SY-2026-001')
     expect(wrapper.get('[data-testid="workforce-labor-panel"]').text()).toContain('今日上工')
     expect(wrapper.get('[data-testid="workforce-labor-panel"]').text()).toContain('王建国')
@@ -234,6 +238,22 @@ describe('P1 Workforce 演示边界', () => {
     expect(wrapper.text()).toContain('设备安装')
     expect(wrapper.text()).toContain('电气接线')
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('今日上工写入成功但刷新失败时，明确告知已保存且不重提', async () => {
+    const repository = new MockWorkforceRepository()
+    const saveSpy = vi.spyOn(repository, 'saveLaborEntriesBatch')
+    const wrapper = mountComponent(WorkforceCenter, 'SY-2026-001', repository)
+    await settle()
+
+    vi.spyOn(repository, 'getWorkforcePreview').mockRejectedValueOnce(new Error('刷新断线'))
+    await wrapper.get('[data-testid="labor-select-201"]').trigger('click')
+    await wrapper.get('[data-testid="workforce-save-labor"]').trigger('click')
+    await settle()
+
+    expect(saveSpy).toHaveBeenCalledTimes(1)
+    expect(wrapper.text()).toContain('已保存但刷新失败')
+    expect(wrapper.text()).not.toContain('保存失败')
   })
 
   it('施工员、项目排单、施工日报和现场垫资入口都能写入共享演示状态', async () => {
@@ -417,15 +437,16 @@ describe('P1 Workforce 演示边界', () => {
     expect(preview.material_advances[0]?.reimbursements).toHaveLength(2)
   })
 
-  it('施工管理操作都有明确的演示入口', async () => {
+  it('施工管理只展示后端真实支持的操作，上工纠错走批量覆盖', async () => {
     const wrapper = mountComponent(WorkforceCenter)
     await settle()
 
     expect(wrapper.get('[data-testid="worker-edit-101"]').text()).toContain('编辑')
     expect(wrapper.get('[data-testid="worker-deactivate-101"]').text()).toContain('停用')
-    expect(wrapper.find('[data-testid="assignment-status-202"]').exists()).toBe(true)
-    expect(wrapper.get('[data-testid="labor-edit-301"]').text()).toContain('编辑')
-    expect(wrapper.get('[data-testid="labor-void-301"]').text()).toContain('作废')
+    expect(wrapper.find('[data-testid="assignment-status-202"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="labor-edit-301"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="labor-void-301"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('重新批量保存')
     expect(wrapper.get('[data-testid="report-confirm-2026-09-09"]').text()).toContain('确认')
     expect(wrapper.get('[data-testid="reimbursement-open-401"]').text()).toContain('报销')
   })
@@ -468,7 +489,7 @@ describe('P2 交付售后演示边界', () => {
     const wrapper = mountComponent(DeliveryWorkspace)
     await settle()
 
-    expect(wrapper.get('[data-testid="delivery-workspace"]').text()).toContain('演示数据')
+    expect(wrapper.get('[data-testid="delivery-workspace"]').text()).toContain('实时数据')
     expect(wrapper.find('.delivery-section-nav').exists()).toBe(true)
     expect(wrapper.find('.el-tabs').exists()).toBe(false)
     expect(wrapper.text()).not.toContain('P2 ·')
@@ -523,7 +544,7 @@ describe('P2 交付售后演示边界', () => {
 
     await wrapper.get('[data-testid="commissioning-create-open"]').trigger('click')
     expect((wrapper.get('[data-testid="commissioning-started-at"] input').element as HTMLInputElement).value).toMatch(new RegExp(`^${expectedToday}`))
-    await wrapper.get('[aria-label="新增调试记录（演示数据）"] .el-dialog__headerbtn').trigger('click')
+    await wrapper.get('[aria-label="新增调试记录"] .el-dialog__headerbtn').trigger('click')
 
     await wrapper.get('[data-testid="delivery-tab-changes"]').trigger('click')
     await wrapper.get('[data-testid="change-create-open"]').trigger('click')
@@ -547,11 +568,48 @@ describe('P2 交付售后演示边界', () => {
     await settle()
 
     await wrapper.get('[data-testid="commissioning-create-open"]').trigger('click')
-    await wrapper.get('[aria-label="新增调试记录（演示数据）"] form').trigger('submit')
+    await wrapper.get('[aria-label="新增调试记录"] form').trigger('submit')
     await settle()
 
     expect(wrapper.text()).toContain('调试记录已新增')
-    expect(wrapper.get('[aria-label="新增调试记录（演示数据）"]').isVisible()).toBe(false)
+    expect(wrapper.get('[aria-label="新增调试记录"]').isVisible()).toBe(false)
+  })
+
+  it('交付写入成功但刷新失败时，先关闭表单并禁止误导重提', async () => {
+    const repository = new MockWorkforceRepository()
+    const saveSpy = vi.spyOn(repository, 'saveCommissioningSession')
+    const wrapper = mountComponent(DeliveryWorkspace, 'SY-2026-001', repository)
+    await settle()
+
+    await wrapper.get('[data-testid="commissioning-create-open"]').trigger('click')
+    vi.spyOn(repository, 'getDeliveryPreview').mockRejectedValueOnce(new Error('刷新断线'))
+    await wrapper.get('[aria-label="新增调试记录"] form').trigger('submit')
+    await settle()
+
+    expect(saveSpy).toHaveBeenCalledTimes(1)
+    expect(wrapper.get('[aria-label="新增调试记录"]').isVisible()).toBe(false)
+    expect(wrapper.text()).toContain('已保存但刷新失败')
+    expect(wrapper.text()).not.toContain('保存失败')
+  })
+
+  it('质保续费价格 null 显示未设置，编辑为空且提交仍为 null', async () => {
+    const repository = new MockWorkforceRepository()
+    const preview = (await repository.getDeliveryPreview('SY-2026-001')).data
+    if (!preview.warranty) throw new Error('测试质保数据不存在')
+    preview.warranty.renewal_price_cents = null
+    vi.spyOn(repository, 'getDeliveryPreview').mockResolvedValue({ source: 'demo', data: preview })
+    const updateSpy = vi.spyOn(repository, 'updateWarranty').mockResolvedValue()
+    const wrapper = mountComponent(DeliveryWorkspace, 'SY-2026-001', repository)
+    await settle()
+
+    await wrapper.get('[data-testid="delivery-tab-acceptance"]').trigger('click')
+    expect(wrapper.get('[data-testid="delivery-acceptance-panel"]').text()).toContain('续费价格未设置')
+    await wrapper.get('[data-testid="warranty-edit-open"]').trigger('click')
+    expect((wrapper.get('[data-testid="warranty-renewal-price"]').element as HTMLInputElement).value).toBe('')
+    await wrapper.get('[aria-label="编辑质保"] form').trigger('submit')
+    await settle()
+
+    expect(updateSpy).toHaveBeenCalledWith('SY-2026-001', expect.objectContaining({ renewal_price_cents: null }))
   })
 
   it('支持调试编辑、变更流转、验收完成、质保编辑、发票作废和售后流转', async () => {

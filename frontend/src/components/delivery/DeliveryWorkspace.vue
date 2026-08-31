@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, toRaw, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 
 import type {
@@ -21,18 +21,25 @@ import type {
   InvoiceType,
   WarrantyStatus,
 } from '../../domain/workforce'
+import { optionalYuanToCents, signedYuanToCents } from '../../domain/workforce'
 import { localISODate, localISODateTimeInput } from '../../domain/dates'
 import { formatMoney, yuanToCents } from '../../domain/formatters'
-import { useDemoBusinessContext } from '../../repositories/demo-context'
+import {
+  createHttpDeliveryRepository,
+  type DeliveryWorkspaceRepository,
+} from '../../repositories/delivery.live'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   projectCode: string
   scope?: 'all' | 'commissioning' | 'delivery'
-}>()
+  repository?: DeliveryWorkspaceRepository
+}>(), {
+  repository: () => createHttpDeliveryRepository(),
+})
 
 type DeliveryTab = 'commissioning' | 'changes' | 'acceptance' | 'after-sales'
 
-const repository = useDemoBusinessContext().workforce
+const repository = toRaw(props.repository)
 const activeTab = ref<DeliveryTab>(props.scope === 'delivery' ? 'acceptance' : 'commissioning')
 const moduleTitle = computed(() => props.scope === 'commissioning'
   ? '调试与工程变更'
@@ -72,7 +79,11 @@ const changeForm = reactive({ source: 'customer_request' as EngineeringChangeSou
 const acceptanceForm = reactive({ acceptanceType: 'pre_acceptance' as AcceptanceType, scheduledOn: '', notes: '' })
 const invoiceForm = reactive({ invoiceType: 'contract_payment' as InvoiceType, status: 'planned' as InvoiceStatus, requestedOn: '', recordedOn: '', invoiceNumber: '', amountYuan: '', counterpartyName: '', notes: '' })
 const afterSalesForm = reactive({ reportedOn: '', serviceOn: '', reason: '', contactName: '', contactPhone: '', coverageType: 'warranty' as AfterSalesCoverageType, notes: '' })
-const acceptanceCompleteForm = reactive({ status: 'passed' as Extract<AcceptanceStatus, 'passed' | 'passed_with_punch' | 'failed'>, performedOn: '', notes: '' })
+const acceptanceCompleteForm = reactive({
+  status: 'passed' as Extract<AcceptanceStatus, 'passed' | 'passed_with_punch' | 'failed'>,
+  performedOn: '', notes: '', warrantyStartsOn: '', warrantyMonths: 12,
+  warrantyRenewalPriceYuan: '', warrantyNotes: '',
+})
 const warrantyForm = reactive({ startsOn: '', durationMonths: 12, renewalPriceYuan: '', notes: '' })
 const invoiceVoidForm = reactive({ reason: '' })
 const afterSalesStatusForm = reactive({ status: 'in_progress' as AfterSalesStatus, resolution: '' })
@@ -89,6 +100,9 @@ const invoiceTypeLabels: Record<InvoiceType, string> = { contract_payment: '合�
 const invoiceStatusLabels: Record<InvoiceStatus, string> = { planned: '计划中', requested: '已申请', recorded: '已登记', void: '已作废' }
 const coverageLabels: Record<AfterSalesCoverageType, string> = { warranty: '保内处理', paid: '付费服务', goodwill: '善意支持' }
 const afterSalesStatusLabels: Record<AfterSalesStatus, string> = { open: '待处理', in_progress: '处理中', completed: '已完成', cancelled: '已取消' }
+const selectedAcceptance = computed(() => model.value?.acceptances.find((item) => item.acceptance_id === selectedAcceptanceId.value) ?? null)
+const acceptanceNeedsWarranty = computed(() => selectedAcceptance.value?.acceptance_type === 'final'
+  && (acceptanceCompleteForm.status === 'passed' || acceptanceCompleteForm.status === 'passed_with_punch'))
 
 function optionalText(value: string): string | null {
   return value.trim() || null
@@ -105,10 +119,15 @@ async function runAction(action: () => Promise<void>, close: () => void, message
   actionSuccess.value = ''
   try {
     await action()
-    await refreshModel()
     close()
-    actionSuccess.value = `${message}（演示数据）`
+    actionSuccess.value = message
     ElMessage.success(actionSuccess.value)
+    try {
+      await refreshModel()
+    } catch {
+      actionSuccess.value = `${message}；已保存但刷新失败，请手动刷新页面查看最新数据`
+      ElMessage.warning(actionSuccess.value)
+    }
   } catch (error) {
     actionError.value = error instanceof Error ? error.message : '保存失败'
   } finally {
@@ -187,7 +206,7 @@ function saveCommissioning(): Promise<void> {
 function saveChange(): Promise<void> {
   return runAction(() => repository.saveEngineeringChange(props.projectCode, {
     source: changeForm.source, title: changeForm.title.trim(), description: changeForm.description.trim(), reason: changeForm.reason.trim(),
-    contract_delta_cents: yuanToCents(changeForm.contractDeltaYuan), estimated_cost_delta_cents: yuanToCents(changeForm.estimatedCostDeltaYuan),
+    contract_delta_cents: signedYuanToCents(changeForm.contractDeltaYuan), estimated_cost_delta_cents: signedYuanToCents(changeForm.estimatedCostDeltaYuan),
     schedule_delta_days: changeForm.scheduleDeltaDays, proposed_on: changeForm.proposedOn, notes: optionalText(changeForm.notes), document_version_ids: [],
   }), () => { changeVisible.value = false }, '工程变更已新增')
 }
@@ -222,6 +241,10 @@ function openAcceptanceComplete(acceptance: DemoAcceptanceViewModel): void {
     status: acceptance.status === 'passed' || acceptance.status === 'passed_with_punch' || acceptance.status === 'failed' ? acceptance.status : 'passed',
     performedOn: acceptance.performed_on ?? localISODate(),
     notes: acceptance.notes ?? '',
+    warrantyStartsOn: acceptance.performed_on ?? localISODate(),
+    warrantyMonths: 12,
+    warrantyRenewalPriceYuan: '',
+    warrantyNotes: '',
   })
   acceptanceCompleteVisible.value = true
 }
@@ -231,6 +254,13 @@ function saveAcceptanceComplete(): Promise<void> {
     status: acceptanceCompleteForm.status,
     performed_on: acceptanceCompleteForm.performedOn,
     notes: optionalText(acceptanceCompleteForm.notes),
+    document_version_ids: [],
+    warranty: acceptanceNeedsWarranty.value ? {
+      starts_on: acceptanceCompleteForm.warrantyStartsOn,
+      duration_months: acceptanceCompleteForm.warrantyMonths,
+      renewal_price_cents: optionalYuanToCents(acceptanceCompleteForm.warrantyRenewalPriceYuan),
+      notes: optionalText(acceptanceCompleteForm.warrantyNotes),
+    } : null,
   }), () => { acceptanceCompleteVisible.value = false }, '验收结果已保存')
 }
 
@@ -238,7 +268,9 @@ function openWarrantyEdit(warranty: DemoWarrantyViewModel): void {
   Object.assign(warrantyForm, {
     startsOn: warranty.starts_on,
     durationMonths: warranty.duration_months,
-    renewalPriceYuan: (warranty.renewal_price_cents / 100).toFixed(2),
+    renewalPriceYuan: warranty.renewal_price_cents === null
+      ? ''
+      : (warranty.renewal_price_cents / 100).toFixed(2),
     notes: warranty.notes ?? '',
   })
   warrantyVisible.value = true
@@ -248,7 +280,7 @@ function saveWarranty(): Promise<void> {
   return runAction(() => repository.updateWarranty(props.projectCode, {
     starts_on: warrantyForm.startsOn,
     duration_months: warrantyForm.durationMonths,
-    renewal_price_cents: yuanToCents(warrantyForm.renewalPriceYuan),
+    renewal_price_cents: optionalYuanToCents(warrantyForm.renewalPriceYuan),
     notes: optionalText(warrantyForm.notes),
   }), () => { warrantyVisible.value = false }, '质保信息已更新')
 }
@@ -291,7 +323,7 @@ watch(
       if (version === loadVersion) model.value = result.data
     } catch (error) {
       if (version === loadVersion) {
-        loadError.value = error instanceof Error ? error.message : '交付演示数据加载失败'
+        loadError.value = error instanceof Error ? error.message : '交付数据加载失败'
       }
     } finally {
       if (version === loadVersion) loading.value = false
@@ -308,7 +340,7 @@ watch(
         <h2>{{ moduleTitle }}</h2>
         <p>{{ moduleDescription }}</p>
       </div>
-      <el-tag type="warning" effect="plain">演示数据</el-tag>
+      <el-tag type="success" effect="plain">实时数据</el-tag>
     </header>
 
     <el-alert
@@ -396,7 +428,7 @@ watch(
                 <el-table-column prop="scheduled_on" label="计划日期" min-width="120" />
                 <el-table-column prop="performed_on" label="实际日期" min-width="120"><template #default="scope">{{ scope.row.performed_on ?? '未执行' }}</template></el-table-column>
                 <el-table-column prop="notes" label="说明" min-width="180"><template #default="scope">{{ scope.row.notes ?? '无' }}</template></el-table-column>
-                <el-table-column label="操作" min-width="110" fixed="right"><template #default="scope"><el-button :data-testid="`acceptance-complete-${scope.row.acceptance_id}`" link type="primary" @click="openAcceptanceComplete(scope.row)">完成验收</el-button></template></el-table-column>
+                <el-table-column label="操作" min-width="110" fixed="right"><template #default="scope"><el-button :data-testid="`acceptance-complete-${scope.row.acceptance_id}`" link type="primary" :disabled="scope.row.status !== 'scheduled'" @click="openAcceptanceComplete(scope.row)">完成验收</el-button></template></el-table-column>
               </el-table>
             </div>
           </el-card>
@@ -407,7 +439,7 @@ watch(
               <el-descriptions-item label="截止">{{ model.warranty.ends_on }}</el-descriptions-item>
               <el-descriptions-item label="期限">{{ model.warranty.duration_months }} 个月</el-descriptions-item>
               <el-descriptions-item label="剩余天数">{{ model.warranty.days_remaining }} 天</el-descriptions-item>
-              <el-descriptions-item label="续费价格">{{ formatMoney(model.warranty.renewal_price_cents) }}（不是收入）</el-descriptions-item>
+              <el-descriptions-item label="续费价格">{{ model.warranty.renewal_price_cents === null ? '未设置' : `${formatMoney(model.warranty.renewal_price_cents)}（不是收入）` }}</el-descriptions-item>
               <el-descriptions-item label="备注">{{ model.warranty.notes ?? '无' }}</el-descriptions-item>
             </el-descriptions>
           </el-card>
@@ -449,25 +481,41 @@ watch(
       </section>
     </div>
 
-    <el-dialog v-model="acceptanceCompleteVisible" :teleported="false" title="完成验收（演示数据）" width="min(94vw, 560px)"><el-form label-position="top" @submit.prevent="saveAcceptanceComplete"><el-form-item label="验收结果"><el-select v-model="acceptanceCompleteForm.status" style="width:100%"><el-option label="通过" value="passed" /><el-option label="带整改项通过" value="passed_with_punch" /><el-option label="未通过" value="failed" /></el-select></el-form-item><el-form-item label="实际验收日期" required><el-date-picker v-model="acceptanceCompleteForm.performedOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item><el-form-item label="结果说明"><el-input v-model="acceptanceCompleteForm.notes" type="textarea" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存验收结果</el-button></el-form></el-dialog>
+    <el-dialog v-model="acceptanceCompleteVisible" :teleported="false" title="完成验收" width="min(94vw, 560px)">
+      <el-form label-position="top" @submit.prevent="saveAcceptanceComplete">
+        <el-form-item label="验收结果"><el-select v-model="acceptanceCompleteForm.status" style="width:100%"><el-option label="通过" value="passed" /><el-option label="带整改项通过" value="passed_with_punch" /><el-option label="未通过" value="failed" /></el-select></el-form-item>
+        <el-form-item label="实际验收日期" required><el-date-picker v-model="acceptanceCompleteForm.performedOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item>
+        <el-form-item label="结果说明"><el-input v-model="acceptanceCompleteForm.notes" type="textarea" /></el-form-item>
+        <template v-if="acceptanceNeedsWarranty">
+          <el-alert title="最终验收通过后将同时建立质保倒计时" type="info" :closable="false" />
+          <el-row :gutter="12">
+            <el-col :xs="24" :sm="12"><el-form-item label="质保开始日" required><el-date-picker v-model="acceptanceCompleteForm.warrantyStartsOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item></el-col>
+            <el-col :xs="24" :sm="12"><el-form-item label="质保月数" required><el-input-number v-model="acceptanceCompleteForm.warrantyMonths" :min="1" :max="240" /></el-form-item></el-col>
+          </el-row>
+          <el-form-item label="过保续费价格（元）"><el-input v-model="acceptanceCompleteForm.warrantyRenewalPriceYuan" inputmode="decimal" /></el-form-item>
+          <el-form-item label="质保备注"><el-input v-model="acceptanceCompleteForm.warrantyNotes" type="textarea" /></el-form-item>
+        </template>
+        <el-button type="primary" native-type="submit" :loading="formBusy">保存验收结果</el-button>
+      </el-form>
+    </el-dialog>
 
-    <el-dialog v-model="warrantyVisible" :teleported="false" title="编辑质保（演示数据）" width="min(94vw, 560px)"><el-form label-position="top" @submit.prevent="saveWarranty"><el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item label="质保开始日" required><el-date-picker v-model="warrantyForm.startsOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item label="质保月数" required><el-input-number v-model="warrantyForm.durationMonths" :min="1" :max="120" /></el-form-item></el-col></el-row><el-form-item label="续费价格（元）"><el-input v-model="warrantyForm.renewalPriceYuan" inputmode="decimal" /></el-form-item><el-form-item label="备注"><el-input v-model="warrantyForm.notes" type="textarea" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存质保</el-button></el-form></el-dialog>
+    <el-dialog v-model="warrantyVisible" :teleported="false" title="编辑质保" width="min(94vw, 560px)"><el-form label-position="top" @submit.prevent="saveWarranty"><el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item label="质保开始日" required><el-date-picker v-model="warrantyForm.startsOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item label="质保月数" required><el-input-number v-model="warrantyForm.durationMonths" :min="1" :max="120" /></el-form-item></el-col></el-row><el-form-item label="续费价格（元）"><el-input v-model="warrantyForm.renewalPriceYuan" data-testid="warranty-renewal-price" inputmode="decimal" /></el-form-item><el-form-item label="备注"><el-input v-model="warrantyForm.notes" type="textarea" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存质保</el-button></el-form></el-dialog>
 
-    <el-dialog v-model="invoiceVoidVisible" :teleported="false" title="作废发票记录（演示数据）" width="min(94vw, 480px)"><el-form label-position="top" @submit.prevent="saveInvoiceVoid"><el-form-item label="作废原因" required><el-input v-model="invoiceVoidForm.reason" type="textarea" /></el-form-item><el-button type="danger" native-type="submit" :loading="formBusy">确认作废</el-button></el-form></el-dialog>
+    <el-dialog v-model="invoiceVoidVisible" :teleported="false" title="作废发票记录" width="min(94vw, 480px)"><el-form label-position="top" @submit.prevent="saveInvoiceVoid"><el-form-item label="作废原因" required><el-input v-model="invoiceVoidForm.reason" type="textarea" /></el-form-item><el-button type="danger" native-type="submit" :loading="formBusy">确认作废</el-button></el-form></el-dialog>
 
-    <el-dialog v-model="afterSalesStatusVisible" :teleported="false" title="更新售后状态（演示数据）" width="min(94vw, 560px)"><el-form label-position="top" @submit.prevent="saveAfterSalesStatus"><el-form-item label="处理状态"><el-select v-model="afterSalesStatusForm.status" style="width:100%"><el-option v-for="(label, value) in afterSalesStatusLabels" :key="value" :value="value" :label="label" /></el-select></el-form-item><el-form-item :label="afterSalesStatusForm.status === 'completed' ? '处理结果（必填）' : '处理进展'"><el-input v-model="afterSalesStatusForm.resolution" type="textarea" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存售后状态</el-button></el-form></el-dialog>
+    <el-dialog v-model="afterSalesStatusVisible" :teleported="false" title="更新售后状态" width="min(94vw, 560px)"><el-form label-position="top" @submit.prevent="saveAfterSalesStatus"><el-form-item label="处理状态"><el-select v-model="afterSalesStatusForm.status" style="width:100%"><el-option v-for="(label, value) in afterSalesStatusLabels" :key="value" :value="value" :label="label" /></el-select></el-form-item><el-form-item :label="afterSalesStatusForm.status === 'completed' ? '处理结果（必填）' : '处理进展'"><el-input v-model="afterSalesStatusForm.resolution" type="textarea" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存售后状态</el-button></el-form></el-dialog>
 
-    <el-dialog v-model="signoffVisible" :teleported="false" title="更新图纸会签（演示数据）" width="min(94vw, 560px)"><el-form label-position="top" @submit.prevent="saveSignoff"><el-form-item label="状态"><el-select v-model="signoffForm.status" style="width:100%"><el-option value="pending" label="待确认" /><el-option value="confirmed" label="已确认" /><el-option value="not_required" label="无需图纸" /></el-select></el-form-item><el-form-item label="确认日期"><el-date-picker v-model="signoffForm.confirmedOn" type="date" value-format="YYYY-MM-DD" clearable style="width:100%" /></el-form-item><el-form-item v-if="signoffForm.status === 'not_required'" label="无需图纸原因"><el-input v-model="signoffForm.reason" /></el-form-item><el-form-item label="备注"><el-input v-model="signoffForm.notes" type="textarea" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存会签</el-button></el-form></el-dialog>
+    <el-dialog v-model="signoffVisible" :teleported="false" title="更新图纸会签" width="min(94vw, 560px)"><el-form label-position="top" @submit.prevent="saveSignoff"><el-form-item label="状态"><el-select v-model="signoffForm.status" style="width:100%"><el-option value="pending" label="待确认" /><el-option value="confirmed" label="已确认" /><el-option value="not_required" label="无需图纸" /></el-select></el-form-item><el-form-item label="确认日期"><el-date-picker v-model="signoffForm.confirmedOn" type="date" value-format="YYYY-MM-DD" clearable style="width:100%" /></el-form-item><el-form-item v-if="signoffForm.status === 'not_required'" label="无需图纸原因"><el-input v-model="signoffForm.reason" /></el-form-item><el-form-item label="备注"><el-input v-model="signoffForm.notes" type="textarea" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存会签</el-button></el-form></el-dialog>
 
-    <el-dialog v-model="commissioningVisible" :teleported="false" :title="selectedCommissioningId === null ? '新增调试记录（演示数据）' : '编辑调试记录（演示数据）'" width="min(94vw, 680px)"><el-form label-position="top" @submit.prevent="saveCommissioning"><el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item data-testid="commissioning-started-at" label="开始时间" required><el-date-picker v-model="commissioningForm.startedAt" type="datetime" value-format="YYYY-MM-DDTHH:mm" :clearable="false" style="width:100%" /></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item label="结束时间"><el-date-picker v-model="commissioningForm.endedAt" type="datetime" value-format="YYYY-MM-DDTHH:mm" clearable style="width:100%" /></el-form-item></el-col></el-row><el-form-item label="状态"><el-select v-model="commissioningForm.status" style="width:100%"><el-option v-for="(label, value) in commissioningLabels" :key="value" :value="value" :label="label" /></el-select></el-form-item><el-form-item label="本次结果"><el-input v-model="commissioningForm.summary" type="textarea" /></el-form-item><el-form-item label="问题"><el-input v-model="commissioningForm.issues" /></el-form-item><el-form-item label="下一步"><el-input v-model="commissioningForm.nextAction" /></el-form-item><el-form-item label="备注"><el-input v-model="commissioningForm.notes" /></el-form-item><el-button data-testid="commissioning-save" type="primary" native-type="submit" :loading="formBusy">保存调试记录</el-button></el-form></el-dialog>
+    <el-dialog v-model="commissioningVisible" :teleported="false" :title="selectedCommissioningId === null ? '新增调试记录' : '编辑调试记录'" width="min(94vw, 680px)"><el-form label-position="top" @submit.prevent="saveCommissioning"><el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item data-testid="commissioning-started-at" label="开始时间" required><el-date-picker v-model="commissioningForm.startedAt" type="datetime" value-format="YYYY-MM-DDTHH:mm" :clearable="false" style="width:100%" /></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item label="结束时间"><el-date-picker v-model="commissioningForm.endedAt" type="datetime" value-format="YYYY-MM-DDTHH:mm" clearable style="width:100%" /></el-form-item></el-col></el-row><el-form-item label="状态"><el-select v-model="commissioningForm.status" style="width:100%"><el-option v-for="(label, value) in commissioningLabels" :key="value" :value="value" :label="label" /></el-select></el-form-item><el-form-item label="本次结果"><el-input v-model="commissioningForm.summary" type="textarea" /></el-form-item><el-form-item label="问题"><el-input v-model="commissioningForm.issues" /></el-form-item><el-form-item label="下一步"><el-input v-model="commissioningForm.nextAction" /></el-form-item><el-form-item label="备注"><el-input v-model="commissioningForm.notes" /></el-form-item><el-button data-testid="commissioning-save" type="primary" native-type="submit" :loading="formBusy">保存调试记录</el-button></el-form></el-dialog>
 
-    <el-dialog v-model="changeVisible" :teleported="false" title="新增工程变更（演示数据）" width="min(94vw, 720px)"><el-form label-position="top" @submit.prevent="saveChange"><el-form-item label="来源"><el-select v-model="changeForm.source" style="width:100%"><el-option v-for="(label, value) in changeSourceLabels" :key="value" :value="value" :label="label" /></el-select></el-form-item><el-form-item label="标题" required><el-input v-model="changeForm.title" /></el-form-item><el-form-item label="变更说明" required><el-input v-model="changeForm.description" type="textarea" /></el-form-item><el-form-item label="原因" required><el-input v-model="changeForm.reason" /></el-form-item><el-row :gutter="12"><el-col :xs="24" :sm="8"><el-form-item label="合同变化（元）"><el-input v-model="changeForm.contractDeltaYuan" inputmode="decimal" /></el-form-item></el-col><el-col :xs="24" :sm="8"><el-form-item label="预测成本变化（元）"><el-input v-model="changeForm.estimatedCostDeltaYuan" inputmode="decimal" /></el-form-item></el-col><el-col :xs="24" :sm="8"><el-form-item label="工期变化（天）"><el-input-number v-model="changeForm.scheduleDeltaDays" /></el-form-item></el-col></el-row><el-form-item data-testid="engineering-change-date" label="提出日期"><el-date-picker v-model="changeForm.proposedOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item><el-form-item label="备注"><el-input v-model="changeForm.notes" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存工程变更</el-button></el-form></el-dialog>
+    <el-dialog v-model="changeVisible" :teleported="false" title="新增工程变更" width="min(94vw, 720px)"><el-form label-position="top" @submit.prevent="saveChange"><el-form-item label="来源"><el-select v-model="changeForm.source" style="width:100%"><el-option v-for="(label, value) in changeSourceLabels" :key="value" :value="value" :label="label" /></el-select></el-form-item><el-form-item label="标题" required><el-input v-model="changeForm.title" /></el-form-item><el-form-item label="变更说明" required><el-input v-model="changeForm.description" type="textarea" /></el-form-item><el-form-item label="原因" required><el-input v-model="changeForm.reason" /></el-form-item><el-row :gutter="12"><el-col :xs="24" :sm="8"><el-form-item label="合同变化（元）"><el-input v-model="changeForm.contractDeltaYuan" inputmode="decimal" /></el-form-item></el-col><el-col :xs="24" :sm="8"><el-form-item label="预测成本变化（元）"><el-input v-model="changeForm.estimatedCostDeltaYuan" inputmode="decimal" /></el-form-item></el-col><el-col :xs="24" :sm="8"><el-form-item label="工期变化（天）"><el-input-number v-model="changeForm.scheduleDeltaDays" /></el-form-item></el-col></el-row><el-form-item data-testid="engineering-change-date" label="提出日期"><el-date-picker v-model="changeForm.proposedOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item><el-form-item label="备注"><el-input v-model="changeForm.notes" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存工程变更</el-button></el-form></el-dialog>
 
-    <el-dialog v-model="acceptanceVisible" :teleported="false" title="新增验收计划（演示数据）" width="min(94vw, 560px)"><el-form label-position="top" @submit.prevent="saveAcceptance"><el-form-item label="验收类型"><el-select v-model="acceptanceForm.acceptanceType" style="width:100%"><el-option v-for="(label, value) in acceptanceTypeLabels" :key="value" :value="value" :label="label" /></el-select></el-form-item><el-form-item data-testid="acceptance-scheduled-date" label="计划日期" required><el-date-picker v-model="acceptanceForm.scheduledOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item><el-form-item label="说明"><el-input v-model="acceptanceForm.notes" type="textarea" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存验收计划</el-button></el-form></el-dialog>
+    <el-dialog v-model="acceptanceVisible" :teleported="false" title="新增验收计划" width="min(94vw, 560px)"><el-form label-position="top" @submit.prevent="saveAcceptance"><el-form-item label="验收类型"><el-select v-model="acceptanceForm.acceptanceType" style="width:100%"><el-option v-for="(label, value) in acceptanceTypeLabels" :key="value" :value="value" :label="label" /></el-select></el-form-item><el-form-item data-testid="acceptance-scheduled-date" label="计划日期" required><el-date-picker v-model="acceptanceForm.scheduledOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item><el-form-item label="说明"><el-input v-model="acceptanceForm.notes" type="textarea" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存验收计划</el-button></el-form></el-dialog>
 
-    <el-dialog v-model="invoiceVisible" :teleported="false" title="登记发票（演示数据）" width="min(94vw, 680px)"><el-form label-position="top" @submit.prevent="saveInvoice"><el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item label="发票类型"><el-select v-model="invoiceForm.invoiceType" style="width:100%"><el-option v-for="(label, value) in invoiceTypeLabels" :key="value" :value="value" :label="label" /></el-select></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item label="状态"><el-select v-model="invoiceForm.status" style="width:100%"><el-option v-for="(label, value) in invoiceStatusLabels" :key="value" :value="value" :label="label" /></el-select></el-form-item></el-col></el-row><el-form-item label="发票号码"><el-input v-model="invoiceForm.invoiceNumber" /></el-form-item><el-form-item label="金额（元）"><el-input v-model="invoiceForm.amountYuan" inputmode="decimal" placeholder="0.00" /></el-form-item><el-form-item label="对方单位"><el-input v-model="invoiceForm.counterpartyName" /></el-form-item><el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item label="申请日期"><el-date-picker v-model="invoiceForm.requestedOn" type="date" value-format="YYYY-MM-DD" clearable style="width:100%" /></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item data-testid="invoice-recorded-date" label="登记日期"><el-date-picker v-model="invoiceForm.recordedOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item></el-col></el-row><el-form-item label="备注"><el-input v-model="invoiceForm.notes" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存发票记录</el-button></el-form></el-dialog>
+    <el-dialog v-model="invoiceVisible" :teleported="false" title="登记发票" width="min(94vw, 680px)"><el-form label-position="top" @submit.prevent="saveInvoice"><el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item label="发票类型"><el-select v-model="invoiceForm.invoiceType" style="width:100%"><el-option v-for="(label, value) in invoiceTypeLabels" :key="value" :value="value" :label="label" /></el-select></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item label="状态"><el-select v-model="invoiceForm.status" style="width:100%"><el-option v-for="(label, value) in invoiceStatusLabels" :key="value" :value="value" :label="label" /></el-select></el-form-item></el-col></el-row><el-form-item label="发票号码"><el-input v-model="invoiceForm.invoiceNumber" /></el-form-item><el-form-item label="金额（元）"><el-input v-model="invoiceForm.amountYuan" inputmode="decimal" placeholder="0.00" /></el-form-item><el-form-item label="对方单位"><el-input v-model="invoiceForm.counterpartyName" /></el-form-item><el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item label="申请日期"><el-date-picker v-model="invoiceForm.requestedOn" type="date" value-format="YYYY-MM-DD" clearable style="width:100%" /></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item data-testid="invoice-recorded-date" label="登记日期"><el-date-picker v-model="invoiceForm.recordedOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item></el-col></el-row><el-form-item label="备注"><el-input v-model="invoiceForm.notes" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存发票记录</el-button></el-form></el-dialog>
 
-    <el-dialog v-model="afterSalesVisible" :teleported="false" title="新增售后案件（演示数据）" width="min(94vw, 680px)"><el-form label-position="top" @submit.prevent="saveAfterSales"><el-form-item label="报修原因" required><el-input v-model="afterSalesForm.reason" type="textarea" /></el-form-item><el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item label="联系人"><el-input v-model="afterSalesForm.contactName" /></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item label="联系电话"><el-input v-model="afterSalesForm.contactPhone" /></el-form-item></el-col></el-row><el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item data-testid="after-sales-reported-date" label="报修日期"><el-date-picker v-model="afterSalesForm.reportedOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item label="服务日期"><el-date-picker v-model="afterSalesForm.serviceOn" type="date" value-format="YYYY-MM-DD" clearable style="width:100%" /></el-form-item></el-col></el-row><el-form-item label="保障方式"><el-select v-model="afterSalesForm.coverageType" style="width:100%"><el-option v-for="(label, value) in coverageLabels" :key="value" :value="value" :label="label" /></el-select></el-form-item><el-form-item label="备注"><el-input v-model="afterSalesForm.notes" type="textarea" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存售后案件</el-button></el-form></el-dialog>
+    <el-dialog v-model="afterSalesVisible" :teleported="false" title="新增售后案件" width="min(94vw, 680px)"><el-form label-position="top" @submit.prevent="saveAfterSales"><el-form-item label="报修原因" required><el-input v-model="afterSalesForm.reason" type="textarea" /></el-form-item><el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item label="联系人"><el-input v-model="afterSalesForm.contactName" /></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item label="联系电话"><el-input v-model="afterSalesForm.contactPhone" /></el-form-item></el-col></el-row><el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item data-testid="after-sales-reported-date" label="报修日期"><el-date-picker v-model="afterSalesForm.reportedOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item label="服务日期"><el-date-picker v-model="afterSalesForm.serviceOn" type="date" value-format="YYYY-MM-DD" clearable style="width:100%" /></el-form-item></el-col></el-row><el-form-item label="保障方式"><el-select v-model="afterSalesForm.coverageType" style="width:100%"><el-option v-for="(label, value) in coverageLabels" :key="value" :value="value" :label="label" /></el-select></el-form-item><el-form-item label="备注"><el-input v-model="afterSalesForm.notes" type="textarea" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存售后案件</el-button></el-form></el-dialog>
   </section>
 </template>
 

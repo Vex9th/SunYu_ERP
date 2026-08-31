@@ -209,7 +209,7 @@ export interface DemoAcceptanceViewModel {
 export interface DemoWarrantyViewModel {
   starts_on: ISODate
   duration_months: number
-  renewal_price_cents: MoneyCents
+  renewal_price_cents: MoneyCents | null
   notes: string | null
   ends_on: ISODate
   days_remaining: number
@@ -260,7 +260,37 @@ export type EngineeringChangeInput = Omit<DemoEngineeringChangeViewModel, 'chang
 export type AcceptanceInput = Pick<DemoAcceptanceViewModel, 'acceptance_type' | 'scheduled_on' | 'notes'>
 export type AcceptanceCompletionInput = Pick<DemoAcceptanceViewModel, 'performed_on' | 'notes'> & {
   status: Extract<AcceptanceStatus, 'passed' | 'passed_with_punch' | 'failed'>
+  document_version_ids?: number[]
+  warranty?: WarrantyInput | null
 }
-export type WarrantyInput = Pick<DemoWarrantyViewModel, 'starts_on' | 'duration_months' | 'renewal_price_cents' | 'notes'>
+export type WarrantyInput = Pick<DemoWarrantyViewModel, 'starts_on' | 'duration_months' | 'notes'> & {
+  renewal_price_cents: MoneyCents
+}
 export type InvoiceInput = Omit<DemoInvoiceViewModel, 'invoice_id' | 'void_reason'>
 export type AfterSalesInput = Omit<DemoAfterSalesCaseViewModel, 'case_id' | 'status' | 'resolution'>
+
+export function optionalYuanToCents(value: string): MoneyCents | null {
+  const normalized = value.trim()
+  if (!normalized) return null
+  if (!/^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/.test(normalized)) {
+    throw new Error('金额必须是最多两位小数的非负元金额')
+  }
+  return parsedYuanToCents(normalized)
+}
+
+export function signedYuanToCents(value: string): MoneyCents {
+  const normalized = value.trim()
+  if (!/^-?(?:0|[1-9]\d*)(?:\.\d{1,2})?$/.test(normalized)) {
+    throw new Error('变更金额必须是最多两位小数的元金额')
+  }
+  const negative = normalized.startsWith('-')
+  const result = parsedYuanToCents(negative ? normalized.slice(1) : normalized)
+  return negative ? -result : result
+}
+
+function parsedYuanToCents(value: string): MoneyCents {
+  const [yuan, fraction = ''] = value.split('.')
+  const result = Number(yuan) * 100 + Number(fraction.padEnd(2, '0'))
+  if (!Number.isSafeInteger(result)) throw new Error('金额超出可保存范围')
+  return result
+}

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, toRaw, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 
 import type {
@@ -13,11 +13,17 @@ import type {
 } from '../../domain/workforce'
 import { localISODate } from '../../domain/dates'
 import { formatMoney, yuanToCents } from '../../domain/formatters'
-import { useDemoBusinessContext } from '../../repositories/demo-context'
+import {
+  createHttpWorkforceWorkspaceRepository,
+  type WorkforceWorkspaceRepository,
+} from '../../repositories/workforce.live'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   projectCode: string
-}>()
+  repository?: WorkforceWorkspaceRepository
+}>(), {
+  repository: () => createHttpWorkforceWorkspaceRepository(),
+})
 
 interface LaborDraft {
   attendanceStatus: AttendanceStatus
@@ -26,7 +32,7 @@ interface LaborDraft {
   workSummary: string
 }
 
-const repository = useDemoBusinessContext().workforce
+const repository = toRaw(props.repository)
 const model = ref<WorkforceDemoViewModel | null>(null)
 const workDate = ref(localISODate())
 const selectedAssignmentIds = ref<number[]>([])
@@ -42,12 +48,9 @@ const assignmentDialogVisible = ref(false)
 const reportDialogVisible = ref(false)
 const advanceDialogVisible = ref(false)
 const workerEditVisible = ref(false)
-const laborEditVisible = ref(false)
-const laborVoidVisible = ref(false)
 const reimbursementVisible = ref(false)
 const formBusy = ref(false)
 const selectedWorkerId = ref(0)
-const selectedLaborEntryId = ref(0)
 const selectedAdvanceId = ref(0)
 let loadVersion = 0
 
@@ -60,8 +63,6 @@ const advanceForm = reactive({
   workerId: 0, spentOn: localISODate(), vendorName: '', itemName: '', specification: '', brand: '', quantity: '', unit: '', unitPriceYuan: '', notes: '',
 })
 const workerEditForm = reactive({ name: '', phone: '', notes: '' })
-const laborEditForm = reactive({ assignmentId: 0, workDate: '', attendanceStatus: 'present' as AttendanceStatus, dayFraction: '1.000' as '1.000' | '0.500', hours: 8, workSummary: '', notes: '' })
-const laborVoidForm = reactive({ reason: '' })
 const reimbursementForm = reactive({ amountYuan: '', reimbursedOn: localISODate(), paymentMethod: 'bank_transfer' as 'bank_transfer' | 'cash' | 'other', notes: '' })
 
 const attendanceLabels: Record<AttendanceStatus, string> = {
@@ -70,7 +71,7 @@ const attendanceLabels: Record<AttendanceStatus, string> = {
   leave: '请假',
 }
 const payBasisLabels: Record<WorkerPayBasis, string> = { daily: '日薪', hourly: '时薪' }
-const assignmentStatusLabels: Record<CrewAssignmentStatus, string> = { planned: '已计划', active: '进行中', completed: '已完成', cancelled: '已取消' }
+const assignmentStatusLabels = { planned: '已计划', active: '进行中', completed: '已完成', cancelled: '已取消' } as const
 
 const workerNames = computed(() => new Map(
   model.value?.workers.map((worker) => [worker.worker_id, worker.name]) ?? [],
@@ -118,6 +119,14 @@ function assignmentRate(payBasis: WorkerPayBasis, rateCents: number): string {
 
 function payBasisLabel(payBasis: WorkerPayBasis): string {
   return payBasisLabels[payBasis]
+}
+
+function assignmentEndLabel(value: string): string {
+  return value === '9999-12-31' ? '长期' : value
+}
+
+function assignmentStatusLabel(status: CrewAssignmentStatus): string {
+  return assignmentStatusLabels[status]
 }
 
 function laborMeasure(entry: WorkforceDemoViewModel['labor_entries'][number]): string {
@@ -224,6 +233,7 @@ function toggleAssignment(assignmentId: number, checked: boolean): void {
 
 async function saveTodayLabor(): Promise<void> {
   if (!model.value || selectedAssignmentIds.value.length === 0) return
+  const submittedCount = selectedAssignmentIds.value.length
   saving.value = true
   successNotice.value = ''
   errorNotice.value = ''
@@ -252,10 +262,15 @@ async function saveTodayLabor(): Promise<void> {
         }
       }),
     })
-    model.value = (await repository.getWorkforcePreview(props.projectCode)).data
-    successNotice.value = `已保存 ${workDate.value} 的 ${selectedAssignmentIds.value.length} 人上工记录（演示数据）`
     selectedAssignmentIds.value = []
-    ElMessage.success('今日上工已统一保存（演示数据）')
+    successNotice.value = `已保存 ${workDate.value} 的 ${submittedCount} 人上工记录`
+    ElMessage.success('今日上工已统一保存')
+    try {
+      await refreshModel()
+    } catch {
+      successNotice.value = '今日上工已保存但刷新失败，请手动刷新页面查看最新数据'
+      ElMessage.warning(successNotice.value)
+    }
   } catch (error) {
     errorNotice.value = error instanceof Error ? error.message : '保存失败'
   } finally {
@@ -278,10 +293,15 @@ async function runForm(action: () => Promise<void>, close: () => void, message: 
   errorNotice.value = ''
   try {
     await action()
-    await refreshModel()
     close()
-    successNotice.value = `${message}（演示数据）`
+    successNotice.value = message
     ElMessage.success(successNotice.value)
+    try {
+      await refreshModel()
+    } catch {
+      successNotice.value = `${message}；已保存但刷新失败，请手动刷新页面查看最新数据`
+      ElMessage.warning(successNotice.value)
+    }
   } catch (error) {
     errorNotice.value = error instanceof Error ? error.message : '保存失败'
   } finally {
@@ -360,53 +380,8 @@ function saveWorkerEdit(): Promise<void> {
 }
 
 function changeWorkerStatus(worker: DemoWorkerViewModel): Promise<void> {
-  const status = worker.status === 'active' ? 'inactive' : 'active'
-  return runForm(() => repository.setWorkerStatus(worker.worker_id, status), () => {}, status === 'inactive' ? '施工员已停用' : '施工员已启用')
-}
-
-function changeAssignmentStatus(assignmentId: number, status: CrewAssignmentStatus): Promise<void> {
-  return runForm(() => repository.setCrewAssignmentStatus(props.projectCode, assignmentId, status), () => {}, '派工状态已更新')
-}
-
-function openLaborEdit(entry: DemoLaborEntryViewModel): void {
-  selectedLaborEntryId.value = entry.entry_id
-  Object.assign(laborEditForm, {
-    assignmentId: entry.assignment_id,
-    workDate: entry.work_date,
-    attendanceStatus: entry.attendance_status,
-    dayFraction: entry.day_fraction === '0.500' ? '0.500' : '1.000',
-    hours: entry.work_minutes === null ? 8 : Number((entry.work_minutes / 60).toFixed(2)),
-    workSummary: entry.work_summary ?? '',
-    notes: entry.notes ?? '',
-  })
-  laborEditVisible.value = true
-}
-
-function saveLaborEdit(): Promise<void> {
-  const assignment = model.value?.crew_assignments.find((item) => item.assignment_id === laborEditForm.assignmentId)
-  return runForm(async () => {
-    if (!assignment) throw new Error('项目排单不存在')
-    const present = laborEditForm.attendanceStatus === 'present'
-    await repository.updateLaborEntry(props.projectCode, selectedLaborEntryId.value, {
-      assignment_id: laborEditForm.assignmentId,
-      work_date: laborEditForm.workDate,
-      attendance_status: laborEditForm.attendanceStatus,
-      day_fraction: present && assignment.pay_basis === 'daily' ? laborEditForm.dayFraction : null,
-      work_minutes: present && assignment.pay_basis === 'hourly' ? Math.round(laborEditForm.hours * 60) : null,
-      work_summary: optionalText(laborEditForm.workSummary),
-      notes: optionalText(laborEditForm.notes),
-    })
-  }, () => { laborEditVisible.value = false }, '上工记录已更新')
-}
-
-function openLaborVoid(entryId: number): void {
-  selectedLaborEntryId.value = entryId
-  laborVoidForm.reason = ''
-  laborVoidVisible.value = true
-}
-
-function saveLaborVoid(): Promise<void> {
-  return runForm(() => repository.voidLaborEntry(props.projectCode, selectedLaborEntryId.value, laborVoidForm.reason), () => { laborVoidVisible.value = false }, '上工记录已作废')
+  if (worker.status !== 'active') return Promise.resolve()
+  return runForm(() => repository.setWorkerStatus(worker.worker_id, 'inactive'), () => {}, '施工员已停用')
 }
 
 function confirmReport(workDate: string): Promise<void> {
@@ -446,7 +421,7 @@ watch(
       }
     } catch (error) {
       if (version === loadVersion) {
-        loadError.value = error instanceof Error ? error.message : '施工演示数据加载失败'
+        loadError.value = error instanceof Error ? error.message : '施工数据加载失败'
       }
     } finally {
       if (version === loadVersion) loading.value = false
@@ -472,7 +447,7 @@ watch(workDate, () => {
         <h2>今日施工</h2>
         <p>项目 {{ projectCode }} · 默认处理今天上工，多人一次保存。</p>
       </div>
-      <el-tag size="small" type="warning" effect="plain">演示数据</el-tag>
+      <el-tag size="small" type="success" effect="plain">实时数据</el-tag>
     </header>
 
     <el-alert
@@ -515,7 +490,7 @@ watch(workDate, () => {
                 </div>
                 <div class="crew-summary-item">
                   <small>项目排期</small>
-                  <span>{{ scope.row.assignment.scheduled_start_on }} 至 {{ scope.row.assignment.scheduled_end_on }}</span>
+                  <span>{{ scope.row.assignment.scheduled_start_on }} 至 {{ assignmentEndLabel(scope.row.assignment.scheduled_end_on) }}</span>
                   <small>{{ payBasisLabel(scope.row.assignment.pay_basis) }} {{ assignmentRate(scope.row.assignment.pay_basis, scope.row.assignment.rate_cents) }}</small>
                 </div>
                 <div class="crew-summary-item">
@@ -524,15 +499,7 @@ watch(workDate, () => {
                   <span v-else>暂无记录</span>
                   <small>{{ scope.row.laborCount }} 次 · {{ formatMoney(scope.row.laborCostCents) }}</small>
                 </div>
-                <el-select
-                  :model-value="scope.row.assignment.status"
-                  :data-testid="`assignment-status-${scope.row.assignment.assignment_id}`"
-                  size="small"
-                  aria-label="派工状态"
-                  @change="changeAssignmentStatus(scope.row.assignment.assignment_id, $event as CrewAssignmentStatus)"
-                >
-                  <el-option v-for="(label, value) in assignmentStatusLabels" :key="value" :label="label" :value="value" />
-                </el-select>
+                <el-tag size="small" effect="plain">{{ assignmentStatusLabel(scope.row.assignment.status) }}</el-tag>
               </div>
             </template>
           </el-table-column>
@@ -543,7 +510,7 @@ watch(workDate, () => {
               <el-table-column prop="name" label="施工员" min-width="110" />
               <el-table-column prop="phone" label="电话" min-width="130"><template #default="scope">{{ scope.row.phone ?? '未填写' }}</template></el-table-column>
               <el-table-column label="状态" min-width="80"><template #default="scope"><el-tag size="small" :type="scope.row.status === 'active' ? 'success' : 'info'">{{ scope.row.status === 'active' ? '在职' : '已停用' }}</el-tag></template></el-table-column>
-              <el-table-column label="操作" min-width="150" fixed="right"><template #default="scope"><div class="compact-actions"><el-button :data-testid="`worker-edit-${scope.row.worker_id}`" link type="primary" @click="openWorkerEdit(scope.row)">编辑</el-button><el-button :data-testid="`worker-deactivate-${scope.row.worker_id}`" link :type="scope.row.status === 'active' ? 'danger' : 'primary'" @click="changeWorkerStatus(scope.row)">{{ scope.row.status === 'active' ? '停用' : '启用' }}</el-button></div></template></el-table-column>
+              <el-table-column label="操作" min-width="150" fixed="right"><template #default="scope"><div class="compact-actions"><el-button :data-testid="`worker-edit-${scope.row.worker_id}`" link type="primary" @click="openWorkerEdit(scope.row)">编辑</el-button><el-button v-if="scope.row.status === 'active'" :data-testid="`worker-deactivate-${scope.row.worker_id}`" link type="danger" @click="changeWorkerStatus(scope.row)">停用</el-button></div></template></el-table-column>
             </el-table>
           </el-collapse-item>
         </el-collapse>
@@ -667,6 +634,7 @@ watch(workDate, () => {
 
       <el-card shadow="never" class="labor-history-card">
         <template #header><strong>最近上工记录</strong></template>
+        <el-alert title="当天记录需要纠错时，请在上方选择日期后重新批量保存" type="info" :closable="false" />
         <div class="table-scroll">
           <el-table :data="model.labor_entries" row-key="entry_id" size="small">
             <el-table-column prop="work_date" label="日期" min-width="108" />
@@ -676,7 +644,6 @@ watch(workDate, () => {
             <el-table-column label="人工成本" min-width="110"><template #default="scope"><strong>{{ formatMoney(scope.row.cost_cents) }}</strong></template></el-table-column>
             <el-table-column prop="work_summary" label="工作内容" min-width="180"><template #default="scope">{{ scope.row.work_summary ?? '未填写' }}</template></el-table-column>
             <el-table-column label="记录状态" min-width="100"><template #default="scope"><el-tag size="small" :type="scope.row.status === 'voided' ? 'info' : 'success'">{{ scope.row.status === 'voided' ? '已作废' : '有效' }}</el-tag></template></el-table-column>
-            <el-table-column label="操作" min-width="130" fixed="right"><template #default="scope"><div class="compact-actions"><el-button :data-testid="`labor-edit-${scope.row.entry_id}`" link type="primary" :disabled="scope.row.status === 'voided'" @click="openLaborEdit(scope.row)">编辑</el-button><el-button :data-testid="`labor-void-${scope.row.entry_id}`" link type="danger" :disabled="scope.row.status === 'voided'" @click="openLaborVoid(scope.row.entry_id)">作废</el-button></div></template></el-table-column>
           </el-table>
         </div>
       </el-card>
@@ -706,15 +673,11 @@ watch(workDate, () => {
       </div>
     </template>
 
-    <el-dialog v-model="workerEditVisible" :teleported="false" title="编辑施工员（演示数据）" width="min(94vw, 520px)"><el-form label-position="top" @submit.prevent="saveWorkerEdit"><el-form-item label="姓名" required><el-input v-model="workerEditForm.name" /></el-form-item><el-form-item label="电话"><el-input v-model="workerEditForm.phone" /></el-form-item><el-form-item label="备注"><el-input v-model="workerEditForm.notes" type="textarea" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存人员</el-button></el-form></el-dialog>
+    <el-dialog v-model="workerEditVisible" :teleported="false" title="编辑施工员" width="min(94vw, 520px)"><el-form label-position="top" @submit.prevent="saveWorkerEdit"><el-form-item label="姓名" required><el-input v-model="workerEditForm.name" /></el-form-item><el-form-item label="电话"><el-input v-model="workerEditForm.phone" /></el-form-item><el-form-item label="备注"><el-input v-model="workerEditForm.notes" type="textarea" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存人员</el-button></el-form></el-dialog>
 
-    <el-dialog v-model="laborEditVisible" :teleported="false" title="编辑上工记录（演示数据）" width="min(94vw, 620px)"><el-form label-position="top" @submit.prevent="saveLaborEdit"><el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item label="日期"><el-date-picker v-model="laborEditForm.workDate" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item label="到场状态"><el-select v-model="laborEditForm.attendanceStatus" style="width:100%"><el-option v-for="(label, value) in attendanceLabels" :key="value" :label="label" :value="value" /></el-select></el-form-item></el-col></el-row><template v-if="laborEditForm.attendanceStatus === 'present'"><el-form-item v-if="model?.crew_assignments.find((item) => item.assignment_id === laborEditForm.assignmentId)?.pay_basis === 'daily'" label="日薪上工量"><el-select v-model="laborEditForm.dayFraction" style="width:100%"><el-option label="全天" value="1.000" /><el-option label="半天" value="0.500" /></el-select></el-form-item><el-form-item v-else label="时薪小时数"><el-input-number v-model="laborEditForm.hours" :min="0.25" :max="24" :step="0.5" /></el-form-item></template><el-form-item label="工作内容"><el-input v-model="laborEditForm.workSummary" type="textarea" /></el-form-item><el-form-item label="备注"><el-input v-model="laborEditForm.notes" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存上工记录</el-button></el-form></el-dialog>
+    <el-dialog v-model="reimbursementVisible" :teleported="false" title="记录报销" width="min(94vw, 560px)"><el-form label-position="top" @submit.prevent="saveReimbursement"><el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item label="报销金额（元）" required><el-input v-model="reimbursementForm.amountYuan" inputmode="decimal" placeholder="0.00" /></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item label="报销日期" required><el-date-picker v-model="reimbursementForm.reimbursedOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item></el-col></el-row><el-form-item label="支付方式"><el-select v-model="reimbursementForm.paymentMethod" style="width:100%"><el-option label="银行转账" value="bank_transfer" /><el-option label="现金" value="cash" /><el-option label="其他" value="other" /></el-select></el-form-item><el-form-item label="备注"><el-input v-model="reimbursementForm.notes" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存报销</el-button></el-form></el-dialog>
 
-    <el-dialog v-model="laborVoidVisible" :teleported="false" title="作废上工记录（演示数据）" width="min(94vw, 480px)"><el-form label-position="top" @submit.prevent="saveLaborVoid"><el-form-item label="作废原因" required><el-input v-model="laborVoidForm.reason" type="textarea" /></el-form-item><el-button type="danger" native-type="submit" :loading="formBusy">确认作废</el-button></el-form></el-dialog>
-
-    <el-dialog v-model="reimbursementVisible" :teleported="false" title="记录报销（演示数据）" width="min(94vw, 560px)"><el-form label-position="top" @submit.prevent="saveReimbursement"><el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item label="报销金额（元）" required><el-input v-model="reimbursementForm.amountYuan" inputmode="decimal" placeholder="0.00" /></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item label="报销日期" required><el-date-picker v-model="reimbursementForm.reimbursedOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item></el-col></el-row><el-form-item label="支付方式"><el-select v-model="reimbursementForm.paymentMethod" style="width:100%"><el-option label="银行转账" value="bank_transfer" /><el-option label="现金" value="cash" /><el-option label="其他" value="other" /></el-select></el-form-item><el-form-item label="备注"><el-input v-model="reimbursementForm.notes" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存报销</el-button></el-form></el-dialog>
-
-    <el-dialog v-model="workerDialogVisible" data-testid="worker-create-dialog" :teleported="false" title="新建施工员（演示数据）" width="min(94vw, 520px)">
+    <el-dialog v-model="workerDialogVisible" data-testid="worker-create-dialog" :teleported="false" title="新建施工员" width="min(94vw, 520px)">
       <el-form label-position="top" @submit.prevent="saveWorker">
         <el-form-item label="姓名" required><el-input v-model="workerForm.name" /></el-form-item>
         <el-form-item label="电话"><el-input v-model="workerForm.phone" /></el-form-item>
@@ -723,7 +686,7 @@ watch(workDate, () => {
       </el-form>
     </el-dialog>
 
-    <el-dialog v-model="assignmentDialogVisible" data-testid="assignment-create-dialog" :teleported="false" title="添加项目工人（演示数据）" width="min(94vw, 620px)">
+    <el-dialog v-model="assignmentDialogVisible" data-testid="assignment-create-dialog" :teleported="false" title="添加项目工人" width="min(94vw, 620px)">
       <el-form label-position="top" @submit.prevent="saveAssignment">
         <el-form-item label="施工员" required><el-select v-model="assignmentForm.workerId" style="width:100%"><el-option v-for="worker in model?.workers ?? []" :key="worker.worker_id" :label="worker.name" :value="worker.worker_id" /></el-select></el-form-item>
         <el-form-item label="岗位" required><el-input v-model="assignmentForm.role" /></el-form-item>
@@ -734,7 +697,7 @@ watch(workDate, () => {
       </el-form>
     </el-dialog>
 
-    <el-dialog v-model="reportDialogVisible" data-testid="daily-report-dialog" :teleported="false" title="施工日报（演示数据）" width="min(94vw, 680px)">
+    <el-dialog v-model="reportDialogVisible" data-testid="daily-report-dialog" :teleported="false" title="施工日报" width="min(94vw, 680px)">
       <el-form label-position="top" @submit.prevent="saveReport">
         <el-row :gutter="12"><el-col :xs="24" :sm="8"><el-form-item data-testid="daily-report-date" label="日期" required><el-date-picker v-model="reportForm.workDate" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item></el-col><el-col :xs="24" :sm="8"><el-form-item label="现场"><el-input v-model="reportForm.location" /></el-form-item></el-col><el-col :xs="24" :sm="8"><el-form-item label="天气"><el-input v-model="reportForm.weather" /></el-form-item></el-col></el-row>
         <el-form-item label="施工内容" required><el-input v-model="reportForm.workSummary" type="textarea" /></el-form-item>
@@ -745,7 +708,7 @@ watch(workDate, () => {
       </el-form>
     </el-dialog>
 
-    <el-dialog v-model="advanceDialogVisible" data-testid="material-advance-dialog" :teleported="false" title="现场垫资（演示数据）" width="min(94vw, 720px)">
+    <el-dialog v-model="advanceDialogVisible" data-testid="material-advance-dialog" :teleported="false" title="现场垫资" width="min(94vw, 720px)">
       <el-form label-position="top" @submit.prevent="saveAdvance">
         <el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item label="垫资人"><el-select v-model="advanceForm.workerId" style="width:100%"><el-option v-for="worker in model?.workers ?? []" :key="worker.worker_id" :label="worker.name" :value="worker.worker_id" /></el-select></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item data-testid="material-advance-date" label="日期"><el-date-picker v-model="advanceForm.spentOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item></el-col></el-row>
         <el-form-item label="商户名称" required><el-input v-model="advanceForm.vendorName" /></el-form-item>
