@@ -117,6 +117,14 @@ def test_create_app_registers_first_business_vertical_slice_routes() -> None:
         "/api/projects/{project_code}/crew-assignments",
         "/api/projects/{project_code}/labor-entries",
         "/api/projects/{project_code}/labor-entries/batch",
+        "/api/projects/{project_code}/site-daily-reports",
+        "/api/projects/{project_code}/site-daily-reports/{work_date}",
+        "/api/projects/{project_code}/site-daily-reports/{work_date}/confirm",
+        "/api/projects/{project_code}/site-daily-reports/{work_date}/reopen",
+        "/api/projects/{project_code}/material-advances",
+        "/api/projects/{project_code}/material-advances/{advance_id}",
+        "/api/projects/{project_code}/material-advances/{advance_id}/reimbursements",
+        "/api/projects/{project_code}/material-advances/{advance_id}/void",
         "/api/projects/{project_code}/documents",
         "/api/projects/{project_code}/quotes",
         "/api/projects/{project_code}/quotes/{quote_id}",
@@ -272,6 +280,7 @@ def test_lifespan_applies_migrations_and_closes_every_owned_connection(
         "007_dashboard_indexes",
         "008_procurement_inventory",
         "009_workforce_delivery",
+        "010_site_report_events",
     }
 
 

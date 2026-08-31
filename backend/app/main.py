@@ -22,6 +22,7 @@ from backend.app.features.inventory import create_inventory_router
 from backend.app.features.procurement import create_procurement_router
 from backend.app.features.project_stages import create_project_stages_router
 from backend.app.features.projects import create_projects_router
+from backend.app.features.site_operations import create_site_operations_router
 from backend.app.features.system import (
     BackupCreator,
     BackupJobResult,
@@ -163,6 +164,9 @@ def create_app(
     application.include_router(create_procurement_router(get_connection, get_settings))
     application.include_router(create_inventory_router(get_connection, get_settings))
     application.include_router(create_workforce_router(get_connection, get_settings))
+    application.include_router(
+        create_site_operations_router(get_connection, get_settings)
+    )
     application.include_router(
         create_system_router(
             get_connection,
