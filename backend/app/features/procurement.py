@@ -1052,6 +1052,24 @@ def create_procurement_router(
             """,
             (project["id"],),
         ).fetchone()[0]
+        paid = connection.execute(
+            """
+            SELECT COALESCE(SUM(payments.amount_cents), 0)
+            FROM supplier_payments AS payments
+            JOIN purchase_orders AS orders ON orders.id = payments.purchase_order_id
+            WHERE orders.project_id = ? AND payments.status = 'active'
+            """,
+            (project["id"],),
+        ).fetchone()[0]
+        invoiced = connection.execute(
+            """
+            SELECT COALESCE(SUM(invoices.amount_cents), 0)
+            FROM supplier_invoices AS invoices
+            JOIN purchase_orders AS orders ON orders.id = invoices.purchase_order_id
+            WHERE orders.project_id = ? AND invoices.status = 'active'
+            """,
+            (project["id"],),
+        ).fetchone()[0]
         consumed = connection.execute(
             """
             SELECT COALESCE(SUM(total_cost_cents), 0)
@@ -1066,7 +1084,8 @@ def create_procurement_router(
             "line_status_counts": dict(counts),
             "procurement_committed_cents": committed,
             "procurement_received_cents": received,
-            "procurement_paid_cents": 0,
+            "procurement_paid_cents": paid,
+            "procurement_invoiced_cents": invoiced,
             "material_consumed_cents": consumed,
         }
 
@@ -1465,6 +1484,36 @@ def _order_response(
         line_value(int(line["unit_cost_cents"]), int(line["quantity_milli"]))
         for line in lines
     )
+    payments = [
+        _payment_response(connection, payment)
+        for payment in connection.execute(
+            """
+            SELECT * FROM supplier_payments
+            WHERE purchase_order_id = ? ORDER BY id
+            """,
+            (row["id"],),
+        ).fetchall()
+    ]
+    invoices = [
+        _invoice_response(connection, invoice)
+        for invoice in connection.execute(
+            """
+            SELECT * FROM supplier_invoices
+            WHERE purchase_order_id = ? ORDER BY id
+            """,
+            (row["id"],),
+        ).fetchall()
+    ]
+    receipts = [
+        _receipt_response(connection, receipt)
+        for receipt in connection.execute(
+            """
+            SELECT * FROM goods_receipts
+            WHERE purchase_order_id = ? ORDER BY id
+            """,
+            (row["id"],),
+        ).fetchall()
+    ]
     return {
         "id": row["id"],
         "project_code": project_code,
@@ -1475,7 +1524,25 @@ def _order_response(
         "expected_delivery_on": row["expected_delivery_on"],
         "notes": row["notes"],
         "status": row["status"],
+        "cancelled_at": row["cancelled_at"],
+        "cancel_reason": row["cancel_reason"],
         "ordered_amount_cents": ordered_amount,
+        "paid_amount_cents": sum(
+            int(payment["amount_cents"])
+            for payment in payments
+            if payment["status"] == "active"
+        ),
+        "invoiced_amount_cents": sum(
+            int(invoice["amount_cents"])
+            for invoice in invoices
+            if invoice["status"] == "active"
+        ),
+        "received_amount_cents": sum(
+            int(line["value_cents"])
+            for receipt in receipts
+            if receipt["status"] == "active"
+            for line in receipt["lines"]
+        ),
         "document_version_ids": [document[0] for document in documents],
         "revision": row["revision"],
         "lines": [
@@ -1495,6 +1562,9 @@ def _order_response(
             }
             for line in lines
         ],
+        "supplier_payments": payments,
+        "supplier_invoices": invoices,
+        "goods_receipts": receipts,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -1518,6 +1588,8 @@ def _receipt_response(
         "warehouse_name": row["warehouse_name"],
         "notes": row["notes"],
         "status": row["status"],
+        "reversal_reason": row["reversal_reason"],
+        "reversed_at": row["reversed_at"],
         "revision": row["revision"],
         "lines": [
             {
@@ -1530,6 +1602,72 @@ def _receipt_response(
             }
             for line in lines
         ],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _payment_response(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> dict[str, object]:
+    allocations = connection.execute(
+        """
+        SELECT purchase_order_line_id, amount_cents
+        FROM supplier_payment_allocations
+        WHERE supplier_payment_id = ? ORDER BY purchase_order_line_id
+        """,
+        (row["id"],),
+    ).fetchall()
+    return {
+        "id": row["id"],
+        "purchase_order_id": row["purchase_order_id"],
+        "paid_on": row["paid_on"],
+        "amount_cents": row["amount_cents"],
+        "payment_method": row["payment_method"],
+        "reference_no": row["reference_no"],
+        "notes": row["notes"],
+        "status": row["status"],
+        "reversal_reason": row["reversal_reason"],
+        "reversed_at": row["reversed_at"],
+        "revision": row["revision"],
+        "allocations": [dict(allocation) for allocation in allocations],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _invoice_response(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> dict[str, object]:
+    allocations = connection.execute(
+        """
+        SELECT purchase_order_line_id, amount_cents
+        FROM supplier_invoice_allocations
+        WHERE supplier_invoice_id = ? ORDER BY purchase_order_line_id
+        """,
+        (row["id"],),
+    ).fetchall()
+    documents = connection.execute(
+        """
+        SELECT document_version_id FROM supplier_invoice_documents
+        WHERE supplier_invoice_id = ? ORDER BY document_version_id
+        """,
+        (row["id"],),
+    ).fetchall()
+    return {
+        "id": row["id"],
+        "purchase_order_id": row["purchase_order_id"],
+        "invoice_no": row["invoice_no"],
+        "invoiced_on": row["invoiced_on"],
+        "amount_cents": row["amount_cents"],
+        "status": row["status"],
+        "reversal_reason": row["reversal_reason"],
+        "reversed_at": row["reversed_at"],
+        "revision": row["revision"],
+        "allocations": [dict(allocation) for allocation in allocations],
+        "document_version_ids": [int(document[0]) for document in documents],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
