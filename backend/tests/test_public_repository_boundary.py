@@ -14,7 +14,11 @@ FORBIDDEN_DIRECTORY_NAMES = {
     "customer-data",
     "secrets",
 }
-FORBIDDEN_FILE_NAMES = {"AGENTS.md", "config.json"}
+FORBIDDEN_FILE_NAMES = {
+    "AGENTS.md",
+    "EXTERNAL_AI_DEVELOPMENT_PROMPT.md",
+    "config.json",
+}
 FORBIDDEN_DATABASE_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
 
 
@@ -24,6 +28,8 @@ def is_forbidden_public_path(path_text: str) -> bool:
     if any(part in FORBIDDEN_DIRECTORY_NAMES for part in parts):
         return True
     if path.name in FORBIDDEN_FILE_NAMES:
+        return True
+    if path.name == ".env" or (path.name.startswith(".env.") and path.name != ".env.example"):
         return True
     if parts[:2] == ("docs", "superpowers"):
         return True
@@ -36,6 +42,7 @@ def is_forbidden_public_path(path_text: str) -> bool:
 def test_public_path_classifier_rejects_internal_and_business_data() -> None:
     forbidden = [
         "docs/superpowers/notes.md",
+        "docs/EXTERNAL_AI_DEVELOPMENT_PROMPT.md",
         ".codex/settings.json",
         ".agents/skills/local.md",
         ".worktrees/feature/file.py",
@@ -43,6 +50,7 @@ def test_public_path_classifier_rejects_internal_and_business_data() -> None:
         "Data/iapm.sqlite",
         "Backups/20260831/iapm.sqlite3",
         "config.json",
+        ".env.production",
         "customer-data/acme/contract.pdf",
         "secrets/token.txt",
         "cache.db-wal",
