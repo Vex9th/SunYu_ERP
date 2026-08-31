@@ -207,48 +207,76 @@ onMounted(loadData)
 </script>
 
 <template>
-  <el-space direction="vertical" alignment="stretch" fill :size="16">
-    <el-card shadow="never">
+  <el-space class="page-stack" direction="vertical" alignment="stretch" fill :size="20">
+    <section class="page-heading">
+      <div>
+        <h1>项目中心</h1>
+        <p>选择一个项目即可开始处理。</p>
+      </div>
+      <el-button data-testid="project-create-open" type="primary" size="large" @click="openProjectCreate">新建项目</el-button>
+    </section>
+
+    <el-card class="data-card" shadow="never">
       <template #header>
         <el-row justify="space-between" align="middle">
-          <el-space direction="vertical" alignment="start" :size="2">
-            <el-text tag="strong" size="large">项目中心</el-text>
-            <el-text type="info">项目是资料、联系人和后续成本核算的主线</el-text>
-          </el-space>
-          <el-button data-testid="project-create-open" type="primary" @click="openProjectCreate">新建项目</el-button>
+          <el-text tag="strong" size="large">项目列表</el-text>
+          <el-radio-group data-testid="project-filter" v-model="selectedStatus" :disabled="loading" @change="loadData">
+            <el-radio-button value="active">在建</el-radio-button>
+            <el-radio-button value="archived">已归档</el-radio-button>
+            <el-radio-button value="all">全部</el-radio-button>
+          </el-radio-group>
         </el-row>
       </template>
 
-      <el-space direction="vertical" alignment="stretch" fill :size="16">
-        <el-radio-group data-testid="project-filter" v-model="selectedStatus" :disabled="loading" @change="loadData">
-          <el-radio-button value="active">在建项目</el-radio-button>
-          <el-radio-button value="archived">已归档</el-radio-button>
-          <el-radio-button value="all">全部项目</el-radio-button>
-        </el-radio-group>
-
+      <el-space data-testid="project-list-stack" class="project-list-stack" direction="vertical" alignment="stretch" fill :size="16">
         <el-alert v-if="actionError" data-testid="project-action-error" :title="actionError" type="error" show-icon :closable="false" />
         <el-skeleton v-if="loading" data-testid="projects-loading" :rows="6" animated />
         <el-result v-else-if="listError" data-testid="projects-error" icon="error" title="项目列表读取失败" :sub-title="listError">
           <template #extra><el-button data-testid="projects-retry" type="primary" @click="loadData">重新读取</el-button></template>
         </el-result>
         <el-empty v-else-if="projects.length === 0" data-testid="projects-empty" :description="selectedStatus === 'active' ? '暂无在建项目' : '当前筛选下暂无项目'" />
-        <el-table v-else :data="projects" row-key="id">
-          <el-table-column prop="project_code" label="项目编号" min-width="150" />
-          <el-table-column prop="name" label="项目名称" min-width="180" />
-          <el-table-column prop="company_name" label="客户" min-width="180" />
-          <el-table-column label="状态" width="100">
-            <template #default="scope"><el-tag :type="scope.row.status === 'active' ? 'success' : 'info'">{{ statusLabel(scope.row.status) }}</el-tag></template>
-          </el-table-column>
-          <el-table-column prop="created_at" label="创建时间" min-width="190" />
-          <el-table-column label="操作" width="230" fixed="right">
-            <template #default="scope">
-              <el-space>
-                <el-button :data-testid="`project-dashboard-${scope.row.project_code}`" link type="primary" @click="emit('open-dashboard', scope.row.project_code)">进入仪表台</el-button>
+        <div v-else class="project-list-content">
+          <el-table class="project-list-table" :data="projects" row-key="id">
+            <el-table-column prop="project_code" label="项目编号" width="132" show-overflow-tooltip />
+            <el-table-column prop="name" label="项目名称" min-width="220">
+              <template #default="scope"><el-button :data-testid="`project-dashboard-${scope.row.project_code}`" class="project-name-link" link type="primary" @click="emit('open-dashboard', scope.row.project_code)">{{ scope.row.name }}</el-button></template>
+            </el-table-column>
+            <el-table-column prop="company_name" label="客户公司" min-width="260">
+              <template #default="scope"><span :data-testid="`project-company-cell-${scope.row.id}`" class="project-company-cell">{{ scope.row.company_name }}</span></template>
+            </el-table-column>
+            <el-table-column label="状态" width="90">
+              <template #default="scope"><el-tag :type="scope.row.status === 'active' ? 'success' : 'info'">{{ statusLabel(scope.row.status) }}</el-tag></template>
+            </el-table-column>
+            <el-table-column label="操作" width="80">
+              <template #default="scope">
                 <el-button v-if="scope.row.status === 'active'" :data-testid="`project-archive-${scope.row.project_code}`" link type="danger" @click="openArchive(scope.row)">归档</el-button>
-              </el-space>
-            </template>
-          </el-table-column>
-        </el-table>
+              </template>
+            </el-table-column>
+          </el-table>
+
+          <div class="project-mobile-list">
+            <el-card
+              v-for="project in projects"
+              :key="project.id"
+              :data-testid="`project-mobile-card-${project.id}`"
+              class="project-mobile-card"
+              shadow="never"
+            >
+              <div class="project-mobile-heading">
+                <div>
+                  <strong>{{ project.name }}</strong>
+                  <span>{{ project.project_code }}</span>
+                </div>
+                <el-tag :type="project.status === 'active' ? 'success' : 'info'">{{ statusLabel(project.status) }}</el-tag>
+              </div>
+              <span class="project-mobile-company">客户：{{ project.company_name }}</span>
+              <div class="project-mobile-actions">
+                <el-button :data-testid="`project-mobile-open-${project.project_code}`" type="primary" @click="emit('open-dashboard', project.project_code)">进入项目</el-button>
+                <el-button v-if="project.status === 'active'" type="danger" plain @click="openArchive(project)">归档</el-button>
+              </div>
+            </el-card>
+          </div>
+        </div>
       </el-space>
     </el-card>
 
@@ -265,7 +293,7 @@ onMounted(loadData)
     >
       <el-alert v-if="actionError" :title="actionError" type="error" show-icon :closable="false" />
       <el-alert v-if="projectValidationError" :title="projectValidationError" type="error" show-icon :closable="false" />
-      <el-alert v-if="companies.length === 0" title="请先在「客户与联系人」中录入公司" type="warning" show-icon :closable="false" />
+      <el-alert v-if="companies.length === 0" title="请先在「公司联系人」中录入公司" type="warning" show-icon :closable="false" />
       <el-form label-position="top" @submit.prevent="saveProject">
         <el-form-item label="项目编号" required><el-input data-testid="project-code" v-model="projectForm.project_code" :disabled="projectBusy" /></el-form-item>
         <el-form-item label="客户" required>
@@ -299,3 +327,26 @@ onMounted(loadData)
     </el-dialog>
   </el-space>
 </template>
+
+<style scoped>
+.project-list-stack,
+.project-list-stack > :deep(.el-space__item),
+.project-list-content,
+.project-list-table { width: 100%; min-width: 0; }
+.project-mobile-list { display: none; }
+.project-company-cell { display: block; white-space: normal; overflow-wrap: anywhere; line-height: 1.45; }
+.project-name-link { height: auto; white-space: normal; text-align: left; line-height: 1.45; }
+@media (max-width: 640px) {
+  .project-list-table { display: none; }
+  .project-mobile-list { display: grid; gap: 10px; }
+  .project-mobile-card :deep(.el-card__body) { display: grid; gap: 12px; padding: 14px; }
+  .project-mobile-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .project-mobile-heading > div { display: grid; min-width: 0; gap: 4px; }
+  .project-mobile-heading strong,
+  .project-mobile-company { overflow-wrap: anywhere; }
+  .project-mobile-heading span,
+  .project-mobile-company { color: var(--sunyu-muted); }
+  .project-mobile-actions { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+  .project-mobile-actions :deep(.el-button) { width: 100%; margin-left: 0; }
+}
+</style>

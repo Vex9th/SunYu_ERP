@@ -426,18 +426,20 @@ onMounted(loadCompanies)
 </script>
 
 <template>
-  <el-space direction="vertical" alignment="stretch" fill :size="16">
-    <el-card shadow="never">
+  <el-space class="page-stack" direction="vertical" alignment="stretch" fill :size="20">
+    <section class="page-heading">
+      <div>
+        <h1>公司联系人</h1>
+        <p>公司资料和联系人统一维护。</p>
+      </div>
+      <el-button data-testid="company-create-open" type="primary" size="large" @click="openCompanyCreate">
+        新增公司
+      </el-button>
+    </section>
+
+    <el-card class="data-card" shadow="never">
       <template #header>
-        <el-row justify="space-between" align="middle">
-          <el-space direction="vertical" alignment="start" :size="2">
-            <el-text tag="strong" size="large">客户与联系人</el-text>
-            <el-text type="info">维护开票资料和一对多联系人</el-text>
-          </el-space>
-          <el-button data-testid="company-create-open" type="primary" @click="openCompanyCreate">
-            新增公司
-          </el-button>
-        </el-row>
+        <el-text tag="strong" size="large">合作公司</el-text>
       </template>
 
       <el-alert
@@ -464,7 +466,9 @@ onMounted(loadCompanies)
         </template>
       </el-result>
       <el-empty v-else-if="companies.length === 0" data-testid="companies-empty" description="暂无客户，可以先新增公司" />
-      <el-table v-else :data="companies" row-key="id">
+      <div v-else class="company-list-content">
+      <div class="company-table-scroll">
+      <el-table class="company-table" :data="companies" row-key="id">
         <el-table-column prop="name" label="公司名称" min-width="180" />
         <el-table-column prop="taxpayer_id" label="税号" min-width="160">
           <template #default="scope">{{ scope.row.taxpayer_id ?? '未录入' }}</template>
@@ -473,7 +477,7 @@ onMounted(loadCompanies)
           <template #default="scope">{{ scope.row.registered_phone ?? '未录入' }}</template>
         </el-table-column>
         <el-table-column prop="contact_count" label="联系人" width="90" />
-        <el-table-column label="操作" width="260" fixed="right">
+        <el-table-column label="操作" width="260">
           <template #default="scope">
             <el-space>
               <el-button :data-testid="`company-detail-${scope.row.id}`" link type="primary" @click="openDetail(scope.row.id)">详情</el-button>
@@ -483,6 +487,20 @@ onMounted(loadCompanies)
           </template>
         </el-table-column>
       </el-table>
+      </div>
+      <div class="company-mobile-list">
+        <el-card v-for="company in companies" :key="company.id" shadow="never" class="company-mobile-item">
+          <strong>{{ company.name }}</strong>
+          <span>电话：{{ company.registered_phone ?? '未录入' }}</span>
+          <span>联系人：{{ company.contact_count }} 人</span>
+          <div class="mobile-actions">
+            <el-button type="primary" plain size="small" @click="openDetail(company.id)">详情</el-button>
+            <el-button plain size="small" @click="openCompanyEdit(company)">编辑</el-button>
+            <el-button type="danger" plain size="small" @click="openCompanyDelete(company)">删除</el-button>
+          </div>
+        </el-card>
+      </div>
+      </div>
     </el-card>
 
     <el-drawer
@@ -515,7 +533,7 @@ onMounted(loadCompanies)
       data-testid="company-detail-drawer"
       :teleported="false"
       title="客户详情"
-      size="min(94vw, 720px)"
+      size="min(100vw, 760px)"
       :before-close="beforeDetailClose"
       :close-on-click-modal="!contactBusy"
       :close-on-press-escape="!contactBusy"
@@ -527,7 +545,15 @@ onMounted(loadCompanies)
       <el-result v-else-if="detailError" data-testid="company-detail-error" icon="error" title="详情读取失败" :sub-title="detailError">
         <template #extra><el-button data-testid="company-detail-retry" type="primary" @click="retryDetail">重试</el-button></template>
       </el-result>
-      <el-space v-else-if="detail" direction="vertical" alignment="stretch" fill :size="16">
+      <el-space
+        v-else-if="detail"
+        data-testid="company-detail-content"
+        class="company-detail-content"
+        direction="vertical"
+        alignment="stretch"
+        fill
+        :size="16"
+      >
         <el-descriptions :column="1" border>
           <el-descriptions-item label="公司名称">{{ detail.name }}</el-descriptions-item>
           <el-descriptions-item label="税号">{{ detail.taxpayer_id ?? '未录入' }}</el-descriptions-item>
@@ -542,10 +568,14 @@ onMounted(loadCompanies)
           <el-button data-testid="contact-create-open" type="primary" @click="openContactCreate">新增联系人</el-button>
         </el-row>
         <el-empty v-if="detail.contacts.length === 0" description="暂无联系人" />
-        <el-table v-else :data="detail.contacts" row-key="id">
-          <el-table-column prop="name" label="姓名" />
-          <el-table-column prop="phone" label="电话"><template #default="scope">{{ scope.row.phone ?? '未录入' }}</template></el-table-column>
-          <el-table-column prop="position" label="职务"><template #default="scope">{{ scope.row.position ?? '未录入' }}</template></el-table-column>
+        <div v-else class="contact-list-content">
+        <div class="company-contact-table-scroll">
+        <el-table data-testid="company-contact-table" class="company-contact-table" :data="detail.contacts" row-key="id">
+          <el-table-column prop="name" label="姓名" min-width="110" />
+          <el-table-column prop="phone" label="电话" min-width="150">
+            <template #default="scope"><span :data-testid="`contact-phone-value-${scope.row.id}`" class="contact-phone-value">{{ scope.row.phone ?? '未录入' }}</span></template>
+          </el-table-column>
+          <el-table-column prop="position" label="职务" min-width="110"><template #default="scope">{{ scope.row.position ?? '未录入' }}</template></el-table-column>
           <el-table-column label="操作" width="140">
             <template #default="scope">
               <el-button :data-testid="`contact-edit-${scope.row.id}`" link @click="openContactEdit(scope.row)">编辑</el-button>
@@ -553,6 +583,18 @@ onMounted(loadCompanies)
             </template>
           </el-table-column>
         </el-table>
+        </div>
+        <div class="contact-mobile-list">
+          <el-card v-for="contact in detail.contacts" :key="contact.id" shadow="never" class="contact-mobile-item">
+            <div><strong>{{ contact.name }}</strong><span>{{ contact.position ?? '未录入职务' }}</span></div>
+            <span class="contact-phone-value">{{ contact.phone ?? '未录入电话' }}</span>
+            <div class="mobile-actions">
+              <el-button plain size="small" @click="openContactEdit(contact)">编辑</el-button>
+              <el-button type="danger" plain size="small" @click="openContactDelete(contact)">删除</el-button>
+            </div>
+          </el-card>
+        </div>
+        </div>
       </el-space>
     </el-drawer>
 
@@ -618,3 +660,29 @@ onMounted(loadCompanies)
     </el-dialog>
   </el-space>
 </template>
+
+<style scoped>
+.company-table-scroll,
+.company-contact-table-scroll { width: 100%; min-width: 0; max-width: 100%; overflow-x: auto; }
+.company-table { width: 100%; min-width: 850px; }
+.company-contact-table { width: 100%; min-width: 560px; }
+.company-mobile-list,
+.contact-mobile-list { display: none; }
+.contact-phone-value { display: inline-block; min-width: 11em; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.company-detail-content,
+.company-detail-content > :deep(.el-space__item) { width: 100%; min-width: 0 !important; max-width: 100%; }
+@media (max-width: 520px) {
+  .company-table-scroll,
+  .company-contact-table-scroll { display: none; }
+  .company-mobile-list,
+  .contact-mobile-list { display: grid; gap: 10px; }
+  .company-mobile-item :deep(.el-card__body),
+  .contact-mobile-item :deep(.el-card__body) { display: grid; gap: 8px; padding: 14px; }
+  .company-mobile-item span,
+  .contact-mobile-item span { color: var(--sunyu-muted); }
+  .contact-mobile-item > :deep(.el-card__body > div:first-child) { display: flex; justify-content: space-between; gap: 12px; }
+  .mobile-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+  .contact-mobile-item .mobile-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .mobile-actions :deep(.el-button) { width: 100%; margin-left: 0; }
+}
+</style>

@@ -64,6 +64,7 @@ describe('App', () => {
   afterEach(() => {
     document.body.innerHTML = ''
     vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
     vi.restoreAllMocks()
   })
 
@@ -205,7 +206,21 @@ describe('App', () => {
     expect(wrapper.get('[data-testid="request-error"]').text()).toContain('密码错误')
   })
 
-  it('认证后默认展示真实项目中心并保留系统与备份页', async () => {
+  it('登录页使用紧凑单栏工具布局，不显示宣传式大标题', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ authenticated: false, password_configured: true }),
+    )
+
+    const wrapper = mountApp()
+    await settle()
+
+    expect(wrapper.find('[data-testid="auth-context"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="auth-form-side"]').classes()).toContain('auth-main')
+    expect(wrapper.text()).not.toContain('把每一个非标项目')
+    expect(wrapper.get('.auth-card').text()).toContain('数据保存在当前主机')
+  })
+
+  it('认证后展示精简主导航，真实基础数据与演示业务模块保持分层', async () => {
     fetchMock
       .mockResolvedValueOnce(
         jsonResponse({ authenticated: true, password_configured: true }),
@@ -214,15 +229,40 @@ describe('App', () => {
 
     const wrapper = mountApp()
     await settle()
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-testid="portfolio-operating-overview"]').exists()).toBe(true)
+    })
 
     const dashboard = wrapper.get('[data-testid="dashboard"]')
-    expect(dashboard.text()).toContain('项目中心')
-    expect(dashboard.text()).not.toContain('模块建设中')
-    expect(dashboard.get('[data-testid="projects-empty"]').text()).toContain('暂无在建项目')
-    expect(dashboard.get('[data-testid="nav-companies"]').text()).toContain('客户与联系人')
-    expect(dashboard.get('[data-testid="nav-system"]').text()).toContain('系统与备份')
-    expect(dashboard.get('[data-testid="projects-empty"]').isVisible()).toBe(true)
+    expect(dashboard.get('[data-testid="nav-overview"]').text()).toBe('总览')
+    expect(dashboard.get('[data-testid="workbench-overview"]').text()).toContain('今天先处理什么')
+    expect(dashboard.get('[data-testid="portfolio-operating-overview"]').text()).toContain('演示数据')
+    expect(dashboard.get('[data-testid="portfolio-operating-overview"]').isVisible()).toBe(true)
+    expect(dashboard.find('[data-testid="portfolio-preview-toggle"]').exists()).toBe(false)
+    expect(dashboard.find('.preview-collapse').exists()).toBe(false)
+    expect(dashboard.get('[data-testid="workbench-summary"]').findAll('.workbench-summary__item')).toHaveLength(4)
+    expect(dashboard.find('.system-brief').exists()).toBe(false)
+    expect(dashboard.get('[data-testid="workbench-recent-projects"]').classes()).toContain('el-col-xl-24')
+    expect(dashboard.get('[data-testid="workbench-active-projects"]').text()).toContain('0')
+    expect(dashboard.get('[data-testid="workbench-companies"]').text()).toContain('0')
+    expect(dashboard.findAll('.workspace-menu [data-testid^="nav-"]').map((item) => item.text())).toEqual([
+      '总览', '项目', '联系人', '库存', '设置',
+    ])
+    expect(dashboard.find('[data-testid="nav-procurement"]').exists()).toBe(false)
+    expect(dashboard.find('[data-testid="nav-workforce"]').exists()).toBe(false)
+    expect(dashboard.find('[data-testid="nav-delivery"]').exists()).toBe(false)
     expect(dashboard.get('[data-testid="scheduler-status"]').isVisible()).toBe(false)
+
+    await dashboard.get('[data-testid="nav-projects"]').trigger('click')
+    await settle()
+    expect(dashboard.get('[data-testid="projects-empty"]').text()).toContain('暂无在建项目')
+    expect(dashboard.get('[data-testid="projects-empty"]').isVisible()).toBe(true)
+
+    await dashboard.get('[data-testid="nav-inventory"]').trigger('click')
+    await vi.waitFor(() => {
+      expect(dashboard.find('[data-testid="inventory-center"]').exists()).toBe(true)
+    })
+    expect(dashboard.get('[data-testid="inventory-center"]').isVisible()).toBe(true)
 
     await dashboard.get('[data-testid="nav-system"]').trigger('click')
     expect(dashboard.get('[data-testid="scheduler-status"]').isVisible()).toBe(true)
@@ -238,6 +278,164 @@ describe('App', () => {
     expect(dashboard.text()).toContain('30 天')
     expect(dashboard.text()).toContain('尚未执行')
     expect(wrapper.find('[data-testid="session-secret"]').exists()).toBe(false)
+  })
+
+  it('生产环境保留尚未接后端的演示页面并明确数据来源', async () => {
+    vi.stubEnv('DEV', false)
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ authenticated: true, password_configured: true }))
+      .mockResolvedValueOnce(jsonResponse(overview))
+
+    const wrapper = mountApp()
+    await settle()
+
+    expect(wrapper.get('[data-testid="nav-projects"]').isVisible()).toBe(true)
+    expect(wrapper.get('[data-testid="nav-companies"]').isVisible()).toBe(true)
+    expect(wrapper.get('[data-testid="nav-system"]').isVisible()).toBe(true)
+    expect(wrapper.get('[data-testid="nav-inventory"]').isVisible()).toBe(true)
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-testid="portfolio-operating-overview"]').exists()).toBe(true)
+    })
+    expect(wrapper.get('[data-testid="portfolio-operating-overview"]').text()).toContain('演示数据')
+  })
+
+  it('总工作台只用现有项目和公司接口生成真实摘要', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ authenticated: true, password_configured: true }),
+      )
+      .mockResolvedValueOnce(jsonResponse(overview))
+    businessFetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/projects?status=active') {
+        return jsonResponse([{
+          id: 21,
+          project_code: 'SY-2026-001',
+          company_id: 1,
+          name: '装配线改造',
+          description: null,
+          status: 'active',
+          archive_reason: null,
+          archived_at: null,
+          created_at: '2026-08-28T02:00:00+00:00',
+          updated_at: '2026-08-28T02:00:00+00:00',
+          company_name: '苏州出发科技',
+        }])
+      }
+      if (path === '/api/companies') {
+        return jsonResponse([{
+          id: 1,
+          name: '苏州出发科技',
+          taxpayer_id: '91320000TEST',
+          registered_address: null,
+          registered_phone: null,
+          bank_name: null,
+          bank_account: null,
+          notes: null,
+          created_at: '2026-08-28T01:00:00+00:00',
+          updated_at: '2026-08-28T01:00:00+00:00',
+          contact_count: 2,
+        }])
+      }
+      throw new Error(`unexpected ${path}`)
+    })
+
+    const wrapper = mountApp()
+    await settle()
+
+    expect(wrapper.get('[data-testid="workbench-active-projects"]').text()).toContain('1')
+    expect(wrapper.get('[data-testid="workbench-companies"]').text()).toContain('1')
+    expect(wrapper.get('[data-testid="workbench-overview"]').text()).toContain('装配线改造')
+    expect(wrapper.get('[data-testid="workbench-overview"]').text()).toContain('联系人2')
+    expect(wrapper.get('[data-testid="workbench-overview"]').text()).toContain('资料待完善0')
+  })
+
+  it('总工作台任一并发接口返回 401 都立即退出失效会话', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ authenticated: true, password_configured: true }),
+      )
+      .mockResolvedValueOnce(jsonResponse(overview))
+    businessFetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/projects?status=active') {
+        return jsonResponse({ detail: '项目服务暂时不可用' }, 503)
+      }
+      if (path === '/api/companies') {
+        return jsonResponse({ detail: 'Authentication required' }, 401)
+      }
+      throw new Error(`unexpected ${path}`)
+    })
+
+    const wrapper = mountApp()
+    await settle()
+
+    expect(wrapper.get('[data-testid="auth-title"]').text()).toContain('密码登录')
+    expect(wrapper.get('[data-testid="request-error"]').text()).toContain('登录状态已失效')
+    expect(wrapper.find('[data-testid="dashboard"]').exists()).toBe(false)
+  })
+
+  it('总工作台不等待悬挂请求即可处理已经返回的 401', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ authenticated: true, password_configured: true }),
+      )
+      .mockResolvedValueOnce(jsonResponse(overview))
+    businessFetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/projects?status=active') {
+        return jsonResponse({ detail: '登录状态已失效' }, 401)
+      }
+      if (path === '/api/companies') {
+        return new Promise<Response>(() => undefined)
+      }
+      throw new Error(`unexpected ${path}`)
+    })
+
+    const wrapper = mountApp()
+    await settle()
+
+    expect(wrapper.get('[data-testid="auth-title"]').text()).toContain('密码登录')
+    expect(wrapper.get('[data-testid="request-error"]').text()).toContain('登录状态已失效')
+  })
+
+  it('总工作台接口失败时将未知指标显示为占位符，不伪装成零数据', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ authenticated: true, password_configured: true }),
+      )
+      .mockResolvedValueOnce(jsonResponse(overview))
+    businessFetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/projects?status=active') {
+        return jsonResponse({ detail: '项目服务暂时不可用' }, 503)
+      }
+      if (path === '/api/companies') {
+        return jsonResponse([{
+          id: 1,
+          name: '苏州出发科技',
+          taxpayer_id: null,
+          registered_address: null,
+          registered_phone: null,
+          bank_name: null,
+          bank_account: null,
+          notes: null,
+          created_at: '2026-08-28T01:00:00+00:00',
+          updated_at: '2026-08-28T01:00:00+00:00',
+          contact_count: 1,
+        }])
+      }
+      throw new Error(`unexpected ${path}`)
+    })
+
+    const wrapper = mountApp()
+    await settle()
+
+    expect(wrapper.get('[data-testid="workbench-error"]').text()).toContain('项目服务暂时不可用')
+    expect(wrapper.get('[data-testid="workbench-active-projects"]').text()).toContain('--')
+    expect(wrapper.get('[data-testid="workbench-companies"]').text()).toContain('1')
+    expect(wrapper.get('[data-testid="workbench-overview"]').text()).not.toContain('暂无在建项目')
+    expect(wrapper.get('[data-testid="workbench-project-error"]').text()).toContain('项目数据读取失败')
   })
 
   it('展示已停止调度器及最近错误信息', async () => {
@@ -680,7 +878,7 @@ describe('App', () => {
     expect(wrapper.find('[data-testid="auth-title"]').exists()).toBe(false)
   })
 
-  it('可在项目、客户和系统三个真实工作页之间切换', async () => {
+  it('可在总工作台、项目、客户和系统四个真实工作页之间切换', async () => {
     fetchMock
       .mockResolvedValueOnce(
         jsonResponse({ authenticated: true, password_configured: true }),
@@ -689,8 +887,12 @@ describe('App', () => {
 
     const wrapper = mountApp()
     await settle()
-    expect(wrapper.get('[data-testid="projects-empty"]').isVisible()).toBe(true)
+    expect(wrapper.get('[data-testid="workbench-overview"]').isVisible()).toBe(true)
     expect(wrapper.get('[data-testid="scheduler-status"]').isVisible()).toBe(false)
+
+    await wrapper.get('[data-testid="nav-projects"]').trigger('click')
+    await settle()
+    expect(wrapper.get('[data-testid="projects-empty"]').isVisible()).toBe(true)
 
     await wrapper.get('[data-testid="nav-companies"]').trigger('click')
     await settle()
@@ -755,6 +957,9 @@ describe('App', () => {
 
     const wrapper = mountApp()
     await settle()
+
+    await wrapper.get('[data-testid="nav-projects"]').trigger('click')
+    await settle()
     await wrapper.get('[data-testid="project-filter"] input[value="archived"]').setValue(true)
     await settle()
     expect(wrapper.text()).toContain('已归档装配线')
@@ -771,17 +976,16 @@ describe('App', () => {
       path === '/api/projects?status=archived')).toHaveLength(1)
   })
 
-  it('390px 工作台使用顶部导航栅格而非固定侧栏', async () => {
+  it('工作台使用统一的导航与内容壳层', async () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse({ authenticated: true, password_configured: true }))
       .mockResolvedValueOnce(jsonResponse(overview))
     const wrapper = mountApp()
     await settle()
 
-    expect(wrapper.get('[data-testid="nav-column"]').classes()).toContain('el-col-xs-24')
-    expect(wrapper.get('[data-testid="nav-column"]').classes()).toContain('el-col-sm-6')
-    expect(wrapper.get('[data-testid="content-column"]').classes()).toContain('el-col-xs-24')
-    expect(wrapper.find('aside[style*="220px"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="nav-column"]').classes()).toContain('workspace-aside')
+    expect(wrapper.get('[data-testid="content-column"]').classes()).toContain('workspace-content')
+    expect(wrapper.get('[data-testid="nav-overview"]').isVisible()).toBe(true)
   })
 
   it('任意业务 API 返回 401 时清空工作台并回到登录页', async () => {
@@ -971,7 +1175,7 @@ describe('App', () => {
     await settle()
     expect(wrapper.get('[data-testid="request-error"]').isVisible()).toBe(true)
     expect(wrapper.get('[data-testid="request-error"]').text()).toContain('退出服务暂时不可用')
-    expect(wrapper.get('[data-testid="projects-empty"]').isVisible()).toBe(true)
+    expect(wrapper.get('[data-testid="workbench-overview"]').isVisible()).toBe(true)
   })
 
   it('备份专属错误只在系统页展示', async () => {

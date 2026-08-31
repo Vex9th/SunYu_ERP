@@ -1,7 +1,12 @@
-interface RequestOptions {
+export interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
+  headers?: HeadersInit
   body?: unknown
 }
+
+import type { ApiErrorPayload } from './domain/contracts'
+
+export type { ApiErrorPayload } from './domain/contracts'
 
 const knownErrorMessages: Record<string, string> = {
   'Authentication required': '登录状态已失效，请重新登录',
@@ -32,10 +37,17 @@ const knownErrorMessages: Record<string, string> = {
   'Project operation failed': '项目操作失败',
 }
 
+const knownErrorCodeMessages: Record<string, string> = {
+  REVISION_CONFLICT: '数据已被其他操作修改，请刷新后重试',
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly errorCode?: string,
+    readonly fieldErrors?: unknown,
+    readonly currentRevision?: number,
   ) {
     super(message)
     this.name = 'ApiError'
@@ -48,10 +60,16 @@ async function sendRequest(path: string, options: RequestOptions = {}): Promise<
     credentials: 'same-origin',
   }
 
+  const headers = normalizeHeaders(options.headers)
   if (options.body !== undefined) {
-    init.headers = { 'Content-Type': 'application/json' }
-    init.body = JSON.stringify(options.body)
+    if (options.body instanceof FormData || options.body instanceof Blob) {
+      init.body = options.body
+    } else {
+      if (!hasHeader(headers, 'Content-Type')) headers['Content-Type'] = 'application/json'
+      init.body = JSON.stringify(options.body)
+    }
   }
+  if (Object.keys(headers).length > 0) init.headers = headers
 
   let response: Response
   try {
@@ -75,7 +93,17 @@ async function responseError(response: Response): Promise<ApiError> {
       'detail' in payload &&
       typeof payload.detail === 'string'
     ) {
-      return new ApiError(knownErrorMessages[payload.detail] ?? payload.detail, response.status)
+      const structured = payload as Partial<ApiErrorPayload>
+      const errorCode = typeof structured.error_code === 'string' ? structured.error_code : undefined
+      return new ApiError(
+        (errorCode ? knownErrorCodeMessages[errorCode] : undefined)
+          ?? knownErrorMessages[payload.detail]
+          ?? payload.detail,
+        response.status,
+        errorCode,
+        structured.field_errors,
+        typeof structured.current_revision === 'number' ? structured.current_revision : undefined,
+      )
     }
   } catch {
     // FastAPI 之外的代理错误没有 JSON detail，统一使用状态码提示。
@@ -88,6 +116,7 @@ export async function requestJson<T>(
   options: RequestOptions = {},
 ): Promise<T> {
   const response = await sendRequest(path, options)
+  if (response.status === 204) return undefined as T
   return (await response.json()) as T
 }
 
@@ -96,4 +125,76 @@ export async function requestVoid(
   options: RequestOptions = {},
 ): Promise<void> {
   await sendRequest(path, options)
+}
+
+function requestPlannedPostJson<T>(
+  path: string,
+  body: unknown,
+  idempotencyKey: string,
+): Promise<T> {
+  return requestJson<T>(path, {
+    method: 'POST',
+    headers: { 'Idempotency-Key': idempotencyKey },
+    body,
+  })
+}
+
+export interface PlannedPostRequest<T> {
+  readonly idempotencyKey: string
+  send(): Promise<T>
+}
+
+export function createPlannedPostRequest<T>(
+  path: string,
+  body: unknown,
+  idempotencyKey = crypto.randomUUID(),
+): PlannedPostRequest<T> {
+  return {
+    idempotencyKey,
+    send: () => requestPlannedPostJson<T>(path, body, idempotencyKey),
+  }
+}
+
+export async function requestBlob(
+  path: string,
+  options: RequestOptions = {},
+): Promise<Blob> {
+  const response = await sendRequest(path, options)
+  return response.blob()
+}
+
+export function withQuery(
+  path: string,
+  params: Record<string, string | number | boolean | null | undefined>,
+): string {
+  const query = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== null && value !== undefined) query.set(key, String(value))
+  }
+  const encoded = query.toString()
+  return encoded ? `${path}?${encoded}` : path
+}
+
+function normalizeHeaders(input?: HeadersInit): Record<string, string> {
+  if (!input) return {}
+  const entries = input instanceof Headers
+    ? [...input.entries()]
+    : Array.isArray(input)
+      ? input
+      : Object.entries(input)
+  const normalized: Record<string, string> = {}
+  const actualNames = new Map<string, string>()
+  for (const [name, value] of entries) {
+    const key = name.toLowerCase()
+    const previousName = actualNames.get(key)
+    if (previousName) delete normalized[previousName]
+    actualNames.set(key, name)
+    normalized[name] = value
+  }
+  return normalized
+}
+
+function hasHeader(headers: Record<string, string>, name: string): boolean {
+  const expected = name.toLowerCase()
+  return Object.keys(headers).some((key) => key.toLowerCase() === expected)
 }
