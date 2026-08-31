@@ -1,4 +1,4 @@
-import { createPlannedPostRequest, requestJson, withQuery } from '../api'
+import { createRetriablePostSender, requestJson, withQuery } from '../api'
 import type { PagedResult } from '../domain/contracts'
 import type {
   CrewAssignmentDto,
@@ -42,15 +42,18 @@ export interface WorkforceHttpRepository {
   updateCrewAssignment(projectCode: string, assignmentId: number, input: CrewAssignmentUpdateInput): Promise<RepositoryResult<CrewAssignmentDto>>
   listLaborEntries(projectCode: string, query?: LaborEntryListQuery): Promise<RepositoryResult<PagedResult<LaborEntryDto>>>
   saveLaborEntriesBatch(projectCode: string, input: LaborBatchInput): Promise<RepositoryResult<LaborBatchDto>>
+  discardSaveLaborEntriesBatch(projectCode: string, input: LaborBatchInput): boolean
 }
 
 class HttpWorkforceRepository implements WorkforceHttpRepository {
+  private readonly postSender = createRetriablePostSender()
+
   async listWorkers(query: WorkerListQuery = {}): Promise<RepositoryResult<PagedResult<WorkerDto>>> {
     return live(await requestJson(withQuery('/api/workers', query)))
   }
 
   async createWorker(input: WorkerInput): Promise<RepositoryResult<WorkerDto>> {
-    return live(await post('/api/workers', input))
+    return live(await this.postSender.send('/api/workers', input))
   }
 
   async getWorker(workerId: number): Promise<RepositoryResult<WorkerDto>> {
@@ -62,7 +65,7 @@ class HttpWorkforceRepository implements WorkforceHttpRepository {
   }
 
   async deactivateWorker(workerId: number, input: WorkerDeactivateInput): Promise<RepositoryResult<WorkerDto>> {
-    return live(await post(`${workerPath(workerId)}/deactivate`, input))
+    return live(await this.postSender.send(`${workerPath(workerId)}/deactivate`, input))
   }
 
   async listCrewAssignments(projectCode: string, query: CrewAssignmentListQuery = {}): Promise<RepositoryResult<PagedResult<CrewAssignmentDto>>> {
@@ -70,7 +73,7 @@ class HttpWorkforceRepository implements WorkforceHttpRepository {
   }
 
   async createCrewAssignment(projectCode: string, input: CrewAssignmentInput): Promise<RepositoryResult<CrewAssignmentDto>> {
-    return live(await post(assignmentCollectionPath(projectCode), input))
+    return live(await this.postSender.send(assignmentCollectionPath(projectCode), input))
   }
 
   async updateCrewAssignment(projectCode: string, assignmentId: number, input: CrewAssignmentUpdateInput): Promise<RepositoryResult<CrewAssignmentDto>> {
@@ -85,7 +88,11 @@ class HttpWorkforceRepository implements WorkforceHttpRepository {
   }
 
   async saveLaborEntriesBatch(projectCode: string, input: LaborBatchInput): Promise<RepositoryResult<LaborBatchDto>> {
-    return live(await post(`${projectPath(projectCode)}/labor-entries/batch`, input))
+    return live(await this.postSender.send(`${projectPath(projectCode)}/labor-entries/batch`, input))
+  }
+
+  discardSaveLaborEntriesBatch(projectCode: string, input: LaborBatchInput): boolean {
+    return this.postSender.discard(`${projectPath(projectCode)}/labor-entries/batch`, input)
   }
 }
 
@@ -103,10 +110,6 @@ function projectPath(projectCode: string): string {
 
 function assignmentCollectionPath(projectCode: string): string {
   return `${projectPath(projectCode)}/crew-assignments`
-}
-
-function post<T>(path: string, body: unknown): Promise<T> {
-  return createPlannedPostRequest<T>(path, body).send()
 }
 
 function live<T>(data: T): RepositoryResult<T> {
