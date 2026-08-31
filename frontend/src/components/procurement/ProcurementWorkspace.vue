@@ -14,6 +14,14 @@ import type {
   PurchaseOrderDto,
   PurchaseOrderInput,
 } from '../../domain/operations-api'
+import type {
+  ProcurementImportPreviewDto,
+  PurchaseOrderRecordDto,
+  PurchaseOrderUpdateInput,
+  QuoteExportInput,
+  SupplierInvoiceInput,
+  SupplierPaymentInput,
+} from '../../domain/procurement-extensions'
 import {
   createHttpProcurementRepository,
   type ProcurementHttpRepository,
@@ -39,9 +47,21 @@ const lineDialogVisible = ref(false)
 const orderDialogVisible = ref(false)
 const orderDrawerVisible = ref(false)
 const receiptDialogVisible = ref(false)
+const importPreview = ref<ProcurementImportPreviewDto | null>(null)
+const importFile = ref<File | null>(null)
+const importProjectCode = ref<string | null>(null)
+let importRepository: ProcurementHttpRepository | null = null
+const importListName = ref('')
+const editOrderDialogVisible = ref(false)
+const cancelOrderDialogVisible = ref(false)
+const paymentDialogVisible = ref(false)
+const invoiceDialogVisible = ref(false)
+const quoteDialogVisible = ref(false)
+const importInput = ref<HTMLInputElement | null>(null)
 const selectedLineListId = ref(0)
 const selectedOrderLine = ref<ProcurementListDetailDto['lines'][number] | null>(null)
 const selectedOrder = ref<PurchaseOrderDto | null>(null)
+const selectedOrderFacts = computed(() => selectedOrder.value as PurchaseOrderRecordDto | null)
 const listForm = reactive({ name: '', notes: '' })
 const lineForm = reactive({
   sequenceNo: 1,
@@ -71,6 +91,11 @@ const receiptForm = reactive({
   notes: '',
 })
 const receiptQuantities = reactive<Record<number, string>>({})
+const editOrderForm = reactive({ orderNo: '', supplierCompanyId: 0, orderedOn: '', expectedDeliveryOn: '', notes: '' })
+const cancelOrderReason = ref('')
+const paymentForm = reactive({ paidOn: localISODate(), amountYuan: '', paymentMethod: '银行转账', referenceNo: '', notes: '' })
+const invoiceForm = reactive({ invoiceNo: '', invoicedOn: localISODate(), amountYuan: '', documentVersionIds: '' })
+const quoteForm = reactive({ listId: 0, title: '', customerCompanyId: 0, notes: '' })
 let generation = 0
 let mounted = true
 let actionSequence = 0
@@ -163,6 +188,13 @@ function isCurrentAction(context: ActionContext): boolean {
     && context.repository === currentRepository()
 }
 
+function isSameActionTarget(context: ActionContext): boolean {
+  return mounted
+    && context.sequence === actionSequence
+    && context.projectCode === props.projectCode
+    && context.repository === currentRepository()
+}
+
 function startAction(): ActionContext {
   return {
     sequence: ++actionSequence,
@@ -182,6 +214,22 @@ function actionErrorMessage(error: unknown): string {
     return '无法连接本地服务，请确认服务仍在运行'
   }
   return error instanceof Error ? error.message : '采购操作失败，请重试'
+}
+
+async function refreshAfterCommittedAction(
+  context: ActionContext,
+  refresh: () => Promise<void>,
+): Promise<void> {
+  try {
+    await refresh()
+    if (isSameActionTarget(context) && loadError.value) {
+      actionError.value = `操作已保存，但刷新失败：${loadError.value}`
+    }
+  } catch (error) {
+    if (isSameActionTarget(context)) {
+      actionError.value = `操作已保存，但刷新失败：${actionErrorMessage(error)}`
+    }
+  }
 }
 
 async function loadWorkspace(
@@ -278,6 +326,19 @@ function resetActionsForContextChange(): void {
   orderDialogVisible.value = false
   orderDrawerVisible.value = false
   receiptDialogVisible.value = false
+  editOrderDialogVisible.value = false
+  cancelOrderDialogVisible.value = false
+  paymentDialogVisible.value = false
+  invoiceDialogVisible.value = false
+  quoteDialogVisible.value = false
+  if (importFile.value && importProjectCode.value && importRepository) {
+    importRepository.discardPreviewProcurementImport(importProjectCode.value, importFile.value)
+  }
+  importFile.value = null
+  importProjectCode.value = null
+  importRepository = null
+  importPreview.value = null
+  importListName.value = ''
   selectedLineListId.value = 0
   selectedOrderLine.value = null
   selectedOrder.value = null
@@ -344,7 +405,7 @@ async function createList(): Promise<void> {
     if (!isCurrentAction(context)) return
     listDialogVisible.value = false
     actionBusy.value = false
-    await loadWorkspace(context.projectCode, context.repository)
+    await refreshAfterCommittedAction(context, () => loadWorkspace(context.projectCode, context.repository))
   } catch (error) {
     pending.inFlight = false
     if (!isCurrentAction(context)) {
@@ -472,7 +533,7 @@ async function createLine(): Promise<void> {
     if (!isCurrentAction(context)) return
     lineDialogVisible.value = false
     actionBusy.value = false
-    await loadWorkspace(context.projectCode, context.repository)
+    await refreshAfterCommittedAction(context, () => loadWorkspace(context.projectCode, context.repository))
   } catch (error) {
     pending.inFlight = false
     if (!isCurrentAction(context)) {
@@ -508,7 +569,7 @@ async function confirmList(list: ProcurementListDetailDto): Promise<void> {
     })
     if (!isCurrentAction(context)) return
     actionBusy.value = false
-    await loadWorkspace(context.projectCode, context.repository)
+    await refreshAfterCommittedAction(context, () => loadWorkspace(context.projectCode, context.repository))
   } catch (error) {
     if (isCurrentAction(context)) actionError.value = actionErrorMessage(error)
   } finally {
@@ -628,7 +689,7 @@ async function createOrder(): Promise<void> {
     selectedOrder.value = result.data
     orderDialogVisible.value = false
     actionBusy.value = false
-    await loadWorkspace(context.projectCode, context.repository)
+    await refreshAfterCommittedAction(context, () => loadWorkspace(context.projectCode, context.repository))
   } catch (error) {
     pending.inFlight = false
     if (!isCurrentAction(context)) {
@@ -689,7 +750,7 @@ async function confirmOrder(): Promise<void> {
     if (!isCurrentAction(context)) return
     selectedOrder.value = result.data
     actionBusy.value = false
-    await loadWorkspace(context.projectCode, context.repository)
+    await refreshAfterCommittedAction(context, () => loadWorkspace(context.projectCode, context.repository))
   } catch (error) {
     if (isCurrentAction(context)) actionError.value = actionErrorMessage(error)
   } finally {
@@ -803,7 +864,7 @@ async function receiveGoods(): Promise<void> {
     orderDrawerVisible.value = false
     selectedOrder.value = null
     actionBusy.value = false
-    await loadWorkspace(context.projectCode, context.repository)
+    await refreshAfterCommittedAction(context, () => loadWorkspace(context.projectCode, context.repository))
   } catch (error) {
     pending.inFlight = false
     if (!isCurrentAction(context)) {
@@ -828,6 +889,354 @@ function beforeReceiptDialogClose(done: () => void): void {
   done()
 }
 
+async function refreshSelectedOrder(context: ActionContext, orderId: number): Promise<void> {
+  const detail = await context.repository.getPurchaseOrder(context.projectCode, orderId)
+  if (!isCurrentAction(context)) return
+  selectedOrder.value = detail.data
+  await loadWorkspace(context.projectCode, context.repository)
+  if (isSameActionTarget(context)) {
+    selectedOrder.value = detail.data
+  }
+}
+
+function openEditOrder(): void {
+  const order = selectedOrder.value
+  if (!order || order.status !== 'draft' || !canWrite.value) return
+  Object.assign(editOrderForm, {
+    orderNo: order.order_no,
+    supplierCompanyId: order.supplier_company_id,
+    orderedOn: order.ordered_on,
+    expectedDeliveryOn: order.expected_delivery_on ?? '',
+    notes: order.notes ?? '',
+  })
+  actionError.value = null
+  editOrderDialogVisible.value = true
+}
+
+function orderUpdatePayload(order: PurchaseOrderDto): PurchaseOrderUpdateInput | null {
+  if (!editOrderForm.orderNo.trim() || !editOrderForm.orderedOn) {
+    actionError.value = '请填写采购单号和下单日期'
+    return null
+  }
+  if (!companies.value.some((company) => company.id === editOrderForm.supplierCompanyId)) {
+    actionError.value = '请选择有效供应商'
+    return null
+  }
+  return {
+    order_no: editOrderForm.orderNo.trim(),
+    supplier_company_id: editOrderForm.supplierCompanyId,
+    ordered_on: editOrderForm.orderedOn,
+    expected_delivery_on: optionalText(editOrderForm.expectedDeliveryOn),
+    lines: order.lines.map((line) => ({
+      procurement_line_id: line.procurement_line_id,
+      quantity: line.quantity,
+      unit_cost_cents: line.unit_cost_cents,
+      overage_reason: line.overage_reason,
+    })),
+    notes: optionalText(editOrderForm.notes),
+    document_version_ids: order.document_version_ids,
+    expected_revision: order.revision,
+  }
+}
+
+async function updateOrder(): Promise<void> {
+  const order = selectedOrder.value
+  if (!order || actionBusy.value) return
+  const input = orderUpdatePayload(order)
+  if (!input) return
+  const context = startAction()
+  actionBusy.value = true
+  actionError.value = null
+  try {
+    const result = await context.repository.updatePurchaseOrder(context.projectCode, order.id, input)
+    if (!isCurrentAction(context)) return
+    selectedOrder.value = result.data
+    editOrderDialogVisible.value = false
+    actionBusy.value = false
+    await refreshAfterCommittedAction(context, () => refreshSelectedOrder(context, order.id))
+  } catch (error) {
+    if (isCurrentAction(context)) actionError.value = actionErrorMessage(error)
+  } finally {
+    if (isCurrentAction(context)) actionBusy.value = false
+  }
+}
+
+function openCancelOrder(): void {
+  if (!selectedOrder.value || !['draft', 'confirmed'].includes(selectedOrder.value.status) || !canWrite.value) return
+  cancelOrderReason.value = ''
+  actionError.value = null
+  cancelOrderDialogVisible.value = true
+}
+
+async function cancelOrder(): Promise<void> {
+  const order = selectedOrder.value
+  const reason = cancelOrderReason.value.trim()
+  if (!order || actionBusy.value) return
+  if (!reason) { actionError.value = '请填写取消原因'; return }
+  const input = { reason, expected_revision: order.revision }
+  const context = startAction()
+  actionBusy.value = true
+  actionError.value = null
+  try {
+    await context.repository.cancelPurchaseOrder(context.projectCode, order.id, input)
+    if (!isCurrentAction(context)) return
+    cancelOrderDialogVisible.value = false
+    orderDrawerVisible.value = false
+    selectedOrder.value = null
+    actionBusy.value = false
+    await refreshAfterCommittedAction(context, () => loadWorkspace(context.projectCode, context.repository))
+  } catch (error) {
+    if (isCurrentAction(context)) actionError.value = actionErrorMessage(error)
+  } finally {
+    if (isCurrentAction(context)) actionBusy.value = false
+  }
+}
+
+function activeAllocatedAmount(
+  order: PurchaseOrderRecordDto,
+  lineId: number,
+  fact: 'payment' | 'invoice',
+): number {
+  const records = fact === 'payment' ? order.supplier_payments ?? [] : order.supplier_invoices ?? []
+  return records.filter((record) => record.status === 'active').flatMap((record) => record.allocations)
+    .filter((allocation) => allocation.purchase_order_line_id === lineId)
+    .reduce((total, allocation) => total + allocation.amount_cents, 0)
+}
+
+function allocateAmount(order: PurchaseOrderRecordDto, amount: number, fact: 'payment' | 'invoice') {
+  let remaining = amount
+  const allocations: Array<{ purchase_order_line_id: number; amount_cents: number }> = []
+  for (const line of order.lines) {
+    const capacity = Math.max(0, line.line_amount_cents - activeAllocatedAmount(order, line.id, fact))
+    const allocated = Math.min(remaining, capacity)
+    if (allocated > 0) allocations.push({ purchase_order_line_id: line.id, amount_cents: allocated })
+    remaining -= allocated
+  }
+  if (remaining > 0) throw new Error(fact === 'payment' ? '付款金额超过采购单未付金额' : '开票金额超过采购单未开票金额')
+  return allocations
+}
+
+function openPayment(): void {
+  if (!selectedOrder.value || !['confirmed', 'partially_received', 'received'].includes(selectedOrder.value.status) || !canWrite.value) return
+  Object.assign(paymentForm, { paidOn: localISODate(), amountYuan: '', paymentMethod: '银行转账', referenceNo: '', notes: '' })
+  actionError.value = null
+  paymentDialogVisible.value = true
+}
+
+function paymentPayload(order: PurchaseOrderRecordDto): SupplierPaymentInput | null {
+  try {
+    const amount = yuanToCents(paymentForm.amountYuan)
+    if (amount <= 0 || !paymentForm.paidOn || !paymentForm.paymentMethod.trim()) throw new Error('请填写有效的付款日期、金额和方式')
+    return {
+      paid_on: paymentForm.paidOn,
+      amount_cents: amount,
+      payment_method: paymentForm.paymentMethod.trim(),
+      reference_no: optionalText(paymentForm.referenceNo),
+      allocations: allocateAmount(order, amount, 'payment'),
+      notes: optionalText(paymentForm.notes),
+    }
+  } catch (error) {
+    actionError.value = actionErrorMessage(error)
+    return null
+  }
+}
+
+async function createPayment(): Promise<void> {
+  const order = selectedOrderFacts.value
+  if (!order || actionBusy.value) return
+  const input = paymentPayload(order)
+  if (!input) return
+  const context = startAction()
+  actionBusy.value = true
+  actionError.value = null
+  try {
+    await context.repository.createSupplierPayment(context.projectCode, order.id, input)
+    if (!isCurrentAction(context)) return
+    paymentDialogVisible.value = false
+    actionBusy.value = false
+    await refreshAfterCommittedAction(context, () => refreshSelectedOrder(context, order.id))
+  } catch (error) {
+    if (isCurrentAction(context)) actionError.value = actionErrorMessage(error)
+  } finally {
+    if (isCurrentAction(context)) actionBusy.value = false
+  }
+}
+
+function openInvoice(): void {
+  if (!selectedOrder.value || !['confirmed', 'partially_received', 'received'].includes(selectedOrder.value.status) || !canWrite.value) return
+  Object.assign(invoiceForm, { invoiceNo: '', invoicedOn: localISODate(), amountYuan: '', documentVersionIds: '' })
+  actionError.value = null
+  invoiceDialogVisible.value = true
+}
+
+function documentVersionIds(value: string): number[] {
+  if (!value.trim()) return []
+  const values = value.split(/[,，\s]+/).filter(Boolean).map(Number)
+  if (values.some((item) => !Number.isSafeInteger(item) || item <= 0) || new Set(values).size !== values.length) {
+    throw new Error('附件版本号格式不正确')
+  }
+  return values
+}
+
+function invoicePayload(order: PurchaseOrderRecordDto): SupplierInvoiceInput | null {
+  try {
+    const amount = yuanToCents(invoiceForm.amountYuan)
+    if (!invoiceForm.invoiceNo.trim() || !invoiceForm.invoicedOn || amount <= 0) throw new Error('请填写有效的发票号、开票日期和金额')
+    return {
+      invoice_no: invoiceForm.invoiceNo.trim(),
+      invoiced_on: invoiceForm.invoicedOn,
+      amount_cents: amount,
+      allocations: allocateAmount(order, amount, 'invoice'),
+      document_version_ids: documentVersionIds(invoiceForm.documentVersionIds),
+    }
+  } catch (error) {
+    actionError.value = actionErrorMessage(error)
+    return null
+  }
+}
+
+async function createInvoice(): Promise<void> {
+  const order = selectedOrderFacts.value
+  if (!order || actionBusy.value) return
+  const input = invoicePayload(order)
+  if (!input) return
+  const context = startAction()
+  actionBusy.value = true
+  actionError.value = null
+  try {
+    await context.repository.createSupplierInvoice(context.projectCode, order.id, input)
+    if (!isCurrentAction(context)) return
+    invoiceDialogVisible.value = false
+    actionBusy.value = false
+    await refreshAfterCommittedAction(context, () => refreshSelectedOrder(context, order.id))
+  } catch (error) {
+    if (isCurrentAction(context)) actionError.value = actionErrorMessage(error)
+  } finally {
+    if (isCurrentAction(context)) actionBusy.value = false
+  }
+}
+
+async function previewImport(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file || actionBusy.value) {
+    input.value = ''
+    return
+  }
+  if (importFile.value && importProjectCode.value && importRepository && importFile.value !== file) {
+    importRepository.discardPreviewProcurementImport(importProjectCode.value, importFile.value)
+  }
+  importFile.value = file
+  importPreview.value = null
+  importListName.value = file.name.replace(/\.xlsx$/i, '')
+  const context = startAction()
+  importProjectCode.value = context.projectCode
+  importRepository = context.repository
+  actionBusy.value = true
+  actionError.value = null
+  try {
+    const result = await context.repository.previewProcurementImport(context.projectCode, file)
+    if (!isCurrentAction(context)) return
+    importPreview.value = result.data
+  } catch (error) {
+    if (isCurrentAction(context)) actionError.value = actionErrorMessage(error)
+  } finally {
+    input.value = ''
+    if (isCurrentAction(context)) actionBusy.value = false
+  }
+}
+
+async function retryImportPreview(): Promise<void> {
+  const file = importFile.value
+  if (!file || actionBusy.value) return
+  const context = startAction()
+  actionBusy.value = true
+  actionError.value = null
+  try {
+    const result = await context.repository.previewProcurementImport(context.projectCode, file)
+    if (!isCurrentAction(context)) return
+    importPreview.value = result.data
+  } catch (error) {
+    if (isCurrentAction(context)) actionError.value = actionErrorMessage(error)
+  } finally {
+    if (isCurrentAction(context)) actionBusy.value = false
+  }
+}
+
+function openImportPicker(): void {
+  if (canWrite.value) importInput.value?.click()
+}
+
+async function confirmImport(): Promise<void> {
+  const preview = importPreview.value
+  if (!preview || preview.errors.length || actionBusy.value) return
+  const listName = importListName.value.trim()
+  if (!listName) { actionError.value = '请填写导入后的采购清单名称'; return }
+  const input = { list_name: listName, expected_revision: preview.revision }
+  const context = startAction()
+  actionBusy.value = true
+  actionError.value = null
+  try {
+    await context.repository.confirmProcurementImport(context.projectCode, preview.id, input)
+    if (!isCurrentAction(context)) return
+    importPreview.value = null
+    importFile.value = null
+    importProjectCode.value = null
+    importRepository = null
+    importListName.value = ''
+    actionBusy.value = false
+    await refreshAfterCommittedAction(context, () => loadWorkspace(context.projectCode, context.repository))
+  } catch (error) {
+    if (isCurrentAction(context)) actionError.value = actionErrorMessage(error)
+  } finally {
+    if (isCurrentAction(context)) actionBusy.value = false
+  }
+}
+
+function openQuote(): void {
+  const list = procurementLists.value.find((item) => item.status === 'confirmed')
+  if (!list || companies.value.length === 0 || !canWrite.value) return
+  Object.assign(quoteForm, {
+    listId: list.id,
+    title: `${list.name} 报价单`,
+    customerCompanyId: companies.value[0]!.id,
+    notes: '',
+  })
+  actionError.value = null
+  quoteDialogVisible.value = true
+}
+
+async function createQuote(): Promise<void> {
+  if (actionBusy.value || !quoteForm.listId || !quoteForm.title.trim() || !quoteForm.customerCompanyId) return
+  const input: QuoteExportInput = {
+    title: quoteForm.title.trim(), customer_company_id: quoteForm.customerCompanyId,
+    notes: optionalText(quoteForm.notes),
+  }
+  const context = startAction()
+  actionBusy.value = true
+  actionError.value = null
+  try {
+    const exported = await context.repository.createQuoteExport(context.projectCode, quoteForm.listId, input)
+    const blob = await context.repository.downloadQuoteExport(context.projectCode, exported.data.id)
+    if (!isCurrentAction(context)) return
+    downloadBlob(blob, `quote-export-${exported.data.id}.xlsx`)
+    quoteDialogVisible.value = false
+  } catch (error) {
+    if (isCurrentAction(context)) actionError.value = actionErrorMessage(error)
+  } finally {
+    if (isCurrentAction(context)) actionBusy.value = false
+  }
+}
+
+function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  anchor.click()
+  URL.revokeObjectURL(url)
+}
+
 async function downloadTemplate(): Promise<void> {
   if (!canWrite.value) return
   const context = startAction()
@@ -836,12 +1245,7 @@ async function downloadTemplate(): Promise<void> {
   try {
     const blob = await context.repository.downloadImportTemplate()
     if (!isCurrentAction(context)) return
-    const url = URL.createObjectURL(blob)
-    const anchor = document.createElement('a')
-    anchor.href = url
-    anchor.download = 'procurement-import-template.xlsx'
-    anchor.click()
-    URL.revokeObjectURL(url)
+    downloadBlob(blob, 'procurement-import-template.xlsx')
   } catch (error) {
     if (isCurrentAction(context)) actionError.value = actionErrorMessage(error)
   } finally {
@@ -862,6 +1266,9 @@ onBeforeUnmount(() => {
   mounted = false
   generation += 1
   actionSequence += 1
+  if (importFile.value && importProjectCode.value && importRepository) {
+    importRepository.discardPreviewProcurementImport(importProjectCode.value, importFile.value)
+  }
   for (const pending of pendingListCreates) abandonListCreate(pending)
   for (const pending of pendingLineCreates) abandonLineCreate(pending)
   for (const pending of pendingOrderCreates) abandonOrderCreate(pending)
@@ -894,10 +1301,44 @@ onBeforeUnmount(() => {
           :disabled="!canWrite"
           @click="downloadTemplate"
         >下载采购模板</el-button>
-        <el-button data-testid="procurement-excel-import" disabled>导入 Excel</el-button>
+        <span data-testid="procurement-import-upload">
+          <input ref="importInput" class="visually-hidden" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" @change="previewImport">
+          <el-button data-testid="procurement-excel-import" :loading="actionBusy" :disabled="!canWrite" @click="openImportPicker">导入 Excel</el-button>
+        </span>
+        <el-button
+          data-testid="procurement-quote-action"
+          :disabled="!canWrite || !procurementLists.some((list) => list.status === 'confirmed') || companies.length === 0"
+          @click="openQuote"
+        >生成客户报价单</el-button>
       </div>
     </header>
-    <p class="capability-note">Excel 自动识别导入：后端尚未接入，不会保存</p>
+    <p class="capability-note">Excel 会先预览校验，确认后才写入采购清单。</p>
+    <div v-if="importFile && !importPreview && actionError" class="import-retry">
+      <span>{{ importFile.name }} 的预览结果未知，可安全复用原请求重试。</span>
+      <el-button data-testid="procurement-import-retry" :loading="actionBusy" @click="retryImportPreview">重试预览</el-button>
+    </div>
+
+    <el-card v-if="importPreview" shadow="never" class="import-preview" data-testid="procurement-import-preview">
+      <template #header><strong>{{ importPreview.filename }} · 识别 {{ importPreview.rows.length }} 行</strong></template>
+      <el-alert
+        v-if="importPreview.errors.length"
+        data-testid="procurement-import-errors"
+        type="error"
+        :closable="false"
+        show-icon
+      >
+        <template #title>发现 {{ importPreview.errors.length }} 处错误，请修改 Excel 后重新选择文件</template>
+        <ul class="import-errors">
+          <li v-for="error in importPreview.errors" :key="`${error.row}-${error.column}-${error.field}`">
+            第 {{ error.row }} 行，第 {{ error.column }} 列：{{ error.message }}
+          </li>
+        </ul>
+      </el-alert>
+      <div v-else class="import-confirm">
+        <el-input v-model="importListName" data-testid="procurement-import-list-name" placeholder="导入后的采购清单名称" />
+        <el-button data-testid="procurement-import-confirm" type="primary" :loading="actionBusy" @click="confirmImport">确认导入</el-button>
+      </div>
+    </el-card>
 
     <el-alert
       v-if="actionError"
@@ -1256,12 +1697,15 @@ onBeforeUnmount(() => {
           </el-descriptions-item>
           <el-descriptions-item label="下单日期">{{ selectedOrder.ordered_on }}</el-descriptions-item>
           <el-descriptions-item label="状态">{{ selectedOrder.status }}</el-descriptions-item>
+          <el-descriptions-item label="已付款">{{ centsToYuan(selectedOrderFacts?.paid_amount_cents ?? 0) }} 元</el-descriptions-item>
+          <el-descriptions-item label="已开票">{{ centsToYuan(selectedOrderFacts?.invoiced_amount_cents ?? 0) }} 元</el-descriptions-item>
+          <el-descriptions-item label="已到货">{{ centsToYuan(selectedOrderFacts?.received_amount_cents ?? 0) }} 元</el-descriptions-item>
         </el-descriptions>
         <div class="drawer-actions">
           <el-button
             data-testid="purchase-order-edit"
-            disabled
-            title="采购单编辑后端尚未接入"
+            :disabled="!canWrite || selectedOrder.status !== 'draft'"
+            @click="openEditOrder"
           >编辑</el-button>
           <el-button
             v-if="selectedOrder.status === 'draft'"
@@ -1278,23 +1722,69 @@ onBeforeUnmount(() => {
           >到货</el-button>
           <el-button
             data-testid="purchase-payment-open"
-            disabled
-            title="供应商付款后端尚未接入"
+            :disabled="!canWrite || !['confirmed', 'partially_received', 'received'].includes(selectedOrder.status)"
+            @click="openPayment"
           >付款</el-button>
           <el-button
             data-testid="purchase-invoice-open"
-            disabled
-            title="进项发票后端尚未接入"
+            :disabled="!canWrite || !['confirmed', 'partially_received', 'received'].includes(selectedOrder.status)"
+            @click="openInvoice"
           >发票</el-button>
           <el-button
             data-testid="purchase-order-cancel-open"
-            disabled
-            title="采购单取消后端尚未接入"
+            :disabled="!canWrite || !['draft', 'confirmed'].includes(selectedOrder.status)"
+            @click="openCancelOrder"
           >取消采购单</el-button>
         </div>
-        <p class="capability-note">编辑、付款、发票和取消尚未接入后端，当前不会保存。</p>
+        <el-empty
+          v-if="(selectedOrderFacts?.supplier_payments?.length ?? 0) === 0 && (selectedOrderFacts?.supplier_invoices?.length ?? 0) === 0"
+          description="暂无付款或进项票记录"
+        />
+        <ul v-else class="record-list fact-list">
+          <li v-for="payment in selectedOrderFacts?.supplier_payments ?? []" :key="`payment-${payment.id}`">
+            <span>付款 {{ payment.paid_on }} · {{ centsToYuan(payment.amount_cents) }} 元</span><el-tag :type="payment.status === 'active' ? 'success' : 'info'">{{ payment.status === 'active' ? '有效' : '已冲销' }}</el-tag>
+          </li>
+          <li v-for="invoice in selectedOrderFacts?.supplier_invoices ?? []" :key="`invoice-${invoice.id}`">
+            <span>发票 {{ invoice.invoice_no }} · {{ centsToYuan(invoice.amount_cents) }} 元</span><el-tag :type="invoice.status === 'active' ? 'success' : 'info'">{{ invoice.status === 'active' ? '有效' : '已冲销' }}</el-tag>
+          </li>
+        </ul>
       </template>
     </el-drawer>
+
+    <el-dialog v-model="editOrderDialogVisible" data-testid="purchase-order-edit-dialog" :teleported="false" title="编辑采购单" width="min(94vw, 680px)">
+      <el-form label-position="top" @submit.prevent="updateOrder"><el-row :gutter="14">
+        <el-col :xs="24" :sm="12"><el-form-item label="采购单号" required><el-input v-model="editOrderForm.orderNo" data-testid="purchase-order-edit-number" /></el-form-item></el-col>
+        <el-col :xs="24" :sm="12"><el-form-item label="供应商" required><el-select v-model="editOrderForm.supplierCompanyId" style="width: 100%"><el-option v-for="company in companies" :key="company.id" :label="company.name" :value="company.id" /></el-select></el-form-item></el-col>
+        <el-col :xs="24" :sm="12"><el-form-item label="下单日期" required><el-input v-model="editOrderForm.orderedOn" /></el-form-item></el-col>
+        <el-col :xs="24" :sm="12"><el-form-item label="预计到货日期"><el-input v-model="editOrderForm.expectedDeliveryOn" /></el-form-item></el-col>
+      </el-row><el-form-item label="备注"><el-input v-model="editOrderForm.notes" type="textarea" /></el-form-item><el-alert title="编辑会保留当前采购行、数量和成本；采购内容调整请另建采购单。" type="info" :closable="false" /><div class="dialog-actions"><el-button @click="editOrderDialogVisible = false">取消</el-button><el-button data-testid="purchase-order-edit-submit" type="primary" native-type="submit" :loading="actionBusy">保存修改</el-button></div></el-form>
+    </el-dialog>
+
+    <el-dialog v-model="cancelOrderDialogVisible" data-testid="purchase-order-cancel-dialog" :teleported="false" title="取消采购单" width="min(92vw, 520px)">
+      <el-form label-position="top" @submit.prevent="cancelOrder"><el-alert title="已有付款、发票或到货的采购单不能直接取消。" type="warning" :closable="false" /><el-form-item label="取消原因" required><el-input v-model="cancelOrderReason" data-testid="purchase-cancel-reason" type="textarea" /></el-form-item><div class="dialog-actions"><el-button @click="cancelOrderDialogVisible = false">返回</el-button><el-button data-testid="purchase-cancel-submit" type="danger" native-type="submit" :loading="actionBusy">确认取消</el-button></div></el-form>
+    </el-dialog>
+
+    <el-dialog v-model="paymentDialogVisible" data-testid="purchase-payment-dialog" :teleported="false" title="登记供应商付款" width="min(94vw, 620px)">
+      <el-form label-position="top" @submit.prevent="createPayment"><el-row :gutter="14">
+        <el-col :xs="24" :sm="12"><el-form-item label="付款日期" required><el-date-picker v-model="paymentForm.paidOn" type="date" value-format="YYYY-MM-DD" style="width: 100%" /></el-form-item></el-col>
+        <el-col :xs="24" :sm="12"><el-form-item label="付款金额（元）" required><el-input v-model="paymentForm.amountYuan" data-testid="purchase-payment-amount" inputmode="decimal" /></el-form-item></el-col>
+        <el-col :xs="24" :sm="12"><el-form-item label="付款方式" required><el-input v-model="paymentForm.paymentMethod" /></el-form-item></el-col>
+        <el-col :xs="24" :sm="12"><el-form-item label="付款参考号"><el-input v-model="paymentForm.referenceNo" /></el-form-item></el-col>
+      </el-row><el-form-item label="备注"><el-input v-model="paymentForm.notes" type="textarea" /></el-form-item><div class="dialog-actions"><el-button @click="paymentDialogVisible = false">取消</el-button><el-button data-testid="purchase-payment-submit" type="primary" native-type="submit" :loading="actionBusy">保存付款</el-button></div></el-form>
+    </el-dialog>
+
+    <el-dialog v-model="invoiceDialogVisible" data-testid="purchase-invoice-dialog" :teleported="false" title="登记进项发票" width="min(94vw, 620px)">
+      <el-form label-position="top" @submit.prevent="createInvoice"><el-row :gutter="14">
+        <el-col :xs="24" :sm="12"><el-form-item label="发票号" required><el-input v-model="invoiceForm.invoiceNo" data-testid="purchase-invoice-number" /></el-form-item></el-col>
+        <el-col :xs="24" :sm="12"><el-form-item label="开票日期" required><el-date-picker v-model="invoiceForm.invoicedOn" type="date" value-format="YYYY-MM-DD" style="width: 100%" /></el-form-item></el-col>
+        <el-col :xs="24" :sm="12"><el-form-item label="发票金额（元）" required><el-input v-model="invoiceForm.amountYuan" data-testid="purchase-invoice-amount" inputmode="decimal" /></el-form-item></el-col>
+        <el-col :xs="24" :sm="12"><el-form-item label="附件版本号"><el-input v-model="invoiceForm.documentVersionIds" placeholder="多个编号用逗号分隔" /></el-form-item></el-col>
+      </el-row><div class="dialog-actions"><el-button @click="invoiceDialogVisible = false">取消</el-button><el-button data-testid="purchase-invoice-submit" type="primary" native-type="submit" :loading="actionBusy">保存发票</el-button></div></el-form>
+    </el-dialog>
+
+    <el-dialog v-model="quoteDialogVisible" data-testid="procurement-quote-dialog" :teleported="false" title="生成隐藏成本价的客户报价单" width="min(94vw, 620px)">
+      <el-form label-position="top" @submit.prevent="createQuote"><el-form-item label="已确认采购清单" required><el-select v-model="quoteForm.listId" style="width: 100%"><el-option v-for="list in procurementLists.filter((item) => item.status === 'confirmed')" :key="list.id" :label="list.name" :value="list.id" /></el-select></el-form-item><el-form-item label="报价单标题" required><el-input v-model="quoteForm.title" data-testid="procurement-quote-title" /></el-form-item><el-form-item label="客户公司" required><el-select v-model="quoteForm.customerCompanyId" style="width: 100%"><el-option v-for="company in companies" :key="company.id" :label="company.name" :value="company.id" /></el-select></el-form-item><el-form-item label="备注"><el-input v-model="quoteForm.notes" type="textarea" /></el-form-item><el-alert title="导出的 Excel 仅包含报价单价，不包含成本价。" type="success" :closable="false" /><div class="dialog-actions"><el-button @click="quoteDialogVisible = false">取消</el-button><el-button data-testid="procurement-quote-submit" type="primary" native-type="submit" :loading="actionBusy">生成并下载</el-button></div></el-form>
+    </el-dialog>
 
     <el-dialog
       v-model="receiptDialogVisible"
@@ -1421,6 +1911,23 @@ onBeforeUnmount(() => {
   color: var(--el-text-color-secondary);
 }
 
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.import-preview { margin-bottom: 16px; }
+.import-errors { margin: 8px 0 0; padding-left: 20px; }
+.import-confirm { display: flex; align-items: center; gap: 12px; }
+.import-retry { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 12px 0; color: var(--el-text-color-secondary); }
+.fact-list { margin-top: 20px; }
+
 .state-message {
   padding: 24px;
   text-align: center;
@@ -1457,5 +1964,7 @@ onBeforeUnmount(() => {
   .workspace-actions {
     flex-wrap: wrap;
   }
+
+  .import-confirm, .import-retry { align-items: stretch; flex-direction: column; }
 }
 </style>

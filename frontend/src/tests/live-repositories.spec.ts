@@ -98,7 +98,7 @@ describe('真实 P0 Repository 契约', () => {
     expectPlannedPost(transitionInit, transition)
   })
 
-  it('采购 Repository 覆盖模板、清单、清单行、采购单、到货与概览，不包含未实现动作', async () => {
+  it('采购 Repository 覆盖模板、清单、采购单、到货、概览与扩展动作', async () => {
     const workbook = new Blob(['xlsx'], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () => jsonResponse())
     fetchMock.mockResolvedValueOnce(jsonResponse([]))
@@ -199,8 +199,12 @@ describe('真实 P0 Repository 契约', () => {
 
     await repository.getProcurementOverview('SY-001')
     expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY-001/procurement-overview')
-    expect('recordSupplierPayment' in repository).toBe(false)
-    expect('recordSupplierInvoice' in repository).toBe(false)
+    expect(repository.previewProcurementImport).toBeTypeOf('function')
+    expect(repository.updatePurchaseOrder).toBeTypeOf('function')
+    expect(repository.cancelPurchaseOrder).toBeTypeOf('function')
+    expect(repository.createSupplierPayment).toBeTypeOf('function')
+    expect(repository.createSupplierInvoice).toBeTypeOf('function')
+    expect(repository.createQuoteExport).toBeTypeOf('function')
   })
 
   it('采购 POST 未知结果重试复用幂等键，明确放弃后才使用新键', async () => {

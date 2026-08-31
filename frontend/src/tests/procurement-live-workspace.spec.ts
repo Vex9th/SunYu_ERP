@@ -13,6 +13,7 @@ import type {
   PurchaseOrderDto,
   PurchaseOrderInput,
 } from '../domain/operations-api'
+import type { ProcurementImportPreviewDto } from '../domain/procurement-extensions'
 import type { RepositoryResult } from '../repositories/common'
 import type { ProcurementHttpRepository } from '../repositories/procurement.live'
 
@@ -154,6 +155,21 @@ function createRepository(options: {
   return {
     listSupplierCompanies: vi.fn(async () => liveResult(options.companies ?? [company()])),
     downloadImportTemplate: vi.fn(async () => new Blob(['xlsx'])),
+    previewProcurementImport: vi.fn(async () => liveResult({
+      id: 31, project_code: projectCode, filename: '采购清单.xlsx', sha256: 'a'.repeat(64),
+      status: 'preview' as const, revision: 1, expires_at: '2026-09-01T08:00:00+08:00',
+      confirmed_list_id: null, rows: [], errors: [], created_at: '2026-08-31T08:00:00+08:00',
+      updated_at: '2026-08-31T08:00:00+08:00',
+    })),
+    confirmProcurementImport: vi.fn(async () => liveResult({
+      import: {
+        id: 31, project_code: projectCode, filename: '采购清单.xlsx', sha256: 'a'.repeat(64),
+        status: 'confirmed' as const, revision: 2, expires_at: '2026-09-01T08:00:00+08:00',
+        confirmed_list_id: detail.id, rows: [], errors: [], created_at: '2026-08-31T08:00:00+08:00',
+        updated_at: '2026-08-31T08:00:00+08:00',
+      },
+      procurement_list: detail,
+    })),
     listProcurementLists: vi.fn(async () => liveResult({
       items: [listSummary(detail)], total: 1, page: 1, page_size: 100,
     })),
@@ -170,6 +186,8 @@ function createRepository(options: {
     createPurchaseOrder: vi.fn(async () => liveResult(order)),
     getPurchaseOrder: vi.fn(async () => liveResult(order)),
     confirmPurchaseOrder: vi.fn(async () => liveResult({ ...order, status: 'confirmed' as const })),
+    updatePurchaseOrder: vi.fn(async () => liveResult(order)),
+    cancelPurchaseOrder: vi.fn(async () => liveResult({ ...order, status: 'cancelled' as const })),
     receiveGoods: vi.fn(async () => liveResult({
         id: 1,
         purchase_order_id: order.id,
@@ -182,11 +200,33 @@ function createRepository(options: {
         created_at: '2026-08-31T08:00:00+08:00',
         updated_at: '2026-08-31T08:00:00+08:00',
     })),
+    createSupplierPayment: vi.fn(async (_projectCode, _orderId, input) => liveResult({
+      id: 1, purchase_order_id: order.id, ...input, status: 'active' as const,
+      reversal_reason: null, reversed_at: null, revision: 1,
+      created_at: '2026-08-31T08:00:00+08:00', updated_at: '2026-08-31T08:00:00+08:00',
+    })),
+    createSupplierInvoice: vi.fn(async (_projectCode, _orderId, input) => liveResult({
+      id: 1, purchase_order_id: order.id, ...input, status: 'active' as const,
+      reversal_reason: null, reversed_at: null, revision: 1,
+      created_at: '2026-08-31T08:00:00+08:00', updated_at: '2026-08-31T08:00:00+08:00',
+    })),
+    createQuoteExport: vi.fn(async (_projectCode, listId, input) => liveResult({
+      id: 1, project_code: projectCode, procurement_list_id: listId, ...input,
+      customer_company_name: '客户公司', created_at: '2026-08-31T08:00:00+08:00',
+      download_url: `/api/projects/${projectCode}/quote-exports/1/download`,
+    })),
+    downloadQuoteExport: vi.fn(async () => new Blob(['quote'])),
     getProcurementOverview: vi.fn(async () => liveResult(overview(projectCode))),
     discardCreateProcurementList: vi.fn(() => false),
     discardCreateProcurementLine: vi.fn(() => false),
     discardCreatePurchaseOrder: vi.fn(() => false),
     discardReceiveGoods: vi.fn(() => false),
+    discardPreviewProcurementImport: vi.fn(() => false),
+    discardConfirmProcurementImport: vi.fn(() => false),
+    discardCancelPurchaseOrder: vi.fn(() => false),
+    discardCreateSupplierPayment: vi.fn(() => false),
+    discardCreateSupplierInvoice: vi.fn(() => false),
+    discardCreateQuoteExport: vi.fn(() => false),
   }
 }
 
@@ -862,7 +902,112 @@ describe('采购工作台真实接口', () => {
     expect(wrapper.find('[data-testid="procurement-action-error"]').exists()).toBe(false)
   })
 
-  it('模板走真实下载，未实现动作明确禁用且空供应商阻止下单', async () => {
+  it('付款 POST 成功但订单刷新失败时关闭表单并只报告已保存后的刷新错误', async () => {
+    const repository = createRepository({ orderStatus: 'confirmed' })
+    vi.mocked(repository.getPurchaseOrder)
+      .mockResolvedValueOnce(liveResult(purchaseOrder('SY-001', 'confirmed')))
+      .mockRejectedValueOnce(new Error('订单刷新失败'))
+    const wrapper = mountWorkspace(repository)
+    await settle()
+
+    await wrapper.get('[data-testid="purchase-order-detail-open"]').trigger('click')
+    await settle()
+    await wrapper.get('[data-testid="purchase-payment-open"]').trigger('click')
+    await wrapper.get('[data-testid="purchase-payment-amount"]').setValue('100.00')
+    await wrapper.get('[data-testid="purchase-payment-submit"]').trigger('click')
+    await settle()
+
+    expect(repository.createSupplierPayment).toHaveBeenCalledTimes(1)
+    expect(wrapper.get('[data-testid="purchase-payment-dialog"]').isVisible()).toBe(false)
+    expect(wrapper.get('[data-testid="procurement-action-error"]').text())
+      .toContain('操作已保存，但刷新失败：订单刷新失败')
+  })
+
+  it('发票 POST 成功但订单刷新失败时关闭表单并只报告已保存后的刷新错误', async () => {
+    const repository = createRepository({ orderStatus: 'confirmed' })
+    vi.mocked(repository.getPurchaseOrder)
+      .mockResolvedValueOnce(liveResult(purchaseOrder('SY-001', 'confirmed')))
+      .mockRejectedValueOnce(new Error('订单刷新失败'))
+    const wrapper = mountWorkspace(repository)
+    await settle()
+
+    await wrapper.get('[data-testid="purchase-order-detail-open"]').trigger('click')
+    await settle()
+    await wrapper.get('[data-testid="purchase-invoice-open"]').trigger('click')
+    await wrapper.get('[data-testid="purchase-invoice-number"]').setValue('INV-REFRESH')
+    await wrapper.get('[data-testid="purchase-invoice-amount"]').setValue('100.00')
+    await wrapper.get('[data-testid="purchase-invoice-submit"]').trigger('click')
+    await settle()
+
+    expect(repository.createSupplierInvoice).toHaveBeenCalledTimes(1)
+    expect(wrapper.get('[data-testid="purchase-invoice-dialog"]').isVisible()).toBe(false)
+    expect(wrapper.get('[data-testid="procurement-action-error"]').text())
+      .toContain('操作已保存，但刷新失败：订单刷新失败')
+  })
+
+  it('打开 A 采购单详情后切到 B 时不读取也不展示 A 的迟到结果', async () => {
+    const repositoryA = createRepository({ projectCode: 'SY-A' })
+    const repositoryB = createRepository({ projectCode: 'SY-B' })
+    let resolveDetail!: (value: RepositoryResult<PurchaseOrderDto>) => void
+    const delayedDetail = new Promise<RepositoryResult<PurchaseOrderDto>>((resolve) => {
+      resolveDetail = resolve
+    })
+    vi.mocked(repositoryA.getPurchaseOrder).mockReturnValue(delayedDetail)
+    const readLateData = vi.fn(() => purchaseOrder('SY-A'))
+    const lateResult = { source: 'live' } as RepositoryResult<PurchaseOrderDto>
+    Object.defineProperty(lateResult, 'data', { get: readLateData })
+    const wrapper = mountWorkspace(repositoryA, 'SY-A')
+    await settle()
+
+    await wrapper.get('[data-testid="purchase-order-detail-open"]').trigger('click')
+    await Promise.resolve()
+    await wrapper.setProps({ projectCode: 'SY-B', repository: repositoryB })
+    await settle()
+    resolveDetail(lateResult)
+    await settle()
+
+    expect(readLateData).not.toHaveBeenCalled()
+    expect(wrapper.text()).toContain('SY-B采购清单')
+    expect(wrapper.find('[data-testid="purchase-order-drawer"]').isVisible()).toBe(false)
+  })
+
+  it('A 的 Excel 预览迟到时不读取结果、不污染 B 预览并由 A repository 清理 pending', async () => {
+    const repositoryA = createRepository({ projectCode: 'SY-A' })
+    const repositoryB = createRepository({ projectCode: 'SY-B' })
+    let resolvePreview!: (value: RepositoryResult<ProcurementImportPreviewDto>) => void
+    const delayedPreview = new Promise<RepositoryResult<ProcurementImportPreviewDto>>((resolve) => {
+      resolvePreview = resolve
+    })
+    vi.mocked(repositoryA.previewProcurementImport).mockReturnValue(delayedPreview)
+    const readLateData = vi.fn(() => ({
+      id: 31, project_code: 'SY-A', filename: 'A.xlsx', sha256: 'a'.repeat(64),
+      status: 'preview' as const, revision: 1, expires_at: '2026-09-01T08:00:00+08:00',
+      confirmed_list_id: null, rows: [], errors: [], created_at: '2026-08-31T08:00:00+08:00',
+      updated_at: '2026-08-31T08:00:00+08:00',
+    }))
+    const lateResult = { source: 'live' } as RepositoryResult<ProcurementImportPreviewDto>
+    Object.defineProperty(lateResult, 'data', { get: readLateData })
+    const wrapper = mountWorkspace(repositoryA, 'SY-A')
+    await settle()
+    const file = new File(['xlsx'], 'A.xlsx')
+    const upload = wrapper.get('[data-testid="procurement-import-upload"] input[type="file"]')
+    Object.defineProperty(upload.element, 'files', { configurable: true, value: [file] })
+
+    await upload.trigger('change')
+    await Promise.resolve()
+    await wrapper.setProps({ projectCode: 'SY-B', repository: repositoryB })
+    await settle()
+    resolvePreview(lateResult)
+    await settle()
+
+    expect(readLateData).not.toHaveBeenCalled()
+    expect(repositoryA.discardPreviewProcurementImport).toHaveBeenCalledWith('SY-A', file)
+    expect(repositoryB.previewProcurementImport).not.toHaveBeenCalled()
+    expect(wrapper.find('[data-testid="procurement-import-preview"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('SY-B采购清单')
+  })
+
+  it('模板走真实下载，扩展动作按采购单状态启用且空供应商阻止下单', async () => {
     const repository = createRepository({ listStatus: 'confirmed', companies: [] })
     const createObjectUrl = vi.fn(() => 'blob:template')
     const revokeObjectUrl = vi.fn()
@@ -876,11 +1021,15 @@ describe('采购工作台真实接口', () => {
     await settle()
     expect(repository.downloadImportTemplate).toHaveBeenCalledTimes(1)
     expect(anchorClick).toHaveBeenCalledTimes(1)
-    expect(wrapper.text()).toContain('Excel 自动识别导入：后端尚未接入，不会保存')
+    expect(wrapper.text()).toContain('Excel 会先预览校验，确认后才写入采购清单')
+    expect(wrapper.get('[data-testid="procurement-excel-import"]').attributes('disabled')).toBeUndefined()
 
     await wrapper.get('[data-testid="purchase-order-detail-open"]').trigger('click')
     await settle()
-    for (const testId of ['purchase-order-edit', 'purchase-payment-open', 'purchase-invoice-open', 'purchase-order-cancel-open']) {
+    for (const testId of ['purchase-order-edit', 'purchase-order-cancel-open']) {
+      expect(wrapper.get(`[data-testid="${testId}"]`).attributes('disabled')).toBeUndefined()
+    }
+    for (const testId of ['purchase-payment-open', 'purchase-invoice-open']) {
       expect(wrapper.get(`[data-testid="${testId}"]`).attributes('disabled')).toBeDefined()
     }
     await wrapper.get('[data-testid="purchase-order-create-101"]').trigger('click')
