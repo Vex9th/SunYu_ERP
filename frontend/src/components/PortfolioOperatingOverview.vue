@@ -3,7 +3,7 @@ import { onMounted, ref } from 'vue'
 
 import type { GlobalDashboard } from '../domain/contracts'
 import { formatMoney } from '../domain/formatters'
-import { createPreviewProjectRepository } from '../repositories/project.mock'
+import { createHttpProjectOperatingRepository } from '../repositories/project-operating.live'
 
 const emit = defineEmits<{
   'open-project': [projectCode: string]
@@ -11,6 +11,8 @@ const emit = defineEmits<{
 
 const dashboard = ref<GlobalDashboard | null>(null)
 const loading = ref(true)
+const loadError = ref<string | null>(null)
+const repository = createHttpProjectOperatingRepository()
 
 const stageLabels: Record<string, string> = {
   planning: '项目规划', site_survey: '现场测绘', quotation: '我方报价',
@@ -21,11 +23,20 @@ const stageLabels: Record<string, string> = {
   acceptance: '验收', final_payment: '尾款', closeout: '收尾',
 }
 
-onMounted(async () => {
-  const result = await createPreviewProjectRepository().getGlobalDashboard()
-  dashboard.value = result.data
-  loading.value = false
-})
+async function loadDashboard(): Promise<void> {
+  loading.value = true
+  loadError.value = null
+  dashboard.value = null
+  try {
+    dashboard.value = await repository.getGlobalDashboard()
+  } catch (error) {
+    loadError.value = error instanceof Error ? error.message : '经营总览读取失败'
+  } finally {
+    loading.value = false
+  }
+}
+
+onMounted(loadDashboard)
 
 function severityType(severity: GlobalDashboard['todos'][number]['severity']): 'info' | 'warning' | 'error' {
   return severity === 'danger' ? 'error' : severity
@@ -51,10 +62,20 @@ function stageLabel(stageCode: string | undefined): string {
         <h2>经营总览</h2>
         <p>在建项目、应收和当前阶段集中查看。</p>
       </div>
-      <el-tag type="warning" effect="plain">演示数据</el-tag>
+      <el-tag data-testid="portfolio-operating-live" type="success" effect="plain">真实后端</el-tag>
     </header>
 
     <el-card v-if="loading" shadow="never"><el-skeleton :rows="6" animated /></el-card>
+
+    <el-result
+      v-else-if="loadError"
+      data-testid="portfolio-operating-error"
+      icon="error"
+      title="经营总览读取失败"
+      :sub-title="loadError"
+    >
+      <template #extra><el-button data-testid="portfolio-operating-retry" type="primary" @click="loadDashboard">重新读取</el-button></template>
+    </el-result>
 
     <template v-else-if="dashboard">
       <div data-testid="backup-compact" class="backup-compact">

@@ -92,7 +92,7 @@ onMounted(loadWorkbench)
     <section class="page-heading page-heading--hero">
       <div>
         <h1>今天先处理什么</h1>
-        <p>真实基础资料与演示经营数据分开标记，日常事项直接处理。</p>
+        <p>项目经营、采购库存和施工交付均连接本机真实数据，日常事项可直接处理。</p>
       </div>
       <el-button type="primary" size="large" @click="emit('navigate', 'projects')">
         进入项目中心

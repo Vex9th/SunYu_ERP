@@ -2,10 +2,13 @@
 import { defineAsyncComponent, reactive, ref, watch } from 'vue'
 
 import { ApiError } from '../api'
-import type { ClosureType, ProjectDetail, ProjectOperatingSnapshot } from '../domain/contracts'
-import { createHttpProjectRepository } from '../repositories/project'
-import type { DataSource } from '../repositories/common'
-import type { ProjectDashboardData } from '../types'
+import type {
+  ClosureType,
+  ProjectDashboard as ProjectDashboardData,
+  ProjectDetail,
+  ProjectOperatingSnapshot,
+} from '../domain/contracts'
+import { createHttpProjectOperatingRepository } from '../repositories/project-operating.live'
 import ProjectCommercialPanel from './project/ProjectCommercialPanel.vue'
 import ProjectOverviewPanel from './project/ProjectOverviewPanel.vue'
 import ProjectRecordsPanel from './project/ProjectRecordsPanel.vue'
@@ -27,8 +30,6 @@ const emit = defineEmits<{
 const data = ref<ProjectDashboardData | null>(null)
 const operating = ref<ProjectOperatingSnapshot | null>(null)
 const projectPreview = ref<ProjectDetail | null>(null)
-const baseSource = ref<DataSource | null>(null)
-const operatingSource = ref<DataSource | null>(null)
 const loading = ref(false)
 const loadError = ref<string | null>(null)
 const editVisible = ref(false)
@@ -48,10 +49,7 @@ const initialTab = (): ProjectWorkspaceTab => 'home'
 const activeTab = ref<ProjectWorkspaceTab>(initialTab())
 const fieldView = ref<'site' | 'commissioning'>('site')
 let loadVersion = 0
-const repository = createHttpProjectRepository()
-const operatingRepository = import('../repositories/project.mock').then(({ createPreviewProjectRepository }) => (
-  createPreviewProjectRepository()
-))
+const repository = createHttpProjectOperatingRepository()
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '请求失败，请稍后重试'
@@ -64,26 +62,19 @@ async function loadDashboard(): Promise<void> {
   data.value = null
   operating.value = null
   projectPreview.value = null
-  baseSource.value = null
-  operatingSource.value = null
   try {
-    const demo = await operatingRepository
-    const [baseResult, operatingResult] = await Promise.all([
-      repository.getBaseDashboard(props.projectCode),
-      demo.getOperatingSnapshot(props.projectCode),
-    ])
-    const previewResult = await demo.openProject({
-      ...baseResult.data.project,
-      company_name: baseResult.data.company.name,
-      closure_type: null,
-      revision: 1,
-    })
+    const result = await repository.getProjectDashboard(props.projectCode)
     if (version === loadVersion) {
-      data.value = baseResult.data
-      baseSource.value = baseResult.source
-      operating.value = operatingResult?.data ?? null
-      operatingSource.value = operatingResult?.source ?? null
-      projectPreview.value = previewResult.data
+      data.value = result
+      operating.value = {
+        stages: result.stages,
+        commercial: result.commercial,
+        costs: result.costs,
+        profit: result.profit,
+        receivables: result.receivables,
+        todos: result.todos,
+      }
+      projectPreview.value = result.project
     }
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) {
@@ -121,15 +112,15 @@ async function saveProjectEdit(): Promise<void> {
   projectSaving.value = true
   projectActionError.value = null
   try {
-    const demo = await operatingRepository
-    const result = await demo.updateProject(props.projectCode, {
+    const result = await repository.updateProject(props.projectCode, {
       company_id: projectPreview.value.company_id,
       name: editForm.name,
       description: editForm.description.trim() || null,
       expected_revision: projectPreview.value.revision,
     })
     if (version === loadVersion) {
-      projectPreview.value = result.data
+      projectPreview.value = result
+      if (data.value) data.value = { ...data.value, project: result }
       editVisible.value = false
     }
   } catch (error) {
@@ -152,14 +143,14 @@ async function saveProjectClose(): Promise<void> {
   projectSaving.value = true
   projectActionError.value = null
   try {
-    const demo = await operatingRepository
-    const result = await demo.closeProject(props.projectCode, {
+    const result = await repository.closeProject(props.projectCode, {
       closure_type: closeForm.closure_type,
       reason: closeForm.reason,
       expected_revision: projectPreview.value.revision,
     })
     if (version === loadVersion) {
-      projectPreview.value = result.data
+      projectPreview.value = result
+      if (data.value) data.value = { ...data.value, project: result }
       closeVisible.value = false
     }
   } catch (error) {
@@ -172,6 +163,7 @@ async function saveProjectClose(): Promise<void> {
 function updateStages(stages: ProjectOperatingSnapshot['stages']): void {
   if (!operating.value) return
   operating.value = { ...operating.value, stages }
+  if (data.value) data.value = { ...data.value, stages }
 }
 
 watch(
@@ -206,12 +198,11 @@ watch(activeTab, (tab) => {
         <el-space class="project-statuses" wrap>
           <el-tag v-if="projectPreview" data-testid="project-status" :type="projectPreview.status === 'active' ? 'success' : 'info'">{{ previewStatusLabel(projectPreview) }}</el-tag>
           <el-tag v-else :type="data.project.status === 'active' ? 'success' : 'info'">{{ statusLabel(data.project.status) }}</el-tag>
-          <el-tag v-if="baseSource === 'live'" data-testid="project-live-notice" type="success" effect="plain">真实后端</el-tag>
-          <el-tag v-if="operatingSource === 'demo'" data-testid="project-demo-notice" type="warning" effect="plain">演示数据</el-tag>
+          <el-tag data-testid="project-live-notice" type="success" effect="plain">真实后端</el-tag>
         </el-space>
         <el-space v-if="(projectPreview?.status ?? data.project.status) === 'active'" class="project-primary-actions" wrap fill>
-          <el-button data-testid="project-edit-open" plain :disabled="!projectPreview" @click="openProjectEdit">编辑演示项目</el-button>
-          <el-button data-testid="project-close-open" plain type="danger" :disabled="!projectPreview" @click="openProjectClose">演示完结</el-button>
+          <el-button data-testid="project-edit-open" plain :disabled="!projectPreview" @click="openProjectEdit">编辑项目</el-button>
+          <el-button data-testid="project-close-open" plain type="danger" :disabled="!projectPreview" @click="openProjectClose">完结项目</el-button>
         </el-space>
       </div>
     </section>
@@ -285,17 +276,17 @@ watch(activeTab, (tab) => {
       </el-tabs>
     </template>
 
-    <el-dialog v-model="editVisible" title="编辑项目 · 演示" :teleported="false" width="min(92vw, 520px)">
+    <el-dialog v-model="editVisible" title="编辑项目" :teleported="false" width="min(92vw, 520px)">
       <el-alert v-if="projectActionError" :title="projectActionError" type="error" :closable="false" />
       <el-form label-position="top" @submit.prevent="saveProjectEdit">
         <el-form-item label="项目名称" required><el-input data-testid="project-edit-name" v-model="editForm.name" /></el-form-item>
         <el-form-item label="项目说明"><el-input data-testid="project-edit-description" v-model="editForm.description" type="textarea" /></el-form-item>
-        <el-text type="info">当前只保存为演示数据，不改动真实项目。</el-text>
-        <div class="dialog-actions"><el-button data-testid="project-edit-save" type="primary" :loading="projectSaving" @click="saveProjectEdit">保存演示修改</el-button></div>
+        <el-text type="info">保存后立即更新当前项目资料。</el-text>
+        <div class="dialog-actions"><el-button data-testid="project-edit-save" type="primary" :loading="projectSaving" @click="saveProjectEdit">保存修改</el-button></div>
       </el-form>
     </el-dialog>
 
-    <el-dialog v-model="closeVisible" title="完结项目 · 演示" :teleported="false" width="min(92vw, 500px)">
+    <el-dialog v-model="closeVisible" title="完结项目" :teleported="false" width="min(92vw, 500px)">
       <el-alert v-if="projectActionError" :title="projectActionError" type="error" :closable="false" />
       <el-form label-position="top" @submit.prevent="saveProjectClose">
         <el-form-item label="完结类型" required>
@@ -305,8 +296,8 @@ watch(activeTab, (tab) => {
           </el-radio-group>
         </el-form-item>
         <el-form-item label="完结原因" required><el-input data-testid="project-close-reason" v-model="closeForm.reason" type="textarea" /></el-form-item>
-        <el-text type="info">完结后演示页不再提供编辑操作，真实后端数据不受影响。</el-text>
-        <div class="dialog-actions"><el-button data-testid="project-close-save" type="danger" :loading="projectSaving" @click="saveProjectClose">确认演示完结</el-button></div>
+        <el-text type="info">完结后项目进入归档，历史资料仍然保留。</el-text>
+        <div class="dialog-actions"><el-button data-testid="project-close-save" type="danger" :loading="projectSaving" @click="saveProjectClose">确认完结</el-button></div>
       </el-form>
     </el-dialog>
   </el-space>

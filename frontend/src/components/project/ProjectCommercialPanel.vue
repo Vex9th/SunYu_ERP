@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { reactive, ref } from 'vue'
+import { reactive, ref, watch } from 'vue'
 
 import type {
   Contract,
@@ -14,14 +14,21 @@ import type {
 } from '../../domain/contracts'
 import { localISODate } from '../../domain/dates'
 import { centsToYuan, formatBasisPoints, formatMoney, yuanToCents } from '../../domain/formatters'
+import {
+  createHttpProjectOperatingRepository,
+  type DocumentVersionOption,
+  type ProjectOperatingRepository,
+} from '../../repositories/project-operating.live'
 
 const props = defineProps<{
   operating: ProjectOperatingSnapshot
   projectCode: string
   customerCompany?: { id: number; name: string }
+  repository?: ProjectOperatingRepository
 }>()
 type CommercialView = 'overview' | 'quotes' | 'contracts' | 'receivables'
 
+const repository = props.repository ?? createHttpProjectOperatingRepository()
 const activeView = ref<CommercialView>('overview')
 const quotes = ref<Quote[]>(props.operating.commercial.accepted_quote ? [{ ...props.operating.commercial.accepted_quote }] : [])
 const contracts = ref<Contract[]>(props.operating.commercial.contracts.map((contract) => ({
@@ -51,6 +58,13 @@ const voidVisible = ref(false)
 const selectedMilestone = ref<PaymentMilestone>('advance')
 const selectedReceiptId = ref<number | null>(null)
 const validationError = ref<string | null>(null)
+const loading = ref(true)
+const loadError = ref<string | null>(null)
+const actionBusy = ref(false)
+const actionSuccess = ref<string | null>(null)
+const actionWarning = ref<string | null>(null)
+const documentOptions = ref<DocumentVersionOption[]>([])
+let loadVersion = 0
 
 const quoteForm = reactive({ quote_date: '', amount_cents: '', valid_until: '', notes: '', document_version_ids: [] as number[] })
 const contractForm = reactive({
@@ -66,11 +80,84 @@ const voidForm = reactive({ voided_on: '', reason: '' })
 
 const quoteStatuses: QuoteStatus[] = ['draft', 'sent', 'accepted', 'rejected', 'withdrawn']
 const contractStatuses: ContractStatus[] = ['draft', 'signed', 'completed', 'terminated']
-const demoDocumentOptions = [
-  { value: 1001, label: '现场测绘记录 V1' },
-  { value: 1002, label: '技术协议 V2' },
-  { value: 1003, label: '合同扫描件 V1' },
-]
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : '商务操作失败'
+}
+
+function setPayments(payments: ProjectOperatingSnapshot['receivables']): void {
+  Object.assign(receivables, payments, {
+    terms: payments.terms.map((term) => ({ ...term })),
+    receipts: payments.receipts.map((receipt) => ({ ...receipt })),
+  })
+}
+
+async function loadCommercial(): Promise<void> {
+  const version = ++loadVersion
+  loading.value = true
+  loadError.value = null
+  try {
+    const [quoteListing, contractListing, payments, options] = await Promise.all([
+      repository.listQuotes(props.projectCode),
+      repository.listContracts(props.projectCode),
+      repository.getPayments(props.projectCode),
+      repository.listDocumentVersionOptions(props.projectCode),
+    ])
+    if (version !== loadVersion) return
+    quotes.value = quoteListing.items
+    contracts.value = contractListing.items
+    setPayments(payments)
+    documentOptions.value = options
+    actionWarning.value = null
+  } catch (error) {
+    if (version === loadVersion) loadError.value = errorMessage(error)
+  } finally {
+    if (version === loadVersion) loading.value = false
+  }
+}
+
+async function refreshPayments(): Promise<void> {
+  setPayments(await repository.getPayments(props.projectCode))
+}
+
+async function refreshPaymentsAfterSave(): Promise<void> {
+  try {
+    await refreshPayments()
+    actionWarning.value = null
+  } catch {
+    actionSuccess.value = null
+    actionWarning.value = '已保存，但刷新失败，请刷新页面。'
+  }
+}
+
+async function submit<T>(action: () => Promise<T>, message: string): Promise<T | undefined> {
+  actionBusy.value = true
+  validationError.value = null
+  actionSuccess.value = null
+  actionWarning.value = null
+  try {
+    const result = await action()
+    actionSuccess.value = message
+    return result
+  } catch (error) {
+    validationError.value = errorMessage(error)
+    return undefined
+  } finally {
+    actionBusy.value = false
+  }
+}
+
+function replaceQuote(quote: Quote): void {
+  const index = quotes.value.findIndex((item) => item.id === quote.id)
+  if (index < 0) quotes.value.unshift(quote)
+  else quotes.value.splice(index, 1, quote)
+}
+
+function replaceContract(contract: Contract): void {
+  const index = contracts.value.findIndex((item) => item.id === contract.id)
+  if (index < 0) contracts.value.unshift(contract)
+  else contracts.value.splice(index, 1, contract)
+}
 
 function milestoneLabel(milestone: PaymentMilestone): string {
   return { advance: '预付款', progress: '进度款', final: '尾款' }[milestone]
@@ -145,42 +232,36 @@ function openQuoteEdit(quote: Quote): void {
   quoteVisible.value = true
 }
 
-function saveQuote(): void {
+async function saveQuote(): Promise<void> {
   const amount = money(quoteForm.amount_cents)
   if (!quoteForm.quote_date || amount === null) {
     validationError.value = '请填写报价日期和正确的元金额'
     return
   }
-  const createdAt = now()
   const existing = quotes.value.find((quote) => quote.id === quoteEditingId.value)
-  if (existing) {
-    Object.assign(existing, {
-      quote_date: quoteForm.quote_date,
-      amount_cents: amount,
-      valid_until: nullable(quoteForm.valid_until),
-      notes: nullable(quoteForm.notes),
-      document_version_ids: [...quoteForm.document_version_ids],
-      revision: existing.revision + 1,
-      updated_at: createdAt,
-    })
-    quoteVisible.value = false
-    return
-  }
-  quotes.value.unshift({
-    id: Math.max(0, ...quotes.value.map((quote) => quote.id)) + 1,
-    project_code: props.projectCode,
-    version_number: Math.max(0, ...quotes.value.map((quote) => quote.version_number)) + 1,
-    status: 'draft',
+  const input = {
     quote_date: quoteForm.quote_date,
     amount_cents: amount,
     valid_until: nullable(quoteForm.valid_until),
     notes: nullable(quoteForm.notes),
     document_version_ids: [...quoteForm.document_version_ids],
-    revision: 1,
-    created_at: createdAt,
-    updated_at: createdAt,
-  })
-  quoteVisible.value = false
+  }
+  const saved = existing
+    ? await submit(
+      () => repository.updateQuote(props.projectCode, existing.id, {
+        ...input,
+        expected_revision: existing.revision,
+      }),
+      '报价已更新。',
+    )
+    : await submit(
+      () => repository.createQuote(props.projectCode, input),
+      '报价已创建。',
+    )
+  if (saved) {
+    replaceQuote(saved)
+    quoteVisible.value = false
+  }
 }
 
 function openContract(): void {
@@ -210,13 +291,10 @@ function openContractEdit(contract: Contract): void {
   contractVisible.value = true
 }
 
-function saveContract(): void {
+async function saveContract(): Promise<void> {
   const companyId = props.customerCompany?.id
     ?? props.operating.commercial.contracts[0]?.customer_company_id
     ?? null
-  const companyName = props.customerCompany?.name
-    ?? props.operating.commercial.contracts[0]?.customer_company_name
-    ?? '当前项目客户'
   const total = money(contractForm.total_amount_cents)
   const allocation = money(contractForm.allocation_amount_cents)
   if (!contractForm.contract_no.trim() || !contractForm.title.trim() || !Number.isSafeInteger(companyId)
@@ -224,44 +302,36 @@ function saveContract(): void {
     validationError.value = '请完整填写合同，当前项目分摊必须等于合同总额'
     return
   }
-  const createdAt = now()
   const existing = contracts.value.find((contract) => contract.id === contractEditingId.value)
-  if (existing) {
-    Object.assign(existing, {
-      contract_no: contractForm.contract_no.trim(),
-      title: contractForm.title.trim(),
-      signed_on: nullable(contractForm.signed_on),
-      total_amount_cents: total,
-      final_delivery_on: nullable(contractForm.final_delivery_on),
-      notes: nullable(contractForm.notes),
-      document_version_ids: [...contractForm.document_version_ids],
-      revision: existing.revision + 1,
-      updated_at: createdAt,
-    })
-    const allocationRecord = existing.allocations.find((item) => item.project_code === props.projectCode)
-    if (allocationRecord) allocationRecord.amount_cents = allocation
-    contractVisible.value = false
-    return
-  }
-  const id = Math.max(20, ...contracts.value.map((contract) => contract.id)) + 1
-  contracts.value.unshift({
-    id,
+  const input = {
     contract_no: contractForm.contract_no.trim(),
     title: contractForm.title.trim(),
     customer_company_id: companyId,
-    customer_company_name: companyName,
-    status: 'draft',
     signed_on: nullable(contractForm.signed_on),
     total_amount_cents: total,
     final_delivery_on: nullable(contractForm.final_delivery_on),
-    allocations: [{ id: id * 10, contract_id: id, project_code: props.projectCode, amount_cents: allocation }],
+    allocations: [{ project_code: props.projectCode, amount_cents: allocation }],
     notes: nullable(contractForm.notes),
     document_version_ids: [...contractForm.document_version_ids],
-    revision: 1,
-    created_at: createdAt,
-    updated_at: createdAt,
-  })
-  contractVisible.value = false
+  }
+  const saved = existing
+    ? await submit(
+      () => repository.updateContract(props.projectCode, existing.id, {
+        ...input,
+        expected_revision: existing.revision,
+      }),
+      '合同已更新。',
+    )
+    : await submit(
+      () => repository.createContract(props.projectCode, input),
+      '合同已创建。',
+    )
+  if (saved) {
+    replaceContract(saved)
+    contractVisible.value = false
+    contractEditingId.value = null
+    await refreshPaymentsAfterSave()
+  }
 }
 
 function openTransition(kind: 'quote' | 'contract', id: number): void {
@@ -274,14 +344,22 @@ function openTransition(kind: 'quote' | 'contract', id: number): void {
   transitionVisible.value = true
 }
 
-function saveTransition(): void {
+async function saveTransition(): Promise<void> {
   const occurredAt = now()
   if (transitionKind.value === 'quote' && quoteTarget.value) {
     const quote = quotes.value.find((item) => item.id === transitionId.value)
     if (quote) {
-      quote.status = quoteTarget.value
-      quote.revision += 1
-      quote.updated_at = occurredAt
+      const saved = await submit(
+        () => repository.transitionQuote(props.projectCode, quote.id, {
+          to_status: quoteTarget.value!,
+          occurred_at: occurredAt,
+          reason: nullable(transitionReason.value),
+          expected_revision: quote.revision,
+        }),
+        '报价状态已更新。',
+      )
+      if (!saved) return
+      replaceQuote(saved)
     }
   } else if (transitionKind.value === 'contract' && contractTarget.value) {
     const contract = contracts.value.find((item) => item.id === transitionId.value)
@@ -290,9 +368,21 @@ function saveTransition(): void {
         validationError.value = '转为已签署前必须补齐签订日期和最终交付日期'
         return
       }
-      contract.status = contractTarget.value
-      contract.revision += 1
-      contract.updated_at = occurredAt
+      const saved = await submit(
+        () => repository.transitionContract(props.projectCode, contract.id, {
+          to_status: contractTarget.value!,
+          occurred_at: occurredAt,
+          reason: nullable(transitionReason.value),
+          expected_revision: contract.revision,
+        }),
+        '合同状态已更新。',
+      )
+      if (!saved) return
+      replaceContract(saved)
+      transitionVisible.value = false
+      transitionId.value = null
+      await refreshPaymentsAfterSave()
+      return
     }
   } else {
     validationError.value = '请选择目标状态'
@@ -310,27 +400,28 @@ function openTerm(term: PaymentTerm): void {
   termVisible.value = true
 }
 
-function saveTerm(): void {
+async function saveTerm(): Promise<void> {
   const term = receivables.terms.find((item) => item.milestone === selectedMilestone.value)
   const planned = money(termForm.planned_amount_cents)
   if (!term || planned === null) {
     validationError.value = '计划金额必须是正确的元金额'
     return
   }
-  term.due_on = nullable(termForm.due_on)
-  term.planned_amount_cents = planned
-  term.outstanding_amount_cents = Math.max(planned - term.received_amount_cents, 0)
-  term.notes = nullable(termForm.notes)
-  term.status = planned === 0 ? 'unplanned' : term.received_amount_cents >= planned ? 'paid'
-    : term.received_amount_cents > 0 ? 'partial' : 'scheduled'
-  term.term_fulfillment_basis_points = planned === 0 ? null
-    : Math.round(term.received_amount_cents * 10000 / planned)
-  term.revision = (term.revision ?? 0) + 1
-  receivables.receivable_amount_cents = receivables.terms.reduce((sum, item) => sum + item.planned_amount_cents, 0)
-  receivables.outstanding_receivable_cents = Math.max(receivables.receivable_amount_cents - receivables.received_amount_cents, 0)
-  receivables.contract_collection_basis_points = receivables.contracted_amount_cents === 0 ? null
-    : Math.round(receivables.allocated_received_amount_cents * 10000 / receivables.contracted_amount_cents)
-  termVisible.value = false
+  const saved = await submit(
+    () => repository.putPaymentTerm(props.projectCode, term.milestone, {
+      due_on: nullable(termForm.due_on),
+      planned_amount_cents: planned,
+      notes: nullable(termForm.notes),
+      expected_revision: term.revision,
+    }),
+    '收款计划已保存。',
+  )
+  if (saved) {
+    const index = receivables.terms.findIndex((item) => item.milestone === saved.milestone)
+    if (index >= 0) receivables.terms.splice(index, 1, saved)
+    termVisible.value = false
+    await refreshPaymentsAfterSave()
+  }
 }
 
 function openReceipt(): void {
@@ -354,7 +445,7 @@ function openReceiptEdit(receipt: Receipt): void {
   receiptVisible.value = true
 }
 
-function saveReceipt(): void {
+async function saveReceipt(): Promise<void> {
   const amount = money(receiptForm.amount_cents)
   if (!receiptForm.received_on || amount === null || amount === 0) {
     validationError.value = '请填写到账日期和大于零的元金额'
@@ -362,51 +453,49 @@ function saveReceipt(): void {
   }
   const existing = receivables.receipts.find((receipt) => receipt.id === receiptEditingId.value)
   if (existing) {
-    existing.received_on = receiptForm.received_on
-    existing.payment_method = receiptForm.payment_method
-    existing.reference_no = nullable(receiptForm.reference_no)
-    existing.notes = nullable(receiptForm.notes)
-    existing.revision += 1
-    existing.updated_at = now()
-    receiptVisible.value = false
+    const saved = await submit(
+      () => repository.updateReceipt(props.projectCode, existing.id, {
+        reference_no: nullable(receiptForm.reference_no),
+        notes: nullable(receiptForm.notes),
+        expected_revision: existing.revision,
+      }),
+      '到账说明已更新。',
+    )
+    if (saved) {
+      const index = receivables.receipts.findIndex((receipt) => receipt.id === saved.id)
+      if (index >= 0) receivables.receipts.splice(index, 1, saved)
+      receiptVisible.value = false
+      receiptEditingId.value = null
+      await refreshPaymentsAfterSave()
+    }
     return
   }
-  const createdAt = now()
-  const allocationId = contracts.value.flatMap((contract) => contract.allocations)
+  const allocationId = contracts.value
+    .filter((contract) => contract.status === 'signed' || contract.status === 'completed')
+    .flatMap((contract) => contract.allocations)
     .find((allocation) => allocation.project_code === props.projectCode)?.id ?? null
-  const receipt: Receipt = {
-    id: Math.max(0, ...receivables.receipts.map((item) => item.id)) + 1,
-    project_code: props.projectCode,
-    contract_allocation_id: allocationId,
-    milestone: receiptForm.milestone,
-    received_on: receiptForm.received_on,
-    amount_cents: amount,
-    payment_method: receiptForm.payment_method,
-    reference_no: nullable(receiptForm.reference_no),
-    notes: nullable(receiptForm.notes),
-    status: 'active',
-    voided_on: null,
-    void_reason: null,
-    revision: 1,
-    created_at: createdAt,
-    updated_at: createdAt,
+  const saved = await submit(
+    () => repository.createReceipt(props.projectCode, {
+      contract_allocation_id: allocationId,
+      milestone: receiptForm.milestone,
+      received_on: receiptForm.received_on,
+      amount_cents: amount,
+      payment_method: receiptForm.payment_method,
+      reference_no: nullable(receiptForm.reference_no),
+      notes: nullable(receiptForm.notes),
+    }),
+    '到账流水已登记。',
+  )
+  if (saved) {
+    receivables.receipts.unshift(saved)
+    receiptVisible.value = false
+    receiptEditingId.value = null
+    Object.assign(receiptForm, {
+      milestone: 'advance', received_on: '', amount_cents: '', payment_method: 'bank_transfer',
+      reference_no: '', notes: '',
+    })
+    await refreshPaymentsAfterSave()
   }
-  receivables.receipts.unshift(receipt)
-  receivables.received_amount_cents += amount
-  receivables.allocated_received_amount_cents += allocationId === null ? 0 : amount
-  receivables.unallocated_received_amount_cents += allocationId === null ? amount : 0
-  receivables.outstanding_receivable_cents = Math.max(receivables.receivable_amount_cents - receivables.received_amount_cents, 0)
-  receivables.contract_collection_basis_points = receivables.contracted_amount_cents === 0 ? null
-    : Math.round(receivables.allocated_received_amount_cents * 10000 / receivables.contracted_amount_cents)
-  const term = receivables.terms.find((item) => item.milestone === receipt.milestone)
-  if (term) {
-    term.received_amount_cents += amount
-    term.outstanding_amount_cents = Math.max(term.planned_amount_cents - term.received_amount_cents, 0)
-    term.status = term.received_amount_cents >= term.planned_amount_cents ? 'paid' : 'partial'
-    term.term_fulfillment_basis_points = term.planned_amount_cents === 0 ? null
-      : Math.round(term.received_amount_cents * 10000 / term.planned_amount_cents)
-  }
-  receiptVisible.value = false
 }
 
 function openVoid(receiptId: number): void {
@@ -417,46 +506,62 @@ function openVoid(receiptId: number): void {
   voidVisible.value = true
 }
 
-function saveVoid(): void {
+async function saveVoid(): Promise<void> {
   const receipt = receivables.receipts.find((item) => item.id === selectedReceiptId.value)
   if (!receipt || !voidForm.voided_on || !voidForm.reason.trim()) {
     validationError.value = '请填写作废日期和原因'
     return
   }
-  receipt.status = 'voided'
-  receipt.voided_on = voidForm.voided_on
-  receipt.void_reason = voidForm.reason.trim()
-  receipt.revision += 1
-  receipt.updated_at = now()
-  receivables.received_amount_cents = Math.max(receivables.received_amount_cents - receipt.amount_cents, 0)
-  if (receipt.contract_allocation_id === null) {
-    receivables.unallocated_received_amount_cents = Math.max(receivables.unallocated_received_amount_cents - receipt.amount_cents, 0)
-  } else {
-    receivables.allocated_received_amount_cents = Math.max(receivables.allocated_received_amount_cents - receipt.amount_cents, 0)
+  const saved = await submit(
+    () => repository.voidReceipt(props.projectCode, receipt.id, {
+      voided_on: voidForm.voided_on,
+      reason: voidForm.reason.trim(),
+      expected_revision: receipt.revision,
+    }),
+    '到账流水已作废。',
+  )
+  if (saved) {
+    const index = receivables.receipts.findIndex((item) => item.id === saved.id)
+    if (index >= 0) receivables.receipts.splice(index, 1, saved)
+    voidVisible.value = false
+    selectedReceiptId.value = null
+    Object.assign(voidForm, { voided_on: '', reason: '' })
+    await refreshPaymentsAfterSave()
   }
-  receivables.outstanding_receivable_cents = Math.max(receivables.receivable_amount_cents - receivables.received_amount_cents, 0)
-  receivables.contract_collection_basis_points = receivables.contracted_amount_cents === 0 ? null
-    : Math.round(receivables.allocated_received_amount_cents * 10000 / receivables.contracted_amount_cents)
-  const term = receivables.terms.find((item) => item.milestone === receipt.milestone)
-  if (term) {
-    term.received_amount_cents = Math.max(term.received_amount_cents - receipt.amount_cents, 0)
-    term.outstanding_amount_cents = Math.max(term.planned_amount_cents - term.received_amount_cents, 0)
-    term.status = term.planned_amount_cents === 0 ? 'unplanned'
-      : term.received_amount_cents >= term.planned_amount_cents ? 'paid'
-        : term.received_amount_cents > 0 ? 'partial' : 'scheduled'
-    term.term_fulfillment_basis_points = term.planned_amount_cents === 0 ? null
-      : Math.round(term.received_amount_cents * 10000 / term.planned_amount_cents)
-  }
-  voidVisible.value = false
 }
+
+watch(() => props.projectCode, () => {
+  activeView.value = 'overview'
+  quoteVisible.value = false
+  contractVisible.value = false
+  transitionVisible.value = false
+  receiptVisible.value = false
+  termVisible.value = false
+  voidVisible.value = false
+  actionSuccess.value = null
+  actionWarning.value = null
+  void loadCommercial()
+}, { immediate: true })
 </script>
 
 <template>
   <el-space data-testid="project-demo-commercial" class="project-panel-stack commercial-stack" direction="vertical" alignment="stretch" fill :size="16">
     <el-row justify="space-between" align="middle">
       <div><el-text tag="strong" size="large">报价与收款</el-text><p class="section-note">报价不是项目收入，发票不是收款。</p></div>
-      <el-tag type="warning" effect="plain">演示数据</el-tag>
+      <el-tag data-testid="commercial-live-notice" type="success" effect="plain">真实后端</el-tag>
     </el-row>
+    <el-skeleton v-if="loading" :rows="5" animated />
+    <el-result v-else-if="loadError" data-testid="commercial-load-error" icon="error" title="商务台账读取失败" :sub-title="loadError">
+      <template #extra><el-button data-testid="commercial-load-retry" type="primary" @click="loadCommercial">重新读取</el-button></template>
+    </el-result>
+    <el-alert v-if="actionSuccess" :title="actionSuccess" type="success" :closable="false" />
+    <el-alert
+      v-if="actionWarning"
+      data-testid="commercial-refresh-warning"
+      :title="actionWarning"
+      type="warning"
+      :closable="false"
+    />
     <el-space wrap>
       <el-button :type="activeView === 'overview' ? 'primary' : 'default'" @click="activeView = 'overview'">经营摘要</el-button>
       <el-button data-testid="commercial-nav-quotes" :type="activeView === 'quotes' ? 'primary' : 'default'" @click="activeView = 'quotes'">报价版本</el-button>
@@ -488,17 +593,17 @@ function saveVoid(): void {
       <el-card data-testid="receipt-ledger" class="data-card" shadow="never"><template #header><div><el-text tag="strong">到账流水</el-text><p class="section-note">发票不是收款；金额纠错使用作废后重录。</p></div></template><el-empty v-if="receivables.receipts.length === 0" description="暂无到账流水" /><el-table v-else :data="receivables.receipts" row-key="id"><el-table-column prop="received_on" label="到账日期" min-width="110" /><el-table-column label="节点" width="90"><template #default="scope">{{ milestoneLabel(scope.row.milestone) }}</template></el-table-column><el-table-column label="金额" min-width="130"><template #default="scope">{{ formatMoney(scope.row.amount_cents) }}</template></el-table-column><el-table-column prop="reference_no" label="参考号" min-width="150" /><el-table-column label="状态" width="90"><template #default="scope"><el-tag :type="scope.row.status === 'active' ? 'success' : 'info'">{{ scope.row.status === 'active' ? '有效' : '已作废' }}</el-tag></template></el-table-column><el-table-column label="操作" width="150"><template #default="scope"><el-button v-if="scope.row.status === 'active'" :data-testid="`receipt-edit-open-${scope.row.id}`" link @click="openReceiptEdit(scope.row)">编辑说明</el-button><el-button v-if="scope.row.status === 'active'" :data-testid="`receipt-void-${scope.row.id}`" link type="danger" @click="openVoid(scope.row.id)">作废</el-button></template></el-table-column></el-table></el-card>
     </el-space>
 
-    <el-dialog v-model="quoteVisible" :title="`${quoteEditingId ? '编辑' : '新建'}报价 · 演示`" :teleported="false"><el-alert v-if="validationError" :title="validationError" type="error" :closable="false" /><el-form label-position="top" @submit.prevent="saveQuote"><el-form-item label="报价日期" required><el-date-picker data-testid="quote-date" v-model="quoteForm.quote_date" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item><el-form-item label="报价金额（元）" required><el-input data-testid="quote-amount" v-model="quoteForm.amount_cents" inputmode="decimal" placeholder="0.00" /></el-form-item><el-form-item label="有效期至"><el-date-picker v-model="quoteForm.valid_until" type="date" value-format="YYYY-MM-DD" clearable style="width:100%" /></el-form-item><el-form-item label="关联附件"><el-select v-model="quoteForm.document_version_ids" multiple style="width:100%"><el-option v-for="item in demoDocumentOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item><el-form-item label="备注"><el-input v-model="quoteForm.notes" type="textarea" /></el-form-item><el-button data-testid="quote-create-save" type="primary" native-type="submit">{{ quoteEditingId ? '保存演示修改' : '加入演示报价' }}</el-button></el-form></el-dialog>
+    <el-dialog v-model="quoteVisible" :title="`${quoteEditingId ? '编辑' : '新建'}报价`" :teleported="false"><el-alert v-if="validationError" :title="validationError" type="error" :closable="false" /><el-form label-position="top" @submit.prevent="saveQuote"><el-form-item label="报价日期" required><el-date-picker data-testid="quote-date" v-model="quoteForm.quote_date" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item><el-form-item label="报价金额（元）" required><el-input data-testid="quote-amount" v-model="quoteForm.amount_cents" inputmode="decimal" placeholder="0.00" /></el-form-item><el-form-item label="有效期至"><el-date-picker v-model="quoteForm.valid_until" type="date" value-format="YYYY-MM-DD" clearable style="width:100%" /></el-form-item><el-form-item label="关联附件"><el-select v-model="quoteForm.document_version_ids" multiple style="width:100%"><el-option v-for="item in documentOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item><el-form-item label="备注"><el-input v-model="quoteForm.notes" type="textarea" /></el-form-item><el-button data-testid="quote-create-save" type="primary" native-type="submit" :loading="actionBusy">{{ quoteEditingId ? '保存修改' : '创建报价' }}</el-button></el-form></el-dialog>
 
-    <el-dialog v-model="contractVisible" :title="`${contractEditingId ? '编辑' : '新建'}合同 · 演示`" :teleported="false"><el-alert v-if="validationError" :title="validationError" type="error" :closable="false" /><el-form label-position="top" @submit.prevent="saveContract"><el-form-item label="合同编号" required><el-input data-testid="contract-no" v-model="contractForm.contract_no" /></el-form-item><el-form-item label="合同名称" required><el-input data-testid="contract-title" v-model="contractForm.title" /></el-form-item><el-form-item label="客户公司" required><el-input data-testid="contract-company" :model-value="customerCompany?.name ?? operating.commercial.contracts[0]?.customer_company_name ?? '当前项目客户'" disabled /></el-form-item><el-form-item label="合同总额（元）" required><el-input data-testid="contract-total" v-model="contractForm.total_amount_cents" inputmode="decimal" placeholder="0.00" /></el-form-item><el-form-item label="当前项目分摊（元）" required><el-input data-testid="contract-allocation" v-model="contractForm.allocation_amount_cents" inputmode="decimal" placeholder="0.00" /></el-form-item><el-form-item label="签订日期"><el-date-picker v-model="contractForm.signed_on" type="date" value-format="YYYY-MM-DD" clearable style="width:100%" /></el-form-item><el-form-item label="最终交付日期"><el-date-picker v-model="contractForm.final_delivery_on" type="date" value-format="YYYY-MM-DD" clearable style="width:100%" /></el-form-item><el-form-item label="关联附件"><el-select v-model="contractForm.document_version_ids" multiple style="width:100%"><el-option v-for="item in demoDocumentOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item><el-form-item label="备注"><el-input v-model="contractForm.notes" type="textarea" /></el-form-item><el-button data-testid="contract-create-save" type="primary" native-type="submit">{{ contractEditingId ? '保存演示修改' : '加入演示合同' }}</el-button></el-form></el-dialog>
+    <el-dialog v-model="contractVisible" :title="`${contractEditingId ? '编辑' : '新建'}合同`" :teleported="false"><el-alert v-if="validationError" :title="validationError" type="error" :closable="false" /><el-form label-position="top" @submit.prevent="saveContract"><el-form-item label="合同编号" required><el-input data-testid="contract-no" v-model="contractForm.contract_no" /></el-form-item><el-form-item label="合同名称" required><el-input data-testid="contract-title" v-model="contractForm.title" /></el-form-item><el-form-item label="客户公司" required><el-input data-testid="contract-company" :model-value="customerCompany?.name ?? operating.commercial.contracts[0]?.customer_company_name ?? '当前项目客户'" disabled /></el-form-item><el-form-item label="合同总额（元）" required><el-input data-testid="contract-total" v-model="contractForm.total_amount_cents" inputmode="decimal" placeholder="0.00" /></el-form-item><el-form-item label="当前项目分摊（元）" required><el-input data-testid="contract-allocation" v-model="contractForm.allocation_amount_cents" inputmode="decimal" placeholder="0.00" /></el-form-item><el-form-item label="签订日期"><el-date-picker v-model="contractForm.signed_on" type="date" value-format="YYYY-MM-DD" clearable style="width:100%" /></el-form-item><el-form-item label="最终交付日期"><el-date-picker v-model="contractForm.final_delivery_on" type="date" value-format="YYYY-MM-DD" clearable style="width:100%" /></el-form-item><el-form-item label="关联附件"><el-select v-model="contractForm.document_version_ids" multiple style="width:100%"><el-option v-for="item in documentOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item><el-form-item label="备注"><el-input v-model="contractForm.notes" type="textarea" /></el-form-item><el-button data-testid="contract-create-save" type="primary" native-type="submit" :loading="actionBusy">{{ contractEditingId ? '保存修改' : '创建合同' }}</el-button></el-form></el-dialog>
 
-    <el-dialog v-model="transitionVisible" title="切换状态 · 演示" :teleported="false"><el-alert v-if="validationError" :title="validationError" type="error" :closable="false" /><el-space v-if="transitionKind === 'quote'" wrap><el-button v-for="status in quoteStatuses" :key="status" :type="quoteTarget === status ? 'primary' : 'default'" @click="quoteTarget = status">{{ quoteStatusLabel(status) }}</el-button></el-space><el-space v-else wrap><el-button v-for="status in contractStatuses" :key="status" :type="contractTarget === status ? 'primary' : 'default'" @click="contractTarget = status">{{ contractStatusLabel(status) }}</el-button></el-space><el-input v-model="transitionReason" type="textarea" placeholder="原因（如需）" /><el-button type="primary" @click="saveTransition">确认切换</el-button></el-dialog>
+    <el-dialog v-model="transitionVisible" title="切换状态" :teleported="false"><el-alert v-if="validationError" :title="validationError" type="error" :closable="false" /><el-space v-if="transitionKind === 'quote'" wrap><el-button v-for="status in quoteStatuses" :key="status" :type="quoteTarget === status ? 'primary' : 'default'" @click="quoteTarget = status">{{ quoteStatusLabel(status) }}</el-button></el-space><el-space v-else wrap><el-button v-for="status in contractStatuses" :key="status" :type="contractTarget === status ? 'primary' : 'default'" @click="contractTarget = status">{{ contractStatusLabel(status) }}</el-button></el-space><el-input v-model="transitionReason" type="textarea" placeholder="原因（如需）" /><el-button type="primary" :loading="actionBusy" @click="saveTransition">确认切换</el-button></el-dialog>
 
-    <el-dialog v-model="termVisible" title="编辑收款计划 · 演示" :teleported="false"><el-alert v-if="validationError" :title="validationError" type="error" :closable="false" /><el-form label-position="top" @submit.prevent="saveTerm"><el-form-item label="计划日期"><el-date-picker v-model="termForm.due_on" type="date" value-format="YYYY-MM-DD" clearable style="width:100%" /></el-form-item><el-form-item label="计划金额（元）"><el-input v-model="termForm.planned_amount_cents" inputmode="decimal" placeholder="0.00" /></el-form-item><el-form-item label="备注"><el-input v-model="termForm.notes" type="textarea" /></el-form-item><el-button type="primary" native-type="submit">保存演示计划</el-button></el-form></el-dialog>
+    <el-dialog v-model="termVisible" title="编辑收款计划" :teleported="false"><el-alert v-if="validationError" :title="validationError" type="error" :closable="false" /><el-form label-position="top" @submit.prevent="saveTerm"><el-form-item label="计划日期"><el-date-picker v-model="termForm.due_on" type="date" value-format="YYYY-MM-DD" clearable style="width:100%" /></el-form-item><el-form-item label="计划金额（元）"><el-input v-model="termForm.planned_amount_cents" inputmode="decimal" placeholder="0.00" /></el-form-item><el-form-item label="备注"><el-input v-model="termForm.notes" type="textarea" /></el-form-item><el-button type="primary" native-type="submit" :loading="actionBusy">保存计划</el-button></el-form></el-dialog>
 
-    <el-dialog v-model="receiptVisible" :title="`${receiptEditingId ? '编辑到账说明' : '登记到账'} · 演示`" :teleported="false"><el-alert v-if="validationError" :title="validationError" type="error" :closable="false" /><el-form label-position="top" @submit.prevent="saveReceipt"><el-form-item label="节点"><el-select v-model="receiptForm.milestone" :disabled="receiptEditingId !== null"><el-option value="advance" label="预付款" /><el-option value="progress" label="进度款" /><el-option value="final" label="尾款" /></el-select></el-form-item><el-form-item label="到账日期" required><el-date-picker data-testid="receipt-date" v-model="receiptForm.received_on" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item><el-form-item label="到账金额（元）" required><el-input data-testid="receipt-amount" v-model="receiptForm.amount_cents" :disabled="receiptEditingId !== null" inputmode="decimal" placeholder="0.00" /></el-form-item><el-form-item label="收款方式"><el-select v-model="receiptForm.payment_method"><el-option value="bank_transfer" label="银行转账" /><el-option value="cash" label="现金" /><el-option value="other" label="其他" /></el-select></el-form-item><el-form-item label="参考号"><el-input data-testid="receipt-reference" v-model="receiptForm.reference_no" /></el-form-item><el-form-item label="备注"><el-input v-model="receiptForm.notes" type="textarea" /></el-form-item><el-button data-testid="receipt-create-save" type="primary" native-type="submit">{{ receiptEditingId ? '保存说明' : '加入演示流水' }}</el-button></el-form></el-dialog>
+    <el-dialog v-model="receiptVisible" :title="receiptEditingId ? '编辑到账说明' : '登记到账'" :teleported="false"><el-alert v-if="validationError" :title="validationError" type="error" :closable="false" /><el-form label-position="top" @submit.prevent="saveReceipt"><el-form-item label="节点"><el-select v-model="receiptForm.milestone" :disabled="receiptEditingId !== null"><el-option value="advance" label="预付款" /><el-option value="progress" label="进度款" /><el-option value="final" label="尾款" /></el-select></el-form-item><el-form-item label="到账日期" required><el-date-picker data-testid="receipt-date" v-model="receiptForm.received_on" type="date" value-format="YYYY-MM-DD" :clearable="false" :disabled="receiptEditingId !== null" style="width:100%" /></el-form-item><el-form-item label="到账金额（元）" required><el-input data-testid="receipt-amount" v-model="receiptForm.amount_cents" :disabled="receiptEditingId !== null" inputmode="decimal" placeholder="0.00" /></el-form-item><el-form-item label="收款方式"><el-select v-model="receiptForm.payment_method" :disabled="receiptEditingId !== null"><el-option value="bank_transfer" label="银行转账" /><el-option value="cash" label="现金" /><el-option value="other" label="其他" /></el-select></el-form-item><el-form-item label="参考号"><el-input data-testid="receipt-reference" v-model="receiptForm.reference_no" /></el-form-item><el-form-item label="备注"><el-input v-model="receiptForm.notes" type="textarea" /></el-form-item><el-button data-testid="receipt-create-save" type="primary" native-type="submit" :loading="actionBusy">{{ receiptEditingId ? '保存说明' : '登记到账' }}</el-button></el-form></el-dialog>
 
-    <el-dialog v-model="voidVisible" title="作废到账 · 演示" :teleported="false"><el-alert v-if="validationError" :title="validationError" type="error" :closable="false" /><el-form label-position="top" @submit.prevent="saveVoid"><el-form-item label="作废日期" required><el-date-picker data-testid="receipt-void-date" v-model="voidForm.voided_on" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item><el-form-item label="原因" required><el-input data-testid="receipt-void-reason" v-model="voidForm.reason" type="textarea" /></el-form-item><el-button data-testid="receipt-void-save" type="danger" native-type="submit">确认演示作废</el-button></el-form></el-dialog>
+    <el-dialog v-model="voidVisible" title="作废到账" :teleported="false"><el-alert v-if="validationError" :title="validationError" type="error" :closable="false" /><el-form label-position="top" @submit.prevent="saveVoid"><el-form-item label="作废日期" required><el-date-picker data-testid="receipt-void-date" v-model="voidForm.voided_on" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item><el-form-item label="原因" required><el-input data-testid="receipt-void-reason" v-model="voidForm.reason" type="textarea" /></el-form-item><el-button data-testid="receipt-void-save" type="danger" native-type="submit" :loading="actionBusy">确认作废</el-button></el-form></el-dialog>
   </el-space>
 </template>
 

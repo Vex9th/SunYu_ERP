@@ -1,16 +1,25 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 
-import type { DocumentDetail, DocumentVersion } from '../../domain/contracts'
-import { createPreviewProjectRepository } from '../../repositories/project.mock'
+import type { DocumentDetail, DocumentSummary } from '../../domain/contracts'
+import {
+  createHttpProjectOperatingRepository,
+  type ProjectOperatingRepository,
+} from '../../repositories/project-operating.live'
 
 const props = defineProps<{
   projectCode: string
+  repository?: ProjectOperatingRepository
 }>()
 
-const documents = ref<DocumentDetail[]>([])
+const repository = props.repository ?? createHttpProjectOperatingRepository()
+const documents = ref<DocumentSummary[]>([])
 const loading = ref(true)
-const demoNotice = ref('所有文档操作均为演示，不上传、归档或下载真实文件。')
+const loadError = ref<string | null>(null)
+const actionError = ref<string | null>(null)
+const refreshWarning = ref<string | null>(null)
+const notice = ref('文档文件保存在当前项目的独立目录中。')
+const busy = ref(false)
 const createVisible = ref(false)
 const editVisible = ref(false)
 const versionVisible = ref(false)
@@ -19,12 +28,12 @@ const selectedDocumentId = ref<number | null>(null)
 const validationError = ref<string | null>(null)
 const selectedCreateFile = ref<File | null>(null)
 const selectedVersionFile = ref<File | null>(null)
-const localVersionFiles = new Map<number, File>()
 const documentCount = computed(() => documents.value.length)
 const versionCount = computed(() => documents.value.reduce(
-  (total, document) => total + document.versions.length,
+  (total, document) => total + document.latest_version_number,
   0,
 ))
+let loadVersion = 0
 
 const categories = [
   'planning_minutes',
@@ -77,14 +86,25 @@ const editForm = reactive({ category: 'other', title: '', notes: '' })
 const versionNotes = ref('')
 const archiveReason = ref('')
 
-onMounted(async () => {
-  const result = await createPreviewProjectRepository().getDocumentLedger(props.projectCode)
-  documents.value = result.data.items
-  loading.value = false
-})
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : '文档操作失败'
+}
 
-function now(): string {
-  return new Date().toISOString()
+async function loadDocuments(): Promise<void> {
+  const version = ++loadVersion
+  loading.value = true
+  loadError.value = null
+  try {
+    const listing = await repository.listDocuments(props.projectCode)
+    if (version === loadVersion) {
+      documents.value = listing.items
+      refreshWarning.value = null
+    }
+  } catch (error) {
+    if (version === loadVersion) loadError.value = errorMessage(error)
+  } finally {
+    if (version === loadVersion) loading.value = false
+  }
 }
 
 function nullable(value: string): string | null {
@@ -105,7 +125,7 @@ function selectCreateFile(event: Event): void {
   selectedCreateFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
 }
 
-function openEdit(document: DocumentDetail): void {
+function openEdit(document: DocumentSummary): void {
   selectedDocumentId.value = document.id
   editForm.category = document.category
   editForm.title = document.title
@@ -114,47 +134,57 @@ function openEdit(document: DocumentDetail): void {
   editVisible.value = true
 }
 
-function saveEdit(): void {
+async function saveEdit(): Promise<void> {
   const document = documents.value.find((item) => item.id === selectedDocumentId.value)
   const title = editForm.title.trim()
   if (!document || !title) {
     validationError.value = '请填写文档标题'
     return
   }
-  document.category = editForm.category
-  document.title = title
-  document.notes = nullable(editForm.notes)
-  document.revision += 1
-  document.updated_at = now()
-  editVisible.value = false
-  demoNotice.value = '演示文档信息已更新，不会修改真实文件。'
+  busy.value = true
+  validationError.value = null
+  actionError.value = null
+  try {
+    const updated = await repository.updateDocument(props.projectCode, document.id, {
+      title,
+      notes: nullable(editForm.notes),
+      expected_revision: document.revision,
+    })
+    replaceDocument(updated)
+    editVisible.value = false
+    notice.value = '文档信息已保存。'
+  } catch (error) {
+    validationError.value = errorMessage(error)
+  } finally {
+    busy.value = false
+  }
 }
 
-function saveCreate(): void {
+async function saveCreate(): Promise<void> {
   const title = createForm.title.trim()
   if (!title || !selectedCreateFile.value) {
     validationError.value = '请填写标题并选择文件'
     return
   }
-  const createdAt = now()
-  const id = Math.max(100, ...documents.value.map((document) => document.id)) + 1
-  const versionId = id * 10
-  documents.value.unshift({
-    id,
-    project_code: props.projectCode,
-    category: createForm.category,
-    title,
-    notes: nullable(createForm.notes),
-    latest_version_number: 1,
-    archived_at: null,
-    revision: 1,
-    created_at: createdAt,
-    updated_at: createdAt,
-    versions: [createVersion(selectedCreateFile.value, 1, nullable(createForm.notes), versionId)],
-  })
-  localVersionFiles.set(versionId, selectedCreateFile.value)
-  createVisible.value = false
-  demoNotice.value = '演示文档已加入本地台账，不会上传真实文件。'
+  busy.value = true
+  actionError.value = null
+  try {
+    const created = await repository.createDocument(props.projectCode, {
+      category: createForm.category,
+      title,
+      notes: nullable(createForm.notes),
+      file: selectedCreateFile.value,
+    })
+    documents.value = [toSummary(created), ...documents.value]
+    createVisible.value = false
+    selectedCreateFile.value = null
+    Object.assign(createForm, { category: 'other', title: '', notes: '' })
+    notice.value = `已上传 ${created.title} V${created.latest_version_number}。`
+  } catch (error) {
+    validationError.value = errorMessage(error)
+  } finally {
+    busy.value = false
+  }
 }
 
 function openVersion(documentId: number): void {
@@ -169,55 +199,63 @@ function selectVersionFile(event: Event): void {
   selectedVersionFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
 }
 
-function saveVersion(): void {
+async function saveVersion(): Promise<void> {
   const document = documents.value.find((item) => item.id === selectedDocumentId.value)
   if (!document || !selectedVersionFile.value) {
     validationError.value = '请选择要追加的版本文件'
     return
   }
-  const versionNumber = document.latest_version_number + 1
-  const versionId = document.id * 10 + versionNumber
-  document.versions.push(createVersion(
-    selectedVersionFile.value,
-    versionNumber,
-    nullable(versionNotes.value),
-    versionId,
-  ))
-  localVersionFiles.set(versionId, selectedVersionFile.value)
-  document.latest_version_number = versionNumber
-  document.revision += 1
-  document.updated_at = now()
-  versionVisible.value = false
-  demoNotice.value = `已在演示台账中追加 V${versionNumber}，不会上传真实文件。`
-}
-
-function createVersion(file: File, versionNumber: number, notes: string | null, id: number): DocumentVersion {
-  return {
-    id,
-    version_number: versionNumber,
-    original_filename: file.name,
-    content_type: file.type || 'application/octet-stream',
-    size_bytes: file.size,
-    sha256: `demo-${id}-${file.size}`,
-    notes,
-    created_at: now(),
+  busy.value = true
+  actionError.value = null
+  refreshWarning.value = null
+  try {
+    const added = await repository.addDocumentVersion(props.projectCode, document.id, {
+      notes: nullable(versionNotes.value),
+      expected_revision: document.revision,
+      file: selectedVersionFile.value,
+    })
+    versionVisible.value = false
+    selectedDocumentId.value = null
+    selectedVersionFile.value = null
+    versionNotes.value = ''
+    notice.value = `已追加 ${added.original_filename}（V${added.version_number}）。`
+    try {
+      const refreshed = await repository.getDocument(props.projectCode, document.id)
+      replaceDocument(refreshed)
+    } catch {
+      refreshWarning.value = '已保存，但刷新失败，请刷新页面。'
+    }
+  } catch (error) {
+    validationError.value = errorMessage(error)
+  } finally {
+    busy.value = false
   }
 }
 
-function showDownload(document: DocumentDetail): void {
-  const version = document.versions[document.versions.length - 1]
-  const file = version ? localVersionFiles.get(version.id) : null
-  if (!version || !file || typeof URL.createObjectURL !== 'function') {
-    demoNotice.value = `当前版本 ${version?.original_filename ?? '无文件'} 来自演示种子，真实下载等待后端文件接口。`
-    return
+async function showDownload(document: DocumentSummary): Promise<void> {
+  busy.value = true
+  actionError.value = null
+  try {
+    const detail = await repository.getDocument(props.projectCode, document.id)
+    const version = [...detail.versions].sort((left, right) => right.version_number - left.version_number)[0]
+    if (!version) throw new Error('当前文档没有可下载版本')
+    const file = await repository.downloadDocumentVersion(
+      props.projectCode,
+      document.id,
+      version.id,
+    )
+    const url = URL.createObjectURL(file)
+    const anchor = window.document.createElement('a')
+    anchor.href = url
+    anchor.download = version.original_filename
+    anchor.click()
+    URL.revokeObjectURL(url)
+    notice.value = `已下载 ${version.original_filename}。`
+  } catch (error) {
+    actionError.value = errorMessage(error)
+  } finally {
+    busy.value = false
   }
-  const url = URL.createObjectURL(file)
-  const anchor = window.document.createElement('a')
-  anchor.href = url
-  anchor.download = version.original_filename
-  anchor.click()
-  URL.revokeObjectURL(url)
-  demoNotice.value = `已下载本次会话中的演示文件：${version.original_filename}`
 }
 
 function openArchive(documentId: number): void {
@@ -227,18 +265,48 @@ function openArchive(documentId: number): void {
   archiveVisible.value = true
 }
 
-function saveArchive(): void {
+async function saveArchive(): Promise<void> {
   const document = documents.value.find((item) => item.id === selectedDocumentId.value)
   if (!document || !archiveReason.value.trim()) {
     validationError.value = '请填写归档原因'
     return
   }
-  document.archived_at = now()
-  document.revision += 1
-  document.updated_at = now()
-  archiveVisible.value = false
-  demoNotice.value = '演示文档已归档，版本历史仍然保留。'
+  busy.value = true
+  actionError.value = null
+  try {
+    const archived = await repository.archiveDocument(props.projectCode, document.id, {
+      reason: archiveReason.value.trim(),
+      expected_revision: document.revision,
+    })
+    replaceDocument(archived)
+    archiveVisible.value = false
+    notice.value = '文档已归档，版本历史和磁盘文件仍然保留。'
+  } catch (error) {
+    validationError.value = errorMessage(error)
+  } finally {
+    busy.value = false
+  }
 }
+
+function toSummary(document: DocumentDetail): DocumentSummary {
+  const { versions: _versions, ...summary } = document
+  return summary
+}
+
+function replaceDocument(document: DocumentDetail): void {
+  const index = documents.value.findIndex((item) => item.id === document.id)
+  if (index >= 0) documents.value.splice(index, 1, toSummary(document))
+}
+
+watch(() => props.projectCode, () => {
+  createVisible.value = false
+  editVisible.value = false
+  versionVisible.value = false
+  archiveVisible.value = false
+  actionError.value = null
+  refreshWarning.value = null
+  void loadDocuments()
+}, { immediate: true })
 </script>
 
 <template>
@@ -251,9 +319,17 @@ function saveArchive(): void {
     :size="16"
   >
     <el-row justify="space-between" align="middle">
-      <el-text data-testid="document-demo-notice" type="info">{{ demoNotice }}</el-text>
-      <el-tag type="warning" effect="plain">演示数据</el-tag>
+      <el-text data-testid="document-live-notice" type="info">{{ notice }}</el-text>
+      <el-tag type="success" effect="plain">真实后端</el-tag>
     </el-row>
+    <el-alert v-if="actionError" :title="actionError" type="error" :closable="false" />
+    <el-alert
+      v-if="refreshWarning"
+      data-testid="document-refresh-warning"
+      :title="refreshWarning"
+      type="warning"
+      :closable="false"
+    />
 
     <el-card class="data-card" shadow="never">
       <template #header>
@@ -265,10 +341,13 @@ function saveArchive(): void {
             </p>
             <p class="section-note">归档只停止继续使用，不删除磁盘文件或版本历史。</p>
           </div>
-          <el-button data-testid="document-create-open" type="primary" @click="openCreate">新建并上传首版</el-button>
+          <el-button data-testid="document-create-open" type="primary" :disabled="busy" @click="openCreate">新建并上传首版</el-button>
         </el-row>
       </template>
       <el-skeleton v-if="loading" :rows="5" animated />
+      <el-result v-else-if="loadError" data-testid="document-load-error" icon="error" title="文档台账读取失败" :sub-title="loadError">
+        <template #extra><el-button data-testid="document-load-retry" type="primary" @click="loadDocuments">重新读取</el-button></template>
+      </el-result>
       <el-empty v-else-if="documents.length === 0" description="暂无文档" />
       <el-table v-else :data="documents" row-key="id">
         <el-table-column label="类别" min-width="150"><template #default="scope">{{ categoryLabel(scope.row.category) }}</template></el-table-column>
@@ -286,7 +365,7 @@ function saveArchive(): void {
           <template #default="scope">
             <el-space :data-testid="`document-row-${scope.row.id}`">
               <el-tag type="info">V{{ scope.row.latest_version_number }}</el-tag>
-              <el-button :data-testid="`document-download-${scope.row.id}`" link @click="showDownload(scope.row)">下载</el-button>
+              <el-button :data-testid="`document-download-${scope.row.id}`" link :disabled="busy" @click="showDownload(scope.row)">下载</el-button>
               <el-button
                 v-if="!scope.row.archived_at"
                 :data-testid="`document-edit-open-${scope.row.id}`"
@@ -314,7 +393,7 @@ function saveArchive(): void {
       </el-table>
     </el-card>
 
-    <el-dialog v-model="createVisible" title="新建逻辑文档 · 演示" :teleported="false" width="min(92vw, 560px)">
+    <el-dialog v-model="createVisible" title="新建逻辑文档" :teleported="false" width="min(92vw, 560px)">
       <el-alert v-if="validationError" :title="validationError" type="error" :closable="false" />
       <el-form label-position="top" @submit.prevent="saveCreate">
         <el-form-item label="类别" required>
@@ -325,38 +404,38 @@ function saveArchive(): void {
         <el-form-item label="标题" required><el-input data-testid="document-create-title" v-model="createForm.title" /></el-form-item>
         <el-form-item label="备注"><el-input v-model="createForm.notes" type="textarea" /></el-form-item>
         <el-form-item label="文件" required><input data-testid="document-create-file" type="file" @change="selectCreateFile" /></el-form-item>
-        <el-button data-testid="document-create-save" type="primary" native-type="submit">加入演示台账</el-button>
+        <el-button data-testid="document-create-save" type="primary" native-type="submit" :loading="busy">上传首版</el-button>
       </el-form>
     </el-dialog>
 
-    <el-dialog v-model="editVisible" title="编辑文档信息 · 演示" :teleported="false" width="min(92vw, 540px)">
+    <el-dialog v-model="editVisible" title="编辑文档信息" :teleported="false" width="min(92vw, 540px)">
       <el-alert v-if="validationError" :title="validationError" type="error" :closable="false" />
       <el-form label-position="top" @submit.prevent="saveEdit">
         <el-form-item label="类别" required>
-          <el-select v-model="editForm.category" style="width: 100%">
+          <el-select v-model="editForm.category" disabled style="width: 100%">
             <el-option v-for="category in categories" :key="category" :label="categoryLabels[category]" :value="category" />
           </el-select>
         </el-form-item>
         <el-form-item label="标题" required><el-input data-testid="document-edit-title" v-model="editForm.title" /></el-form-item>
         <el-form-item label="备注"><el-input data-testid="document-edit-notes" v-model="editForm.notes" type="textarea" /></el-form-item>
-        <el-button data-testid="document-edit-save" type="primary" native-type="submit">保存演示信息</el-button>
+        <el-button data-testid="document-edit-save" type="primary" native-type="submit" :loading="busy">保存信息</el-button>
       </el-form>
     </el-dialog>
 
-    <el-dialog v-model="versionVisible" title="追加文档版本 · 演示" :teleported="false" width="min(92vw, 520px)">
+    <el-dialog v-model="versionVisible" title="追加文档版本" :teleported="false" width="min(92vw, 520px)">
       <el-alert v-if="validationError" :title="validationError" type="error" :closable="false" />
       <el-form label-position="top" @submit.prevent="saveVersion">
         <el-form-item label="文件" required><input data-testid="document-version-file" type="file" @change="selectVersionFile" /></el-form-item>
         <el-form-item label="备注"><el-input v-model="versionNotes" type="textarea" /></el-form-item>
-        <el-button data-testid="document-version-save" type="primary" native-type="submit">追加演示版本</el-button>
+        <el-button data-testid="document-version-save" type="primary" native-type="submit" :loading="busy">上传新版本</el-button>
       </el-form>
     </el-dialog>
 
-    <el-dialog v-model="archiveVisible" title="归档逻辑文档 · 演示" :teleported="false" width="min(92vw, 500px)">
+    <el-dialog v-model="archiveVisible" title="归档逻辑文档" :teleported="false" width="min(92vw, 500px)">
       <el-alert v-if="validationError" :title="validationError" type="error" :closable="false" />
       <el-form label-position="top" @submit.prevent="saveArchive">
         <el-form-item label="归档原因" required><el-input data-testid="document-archive-reason" v-model="archiveReason" type="textarea" /></el-form-item>
-        <el-button data-testid="document-archive-save" type="danger" native-type="submit">确认演示归档</el-button>
+        <el-button data-testid="document-archive-save" type="danger" native-type="submit" :loading="busy">确认归档</el-button>
       </el-form>
     </el-dialog>
   </el-space>

@@ -23,6 +23,54 @@ const overview = {
   },
 }
 
+const portfolioDashboard = {
+  generated_at: '2026-08-31T10:00:00+08:00',
+  summary: {
+    active_project_count: 0,
+    overdue_receivable_count: 0,
+    upcoming_delivery_count: 0,
+    contracted_amount_cents: 0,
+    received_amount_cents: 0,
+    outstanding_receivable_cents: 0,
+  },
+  projects: [],
+  todos: [],
+  backup: { healthy: true, last_success_at: null, message: null },
+}
+
+const emptyProjectOperating = {
+  stages: [],
+  commercial: { accepted_quote: null, contracts: [] },
+  costs: {
+    material_consumed_cents: 0,
+    labor_cents: 0,
+    field_material_cents: 0,
+    total_cents: 0,
+    procurement_committed_cents: 0,
+    procurement_received_cents: 0,
+    procurement_paid_cents: 0,
+    completeness: 'complete',
+  },
+  profit: {
+    contracted_amount_cents: 0,
+    actual_cost_cents: 0,
+    actual_profit_cents: 0,
+    margin_basis_points: null,
+  },
+  receivables: {
+    contracted_amount_cents: 0,
+    receivable_amount_cents: 0,
+    received_amount_cents: 0,
+    allocated_received_amount_cents: 0,
+    unallocated_received_amount_cents: 0,
+    outstanding_receivable_cents: 0,
+    contract_collection_basis_points: null,
+    terms: [],
+    receipts: [],
+  },
+  todos: [],
+}
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -54,6 +102,7 @@ describe('App', () => {
     businessFetchMock = vi.fn<typeof fetch>().mockImplementation(async () => jsonResponse([]))
     vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (input, init) => {
       const path = String(input)
+      if (path === '/api/dashboard') return jsonResponse(portfolioDashboard)
       if (path.startsWith('/api/projects') || path.startsWith('/api/companies')) {
         return businessFetchMock(input, init)
       }
@@ -220,7 +269,7 @@ describe('App', () => {
     expect(wrapper.get('.auth-card').text()).toContain('数据保存在当前主机')
   })
 
-  it('认证后展示精简主导航，真实基础数据与演示业务模块保持分层', async () => {
+  it('认证后展示精简主导航和真实经营总览', async () => {
     fetchMock
       .mockResolvedValueOnce(
         jsonResponse({ authenticated: true, password_configured: true }),
@@ -236,7 +285,7 @@ describe('App', () => {
     const dashboard = wrapper.get('[data-testid="dashboard"]')
     expect(dashboard.get('[data-testid="nav-overview"]').text()).toBe('总览')
     expect(dashboard.get('[data-testid="workbench-overview"]').text()).toContain('今天先处理什么')
-    expect(dashboard.get('[data-testid="portfolio-operating-overview"]').text()).toContain('演示数据')
+    expect(dashboard.get('[data-testid="portfolio-operating-overview"]').text()).toContain('真实后端')
     expect(dashboard.get('[data-testid="portfolio-operating-overview"]').isVisible()).toBe(true)
     expect(dashboard.find('[data-testid="portfolio-preview-toggle"]').exists()).toBe(false)
     expect(dashboard.find('.preview-collapse').exists()).toBe(false)
@@ -280,7 +329,7 @@ describe('App', () => {
     expect(wrapper.find('[data-testid="session-secret"]').exists()).toBe(false)
   })
 
-  it('生产环境保留尚未接后端的演示页面并明确数据来源', async () => {
+  it('生产环境保留真实经营页面并明确数据来源', async () => {
     vi.stubEnv('DEV', false)
     fetchMock
       .mockResolvedValueOnce(jsonResponse({ authenticated: true, password_configured: true }))
@@ -296,7 +345,7 @@ describe('App', () => {
     await vi.waitFor(() => {
       expect(wrapper.find('[data-testid="portfolio-operating-overview"]').exists()).toBe(true)
     })
-    expect(wrapper.get('[data-testid="portfolio-operating-overview"]').text()).toContain('演示数据')
+    expect(wrapper.get('[data-testid="portfolio-operating-overview"]').text()).toContain('真实后端')
   })
 
   it('总工作台只用现有项目和公司接口生成真实摘要', async () => {
@@ -946,10 +995,11 @@ describe('App', () => {
       if (path === '/api/projects?status=archived') return jsonResponse([archivedProject])
       if (path === '/api/projects/SY-ARCHIVED/dashboard') {
         return jsonResponse({
-          project: archivedProject,
+          project: { ...archivedProject, closure_type: 'completed', revision: 2 },
           company: dashboardCompany,
           contacts: [],
           documents: { document_count: 0, version_count: 0, categories: [] },
+          ...emptyProjectOperating,
         })
       }
       throw new Error(`unexpected ${path}`)
