@@ -14,10 +14,8 @@ export interface ProjectRepository {
   getBaseDashboard(projectCode: string): Promise<RepositoryResult<ProjectDashboardData>>
 }
 
-export interface ProjectOperatingRepository {
-  getOperatingSnapshot(projectCode: string): Promise<RepositoryResult<ProjectOperatingSnapshot>>
-  getGlobalDashboard(): Promise<RepositoryResult<GlobalDashboard>>
-  getDocumentLedger(projectCode: string): Promise<RepositoryResult<PagedResult<DocumentDetail>>>
+export interface ProjectStageRepository {
+  listProjectStages(projectCode: string): Promise<RepositoryResult<ProjectStage[]>>
   updateStageSchedule(
     projectCode: string,
     stageCode: string,
@@ -28,6 +26,13 @@ export interface ProjectOperatingRepository {
     stageCode: string,
     input: StageTransitionInput,
   ): Promise<RepositoryResult<ProjectStage>>
+}
+
+export interface ProjectOperatingRepository
+  extends Pick<ProjectStageRepository, 'updateStageSchedule' | 'transitionStage'> {
+  getOperatingSnapshot(projectCode: string): Promise<RepositoryResult<ProjectOperatingSnapshot>>
+  getGlobalDashboard(): Promise<RepositoryResult<GlobalDashboard>>
+  getDocumentLedger(projectCode: string): Promise<RepositoryResult<PagedResult<DocumentDetail>>>
 }
 
 export interface StageScheduleInput {

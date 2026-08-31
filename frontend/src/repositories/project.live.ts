@@ -1,23 +1,9 @@
 import { createPlannedPostRequest, requestJson } from '../api'
 import type { ProjectStage } from '../domain/contracts'
 import type { RepositoryResult } from './common'
-import type { StageScheduleInput, StageTransitionInput } from './project'
+import type { ProjectStageRepository, StageScheduleInput, StageTransitionInput } from './project'
 
-export interface ProjectStageHttpRepository {
-  listProjectStages(projectCode: string): Promise<RepositoryResult<ProjectStage[]>>
-  updateStageSchedule(
-    projectCode: string,
-    stageCode: string,
-    input: StageScheduleInput,
-  ): Promise<RepositoryResult<ProjectStage>>
-  transitionStage(
-    projectCode: string,
-    stageCode: string,
-    input: StageTransitionInput,
-  ): Promise<RepositoryResult<ProjectStage>>
-}
-
-class HttpProjectStageRepository implements ProjectStageHttpRepository {
+class HttpProjectStageRepository implements ProjectStageRepository {
   async listProjectStages(projectCode: string): Promise<RepositoryResult<ProjectStage[]>> {
     return live(await requestJson<ProjectStage[]>(stageCollectionPath(projectCode)))
   }
@@ -47,7 +33,7 @@ class HttpProjectStageRepository implements ProjectStageHttpRepository {
   }
 }
 
-export function createHttpProjectStageRepository(): ProjectStageHttpRepository {
+export function createHttpProjectStageRepository(): ProjectStageRepository {
   return new HttpProjectStageRepository()
 }
 

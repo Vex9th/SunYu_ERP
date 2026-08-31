@@ -6,6 +6,7 @@ import PortfolioOperatingOverview from '../components/PortfolioOperatingOverview
 import ProjectCommercialPanel from '../components/project/ProjectCommercialPanel.vue'
 import ProjectDocumentsPanel from '../components/project/ProjectDocumentsPanel.vue'
 import ProjectStagesPanel from '../components/project/ProjectStagesPanel.vue'
+import type { ProjectStageRepository } from '../repositories/project'
 import { MockProjectRepository } from '../repositories/project.mock'
 
 async function settle(): Promise<void> {
@@ -19,6 +20,17 @@ function mountComponent(component: object, props: Record<string, unknown> = {}):
     props,
     global: { plugins: [ElementPlus] },
   })
+}
+
+function stageRepository(repository: MockProjectRepository): ProjectStageRepository {
+  return {
+    async listProjectStages(projectCode) {
+      const snapshot = await repository.getOperatingSnapshot(projectCode)
+      return { source: snapshot.source, data: snapshot.data.stages }
+    },
+    updateStageSchedule: (...args) => repository.updateStageSchedule(...args),
+    transitionStage: (...args) => repository.transitionStage(...args),
+  }
 }
 
 describe('P0 preview workspaces', () => {
@@ -98,8 +110,9 @@ describe('P0 preview workspaces', () => {
     const wrapper = mountComponent(ProjectStagesPanel, {
       projectCode: 'SY-2026-001',
       stages: uiSnapshot.stages,
-      repository,
+      repository: stageRepository(repository),
     })
+    await settle()
 
     expect(wrapper.findAll('[data-testid^="stage-row-"]')).toHaveLength(18)
     expect(wrapper.get('[data-testid="stage-row-mechanical_design"]').text()).toContain('机械设计')
@@ -136,8 +149,9 @@ describe('P0 preview workspaces', () => {
     const wrapper = mountComponent(ProjectStagesPanel, {
       projectCode: 'SY-2026-001',
       stages: snapshot.stages,
-      repository,
+      repository: stageRepository(repository),
     })
+    await settle()
 
     await wrapper.get('[data-testid="stage-transition-staffing"]').trigger('click')
     await wrapper.getComponent('[data-testid="stage-transition-status"]').setValue('skipped')

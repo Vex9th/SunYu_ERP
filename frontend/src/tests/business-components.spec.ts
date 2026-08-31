@@ -707,12 +707,12 @@ describe('ProjectDashboard', () => {
     expect(summary.text()).toContain('下一步')
     expect(summary.text()).toContain('电气设计')
     expect(summary.text()).toContain('待办 2')
-    expect(wrapper.find('[data-testid="project-demo-stages"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="project-stages"]').exists()).toBe(false)
     expect(wrapper.text()).not.toContain('编辑排期')
     expect(wrapper.text()).not.toContain('变更状态')
 
     await wrapper.get('[data-testid="project-stage-flow-open"]').trigger('click')
-    expect(wrapper.get('[data-testid="project-demo-stages"]').isVisible()).toBe(true)
+    expect(wrapper.get('[data-testid="project-stages"]').isVisible()).toBe(true)
     expect(wrapper.findAll('[data-testid^="stage-row-"]')).toHaveLength(18)
     expect(wrapper.text()).toContain('编辑排期')
     expect(wrapper.text()).toContain('变更状态')
@@ -892,11 +892,11 @@ describe('ProjectDashboard', () => {
     expect(wrapper.get('[data-testid="project-demo-costs"]').text()).toContain('采购承诺（不计利润）')
     expect(wrapper.get('[data-testid="project-demo-todos"]').text()).toContain('严重 · 2026-09-02')
     expect(wrapper.get('[data-testid="project-demo-todos"]').text()).toContain('警告 · 2026-11-30')
-    expect(wrapper.find('[data-testid="project-demo-stages"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="project-stages"]').exists()).toBe(false)
 
     await wrapper.get('[data-testid="project-nav-workforce"]').trigger('click')
     expect(wrapper.get('[data-testid="project-panel-overview"]').isVisible()).toBe(false)
-    expect(wrapper.find('[data-testid="project-demo-stages"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="project-stages"]').exists()).toBe(false)
 
     await wrapper.get('[data-testid="project-nav-procurement"]').trigger('click')
     await vi.waitFor(() => {

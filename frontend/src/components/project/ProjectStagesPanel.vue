@@ -1,17 +1,17 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 
 import type { ProjectOperatingSnapshot, ProjectStage, ProjectStageStatus } from '../../domain/contracts'
-import type { ProjectOperatingRepository } from '../../repositories/project'
-import { createPreviewProjectRepository } from '../../repositories/project.mock'
+import { createHttpProjectStageRepository } from '../../repositories/project.live'
+import type { ProjectStageRepository } from '../../repositories/project'
 
 const props = withDefaults(defineProps<{
   projectCode?: string
   stages: ProjectOperatingSnapshot['stages']
-  repository?: ProjectOperatingRepository
+  repository?: ProjectStageRepository
 }>(), {
   projectCode: 'SY-2026-001',
-  repository: () => createPreviewProjectRepository(),
+  repository: () => createHttpProjectStageRepository(),
 })
 const emit = defineEmits<{ changed: [stages: ProjectStage[]] }>()
 
@@ -22,8 +22,42 @@ const transitionVisible = ref(false)
 const selectedStageCode = ref('')
 const actionError = ref<string | null>(null)
 const saving = ref(false)
+const loading = ref(false)
+const loadError = ref<string | null>(null)
+const stagesLoaded = ref(false)
+let loadSequence = 0
+let contextGeneration = 0
 
-watch(() => props.stages, (stages) => { displayStages.value = copyStages(stages) }, { deep: true })
+function resetTransientState(): void {
+  scheduleVisible.value = false
+  transitionVisible.value = false
+  selectedStageCode.value = ''
+  actionError.value = null
+  saving.value = false
+}
+
+watch(() => props.stages, (stages) => {
+  if (!stagesLoaded.value) displayStages.value = copyStages(stages)
+}, { deep: true })
+
+watch(
+  [() => props.projectCode, () => props.repository],
+  () => {
+    contextGeneration += 1
+    resetTransientState()
+    void loadProjectStages()
+  },
+  { immediate: true },
+)
+
+onBeforeUnmount(() => {
+  contextGeneration += 1
+  loadSequence += 1
+  resetTransientState()
+  loading.value = false
+  loadError.value = null
+  stagesLoaded.value = false
+})
 
 const stageLabels: Record<string, string> = {
   planning: '项目规划', site_survey: '现场测绘', quotation: '我方报价',
@@ -52,10 +86,30 @@ const transitionForm = reactive({ to_status: 'in_progress' as ProjectStageStatus
 const completedCount = computed(() => displayStages.value.filter((stage) => stage.status === 'completed').length)
 const selectedStage = computed(() => displayStages.value.find((stage) => stage.stage_code === selectedStageCode.value))
 const availableTransitions = computed(() => selectedStage.value ? transitionOptions[selectedStage.value.status] : [])
+const canWrite = computed(() => stagesLoaded.value && !loading.value && !loadError.value)
 
 function nullable(value: string): string | null {
   const trimmed = value.trim()
   return trimmed || null
+}
+
+async function loadProjectStages(): Promise<void> {
+  const sequence = ++loadSequence
+  displayStages.value = copyStages(props.stages)
+  stagesLoaded.value = false
+  loading.value = true
+  loadError.value = null
+  try {
+    const result = await props.repository.listProjectStages(props.projectCode)
+    if (sequence !== loadSequence) return
+    displayStages.value = copyStages(result.data)
+    stagesLoaded.value = true
+  } catch (error) {
+    if (sequence !== loadSequence) return
+    loadError.value = error instanceof Error ? error.message : '无法读取项目阶段'
+  } finally {
+    if (sequence === loadSequence) loading.value = false
+  }
 }
 
 function replaceStage(stage: ProjectStage): void {
@@ -64,7 +118,18 @@ function replaceStage(stage: ProjectStage): void {
   emit('changed', copyStages(displayStages.value))
 }
 
+function isCurrentContext(
+  generation: number,
+  projectCode: string,
+  repository: ProjectStageRepository,
+): boolean {
+  return generation === contextGeneration
+    && projectCode === props.projectCode
+    && repository === props.repository
+}
+
 function openSchedule(stage: ProjectStage): void {
+  if (!canWrite.value) return
   selectedStageCode.value = stage.stage_code
   Object.assign(scheduleForm, {
     planned_start_on: stage.planned_start_on ?? '',
@@ -76,26 +141,33 @@ function openSchedule(stage: ProjectStage): void {
 }
 
 async function saveSchedule(): Promise<void> {
-  if (!selectedStage.value) return
+  const stage = selectedStage.value
+  if (!stage || !canWrite.value) return
+  const generation = contextGeneration
+  const projectCode = props.projectCode
+  const repository = props.repository
   saving.value = true
   actionError.value = null
   try {
-    const result = await props.repository.updateStageSchedule(props.projectCode, selectedStage.value.stage_code, {
+    const result = await repository.updateStageSchedule(projectCode, stage.stage_code, {
       planned_start_on: nullable(scheduleForm.planned_start_on),
       planned_end_on: nullable(scheduleForm.planned_end_on),
       notes: nullable(scheduleForm.notes),
-      expected_revision: selectedStage.value.revision,
+      expected_revision: stage.revision,
     })
+    if (!isCurrentContext(generation, projectCode, repository)) return
     replaceStage(result.data)
     scheduleVisible.value = false
   } catch (error) {
+    if (!isCurrentContext(generation, projectCode, repository)) return
     actionError.value = error instanceof Error ? error.message : '排期保存失败'
   } finally {
-    saving.value = false
+    if (isCurrentContext(generation, projectCode, repository)) saving.value = false
   }
 }
 
 function openTransition(stage: ProjectStage): void {
+  if (!canWrite.value) return
   selectedStageCode.value = stage.stage_code
   transitionForm.to_status = transitionOptions[stage.status][0] ?? 'in_progress'
   transitionForm.reason = ''
@@ -104,39 +176,68 @@ function openTransition(stage: ProjectStage): void {
 }
 
 async function saveTransition(): Promise<void> {
-  if (!selectedStage.value) return
+  const stage = selectedStage.value
+  if (!stage || !canWrite.value) return
+  const generation = contextGeneration
+  const projectCode = props.projectCode
+  const repository = props.repository
   saving.value = true
   actionError.value = null
   try {
-    const result = await props.repository.transitionStage(props.projectCode, selectedStage.value.stage_code, {
+    const result = await repository.transitionStage(projectCode, stage.stage_code, {
       to_status: transitionForm.to_status,
       occurred_at: new Date().toISOString(),
       reason: nullable(transitionForm.reason),
-      expected_revision: selectedStage.value.revision,
+      expected_revision: stage.revision,
     })
+    if (!isCurrentContext(generation, projectCode, repository)) return
     replaceStage(result.data)
     transitionVisible.value = false
   } catch (error) {
+    if (!isCurrentContext(generation, projectCode, repository)) return
     actionError.value = error instanceof Error ? error.message : '状态流转失败'
   } finally {
-    saving.value = false
+    if (isCurrentContext(generation, projectCode, repository)) saving.value = false
   }
 }
 </script>
 
 <template>
-  <el-card data-testid="project-demo-stages" class="stage-flow" shadow="never">
+  <el-card data-testid="project-stages" class="stage-flow" shadow="never">
     <template #header>
       <div class="stage-flow__heading">
         <div>
           <el-text tag="strong" size="large">完整项目流程</el-text>
-          <p class="section-note">排期和状态操作只写入演示数据，不调用尚未实现的后端接口。</p>
+          <p class="section-note">查看当前项目阶段，并维护排期和实际进展。</p>
         </div>
-        <el-space><el-tag type="warning" effect="plain">演示数据</el-tag><el-tag type="info">{{ completedCount }} / {{ displayStages.length }} 已完成</el-tag></el-space>
+        <el-space><el-tag type="success" effect="plain">项目进度</el-tag><el-tag type="info">{{ completedCount }} / {{ displayStages.length }} 已完成</el-tag></el-space>
       </div>
     </template>
 
-    <el-timeline class="stage-timeline">
+    <el-alert
+      v-if="loading"
+      data-testid="project-stages-loading"
+      title="正在读取项目阶段…"
+      type="info"
+      :closable="false"
+      show-icon
+    />
+    <el-alert
+      v-else-if="loadError"
+      data-testid="project-stages-load-error"
+      title="项目阶段读取失败"
+      :description="`${loadError}；读取失败期间为只读状态，当前保留页面已有阶段供查看。`"
+      type="error"
+      :closable="false"
+      show-icon
+    />
+
+    <el-empty
+      v-if="stagesLoaded && !loading && !loadError && displayStages.length === 0"
+      data-testid="project-stages-empty"
+      description="当前项目没有阶段记录"
+    />
+    <el-timeline v-else-if="displayStages.length > 0" class="stage-timeline">
       <el-timeline-item v-for="(stage, index) in displayStages" :key="stage.stage_code"
         :data-testid="`stage-row-${stage.stage_code}`" :type="statusTypes[stage.status]" :hollow="stage.status === 'pending'">
         <div class="stage-row">
@@ -145,8 +246,8 @@ async function saveTransition(): Promise<void> {
             <strong>{{ stageLabels[stage.stage_code] ?? stage.stage_code }}</strong>
             <el-tag size="small" :type="statusTypes[stage.status]">{{ statusLabels[stage.status] }}</el-tag>
             <span class="stage-row__actions">
-              <el-button :data-testid="`stage-schedule-${stage.stage_code}`" link type="primary" @click="openSchedule(stage)">编辑排期</el-button>
-              <el-button :data-testid="`stage-transition-${stage.stage_code}`" link @click="openTransition(stage)">变更状态</el-button>
+              <el-button :data-testid="`stage-schedule-${stage.stage_code}`" :disabled="!canWrite" link type="primary" @click="openSchedule(stage)">编辑排期</el-button>
+              <el-button :data-testid="`stage-transition-${stage.stage_code}`" :disabled="!canWrite" link @click="openTransition(stage)">变更状态</el-button>
             </span>
           </div>
           <div class="stage-row__detail">
@@ -163,7 +264,7 @@ async function saveTransition(): Promise<void> {
       </el-timeline-item>
     </el-timeline>
 
-    <el-dialog v-model="scheduleVisible" title="编辑阶段排期 · 演示" :teleported="false" width="min(92vw, 520px)">
+    <el-dialog v-model="scheduleVisible" title="编辑阶段排期" :teleported="false" width="min(92vw, 520px)">
       <el-alert v-if="actionError" :title="actionError" type="error" :closable="false" />
       <el-form label-position="top" @submit.prevent="saveSchedule">
         <el-row :gutter="12">
@@ -171,11 +272,11 @@ async function saveTransition(): Promise<void> {
           <el-col :xs="24" :sm="12"><el-form-item label="计划完成"><el-input data-testid="stage-schedule-end" v-model="scheduleForm.planned_end_on" placeholder="YYYY-MM-DD" /></el-form-item></el-col>
         </el-row>
         <el-form-item label="排期备注"><el-input data-testid="stage-schedule-notes" v-model="scheduleForm.notes" type="textarea" /></el-form-item>
-        <el-button data-testid="stage-schedule-save" type="primary" :loading="saving" @click="saveSchedule">保存演示排期</el-button>
+        <el-button data-testid="stage-schedule-save" type="primary" :loading="saving" @click="saveSchedule">保存排期</el-button>
       </el-form>
     </el-dialog>
 
-    <el-dialog v-model="transitionVisible" title="变更阶段状态 · 演示" :teleported="false" width="min(92vw, 500px)">
+    <el-dialog v-model="transitionVisible" title="变更阶段状态" :teleported="false" width="min(92vw, 500px)">
       <el-alert v-if="actionError" :title="actionError" type="error" :closable="false" />
       <el-form label-position="top" @submit.prevent="saveTransition">
         <el-form-item label="目标状态" required>
@@ -184,7 +285,7 @@ async function saveTransition(): Promise<void> {
           </el-select>
         </el-form-item>
         <el-form-item label="原因（阻塞、跳过或重开时必填）"><el-input data-testid="stage-transition-reason" v-model="transitionForm.reason" type="textarea" /></el-form-item>
-        <el-button data-testid="stage-transition-save" type="primary" :loading="saving" @click="saveTransition">确认演示流转</el-button>
+        <el-button data-testid="stage-transition-save" type="primary" :loading="saving" @click="saveTransition">确认状态变更</el-button>
       </el-form>
     </el-dialog>
   </el-card>
