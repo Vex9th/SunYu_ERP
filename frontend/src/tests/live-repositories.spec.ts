@@ -68,10 +68,14 @@ describe('真实 P0 Repository 契约', () => {
   it('采购 Repository 覆盖模板、清单、清单行、采购单、到货与概览，不包含未实现动作', async () => {
     const workbook = new Blob(['xlsx'], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () => jsonResponse())
+    fetchMock.mockResolvedValueOnce(jsonResponse([]))
     fetchMock.mockResolvedValueOnce(new Response(workbook))
     fetchMock.mockResolvedValueOnce(jsonResponse({ items: [], total: 0, page: 2, page_size: 20 }))
     vi.stubGlobal('fetch', fetchMock)
     const repository = createHttpProcurementRepository()
+
+    await repository.listSupplierCompanies()
+    expect(lastRequest(fetchMock)[0]).toBe('/api/companies')
 
     await expect(repository.downloadImportTemplate()).resolves.toBeInstanceOf(Blob)
     expect(lastRequest(fetchMock)[0]).toBe('/api/procurement/import-template.xlsx')
@@ -164,6 +168,31 @@ describe('真实 P0 Repository 契约', () => {
     expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY-001/procurement-overview')
     expect('recordSupplierPayment' in repository).toBe(false)
     expect('recordSupplierInvoice' in repository).toBe(false)
+  })
+
+  it('采购 POST 未知结果重试复用幂等键，明确放弃后才使用新键', async () => {
+    const firstError = new TypeError('Failed to fetch')
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockRejectedValueOnce(firstError)
+      .mockResolvedValueOnce(jsonResponse({ id: 7 }))
+      .mockRejectedValueOnce(firstError)
+      .mockResolvedValueOnce(jsonResponse({ id: 8 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const repository = createHttpProcurementRepository()
+    const input = { name: '控制柜采购', notes: null }
+
+    await expect(repository.createProcurementList('SY-001', input)).rejects.toThrow('无法连接本地服务')
+    const firstKey = (lastRequest(fetchMock)[1].headers as Record<string, string>)['Idempotency-Key']
+    await repository.createProcurementList('SY-001', input)
+    const retryKey = (lastRequest(fetchMock)[1].headers as Record<string, string>)['Idempotency-Key']
+    expect(retryKey).toBe(firstKey)
+
+    await expect(repository.createProcurementList('SY-001', input)).rejects.toThrow('无法连接本地服务')
+    const abandonedKey = (lastRequest(fetchMock)[1].headers as Record<string, string>)['Idempotency-Key']
+    expect(repository.discardCreateProcurementList('SY-001', input)).toBe(true)
+    await repository.createProcurementList('SY-001', input)
+    const replacementKey = (lastRequest(fetchMock)[1].headers as Record<string, string>)['Idempotency-Key']
+    expect(replacementKey).not.toBe(abandonedKey)
   })
 
   it('库存 Repository 保留金额分和十进制数量原值，并覆盖流水、调整和项目领用', async () => {
