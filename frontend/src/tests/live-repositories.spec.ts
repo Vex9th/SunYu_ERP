@@ -26,6 +26,39 @@ function expectPlannedPost(init: RequestInit, body: unknown): void {
   expect(JSON.parse(String(init.body))).toEqual(body)
 }
 
+async function expectRetriableInventoryPost(
+  fetchMock: ReturnType<typeof vi.fn>,
+  expectedPath: string,
+  input: unknown,
+  submit: () => Promise<unknown>,
+  discard: () => boolean,
+): Promise<void> {
+  await expect(submit()).rejects.toThrow('无法连接本地服务')
+  const [firstPath, firstInit] = lastRequest(fetchMock)
+  expect(firstPath).toBe(expectedPath)
+  expectPlannedPost(firstInit, input)
+  const firstKey = (firstInit.headers as Record<string, string>)['Idempotency-Key']
+
+  await submit()
+  const [retryPath, retryInit] = lastRequest(fetchMock)
+  expect(retryPath).toBe(expectedPath)
+  expectPlannedPost(retryInit, input)
+  expect((retryInit.headers as Record<string, string>)['Idempotency-Key']).toBe(firstKey)
+
+  await expect(submit()).rejects.toThrow('无法连接本地服务')
+  const [abandonedPath, abandonedInit] = lastRequest(fetchMock)
+  expect(abandonedPath).toBe(expectedPath)
+  expectPlannedPost(abandonedInit, input)
+  const abandonedKey = (abandonedInit.headers as Record<string, string>)['Idempotency-Key']
+
+  expect(discard()).toBe(true)
+  await submit()
+  const [replacementPath, replacementInit] = lastRequest(fetchMock)
+  expect(replacementPath).toBe(expectedPath)
+  expectPlannedPost(replacementInit, input)
+  expect((replacementInit.headers as Record<string, string>)['Idempotency-Key']).not.toBe(abandonedKey)
+}
+
 describe('真实 P0 Repository 契约', () => {
   beforeEach(() => vi.restoreAllMocks())
 
@@ -252,6 +285,86 @@ describe('真实 P0 Repository 契约', () => {
     await repository.createProjectInventoryIssue('SY/001', issue)
     expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY%2F001/inventory-issues')
     expectPlannedPost(lastRequest(fetchMock)[1], issue)
+  })
+
+  it('库存物料 POST 未知结果重试复用幂等键，明确放弃后才使用新键', async () => {
+    const firstError = new TypeError('Failed to fetch')
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockRejectedValueOnce(firstError)
+      .mockResolvedValueOnce(jsonResponse({ id: 5 }))
+      .mockRejectedValueOnce(firstError)
+      .mockResolvedValueOnce(jsonResponse({ id: 6 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const repository = createHttpInventoryRepository()
+    const input = {
+      brand: null,
+      name: '接线端子',
+      model: null,
+      specification: '2.5mm²',
+      unit: '盒',
+      opening_quantity: '10.125',
+      opening_unit_cost_cents: 3567,
+      notes: null,
+    }
+
+    await expectRetriableInventoryPost(
+      fetchMock,
+      '/api/inventory/items',
+      input,
+      () => repository.createInventoryItem(input),
+      () => repository.discardCreateInventoryItem(input),
+    )
+  })
+
+  it('库存调整 POST 未知结果重试复用幂等键，明确放弃后才使用新键', async () => {
+    const firstError = new TypeError('Failed to fetch')
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockRejectedValueOnce(firstError)
+      .mockResolvedValueOnce(jsonResponse({ id: 8 }))
+      .mockRejectedValueOnce(firstError)
+      .mockResolvedValueOnce(jsonResponse({ id: 9 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const repository = createHttpInventoryRepository()
+    const input = {
+      item_id: 5,
+      quantity_delta: '-1.125',
+      unit_cost_cents: null,
+      reason: '盘亏',
+      occurred_on: '2026-08-29',
+    }
+
+    await expectRetriableInventoryPost(
+      fetchMock,
+      '/api/inventory/adjustments',
+      input,
+      () => repository.createInventoryAdjustment(input),
+      () => repository.discardCreateInventoryAdjustment(input),
+    )
+  })
+
+  it('项目领用 POST 未知结果重试复用幂等键，明确放弃后才使用新键', async () => {
+    const firstError = new TypeError('Failed to fetch')
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockRejectedValueOnce(firstError)
+      .mockResolvedValueOnce(jsonResponse({ id: 13 }))
+      .mockRejectedValueOnce(firstError)
+      .mockResolvedValueOnce(jsonResponse({ id: 14 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const repository = createHttpInventoryRepository()
+    const input = {
+      issued_on: '2026-08-29',
+      worker_id: 2,
+      lines: [{ inventory_item_id: 5, procurement_line_id: 11, quantity: '0.375' }],
+      notes: null,
+    }
+
+    await expectRetriableInventoryPost(
+      fetchMock,
+      '/api/projects/SY%2F001/inventory-issues',
+      input,
+      () => repository.createProjectInventoryIssue('SY/001', input),
+      () => repository.discardCreateProjectInventoryIssue('SY/001', input),
+    )
   })
 
   it('人员 Repository 覆盖施工员、排单、上工查询与今日多人原子提交', async () => {

@@ -1,4 +1,4 @@
-import { createPlannedPostRequest, requestJson, withQuery } from '../api'
+import { createRetriablePostSender, requestJson, withQuery } from '../api'
 import type { PagedResult } from '../domain/contracts'
 import type {
   InventoryAdjustmentDto,
@@ -27,15 +27,20 @@ export interface InventoryHttpRepository {
   listInventoryMovements(itemId: number, query?: PaginationQuery): Promise<RepositoryResult<PagedResult<InventoryMovementDto>>>
   createInventoryAdjustment(input: InventoryAdjustmentInput): Promise<RepositoryResult<InventoryAdjustmentDto>>
   createProjectInventoryIssue(projectCode: string, input: InventoryIssueInput): Promise<RepositoryResult<InventoryIssueDto>>
+  discardCreateInventoryItem(input: InventoryItemInput): boolean
+  discardCreateInventoryAdjustment(input: InventoryAdjustmentInput): boolean
+  discardCreateProjectInventoryIssue(projectCode: string, input: InventoryIssueInput): boolean
 }
 
 class HttpInventoryRepository implements InventoryHttpRepository {
+  private readonly postSender = createRetriablePostSender()
+
   async listInventoryItems(query: InventoryListQuery = {}): Promise<RepositoryResult<PagedResult<InventoryItemDto>>> {
     return live(await requestJson(withQuery('/api/inventory/items', query)))
   }
 
   async createInventoryItem(input: InventoryItemInput): Promise<RepositoryResult<InventoryItemDto>> {
-    return live(await post('/api/inventory/items', input))
+    return live(await this.postSender.send(INVENTORY_ITEMS_PATH, input))
   }
 
   async getInventoryItem(itemId: number): Promise<RepositoryResult<InventoryItemDetailDto>> {
@@ -51,13 +56,28 @@ class HttpInventoryRepository implements InventoryHttpRepository {
   }
 
   async createInventoryAdjustment(input: InventoryAdjustmentInput): Promise<RepositoryResult<InventoryAdjustmentDto>> {
-    return live(await post('/api/inventory/adjustments', input))
+    return live(await this.postSender.send(INVENTORY_ADJUSTMENTS_PATH, input))
   }
 
   async createProjectInventoryIssue(projectCode: string, input: InventoryIssueInput): Promise<RepositoryResult<InventoryIssueDto>> {
-    return live(await post(`/api/projects/${encodeURIComponent(projectCode)}/inventory-issues`, input))
+    return live(await this.postSender.send(projectInventoryIssuesPath(projectCode), input))
+  }
+
+  discardCreateInventoryItem(input: InventoryItemInput): boolean {
+    return this.postSender.discard(INVENTORY_ITEMS_PATH, input)
+  }
+
+  discardCreateInventoryAdjustment(input: InventoryAdjustmentInput): boolean {
+    return this.postSender.discard(INVENTORY_ADJUSTMENTS_PATH, input)
+  }
+
+  discardCreateProjectInventoryIssue(projectCode: string, input: InventoryIssueInput): boolean {
+    return this.postSender.discard(projectInventoryIssuesPath(projectCode), input)
   }
 }
+
+const INVENTORY_ITEMS_PATH = '/api/inventory/items'
+const INVENTORY_ADJUSTMENTS_PATH = '/api/inventory/adjustments'
 
 export function createHttpInventoryRepository(): InventoryHttpRepository {
   return new HttpInventoryRepository()
@@ -67,8 +87,8 @@ function itemPath(itemId: number): string {
   return `/api/inventory/items/${itemId}`
 }
 
-function post<T>(path: string, body: unknown): Promise<T> {
-  return createPlannedPostRequest<T>(path, body).send()
+function projectInventoryIssuesPath(projectCode: string): string {
+  return `/api/projects/${encodeURIComponent(projectCode)}/inventory-issues`
 }
 
 function live<T>(data: T): RepositoryResult<T> {
