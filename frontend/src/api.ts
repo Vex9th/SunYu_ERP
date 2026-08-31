@@ -155,6 +155,132 @@ export function createPlannedPostRequest<T>(
   }
 }
 
+export interface RetriablePostSender {
+  send<T>(path: string, body: unknown): Promise<T>
+  discard(path: string, body?: unknown): boolean
+}
+
+interface PendingPost {
+  readonly signature: string
+  readonly idempotencyKey: string
+  inFlight?: Promise<unknown>
+}
+
+export function createRetriablePostSender(): RetriablePostSender {
+  const pendingByPath = new Map<string, PendingPost>()
+
+  return {
+    send<T>(path: string, body: unknown): Promise<T> {
+      let signature: string
+      try {
+        signature = stableJsonSignature(body)
+      } catch (error) {
+        return Promise.reject(error)
+      }
+      let pending = pendingByPath.get(path)
+
+      if (pending?.inFlight) {
+        if (pending.signature === signature) return pending.inFlight as Promise<T>
+        return Promise.reject(new Error('该路径已有其他请求正在提交'))
+      }
+
+      if (!pending || pending.signature !== signature) {
+        pending = {
+          signature,
+          idempotencyKey: crypto.randomUUID(),
+        }
+        pendingByPath.set(path, pending)
+      }
+
+      const activePending = pending
+      const inFlight = requestPlannedPostJson<T>(path, body, activePending.idempotencyKey).then(
+        (result) => {
+          if (pendingByPath.get(path) === activePending) pendingByPath.delete(path)
+          return result
+        },
+        (error: unknown) => {
+          if (pendingByPath.get(path) === activePending) {
+            activePending.inFlight = undefined
+            if (isDefinitiveClientRejection(error)) pendingByPath.delete(path)
+          }
+          throw error
+        },
+      )
+      activePending.inFlight = inFlight
+      return inFlight
+    },
+    discard(path: string, body?: unknown): boolean {
+      const pending = pendingByPath.get(path)
+      if (!pending || pending.inFlight) return false
+      if (body !== undefined && pending.signature !== stableJsonSignature(body)) return false
+      return pendingByPath.delete(path)
+    },
+  }
+}
+
+function isDefinitiveClientRejection(error: unknown): boolean {
+  return error instanceof ApiError
+    && error.status >= 400
+    && error.status < 500
+    && ![408, 425, 429].includes(error.status)
+}
+
+function stableJsonSignature(value: unknown, ancestors = new Set<object>()): string {
+  if (value === null) return 'null'
+
+  switch (typeof value) {
+    case 'string':
+    case 'boolean':
+      return JSON.stringify(value)
+    case 'number':
+      if (Number.isFinite(value)) return JSON.stringify(value)
+      break
+    case 'object': {
+      if (ancestors.has(value)) break
+      ancestors.add(value)
+      try {
+        const ownKeys = Reflect.ownKeys(value)
+        const descriptors = Object.getOwnPropertyDescriptors(value)
+        if (Array.isArray(value)) {
+          if (ownKeys.length !== value.length + 1 || ownKeys.some((key) => typeof key !== 'string')) {
+            break
+          }
+          const items: string[] = []
+          for (let index = 0; index < value.length; index += 1) {
+            items.push(stableJsonSignature(jsonDataPropertyValue(descriptors[String(index)]), ancestors))
+          }
+          return `[${items.join(',')}]`
+        }
+
+        const prototype = Object.getPrototypeOf(value)
+        if (prototype !== Object.prototype && prototype !== null) break
+
+        const entries = ownKeys.map((key) => {
+          if (typeof key !== 'string') return invalidJsonBody()
+          return [key, jsonDataPropertyValue(descriptors[key])] as const
+        })
+        return `{${entries
+          .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+          .map(([key, item]) => `${JSON.stringify(key)}:${stableJsonSignature(item, ancestors)}`)
+          .join(',')}}`
+      } finally {
+        ancestors.delete(value)
+      }
+    }
+  }
+
+  return invalidJsonBody()
+}
+
+function jsonDataPropertyValue(descriptor: PropertyDescriptor | undefined): unknown {
+  if (!descriptor?.enumerable || !('value' in descriptor)) return invalidJsonBody()
+  return descriptor.value
+}
+
+function invalidJsonBody(): never {
+  throw new TypeError('POST 请求体必须是无循环引用的 JSON 兼容值')
+}
+
 export async function requestBlob(
   path: string,
   options: RequestOptions = {},

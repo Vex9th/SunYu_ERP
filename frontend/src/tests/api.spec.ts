@@ -4,6 +4,7 @@ import {
   ApiError,
   requestBlob,
   createPlannedPostRequest,
+  createRetriablePostSender,
   requestJson,
   requestVoid,
   withQuery,
@@ -86,6 +87,362 @@ describe('API client', () => {
         'Idempotency-Key': '018f3e40-1234-7000-8000-123456789abc',
       }),
     }))
+  })
+
+  it('5xx 后重试语义相同的请求会复用 Idempotency-Key', async () => {
+    const randomUUID = vi.spyOn(crypto, 'randomUUID').mockReturnValue(
+      '018f3e40-1234-7000-8000-123456789abc',
+    )
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ detail: 'Service unavailable' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 1 }), { status: 201 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const sender = createRetriablePostSender()
+
+    await expect(sender.send('/api/projects/SY-1/receipts', {
+      amount_cents: 1280000,
+      receipt_type: 'advance',
+    })).rejects.toMatchObject({ status: 503 })
+    await expect(sender.send('/api/projects/SY-1/receipts', {
+      receipt_type: 'advance',
+      amount_cents: 1280000,
+    })).resolves.toEqual({ id: 1 })
+
+    expect(randomUUID).toHaveBeenCalledOnce()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).toMatchObject({
+      'Idempotency-Key': '018f3e40-1234-7000-8000-123456789abc',
+    })
+    expect(fetchMock.mock.calls[1]?.[1]?.headers).toMatchObject({
+      'Idempotency-Key': '018f3e40-1234-7000-8000-123456789abc',
+    })
+  })
+
+  it('网络异常后重试会复用 Idempotency-Key', async () => {
+    const randomUUID = vi.spyOn(crypto, 'randomUUID').mockReturnValue(
+      '018f3e40-1234-7000-8000-123456789abc',
+    )
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError('network disconnected'))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 1 }), { status: 201 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const sender = createRetriablePostSender()
+
+    await expect(sender.send('/api/projects/SY-1/receipts', { amount_cents: 1280000 }))
+      .rejects.toMatchObject({ status: 0 })
+    await expect(sender.send('/api/projects/SY-1/receipts', { amount_cents: 1280000 }))
+      .resolves.toEqual({ id: 1 })
+
+    expect(randomUUID).toHaveBeenCalledOnce()
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).toMatchObject({
+      'Idempotency-Key': '018f3e40-1234-7000-8000-123456789abc',
+    })
+    expect(fetchMock.mock.calls[1]?.[1]?.headers).toMatchObject({
+      'Idempotency-Key': '018f3e40-1234-7000-8000-123456789abc',
+    })
+  })
+
+  it('服务端成功状态但返回结果未知时，重试会复用 Idempotency-Key', async () => {
+    const randomUUID = vi.spyOn(crypto, 'randomUUID').mockReturnValue(
+      '018f3e40-1234-7000-8000-123456789abc',
+    )
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response('not-json', { status: 201 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 1 }), { status: 201 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const sender = createRetriablePostSender()
+
+    await expect(sender.send('/api/projects/SY-1/receipts', { amount_cents: 1280000 }))
+      .rejects.toBeInstanceOf(SyntaxError)
+    await expect(sender.send('/api/projects/SY-1/receipts', { amount_cents: 1280000 }))
+      .resolves.toEqual({ id: 1 })
+
+    expect(randomUUID).toHaveBeenCalledOnce()
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).toMatchObject({
+      'Idempotency-Key': '018f3e40-1234-7000-8000-123456789abc',
+    })
+    expect(fetchMock.mock.calls[1]?.[1]?.headers).toMatchObject({
+      'Idempotency-Key': '018f3e40-1234-7000-8000-123456789abc',
+    })
+  })
+
+  it('成功后清理 pending，同一 payload 的下次提交使用新键', async () => {
+    const randomUUID = vi.spyOn(crypto, 'randomUUID')
+      .mockReturnValueOnce('018f3e40-1234-7000-8000-123456789abc')
+      .mockReturnValueOnce('018f3e40-1234-7000-8000-abcdefabcdef')
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => new Response(JSON.stringify({ id: 1 }), { status: 201 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const sender = createRetriablePostSender()
+
+    await sender.send('/api/projects/SY-1/receipts', { amount_cents: 1280000 })
+    await sender.send('/api/projects/SY-1/receipts', { amount_cents: 1280000 })
+
+    expect(randomUUID).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).toMatchObject({
+      'Idempotency-Key': '018f3e40-1234-7000-8000-123456789abc',
+    })
+    expect(fetchMock.mock.calls[1]?.[1]?.headers).toMatchObject({
+      'Idempotency-Key': '018f3e40-1234-7000-8000-abcdefabcdef',
+    })
+  })
+
+  it.each([400, 401, 403, 404, 409, 422])(
+    '%i 后清理 pending，同一 payload 的下次提交使用新键',
+    async (status) => {
+      const randomUUID = vi.spyOn(crypto, 'randomUUID')
+        .mockReturnValueOnce('018f3e40-1234-7000-8000-123456789abc')
+        .mockReturnValueOnce('018f3e40-1234-7000-8000-abcdefabcdef')
+      const fetchMock = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(new Response(JSON.stringify({ detail: 'Rejected' }), { status }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ id: 1 }), { status: 201 }))
+      vi.stubGlobal('fetch', fetchMock)
+      const sender = createRetriablePostSender()
+
+      await expect(sender.send('/api/projects/SY-1/receipts', { amount_cents: 1280000 }))
+        .rejects.toMatchObject({ status })
+      await expect(sender.send('/api/projects/SY-1/receipts', { amount_cents: 1280000 }))
+        .resolves.toEqual({ id: 1 })
+
+      expect(randomUUID).toHaveBeenCalledTimes(2)
+      expect(fetchMock.mock.calls[0]?.[1]?.headers).toMatchObject({
+        'Idempotency-Key': '018f3e40-1234-7000-8000-123456789abc',
+      })
+      expect(fetchMock.mock.calls[1]?.[1]?.headers).toMatchObject({
+        'Idempotency-Key': '018f3e40-1234-7000-8000-abcdefabcdef',
+      })
+    },
+  )
+
+  it.each([408, 425, 429])('%i 结果不确定时保留 pending 并复用原键', async (status) => {
+    const randomUUID = vi.spyOn(crypto, 'randomUUID').mockReturnValue(
+      '018f3e40-1234-7000-8000-123456789abc',
+    )
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ detail: 'Retry later' }), { status }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 1 }), { status: 201 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const sender = createRetriablePostSender()
+
+    await expect(sender.send('/api/projects/SY-1/receipts', { amount_cents: 1280000 }))
+      .rejects.toMatchObject({ status })
+    await expect(sender.send('/api/projects/SY-1/receipts', { amount_cents: 1280000 }))
+      .resolves.toEqual({ id: 1 })
+
+    expect(randomUUID).toHaveBeenCalledOnce()
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).toMatchObject({
+      'Idempotency-Key': '018f3e40-1234-7000-8000-123456789abc',
+    })
+    expect(fetchMock.mock.calls[1]?.[1]?.headers).toMatchObject({
+      'Idempotency-Key': '018f3e40-1234-7000-8000-123456789abc',
+    })
+  })
+
+  it('重试待定期间同一路径改变 payload 会使用新键', async () => {
+    const randomUUID = vi.spyOn(crypto, 'randomUUID')
+      .mockReturnValueOnce('018f3e40-1234-7000-8000-123456789abc')
+      .mockReturnValueOnce('018f3e40-1234-7000-8000-abcdefabcdef')
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError('network disconnected'))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 2 }), { status: 201 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const sender = createRetriablePostSender()
+
+    await expect(sender.send('/api/projects/SY-1/receipts', { amount_cents: 1280000 }))
+      .rejects.toMatchObject({ status: 0 })
+    await expect(sender.send('/api/projects/SY-1/receipts', { amount_cents: 2560000 }))
+      .resolves.toEqual({ id: 2 })
+
+    expect(randomUUID).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1]?.[1]?.headers).toMatchObject({
+      'Idempotency-Key': '018f3e40-1234-7000-8000-abcdefabcdef',
+    })
+  })
+
+  it('数组顺序改变视为新提交意图并使用新键', async () => {
+    const randomUUID = vi.spyOn(crypto, 'randomUUID')
+      .mockReturnValueOnce('018f3e40-1234-7000-8000-123456789abc')
+      .mockReturnValueOnce('018f3e40-1234-7000-8000-abcdefabcdef')
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError('network disconnected'))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 2 }), { status: 201 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const sender = createRetriablePostSender()
+
+    await expect(sender.send('/api/projects/SY-1/receipts', { amounts: [1280000, 2560000] }))
+      .rejects.toMatchObject({ status: 0 })
+    await expect(sender.send('/api/projects/SY-1/receipts', { amounts: [2560000, 1280000] }))
+      .resolves.toEqual({ id: 2 })
+
+    expect(randomUUID).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1]?.[1]?.headers).toMatchObject({
+      'Idempotency-Key': '018f3e40-1234-7000-8000-abcdefabcdef',
+    })
+  })
+
+  it('同一路径和 payload 的并发提交复用同一 Promise', async () => {
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('018f3e40-1234-7000-8000-123456789abc')
+    let resolveFetch!: (response: Response) => void
+    const fetchMock = vi.fn<typeof fetch>().mockReturnValue(new Promise<Response>((resolve) => {
+      resolveFetch = resolve
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const sender = createRetriablePostSender()
+
+    const first = sender.send('/api/projects/SY-1/receipts', { amount_cents: 1280000 })
+    const second = sender.send('/api/projects/SY-1/receipts', { amount_cents: 1280000 })
+
+    expect(second).toBe(first)
+    expect(fetchMock).toHaveBeenCalledOnce()
+    resolveFetch(new Response(JSON.stringify({ id: 1 }), { status: 201 }))
+    await expect(first).resolves.toEqual({ id: 1 })
+  })
+
+  it('同一路径正在提交时不允许另一个 payload 静默覆盖', async () => {
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('018f3e40-1234-7000-8000-123456789abc')
+    let resolveFetch!: (response: Response) => void
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockReturnValue(new Promise<Response>((resolve) => {
+      resolveFetch = resolve
+    })))
+    const sender = createRetriablePostSender()
+    const first = sender.send('/api/projects/SY-1/receipts', { amount_cents: 1280000 })
+
+    await expect(sender.send('/api/projects/SY-1/receipts', { amount_cents: 2560000 }))
+      .rejects.toThrow('该路径已有其他请求正在提交')
+
+    resolveFetch(new Response(JSON.stringify({ id: 1 }), { status: 201 }))
+    await first
+  })
+
+  it('循环引用的 JSON 请求体返回 rejected Promise 且不发起请求', async () => {
+    const randomUUID = vi.spyOn(crypto, 'randomUUID')
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal('fetch', fetchMock)
+    const sender = createRetriablePostSender()
+    const body: Record<string, unknown> = {}
+    body.self = body
+
+    await expect(sender.send('/api/projects/SY-1/receipts', body))
+      .rejects.toThrow('POST 请求体必须是无循环引用的 JSON 兼容值')
+    expect(randomUUID).not.toHaveBeenCalled()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('稀疏数组返回 rejected Promise，避免签名与实际 JSON body 不一致', async () => {
+    const randomUUID = vi.spyOn(crypto, 'randomUUID')
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ id: 1 }), { status: 201 }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const sender = createRetriablePostSender()
+
+    await expect(sender.send('/api/projects/SY-1/receipts', Array(1)))
+      .rejects.toThrow('POST 请求体必须是无循环引用的 JSON 兼容值')
+    expect(randomUUID).not.toHaveBeenCalled()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('带 accessor 的对象返回 rejected Promise 且不读取 getter', async () => {
+    const getter = vi.fn(() => 1280000)
+    const body: Record<string, unknown> = {}
+    Object.defineProperty(body, 'amount_cents', {
+      enumerable: true,
+      get: getter,
+    })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ id: 1 }), { status: 201 }),
+    ))
+    const sender = createRetriablePostSender()
+
+    await expect(sender.send('/api/projects/SY-1/receipts', body))
+      .rejects.toThrow('POST 请求体必须是无循环引用的 JSON 兼容值')
+    expect(getter).not.toHaveBeenCalled()
+  })
+
+  it.each(['toJSON', 'hidden'])('带非枚举自有属性 %s 的对象返回 rejected Promise', async (propertyName) => {
+    const body: Record<string, unknown> = { amount_cents: 1280000 }
+    Object.defineProperty(body, propertyName, {
+      enumerable: false,
+      value: propertyName === 'toJSON' ? () => ({ amount_cents: 2560000 }) : 'metadata',
+    })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ id: 1 }), { status: 201 }),
+    ))
+    const sender = createRetriablePostSender()
+
+    await expect(sender.send('/api/projects/SY-1/receipts', body))
+      .rejects.toThrow('POST 请求体必须是无循环引用的 JSON 兼容值')
+  })
+
+  it('带 symbol 自有键的对象返回 rejected Promise', async () => {
+    const body: Record<PropertyKey, unknown> = { amount_cents: 1280000 }
+    body[Symbol('metadata')] = 'hidden'
+    const sender = createRetriablePostSender()
+
+    await expect(sender.send('/api/projects/SY-1/receipts', body))
+      .rejects.toThrow('POST 请求体必须是无循环引用的 JSON 兼容值')
+  })
+
+  it('未知结果 pending 可按动态 path 和语义匹配 body 显式放弃', async () => {
+    const randomUUID = vi.spyOn(crypto, 'randomUUID')
+      .mockReturnValueOnce('018f3e40-1234-7000-8000-123456789abc')
+      .mockReturnValueOnce('018f3e40-1234-7000-8000-abcdefabcdef')
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError('network disconnected'))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 1 }), { status: 201 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const sender = createRetriablePostSender()
+    const path = '/api/projects/SY-2026-009/receipts'
+
+    await expect(sender.send(path, { amount_cents: 1280000, receipt_type: 'advance' }))
+      .rejects.toMatchObject({ status: 0 })
+    expect(sender.discard('/api/projects/SY-2026-010/receipts')).toBe(false)
+    expect(sender.discard(path, { amount_cents: 2560000, receipt_type: 'advance' })).toBe(false)
+    expect(sender.discard(path, { receipt_type: 'advance', amount_cents: 1280000 })).toBe(true)
+    await expect(sender.send(path, { amount_cents: 1280000, receipt_type: 'advance' }))
+      .resolves.toEqual({ id: 1 })
+
+    expect(randomUUID).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1]?.[1]?.headers).toMatchObject({
+      'Idempotency-Key': '018f3e40-1234-7000-8000-abcdefabcdef',
+    })
+  })
+
+  it('不传 body 时可显式放弃指定 path 的未知结果 pending', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockRejectedValue(new TypeError('network disconnected')))
+    const sender = createRetriablePostSender()
+    const path = '/api/projects/SY-2026-011/receipts'
+
+    await expect(sender.send(path, { amount_cents: 1280000 })).rejects.toMatchObject({ status: 0 })
+
+    expect(sender.discard(path)).toBe(true)
+    expect(sender.discard(path)).toBe(false)
+  })
+
+  it('仍在 in-flight 的请求不允许显式放弃', async () => {
+    let resolveFetch!: (response: Response) => void
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockReturnValue(new Promise<Response>((resolve) => {
+      resolveFetch = resolve
+    })))
+    const sender = createRetriablePostSender()
+    const path = '/api/projects/SY-2026-012/receipts'
+    const body = { amount_cents: 1280000 }
+
+    const inFlight = sender.send(path, body)
+
+    expect(sender.discard(path)).toBe(false)
+    expect(sender.discard(path, body)).toBe(false)
+    resolveFetch(new Response(JSON.stringify({ id: 1 }), { status: 201 }))
+    await inFlight
   })
 
   it('自定义 content-type 大小写不同时不重复追加 JSON 媒体类型', async () => {
