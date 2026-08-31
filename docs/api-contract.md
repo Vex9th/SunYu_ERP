@@ -169,7 +169,7 @@
 
 `ProjectStage` 核心字段：`stage_code`、`status`、`status_reason`、`planned_start_on`、`planned_end_on`、`started_at`、`blocked_at`、`completed_at`、`notes`、`revision`。允许流转：`pending → in_progress/skipped`、`in_progress → blocked/completed/skipped`、`blocked → in_progress/skipped`；`completed/skipped → in_progress` 仅用于纠错。进入 `blocked/skipped` 或从终态纠错都必须填写原因，所有流转保留事件历史。
 
-### 4.2 文件和版本归档
+### 4.2 文件和版本归档（已实现）
 
 文件类别：
 
@@ -191,6 +191,8 @@ API 的 `title` 映射现有数据库列 `documents.logical_name`，不新增第
 
 ### 4.3 报价
 
+> 实现状态：已实现。
+
 报价状态：`draft | sent | accepted | rejected | withdrawn`。
 
 | Method | Path | 请求/响应 |
@@ -205,6 +207,8 @@ API 的 `title` 映射现有数据库列 `documents.logical_name`，不新增第
 
 ### 4.4 合同与项目分摊
 
+> 实现状态：已实现。
+
 合同状态：`draft | signed | completed | terminated`。
 
 | Method | Path | 请求/响应 |
@@ -218,6 +222,8 @@ API 的 `title` 映射现有数据库列 `documents.logical_name`，不新增第
 草稿的 `signed_on`、`final_delivery_on` 允许为 `null`；转为 `signed` 时必须补齐签订日期、最终交付日期和完整分摊。`allocations` 为 `[{"project_code":"SY-2026-001","amount_cents":1280000}]`，已签合同时合计必须等于合同总额。前端第一版可只操作当前项目的一条分摊，但类型必须保留数组，避免以后一个合同对应多个项目时重做页面。
 
 ### 4.5 三段收款
+
+> 实现状态：已实现。
 
 固定收款节点：`advance | progress | final`。计划完成状态由金额自动计算：`unplanned | scheduled | partial | paid`，另返回只读 `is_overdue: boolean`，避免“部分到账且已逾期”无法表达。到账记录状态：`active | voided`。收款方式：`bank_transfer | cash | other`；P0 不把未兑付承兑票据计入实际到账。
 

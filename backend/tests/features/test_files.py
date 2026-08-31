@@ -202,6 +202,68 @@ def test_stores_two_versions_with_hash_size_and_data_relative_paths(
     _assert_no_work_files(data_dir)
 
 
+def test_document_scoped_versions_use_independent_directories_and_sequences(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "设计图.dwg"
+    source.write_bytes(b"document-one")
+    data_dir = tmp_path / "Data"
+
+    first_document = files.store_version(
+        source,
+        data_dir,
+        "PRJ-001",
+        "mechanical_design",
+        document_id=101,
+    )
+    source.write_bytes(b"document-two")
+    second_document = files.store_version(
+        source,
+        data_dir,
+        "PRJ-001",
+        "mechanical_design",
+        document_id=102,
+    )
+
+    assert first_document.version_number == 1
+    assert second_document.version_number == 1
+    assert first_document.relative_path.parts[:4] == (
+        "Projects",
+        "PRJ-001",
+        "mechanical_design",
+        "101",
+    )
+    assert second_document.relative_path.parts[:4] == (
+        "Projects",
+        "PRJ-001",
+        "mechanical_design",
+        "102",
+    )
+    assert first_document.path.read_bytes() == b"document-one"
+    assert second_document.path.read_bytes() == b"document-two"
+    _assert_no_work_files(data_dir)
+
+
+@pytest.mark.parametrize("document_id", [0, -1, True, "101"])
+def test_rejects_invalid_document_id_before_creating_storage(
+    tmp_path: Path,
+    document_id: object,
+) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("safe", encoding="utf-8")
+
+    with pytest.raises((TypeError, ValueError), match="document_id"):
+        files.store_version(
+            source,
+            tmp_path / "Data",
+            "PRJ-001",
+            "other",
+            document_id=document_id,  # type: ignore[arg-type]
+        )
+
+    assert not (tmp_path / "Data").exists()
+
+
 def test_store_version_uses_normalized_project_code(tmp_path: Path) -> None:
     source = tmp_path / "source.txt"
     source.write_text("safe", encoding="utf-8")
@@ -1515,3 +1577,63 @@ def test_source_change_during_copy_fails_without_publishing(
 
     _assert_no_work_files(data_dir)
     assert not list((data_dir / "Projects").rglob("*"))
+
+
+def test_stage_and_publish_can_be_separated_without_recopying_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "large-design.zip"
+    source.write_bytes(b"engineering-version")
+    data_dir = tmp_path / "Data"
+
+    staged = files.stage_version(
+        source,
+        data_dir,
+        original_name="机械设计归档.zip",
+    )
+
+    assert staged.path.parent == data_dir / "Temp"
+    assert staged.path.read_bytes() == b"engineering-version"
+    stored = files.publish_staged_version(
+        staged,
+        "P-1",
+        "mechanical_design",
+        document_id=7,
+        verify_content=False,
+    )
+
+    assert stored.relative_path.parts[:4] == (
+        "Projects",
+        "P-1",
+        "mechanical_design",
+        "7",
+    )
+    assert stored.path.read_bytes() == b"engineering-version"
+    assert list((data_dir / "Temp").iterdir()) == []
+
+
+def test_discard_staged_version_removes_unpublished_temp(tmp_path: Path) -> None:
+    source = tmp_path / "drawing.dwg"
+    source.write_bytes(b"drawing")
+    data_dir = tmp_path / "Data"
+    staged = files.stage_version(source, data_dir)
+
+    files.discard_staged_version(staged)
+
+    assert list((data_dir / "Temp").iterdir()) == []
+
+
+def test_cleanup_stale_staged_versions_only_removes_owned_regular_files(
+    tmp_path: Path,
+) -> None:
+    temp_dir = tmp_path / "Data" / "Temp"
+    temp_dir.mkdir(parents=True)
+    stale = temp_dir / ".upload-deadbeef.tmp"
+    unrelated = temp_dir / "keep-me.txt"
+    stale.write_bytes(b"stale")
+    unrelated.write_bytes(b"unrelated")
+
+    files.cleanup_stale_staged_versions(tmp_path / "Data")
+
+    assert not stale.exists()
+    assert unrelated.read_bytes() == b"unrelated"

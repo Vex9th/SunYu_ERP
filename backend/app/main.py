@@ -12,9 +12,12 @@ from fastapi.staticfiles import StaticFiles
 from backend.app.core.config import Settings, load_settings
 from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
+from backend.app.features import files
 from backend.app.features.auth import create_auth_router
 from backend.app.features.backups import create_backup, prune_backups
+from backend.app.features.commercial import create_commercial_router
 from backend.app.features.companies import create_companies_router
+from backend.app.features.documents import create_documents_router
 from backend.app.features.inventory import create_inventory_router
 from backend.app.features.procurement import create_procurement_router
 from backend.app.features.project_stages import create_project_stages_router
@@ -55,6 +58,7 @@ def create_app(
     async def lifespan(application: FastAPI) -> Iterator[None]:
         settings = load_settings(selected_config_path)
         settings.data_dir.mkdir(parents=True, exist_ok=True)
+        files.cleanup_stale_staged_versions(settings.data_dir)
         database_path = settings.data_dir / "iapm.sqlite"
         connection = connect_database(database_path)
         migration_failure: BaseException | None = None
@@ -151,6 +155,8 @@ def create_app(
     application.include_router(create_auth_router(get_connection, get_session_secret))
     application.include_router(create_companies_router(get_connection, get_settings))
     application.include_router(create_projects_router(get_connection, get_settings))
+    application.include_router(create_documents_router(get_connection, get_settings))
+    application.include_router(create_commercial_router(get_connection, get_settings))
     application.include_router(
         create_project_stages_router(get_connection, get_settings)
     )

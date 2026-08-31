@@ -32,6 +32,8 @@ _WINDOWS_DEVICE_NAMES = frozenset(
 _VERSIONED_FILENAME = re.compile(
     r"^\d{8}T\d{12}Z_v(?P<version>\d+)_"
 )
+_VERSION_RESERVATION = re.compile(r"^\.version-\d{12}\.reserve$")
+_STAGED_UPLOAD_NAME = re.compile(r"^\.upload-[A-Za-z0-9_-]+\.tmp$")
 _FileIdentity = tuple[int, int]
 _BOUND_DIRECTORY_SUPPORTED = hasattr(os, "O_DIRECTORY") and all(
     function in os.supports_dir_fd
@@ -108,11 +110,25 @@ class StoredFileVersion:
     created_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class StagedFileVersion:
+    path: Path
+    data_root: Path
+    identity: _FileIdentity
+    original_name: str
+    sanitized_name: str
+    size_bytes: int
+    sha256: str
+
+
 def store_version(
     source_path: str | Path,
     data_dir: str | Path,
     project_code: str,
     category: str,
+    *,
+    document_id: int | None = None,
+    original_name: str | None = None,
 ) -> StoredFileVersion:
     """Copy one source version into an application-owned project directory.
 
@@ -122,51 +138,212 @@ def store_version(
     """
     project_code = normalize_project_code(project_code)
     _validate_path_segment(category, "category")
+    if document_id is not None:
+        if isinstance(document_id, bool) or not isinstance(document_id, int):
+            raise TypeError("document_id must be an integer")
+        if document_id < 1:
+            raise ValueError("document_id must be positive")
+    staged = stage_version(
+        source_path,
+        data_dir,
+        original_name=original_name,
+    )
+    return publish_staged_version(
+        staged,
+        project_code,
+        category,
+        document_id=document_id,
+    )
+
+
+def stage_version(
+    source_path: str | Path,
+    data_dir: str | Path,
+    *,
+    original_name: str | None = None,
+) -> StagedFileVersion:
+    """Durably copy a source into ``Data/Temp`` before a database write lock."""
     source = Path(source_path)
     initial_source_stat = _require_regular_source(source)
-    original_name = source.name
-    sanitized_name = _sanitize_filename(original_name)
-
+    selected_original_name = source.name if original_name is None else original_name
+    if not isinstance(selected_original_name, str):
+        raise TypeError("original_name must be a string")
+    if not selected_original_name:
+        raise ValueError("original_name must not be empty")
+    sanitized_name = _sanitize_filename(selected_original_name)
     data_root, temp_dir = _prepare_data_root(Path(data_dir))
     temporary_path, temporary_identity, size_bytes, sha256 = _stage_source(
         source,
         initial_source_stat,
         temp_dir,
     )
+    return StagedFileVersion(
+        path=temporary_path,
+        data_root=data_root,
+        identity=temporary_identity,
+        original_name=selected_original_name,
+        sanitized_name=sanitized_name,
+        size_bytes=size_bytes,
+        sha256=sha256,
+    )
+
+
+def publish_staged_version(
+    staged: StagedFileVersion,
+    project_code: str,
+    category: str,
+    *,
+    document_id: int | None = None,
+    verify_content: bool = True,
+) -> StoredFileVersion:
+    """Atomically publish a previously staged file into one project directory."""
+    project_code = normalize_project_code(project_code)
+    _validate_path_segment(category, "category")
+    if document_id is not None:
+        if isinstance(document_id, bool) or not isinstance(document_id, int):
+            raise TypeError("document_id must be an integer")
+        if document_id < 1:
+            raise ValueError("document_id must be positive")
     try:
-        category_dir = _prepare_category_directory(
-            data_root,
+        destination_dir = _prepare_category_directory(
+            staged.data_root,
             project_code,
             category,
         )
+        if document_id is not None:
+            destination_dir = _ensure_contained_directory(
+                staged.data_root,
+                destination_dir / str(document_id),
+            )
         created_at = datetime.now(timezone.utc)
         version_number, target_path = _publish_staged_file(
-            temporary_path,
-            temporary_identity,
-            data_root,
-            category_dir,
-            sanitized_name,
+            staged.path,
+            staged.identity,
+            staged.data_root,
+            destination_dir,
+            staged.sanitized_name,
             created_at,
-            size_bytes,
-            sha256,
+            staged.size_bytes,
+            staged.sha256 if verify_content else None,
         )
-        relative_path = target_path.relative_to(data_root)
+        relative_path = target_path.relative_to(staged.data_root)
         return StoredFileVersion(
             path=target_path,
             relative_path=relative_path,
-            original_name=original_name,
+            original_name=staged.original_name,
             version_number=version_number,
-            size_bytes=size_bytes,
-            sha256=sha256,
+            size_bytes=staged.size_bytes,
+            sha256=staged.sha256,
             created_at=created_at.isoformat(),
         )
     except BaseException as primary:
         _cleanup_after_failure(
             primary,
-            temporary_path,
-            temporary_identity,
+            staged.path,
+            staged.identity,
         )
         raise
+
+
+def discard_staged_version(staged: StagedFileVersion) -> None:
+    """Discard one unpublished staged file without touching another writer's file."""
+    _unlink_owned_path(staged.path, staged.path, staged.identity)
+
+
+def cleanup_stale_staged_versions(data_dir: str | Path) -> None:
+    """Remove application-owned upload stages before the app accepts requests."""
+    _, temp_dir = _prepare_data_root(Path(data_dir))
+    for candidate in temp_dir.iterdir():
+        if _STAGED_UPLOAD_NAME.fullmatch(candidate.name) is None:
+            continue
+        try:
+            candidate_stat = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISREG(candidate_stat.st_mode):
+            candidate.unlink()
+
+
+def reconcile_document_versions(
+    data_dir: str | Path,
+    project_code: str,
+    category: str,
+    document_id: int,
+    referenced_relative_paths: list[str],
+) -> None:
+    """Remove crash residue that has no committed document-version record."""
+    project_code = normalize_project_code(project_code)
+    _validate_path_segment(category, "category")
+    if isinstance(document_id, bool) or not isinstance(document_id, int):
+        raise TypeError("document_id must be an integer")
+    if document_id < 1:
+        raise ValueError("document_id must be positive")
+    data_root, _ = _prepare_data_root(Path(data_dir))
+    destination_dir = _ensure_contained_directory(
+        data_root,
+        _prepare_category_directory(data_root, project_code, category)
+        / str(document_id),
+    )
+    expected_prefix = ("Projects", project_code, category, str(document_id))
+    referenced_names: set[str] = set()
+    for value in referenced_relative_paths:
+        relative_path = Path(value)
+        if (
+            relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or relative_path.parts[:4] != expected_prefix
+            or len(relative_path.parts) != 5
+        ):
+            raise ValueError("referenced file path is outside document directory")
+        referenced_names.add(relative_path.name)
+
+    binding = _open_bound_directory(data_root, destination_dir)
+    try:
+        for name in binding.names():
+            if name in referenced_names:
+                continue
+            if _VERSIONED_FILENAME.match(name) is None and _VERSION_RESERVATION.fullmatch(
+                name
+            ) is None:
+                continue
+            try:
+                file_stat = binding.stat(name)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(file_stat.st_mode):
+                binding.unlink(name)
+    finally:
+        binding.close()
+
+
+def delete_stored_version(
+    stored: StoredFileVersion,
+    data_dir: str | Path,
+) -> None:
+    """Delete exactly one file returned by ``store_version`` after DB failure."""
+    data_root = Path(data_dir).resolve(strict=True)
+    relative_path = stored.relative_path
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise ValueError("stored file path is outside data_dir")
+    target_path = data_root / relative_path
+    resolved_target = target_path.resolve(strict=True)
+    if (
+        not resolved_target.is_relative_to(data_root)
+        or resolved_target != target_path.absolute()
+    ):
+        raise ValueError("stored file path is outside data_dir")
+    target_stat = resolved_target.stat()
+    if not stat.S_ISREG(target_stat.st_mode):
+        raise ValueError("stored file is not a regular file")
+    if target_stat.st_size != stored.size_bytes:
+        raise RuntimeError("stored file changed before rollback")
+    with resolved_target.open("rb") as stored_file:
+        digest = hashlib.sha256()
+        while chunk := stored_file.read(_COPY_CHUNK_SIZE):
+            digest.update(chunk)
+    if digest.hexdigest() != stored.sha256:
+        raise RuntimeError("stored file changed before rollback")
+    resolved_target.unlink()
 
 
 def _validate_path_segment(value: str, field: str) -> None:
@@ -499,7 +676,7 @@ def _publish_staged_file(
     sanitized_name: str,
     created_at: datetime,
     expected_size: int,
-    expected_sha256: str,
+    expected_sha256: str | None,
 ) -> tuple[int, Path]:
     binding = _open_bound_directory(data_root, category_dir)
     try:
@@ -538,7 +715,7 @@ def _publish_in_bound_directory(
     sanitized_name: str,
     created_at: datetime,
     expected_size: int,
-    expected_sha256: str,
+    expected_sha256: str | None,
 ) -> tuple[int, Path]:
     version_number = _next_bound_version(binding)
     timestamp = created_at.strftime("%Y%m%dT%H%M%S%fZ")
@@ -690,13 +867,16 @@ def _require_final_target_integrity(
     target_name: str,
     temporary_identity: _FileIdentity,
     expected_size: int,
-    expected_sha256: str,
+    expected_sha256: str | None,
 ) -> None:
     if not _bound_name_has_identity(binding, target_name, temporary_identity):
         raise RuntimeError("target ownership or integrity changed before return")
     target_stat = binding.stat(target_name)
     if target_stat.st_size != expected_size:
         raise RuntimeError("target ownership or integrity changed before return")
+
+    if expected_sha256 is None:
+        return
 
     file_descriptor = binding.open_readonly(target_name)
     target_file: BinaryIO | None = None

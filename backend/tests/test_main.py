@@ -64,6 +64,25 @@ def test_create_app_defers_config_and_database_writes_until_lifespan(
     assert (tmp_path / "Data" / "iapm.sqlite").is_file()
 
 
+def test_lifespan_cleans_stale_document_stage_before_serving_requests(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    temp_dir = tmp_path / "Data" / "Temp"
+    temp_dir.mkdir(parents=True)
+    stale = temp_dir / ".upload-crashed.tmp"
+    unrelated = temp_dir / "keep-me.txt"
+    stale.write_bytes(b"stale-upload")
+    unrelated.write_bytes(b"unrelated")
+    application = main_module.create_app(config_path=config_path)
+
+    with TestClient(application) as client:
+        assert client.get("/api/health").status_code == 200
+        assert not stale.exists()
+        assert unrelated.read_bytes() == b"unrelated"
+
+
 def test_create_app_only_serves_frontend_when_dist_is_explicit(
     tmp_path: Path,
 ) -> None:
@@ -98,6 +117,18 @@ def test_create_app_registers_first_business_vertical_slice_routes() -> None:
         "/api/projects/{project_code}/crew-assignments",
         "/api/projects/{project_code}/labor-entries",
         "/api/projects/{project_code}/labor-entries/batch",
+        "/api/projects/{project_code}/documents",
+        "/api/projects/{project_code}/quotes",
+        "/api/projects/{project_code}/quotes/{quote_id}",
+        "/api/projects/{project_code}/quotes/{quote_id}/transition",
+        "/api/projects/{project_code}/contracts",
+        "/api/projects/{project_code}/contracts/{contract_id}",
+        "/api/projects/{project_code}/contracts/{contract_id}/transition",
+        "/api/projects/{project_code}/payments",
+        "/api/projects/{project_code}/payment-terms/{milestone}",
+        "/api/projects/{project_code}/receipts",
+        "/api/projects/{project_code}/receipts/{receipt_id}",
+        "/api/projects/{project_code}/receipts/{receipt_id}/void",
     }
 
     assert expected_paths <= paths.keys()
