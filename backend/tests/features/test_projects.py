@@ -347,7 +347,11 @@ def test_unicode_equivalent_project_codes_conflict_and_resolve_same_project(
     assert duplicate.status_code == 409
     assert duplicate.json() == {"detail": "Project code already exists"}
     assert dashboard.status_code == 200
-    assert dashboard.json()["project"] == original
+    dashboard_project = dashboard.json()["project"]
+    assert {key: dashboard_project[key] for key in original} == original
+    assert dashboard_project["company_name"] == "示例公司"
+    assert dashboard_project["closure_type"] is None
+    assert dashboard_project["revision"] == 1
     assert archived.status_code == 200
     assert archived.json()["project_code"] == stored_code
     assert archived.json()["archive_reason"] == "等价编号归档"
@@ -622,11 +626,17 @@ def test_archive_and_dashboard_validate_project_code_without_echo(
         archived = client.post("/api/projects/CON/archive", json={"reason": None})
         dashboard = client.get("/api/projects/COM1/dashboard")
 
-    for response in (archived, dashboard):
-        assert response.status_code == 422
-        assert response.json() == {"detail": "Invalid project code"}
-        assert "CON" not in response.text
-        assert "COM1" not in response.text
+    assert archived.status_code == 422
+    assert archived.json() == {"detail": "Invalid project code"}
+    assert dashboard.status_code == 422
+    assert dashboard.json() == {
+        "detail": "Invalid project code",
+        "error_code": "VALIDATION_ERROR",
+        "field_errors": {},
+        "current_revision": None,
+    }
+    assert "CON" not in archived.text
+    assert "COM1" not in dashboard.text
 
 
 def test_missing_project_archive_and_dashboard_are_fixed_404(
@@ -639,9 +649,15 @@ def test_missing_project_archive_and_dashboard_are_fixed_404(
         )
         dashboard = client.get("/api/projects/MISSING/dashboard")
 
-    for response in (archived, dashboard):
-        assert response.status_code == 404
-        assert response.json() == {"detail": "Project not found"}
+    assert archived.status_code == 404
+    assert archived.json() == {"detail": "Project not found"}
+    assert dashboard.status_code == 404
+    assert dashboard.json() == {
+        "detail": "Project not found",
+        "error_code": "RESOURCE_NOT_FOUND",
+        "field_errors": {},
+        "current_revision": None,
+    }
 
 
 def test_dashboard_returns_real_company_contacts_and_document_counts(
@@ -723,8 +739,19 @@ def test_dashboard_returns_real_company_contacts_and_document_counts(
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"project", "company", "contacts", "documents"}
-    assert body["project"] == project
+    assert set(body) == {
+        "project",
+        "company",
+        "contacts",
+        "documents",
+        "stages",
+        "commercial",
+        "costs",
+        "profit",
+        "receivables",
+        "todos",
+    }
+    assert {key: body["project"][key] for key in project} == project
     assert set(body["company"]) == COMPANY_KEYS
     assert body["company"]["name"] == "示例公司"
     assert [contact["name"] for contact in body["contacts"]] == ["张三", "李四"]
@@ -748,8 +775,8 @@ def test_dashboard_returns_real_company_contacts_and_document_counts(
         harness.settings.session_secret,
     ):
         assert private_value not in serialized
-    for fabricated_field in ("profit", "cost", "progress", "todos", "quote"):
-        assert fabricated_field not in serialized
+    assert body["costs"]["total_cents"] == 0
+    assert body["profit"]["actual_profit_cents"] == 0
 
 
 def test_dashboard_without_documents_returns_zero_counts(
@@ -1415,7 +1442,7 @@ def test_commit_failure_rolls_back_and_logs_without_client_leak(
     ("path", "sql_prefix"),
     [
         ("/api/projects", "SELECT PROJECTS.ID,"),
-        ("/api/projects/P-1/dashboard", "SELECT ID, PROJECT_CODE,"),
+        ("/api/projects/P-1/dashboard", "SELECT PROJECTS.ID,"),
     ],
 )
 def test_unexpected_read_failure_logs_once_and_returns_fixed_500(
@@ -1434,7 +1461,15 @@ def test_unexpected_read_failure_logs_once_and_returns_fixed_500(
         response = client.get(path)
 
     assert response.status_code == 500
-    assert response.json() == {"detail": "Project operation failed"}
+    if path.endswith("/dashboard"):
+        assert response.json() == {
+            "detail": "Project operation failed",
+            "error_code": "PROJECT_OPERATION_FAILED",
+            "field_errors": {},
+            "current_revision": None,
+        }
+    else:
+        assert response.json() == {"detail": "Project operation failed"}
     assert "private_secret_table" not in response.text
     records = _project_error_records(caplog)
     assert len(records) == 1

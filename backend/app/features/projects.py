@@ -8,6 +8,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
@@ -24,6 +25,7 @@ from backend.app.features.api_common import (
     save_idempotent_response,
 )
 from backend.app.features.auth import require_authenticated_session
+from backend.app.features.dashboards import build_project_operating_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -233,14 +235,15 @@ def create_projects_router(
     @router.get("/{project_code}/dashboard")
     def get_project_dashboard(
         _: None = authentication_dependency,
-        project_code: str = project_code_dependency,
+        project_code: str = structured_project_code_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         try:
             with transaction(connection):
-                project = _project_by_key(connection, project_code)
-                if project is None:
-                    raise _project_not_found()
+                project_row = _project_detail_row_by_key(connection, project_code)
+                if project_row is None:
+                    raise _resource_not_found("Project not found")
+                project = _row_response(project_row, _PROJECT_DETAIL_FIELDS)
                 company = _company_by_id(connection, int(project["company_id"]))
                 if company is None:
                     raise sqlite3.DatabaseError("project company is missing")
@@ -252,13 +255,19 @@ def create_projects_router(
                     connection,
                     str(project["project_code"]),
                 )
+                operating = build_project_operating_snapshot(
+                    connection,
+                    project,
+                    today=_business_date(now),
+                )
         except sqlite3.Error as exc:
-            raise _unexpected_database_failure(exc) from None
+            raise _unexpected_structured_database_failure(exc) from None
         return {
             "project": project,
             "company": company,
             "contacts": contacts,
             "documents": documents,
+            **operating,
         }
 
     @router.get("/{project_code}")
@@ -837,6 +846,13 @@ def _timestamp(clock: Clock) -> str:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _business_date(clock: Clock) -> str:
+    value = clock()
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("clock must return an aware datetime")
+    return value.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
 
 
 def _is_unique_constraint(failure: sqlite3.IntegrityError) -> bool:
