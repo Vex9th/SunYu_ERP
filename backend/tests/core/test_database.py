@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from backend.app.core import database
 from backend.app.core.database import connect_database, transaction
 
 
@@ -127,4 +128,51 @@ def test_nested_transaction_fails_without_committing_outer_transaction(
         assert observer.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 1
     finally:
         observer.close()
+        connection.close()
+
+
+def test_immediate_transaction_acquires_write_lock_before_first_write(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "erp.sqlite3"
+    connection = connect_database(database_path)
+    observer = connect_database(database_path)
+    try:
+        connection.execute("CREATE TABLE entries (value TEXT NOT NULL)")
+        observer.execute("PRAGMA busy_timeout=1")
+
+        with database.transaction_immediate(connection):
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                observer.execute("BEGIN IMMEDIATE")
+
+            connection.execute("INSERT INTO entries VALUES ('serialized')")
+            assert observer.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 0
+
+        assert observer.execute("SELECT value FROM entries").fetchone()[0] == (
+            "serialized"
+        )
+    finally:
+        if observer.in_transaction:
+            observer.rollback()
+        observer.close()
+        connection.close()
+
+
+def test_immediate_transaction_rolls_back_original_failure(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    failure = RuntimeError("inventory write failed")
+    try:
+        connection.execute("CREATE TABLE entries (value TEXT NOT NULL)")
+
+        with (
+            pytest.raises(RuntimeError) as raised,
+            database.transaction_immediate(connection),
+        ):
+            connection.execute("INSERT INTO entries VALUES ('discarded')")
+            raise failure
+
+        assert raised.value is failure
+        assert not connection.in_transaction
+        assert connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 0
+    finally:
         connection.close()

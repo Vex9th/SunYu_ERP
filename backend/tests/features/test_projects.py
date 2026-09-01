@@ -347,7 +347,11 @@ def test_unicode_equivalent_project_codes_conflict_and_resolve_same_project(
     assert duplicate.status_code == 409
     assert duplicate.json() == {"detail": "Project code already exists"}
     assert dashboard.status_code == 200
-    assert dashboard.json()["project"] == original
+    dashboard_project = dashboard.json()["project"]
+    assert {key: dashboard_project[key] for key in original} == original
+    assert dashboard_project["company_name"] == "示例公司"
+    assert dashboard_project["closure_type"] is None
+    assert dashboard_project["revision"] == 1
     assert archived.status_code == 200
     assert archived.json()["project_code"] == stored_code
     assert archived.json()["archive_reason"] == "等价编号归档"
@@ -526,6 +530,7 @@ def test_archive_normalizes_reason_and_is_case_insensitive(
             "/api/projects/project-a/archive",
             json={"reason": "  客户取消  "},
         )
+        detail = client.get("/api/projects/PROJECT-A")
 
     assert response.status_code == 200
     assert response.json() == {
@@ -535,6 +540,8 @@ def test_archive_normalizes_reason_and_is_case_insensitive(
         "archived_at": harness.clock.value.isoformat(),
         "updated_at": harness.clock.value.isoformat(),
     }
+    assert detail.status_code == 200
+    assert detail.json()["revision"] == 2
 
 
 def test_archive_is_idempotent_and_preserves_first_values(
@@ -619,11 +626,17 @@ def test_archive_and_dashboard_validate_project_code_without_echo(
         archived = client.post("/api/projects/CON/archive", json={"reason": None})
         dashboard = client.get("/api/projects/COM1/dashboard")
 
-    for response in (archived, dashboard):
-        assert response.status_code == 422
-        assert response.json() == {"detail": "Invalid project code"}
-        assert "CON" not in response.text
-        assert "COM1" not in response.text
+    assert archived.status_code == 422
+    assert archived.json() == {"detail": "Invalid project code"}
+    assert dashboard.status_code == 422
+    assert dashboard.json() == {
+        "detail": "Invalid project code",
+        "error_code": "VALIDATION_ERROR",
+        "field_errors": {},
+        "current_revision": None,
+    }
+    assert "CON" not in archived.text
+    assert "COM1" not in dashboard.text
 
 
 def test_missing_project_archive_and_dashboard_are_fixed_404(
@@ -636,9 +649,15 @@ def test_missing_project_archive_and_dashboard_are_fixed_404(
         )
         dashboard = client.get("/api/projects/MISSING/dashboard")
 
-    for response in (archived, dashboard):
-        assert response.status_code == 404
-        assert response.json() == {"detail": "Project not found"}
+    assert archived.status_code == 404
+    assert archived.json() == {"detail": "Project not found"}
+    assert dashboard.status_code == 404
+    assert dashboard.json() == {
+        "detail": "Project not found",
+        "error_code": "RESOURCE_NOT_FOUND",
+        "field_errors": {},
+        "current_revision": None,
+    }
 
 
 def test_dashboard_returns_real_company_contacts_and_document_counts(
@@ -720,8 +739,19 @@ def test_dashboard_returns_real_company_contacts_and_document_counts(
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"project", "company", "contacts", "documents"}
-    assert body["project"] == project
+    assert set(body) == {
+        "project",
+        "company",
+        "contacts",
+        "documents",
+        "stages",
+        "commercial",
+        "costs",
+        "profit",
+        "receivables",
+        "todos",
+    }
+    assert {key: body["project"][key] for key in project} == project
     assert set(body["company"]) == COMPANY_KEYS
     assert body["company"]["name"] == "示例公司"
     assert [contact["name"] for contact in body["contacts"]] == ["张三", "李四"]
@@ -745,8 +775,8 @@ def test_dashboard_returns_real_company_contacts_and_document_counts(
         harness.settings.session_secret,
     ):
         assert private_value not in serialized
-    for fabricated_field in ("profit", "cost", "progress", "todos", "quote"):
-        assert fabricated_field not in serialized
+    assert body["costs"]["total_cents"] == 0
+    assert body["profit"]["actual_profit_cents"] == 0
 
 
 def test_dashboard_without_documents_returns_zero_counts(
@@ -763,6 +793,410 @@ def test_dashboard_without_documents_returns_zero_counts(
         "version_count": 0,
         "categories": [],
     }
+
+
+def test_project_detail_update_and_revision_conflict(
+    harness: ProjectsHarness,
+) -> None:
+    first_company_id = _insert_company(harness, name="原客户")
+    second_company_id = _insert_company(harness, name="新客户")
+    with harness.client() as client:
+        _create_project(client, company_id=first_company_id)
+        detail = client.get("/api/projects/p-2026-001")
+        missing_company = client.put(
+            "/api/projects/P-2026-001",
+            json={
+                "company_id": 999,
+                "name": "不应保存",
+                "description": None,
+                "expected_revision": 1,
+            },
+        )
+        updated = client.put(
+            "/api/projects/P-2026-001",
+            json={
+                "company_id": second_company_id,
+                "name": "  新项目名称  ",
+                "description": "  新说明  ",
+                "expected_revision": 1,
+            },
+        )
+        stale = client.put(
+            "/api/projects/P-2026-001",
+            json={
+                "company_id": first_company_id,
+                "name": "过期修改",
+                "description": None,
+                "expected_revision": 1,
+            },
+        )
+
+    assert detail.status_code == 200
+    assert missing_company.status_code == 404
+    assert missing_company.json()["error_code"] == "RESOURCE_NOT_FOUND"
+    assert detail.json() == {
+        "id": 1,
+        "project_code": "P-2026-001",
+        "company_id": first_company_id,
+        "company_name": "原客户",
+        "name": "自动化改造项目",
+        "description": "产线升级",
+        "status": "active",
+        "closure_type": None,
+        "archive_reason": None,
+        "archived_at": None,
+        "revision": 1,
+        "created_at": NOW.isoformat(),
+        "updated_at": NOW.isoformat(),
+    }
+    assert updated.status_code == 200
+    assert updated.json() == {
+        **detail.json(),
+        "company_id": second_company_id,
+        "company_name": "新客户",
+        "name": "新项目名称",
+        "description": "新说明",
+        "revision": 2,
+    }
+    assert stale.status_code == 409
+    assert stale.json() == {
+        "detail": "Resource was modified",
+        "error_code": "REVISION_CONFLICT",
+        "field_errors": {},
+        "current_revision": 2,
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {
+            "company_id": 1,
+            "name": "项目",
+            "description": None,
+            "expected_revision": 1,
+            "unknown": "private",
+        },
+        {"company_id": 1, "name": "项目", "description": None},
+        {
+            "company_id": "1",
+            "name": "项目",
+            "description": None,
+            "expected_revision": 1,
+        },
+        {
+            "company_id": 1,
+            "name": "  ",
+            "description": None,
+            "expected_revision": 1,
+        },
+    ],
+)
+def test_update_project_rejects_non_strict_payload(
+    harness: ProjectsHarness,
+    payload: object,
+) -> None:
+    company_id = _insert_company(harness)
+    with harness.client() as client:
+        _create_project(client, company_id=company_id)
+        response = client.put("/api/projects/P-2026-001", json=payload)
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": "Invalid project payload",
+        "error_code": "VALIDATION_ERROR",
+        "field_errors": {},
+        "current_revision": None,
+    }
+    assert "private" not in response.text
+
+
+def test_close_project_is_idempotent_and_rejects_key_reuse(
+    harness: ProjectsHarness,
+) -> None:
+    company_id = _insert_company(harness)
+    headers = {"Idempotency-Key": "70000000-0000-4000-8000-000000000001"}
+    payload = {
+        "closure_type": "cancelled",
+        "reason": "客户未接受报价",
+        "expected_revision": 1,
+    }
+    with harness.client() as client:
+        _create_project(client, company_id=company_id)
+        closed = client.post(
+            "/api/projects/P-2026-001/close",
+            headers=headers,
+            json=payload,
+        )
+        replay = client.post(
+            "/api/projects/p-2026-001/close",
+            headers=headers,
+            json=payload,
+        )
+        reused = client.post(
+            "/api/projects/P-2026-001/close",
+            headers=headers,
+            json={**payload, "reason": "不同原因"},
+        )
+        second_close = client.post(
+            "/api/projects/P-2026-001/close",
+            headers={"Idempotency-Key": "70000000-0000-4000-8000-000000000002"},
+            json={**payload, "expected_revision": 2},
+        )
+        archived_update = client.put(
+            "/api/projects/P-2026-001",
+            json={
+                "company_id": company_id,
+                "name": "不应修改",
+                "description": None,
+                "expected_revision": 2,
+            },
+        )
+
+    assert closed.status_code == replay.status_code == 200
+    assert replay.json() == closed.json()
+    assert closed.json() == {
+        "id": 1,
+        "project_code": "P-2026-001",
+        "company_id": company_id,
+        "company_name": "示例公司",
+        "name": "自动化改造项目",
+        "description": "产线升级",
+        "status": "archived",
+        "closure_type": "cancelled",
+        "archive_reason": "客户未接受报价",
+        "archived_at": NOW.isoformat(),
+        "revision": 2,
+        "created_at": NOW.isoformat(),
+        "updated_at": NOW.isoformat(),
+    }
+    assert reused.status_code == 409
+    assert reused.json()["error_code"] == "IDEMPOTENCY_KEY_REUSED"
+    assert second_close.status_code == 409
+    assert second_close.json()["error_code"] == "PROJECT_ALREADY_CLOSED"
+    assert archived_update.status_code == 409
+    assert archived_update.json()["error_code"] == "PROJECT_ARCHIVED"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_status"),
+    [
+        ({"closure_type": "invalid", "reason": "原因", "expected_revision": 1}, 422),
+        ({"closure_type": "completed", "reason": "  ", "expected_revision": 1}, 422),
+        ({"closure_type": "completed", "reason": "原因", "expected_revision": 0}, 422),
+        ({"closure_type": "completed", "reason": "原因"}, 422),
+        (
+            {
+                "closure_type": "completed",
+                "reason": "原因",
+                "expected_revision": 1,
+                "unknown": "private",
+            },
+            422,
+        ),
+    ],
+)
+def test_close_project_rejects_invalid_payload(
+    harness: ProjectsHarness,
+    payload: dict[str, object],
+    expected_status: int,
+) -> None:
+    company_id = _insert_company(harness)
+    with harness.client() as client:
+        _create_project(client, company_id=company_id)
+        response = client.post(
+            "/api/projects/P-2026-001/close",
+            headers={"Idempotency-Key": "70000000-0000-4000-8000-000000000003"},
+            json=payload,
+        )
+
+    assert response.status_code == expected_status
+    assert "private" not in response.text
+
+
+def test_close_project_rejects_invalid_idempotency_key(
+    harness: ProjectsHarness,
+) -> None:
+    company_id = _insert_company(harness)
+    with harness.client() as client:
+        _create_project(client, company_id=company_id)
+        response = client.post(
+            "/api/projects/P-2026-001/close",
+            headers={"Idempotency-Key": "not-a-uuid"},
+            json={
+                "closure_type": "completed",
+                "reason": "正常完成",
+                "expected_revision": 1,
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "VALIDATION_ERROR"
+
+
+def test_close_project_requires_structured_idempotency_key_error(
+    harness: ProjectsHarness,
+) -> None:
+    company_id = _insert_company(harness)
+    with harness.client() as client:
+        _create_project(client, company_id=company_id)
+        response = client.post(
+            "/api/projects/P-2026-001/close",
+            json={
+                "closure_type": "completed",
+                "reason": "正常完成",
+                "expected_revision": 1,
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": "Invalid Idempotency-Key",
+        "error_code": "VALIDATION_ERROR",
+        "field_errors": {},
+        "current_revision": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("method", "suffix", "payload", "headers"),
+    [
+        ("get", "", None, None),
+        (
+            "put",
+            "",
+            {
+                "company_id": 1,
+                "name": "项目",
+                "description": None,
+                "expected_revision": 1,
+            },
+            None,
+        ),
+        (
+            "post",
+            "/close",
+            {
+                "closure_type": "completed",
+                "reason": "正常完成",
+                "expected_revision": 1,
+            },
+            {"Idempotency-Key": "70000000-0000-4000-8000-000000000006"},
+        ),
+    ],
+)
+def test_new_project_routes_use_structured_invalid_path_errors(
+    harness: ProjectsHarness,
+    method: str,
+    suffix: str,
+    payload: object,
+    headers: dict[str, str] | None,
+) -> None:
+    with harness.client() as client:
+        response = client.request(
+            method,
+            f"/api/projects/CON{suffix}",
+            json=payload,
+            headers=headers,
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": "Invalid project code",
+        "error_code": "VALIDATION_ERROR",
+        "field_errors": {},
+        "current_revision": None,
+    }
+
+
+def test_update_commit_failure_rolls_back_project_changes(tmp_path: Path) -> None:
+    setup = _build_harness(tmp_path)
+    original_company_id = _insert_company(setup, name="原客户")
+    replacement_company_id = _insert_company(setup, name="新客户")
+    with setup.client() as client:
+        _create_project(client, company_id=original_company_id)
+
+    harness = _build_harness(tmp_path, commit_failure=_missing_table_error())
+    with harness.client(raise_server_exceptions=False) as client:
+        response = client.put(
+            "/api/projects/P-2026-001",
+            json={
+                "company_id": replacement_company_id,
+                "name": "不应保存",
+                "description": "不应保存",
+                "expected_revision": 1,
+            },
+        )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "detail": "Project operation failed",
+        "error_code": "PROJECT_OPERATION_FAILED",
+        "field_errors": {},
+        "current_revision": None,
+    }
+    connection = connect_database(harness.database_path)
+    try:
+        row = connection.execute(
+            "SELECT company_id, name, description, revision FROM projects"
+        ).fetchone()
+        assert tuple(row) == (
+            original_company_id,
+            "自动化改造项目",
+            "产线升级",
+            1,
+        )
+    finally:
+        connection.close()
+
+
+def test_close_commit_failure_rolls_back_project_and_idempotency(
+    tmp_path: Path,
+) -> None:
+    setup = _build_harness(tmp_path)
+    company_id = _insert_company(setup)
+    with setup.client() as client:
+        _create_project(client, company_id=company_id)
+
+    harness = _build_harness(tmp_path, commit_failure=_missing_table_error())
+    with harness.client(raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/projects/P-2026-001/close",
+            headers={
+                "Idempotency-Key": "70000000-0000-4000-8000-000000000005"
+            },
+            json={
+                "closure_type": "cancelled",
+                "reason": "不应保存",
+                "expected_revision": 1,
+            },
+        )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "detail": "Project operation failed",
+        "error_code": "PROJECT_OPERATION_FAILED",
+        "field_errors": {},
+        "current_revision": None,
+    }
+    connection = connect_database(harness.database_path)
+    try:
+        project = connection.execute(
+            """
+            SELECT status, closure_type, archive_reason, archived_at, revision
+            FROM projects
+            """
+        ).fetchone()
+        assert tuple(project) == ("active", None, None, None, 1)
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM idempotency_requests"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        connection.close()
 
 
 def test_dashboard_uses_one_snapshot_for_totals_and_categories(
@@ -812,6 +1246,17 @@ def test_dashboard_uses_one_snapshot_for_totals_and_categories(
         ("post", "/api/projects", _project_payload()),
         ("post", "/api/projects/P-1/archive", {"reason": None}),
         ("get", "/api/projects/P-1/dashboard", None),
+        ("get", "/api/projects/P-1", None),
+        (
+            "put",
+            "/api/projects/P-1",
+            {
+                "company_id": 1,
+                "name": "项目",
+                "description": None,
+                "expected_revision": 1,
+            },
+        ),
     ],
 )
 def test_every_business_route_requires_authentication(
@@ -825,6 +1270,21 @@ def test_every_business_route_requires_authentication(
 
     assert response.status_code == 401
     assert response.json() == {"detail": "Authentication required"}
+
+
+def test_close_route_requires_authentication_before_reading_body(
+    harness: ProjectsHarness,
+) -> None:
+    with harness.client(authenticated=False) as client:
+        response = client.post(
+            "/api/projects/P-1/close",
+            headers={"Idempotency-Key": "70000000-0000-4000-8000-000000000004"},
+            content=b'{"private":',
+        )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Authentication required"}
+    assert "private" not in response.text
 
 
 @pytest.mark.parametrize(
@@ -982,7 +1442,7 @@ def test_commit_failure_rolls_back_and_logs_without_client_leak(
     ("path", "sql_prefix"),
     [
         ("/api/projects", "SELECT PROJECTS.ID,"),
-        ("/api/projects/P-1/dashboard", "SELECT ID, PROJECT_CODE,"),
+        ("/api/projects/P-1/dashboard", "SELECT PROJECTS.ID,"),
     ],
 )
 def test_unexpected_read_failure_logs_once_and_returns_fixed_500(
@@ -1001,7 +1461,15 @@ def test_unexpected_read_failure_logs_once_and_returns_fixed_500(
         response = client.get(path)
 
     assert response.status_code == 500
-    assert response.json() == {"detail": "Project operation failed"}
+    if path.endswith("/dashboard"):
+        assert response.json() == {
+            "detail": "Project operation failed",
+            "error_code": "PROJECT_OPERATION_FAILED",
+            "field_errors": {},
+            "current_revision": None,
+        }
+    else:
+        assert response.json() == {"detail": "Project operation failed"}
     assert "private_secret_table" not in response.text
     records = _project_error_records(caplog)
     assert len(records) == 1

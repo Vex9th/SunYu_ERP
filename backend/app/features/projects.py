@@ -1,20 +1,31 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
+from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from backend.app.core.config import Settings
-from backend.app.core.database import transaction
+from backend.app.core.database import transaction, transaction_immediate
 from backend.app.core.storage_paths import (
     normalize_project_code,
     project_code_identity,
 )
+from backend.app.features.api_common import (
+    ApiError,
+    ApiErrorRoute,
+    restore_idempotent_response,
+    save_idempotent_response,
+)
 from backend.app.features.auth import require_authenticated_session
+from backend.app.features.dashboards import build_project_operating_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +67,15 @@ _CONTACT_RESPONSE_FIELDS = (
 )
 _SQLITE_MAX_INTEGER = 2**63 - 1
 _PROJECT_STATUSES = frozenset({"active", "archived", "all"})
+_PROJECT_UPDATE_FIELDS = {"company_id", "name", "description", "expected_revision"}
+_PROJECT_CLOSE_FIELDS = {"closure_type", "reason", "expected_revision"}
+_CLOSURE_TYPES = frozenset({"cancelled", "completed"})
 
 Clock = Callable[[], datetime]
 ProjectPayload = dict[str, str | int | None]
 ArchivePayload = dict[str, str | None]
+ProjectUpdatePayload = dict[str, str | int | None]
+ProjectClosePayload = dict[str, str | int]
 
 
 def create_projects_router(
@@ -68,13 +84,18 @@ def create_projects_router(
     *,
     clock: Clock | None = None,
 ) -> APIRouter:
-    router = APIRouter(prefix="/api/projects", tags=["projects"])
+    router = APIRouter(
+        prefix="/api/projects",
+        tags=["projects"],
+        route_class=ApiErrorRoute,
+    )
     connection_dependency = Depends(get_connection)
     settings_dependency = Depends(get_settings)
     project_payload_dependency = Depends(_read_project_payload)
     archive_payload_dependency = Depends(_read_archive_payload)
     project_status_dependency = Depends(_read_project_status)
     project_code_dependency = Depends(_read_path_project_code)
+    structured_project_code_dependency = Depends(_read_structured_path_project_code)
     now = clock or _utc_now
 
     def require_session(
@@ -196,7 +217,7 @@ def create_projects_router(
                     """
                     UPDATE projects
                     SET status = 'archived', archive_reason = ?,
-                        archived_at = ?, updated_at = ?
+                        archived_at = ?, revision = revision + 1, updated_at = ?
                     WHERE project_code_key = ?
                       AND status = 'active'
                     """,
@@ -214,14 +235,15 @@ def create_projects_router(
     @router.get("/{project_code}/dashboard")
     def get_project_dashboard(
         _: None = authentication_dependency,
-        project_code: str = project_code_dependency,
+        project_code: str = structured_project_code_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         try:
             with transaction(connection):
-                project = _project_by_key(connection, project_code)
-                if project is None:
-                    raise _project_not_found()
+                project_row = _project_detail_row_by_key(connection, project_code)
+                if project_row is None:
+                    raise _resource_not_found("Project not found")
+                project = _row_response(project_row, _PROJECT_DETAIL_FIELDS)
                 company = _company_by_id(connection, int(project["company_id"]))
                 if company is None:
                     raise sqlite3.DatabaseError("project company is missing")
@@ -233,14 +255,145 @@ def create_projects_router(
                     connection,
                     str(project["project_code"]),
                 )
+                operating = build_project_operating_snapshot(
+                    connection,
+                    project,
+                    today=_business_date(now),
+                )
         except sqlite3.Error as exc:
-            raise _unexpected_database_failure(exc) from None
+            raise _unexpected_structured_database_failure(exc) from None
         return {
             "project": project,
             "company": company,
             "contacts": contacts,
             "documents": documents,
+            **operating,
         }
+
+    @router.get("/{project_code}")
+    def get_project_detail(
+        _: None = authentication_dependency,
+        project_code: str = structured_project_code_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        try:
+            response = _project_detail_by_key(connection, project_code)
+        except sqlite3.Error as exc:
+            raise _unexpected_structured_database_failure(exc) from None
+        if response is None:
+            raise _resource_not_found("Project not found")
+        return response
+
+    @router.put("/{project_code}")
+    async def update_project(
+        request: Request,
+        _: None = authentication_dependency,
+        project_code: str = structured_project_code_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        payload = await _read_project_update_payload(request)
+        timestamp = _timestamp(now)
+        try:
+            with transaction_immediate(connection):
+                current = _project_detail_row_by_key(connection, project_code)
+                if current is None:
+                    raise _resource_not_found("Project not found")
+                if current["status"] != "active":
+                    raise _business_conflict("Project is archived", "PROJECT_ARCHIVED")
+                _require_revision(current, int(payload["expected_revision"]))
+                company = connection.execute(
+                    "SELECT 1 FROM companies WHERE id = ?",
+                    (payload["company_id"],),
+                ).fetchone()
+                if company is None:
+                    raise _resource_not_found("Company not found")
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET company_id = ?, name = ?, description = ?,
+                        revision = revision + 1, updated_at = ?
+                    WHERE project_code_key = ? AND revision = ?
+                    """,
+                    (
+                        payload["company_id"],
+                        payload["name"],
+                        payload["description"],
+                        timestamp,
+                        project_code,
+                        payload["expected_revision"],
+                    ),
+                )
+                response = _project_detail_by_key(connection, project_code)
+                if response is None:
+                    raise sqlite3.DatabaseError("updated project is missing")
+                return response
+        except sqlite3.Error as exc:
+            raise _unexpected_structured_database_failure(exc) from None
+
+    @router.post("/{project_code}/close")
+    async def close_project(
+        request: Request,
+        _: None = authentication_dependency,
+        project_code: str = structured_project_code_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        key = _read_idempotency_key(request)
+        payload = await _read_project_close_payload(request)
+        request_hash = _request_hash(payload)
+        scope = f"POST:/api/projects/{project_code}/close"
+        timestamp = _timestamp(now)
+        try:
+            with transaction_immediate(connection):
+                restored = restore_idempotent_response(
+                    connection,
+                    scope=scope,
+                    key=key,
+                    request_hash=request_hash,
+                )
+                if restored is not None:
+                    return restored
+                current = _project_detail_row_by_key(connection, project_code)
+                if current is None:
+                    raise _resource_not_found("Project not found")
+                if current["status"] != "active":
+                    raise _business_conflict(
+                        "Project is already closed",
+                        "PROJECT_ALREADY_CLOSED",
+                    )
+                _require_revision(current, int(payload["expected_revision"]))
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET status = 'archived', closure_type = ?, archive_reason = ?,
+                        archived_at = ?, revision = revision + 1, updated_at = ?
+                    WHERE project_code_key = ? AND revision = ?
+                    """,
+                    (
+                        payload["closure_type"],
+                        payload["reason"],
+                        timestamp,
+                        timestamp,
+                        project_code,
+                        payload["expected_revision"],
+                    ),
+                )
+                response = _project_detail_by_key(connection, project_code)
+                if response is None:
+                    raise sqlite3.DatabaseError("closed project is missing")
+                save_idempotent_response(
+                    connection,
+                    scope=scope,
+                    key=key,
+                    request_hash=request_hash,
+                    response=response,
+                    response_status=status.HTTP_200_OK,
+                    resource_type="project",
+                    resource_id=int(current["id"]),
+                    created_at=timestamp,
+                )
+                return response
+        except sqlite3.Error as exc:
+            raise _unexpected_structured_database_failure(exc) from None
 
     return router
 
@@ -307,6 +460,72 @@ async def _read_archive_payload(request: Request) -> ArchivePayload:
     }
 
 
+async def _read_project_update_payload(request: Request) -> ProjectUpdatePayload:
+    payload = await _read_json_object(request, "Invalid project payload")
+    if set(payload) != _PROJECT_UPDATE_FIELDS:
+        raise _invalid_structured_payload("Invalid project payload")
+    company_id = _positive_integer(
+        payload["company_id"],
+        "Invalid project payload",
+    )
+    name = _normalize_structured_text(
+        payload["name"],
+        required=True,
+        detail="Invalid project payload",
+    )
+    raw_description = payload["description"]
+    description = (
+        None
+        if raw_description is None
+        else _normalize_structured_text(
+            raw_description,
+            required=False,
+            detail="Invalid project payload",
+        )
+    )
+    return {
+        "company_id": company_id,
+        "name": name,
+        "description": description,
+        "expected_revision": _positive_integer(
+            payload["expected_revision"],
+            "Invalid project payload",
+        ),
+    }
+
+
+async def _read_project_close_payload(request: Request) -> ProjectClosePayload:
+    payload = await _read_json_object(request, "Invalid project close payload")
+    if set(payload) != _PROJECT_CLOSE_FIELDS:
+        raise _invalid_structured_payload("Invalid project close payload")
+    closure_type = payload["closure_type"]
+    if not isinstance(closure_type, str) or closure_type not in _CLOSURE_TYPES:
+        raise _invalid_structured_payload("Invalid project close payload")
+    reason = _normalize_structured_text(
+        payload["reason"],
+        required=True,
+        detail="Invalid project close payload",
+    )
+    return {
+        "closure_type": closure_type,
+        "reason": reason,
+        "expected_revision": _positive_integer(
+            payload["expected_revision"],
+            "Invalid project close payload",
+        ),
+    }
+
+
+async def _read_json_object(request: Request, detail: str) -> dict[str, object]:
+    try:
+        payload: Any = await request.json()
+    except (RecursionError, UnicodeError, ValueError):
+        raise _invalid_structured_payload(detail) from None
+    if not isinstance(payload, dict):
+        raise _invalid_structured_payload(detail)
+    return payload
+
+
 def _read_project_status(request: Request) -> str:
     values = request.query_params.getlist("status")
     if not values:
@@ -322,6 +541,13 @@ def _read_project_status(request: Request) -> str:
 def _read_path_project_code(project_code: str) -> str:
     normalized = _normalize_project_code(project_code, detail="Invalid project code")
     return project_code_identity(normalized)
+
+
+def _read_structured_path_project_code(project_code: str) -> str:
+    try:
+        return _read_path_project_code(project_code)
+    except HTTPException:
+        raise _invalid_structured_payload("Invalid project code") from None
 
 
 def _normalize_project_code(value: object, *, detail: str) -> str:
@@ -353,6 +579,72 @@ def _normalize_text(
     except UnicodeEncodeError:
         raise _invalid_payload(detail) from None
     return normalized
+
+
+def _normalize_structured_text(
+    value: object,
+    *,
+    required: bool,
+    detail: str,
+) -> str | None:
+    try:
+        normalized = _normalize_text(value, required=required, detail=detail)
+    except HTTPException:
+        raise _invalid_structured_payload(detail) from None
+    return normalized
+
+
+def _positive_integer(value: object, detail: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= _SQLITE_MAX_INTEGER
+    ):
+        raise _invalid_structured_payload(detail)
+    return value
+
+
+def _validate_idempotency_key(value: str) -> str:
+    try:
+        parsed = UUID(value)
+    except (AttributeError, ValueError):
+        raise _invalid_structured_payload("Invalid Idempotency-Key") from None
+    canonical = str(parsed)
+    if value.lower() != canonical:
+        raise _invalid_structured_payload("Invalid Idempotency-Key")
+    return canonical
+
+
+def _read_idempotency_key(request: Request) -> str:
+    values = request.headers.getlist("Idempotency-Key")
+    if len(values) != 1:
+        raise _invalid_structured_payload("Invalid Idempotency-Key")
+    return _validate_idempotency_key(values[0])
+
+
+def _request_hash(payload: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
+def _require_revision(row: sqlite3.Row, expected_revision: int) -> None:
+    if row["revision"] != expected_revision:
+        raise ApiError(
+            status.HTTP_409_CONFLICT,
+            "Resource was modified",
+            "REVISION_CONFLICT",
+            current_revision=int(row["revision"]),
+            headers={
+                "X-Error-Code": "REVISION_CONFLICT",
+                "X-Current-Revision": str(row["revision"]),
+            },
+        )
 
 
 def _project_by_id(
@@ -391,6 +683,61 @@ def _project_by_key(
     if row is None:
         return None
     return _row_response(row, _PROJECT_RESPONSE_FIELDS)
+
+
+_PROJECT_DETAIL_FIELDS = (
+    "id",
+    "project_code",
+    "company_id",
+    "company_name",
+    "name",
+    "description",
+    "status",
+    "closure_type",
+    "archive_reason",
+    "archived_at",
+    "revision",
+    "created_at",
+    "updated_at",
+)
+
+
+def _project_detail_row_by_key(
+    connection: sqlite3.Connection,
+    project_code_key: str,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT
+            projects.id,
+            projects.project_code,
+            projects.company_id,
+            companies.name AS company_name,
+            projects.name,
+            projects.description,
+            projects.status,
+            projects.closure_type,
+            projects.archive_reason,
+            projects.archived_at,
+            projects.revision,
+            projects.created_at,
+            projects.updated_at
+        FROM projects
+        JOIN companies ON companies.id = projects.company_id
+        WHERE projects.project_code_key = ?
+        """,
+        (project_code_key,),
+    ).fetchone()
+
+
+def _project_detail_by_key(
+    connection: sqlite3.Connection,
+    project_code_key: str,
+) -> dict[str, object] | None:
+    row = _project_detail_row_by_key(connection, project_code_key)
+    if row is None:
+        return None
+    return _row_response(row, _PROJECT_DETAIL_FIELDS)
 
 
 def _company_by_id(
@@ -501,6 +848,13 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _business_date(clock: Clock) -> str:
+    value = clock()
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("clock must return an aware datetime")
+    return value.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
+
+
 def _is_unique_constraint(failure: sqlite3.IntegrityError) -> bool:
     return (
         getattr(failure, "sqlite_errorcode", None) == sqlite3.SQLITE_CONSTRAINT_UNIQUE
@@ -526,6 +880,31 @@ def _invalid_payload(detail: str) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         detail=detail,
+    )
+
+
+def _invalid_structured_payload(detail: str) -> ApiError:
+    return ApiError(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail,
+        "VALIDATION_ERROR",
+    )
+
+
+def _resource_not_found(detail: str) -> ApiError:
+    return ApiError(
+        status.HTTP_404_NOT_FOUND,
+        detail,
+        "RESOURCE_NOT_FOUND",
+    )
+
+
+def _business_conflict(detail: str, error_code: str) -> ApiError:
+    return ApiError(
+        status.HTTP_409_CONFLICT,
+        detail,
+        error_code,
+        headers={"X-Error-Code": error_code},
     )
 
 
@@ -558,9 +937,22 @@ def _operation_failed() -> HTTPException:
 
 
 def _unexpected_database_failure(failure: sqlite3.Error) -> HTTPException:
+    _log_database_failure(failure)
+    return _operation_failed()
+
+
+def _unexpected_structured_database_failure(failure: sqlite3.Error) -> ApiError:
+    _log_database_failure(failure)
+    return ApiError(
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+        "Project operation failed",
+        "PROJECT_OPERATION_FAILED",
+    )
+
+
+def _log_database_failure(failure: sqlite3.Error) -> None:
     logger.exception(
         "Project database operation failed (sqlite_errorcode=%s, sqlite_errorname=%s)",
         getattr(failure, "sqlite_errorcode", None),
         getattr(failure, "sqlite_errorname", None),
     )
-    return _operation_failed()

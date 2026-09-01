@@ -28,6 +28,15 @@ def business_schema(tmp_path: Path) -> Iterator[sqlite3.Connection]:
             "002_documents",
             "003_companies_projects",
             "004_project_code_identity",
+            "005_project_workflow_documents",
+            "006_commercial_finance",
+            "007_dashboard_indexes",
+            "008_procurement_inventory",
+            "009_workforce_delivery",
+            "010_site_report_events",
+            "011_procurement_audit",
+            "012_delivery_events",
+            "013_workforce_events",
         ]
         yield connection
     finally:
@@ -136,6 +145,8 @@ def test_business_migration_creates_exact_columns(
             ("archived_at", "TEXT", 0, None, 0),
             ("created_at", "TEXT", 1, None, 0),
             ("updated_at", "TEXT", 1, None, 0),
+            ("closure_type", "TEXT", 0, None, 0),
+            ("revision", "INTEGER", 1, "1", 0),
         ],
     }
     for table, expected in expected_columns.items():

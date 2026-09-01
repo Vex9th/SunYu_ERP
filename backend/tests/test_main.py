@@ -64,6 +64,25 @@ def test_create_app_defers_config_and_database_writes_until_lifespan(
     assert (tmp_path / "Data" / "iapm.sqlite").is_file()
 
 
+def test_lifespan_cleans_stale_document_stage_before_serving_requests(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    temp_dir = tmp_path / "Data" / "Temp"
+    temp_dir.mkdir(parents=True)
+    stale = temp_dir / ".upload-crashed.tmp"
+    unrelated = temp_dir / "keep-me.txt"
+    stale.write_bytes(b"stale-upload")
+    unrelated.write_bytes(b"unrelated")
+    application = main_module.create_app(config_path=config_path)
+
+    with TestClient(application) as client:
+        assert client.get("/api/health").status_code == 200
+        assert not stale.exists()
+        assert unrelated.read_bytes() == b"unrelated"
+
+
 def test_create_app_only_serves_frontend_when_dist_is_explicit(
     tmp_path: Path,
 ) -> None:
@@ -76,6 +95,67 @@ def test_create_app_only_serves_frontend_when_dist_is_explicit(
     with TestClient(application) as client:
         assert client.get("/").status_code == 404
         assert client.get("/api/health").json() == {"status": "ok"}
+
+
+def test_create_app_registers_first_business_vertical_slice_routes() -> None:
+    application = main_module.create_app()
+    paths = application.openapi()["paths"]
+
+    expected_paths = {
+        "/api/projects/{project_code}/stages",
+        "/api/projects/{project_code}/stages/{stage_code}",
+        "/api/projects/{project_code}/stages/{stage_code}/transition",
+        "/api/procurement/import-template.xlsx",
+        "/api/projects/{project_code}/procurement-lists",
+        "/api/projects/{project_code}/purchase-orders",
+        "/api/projects/{project_code}/procurement-overview",
+        "/api/projects/{project_code}/procurement-imports/preview",
+        "/api/projects/{project_code}/procurement-imports/{import_id}/confirm",
+        "/api/projects/{project_code}/purchase-orders/{order_id}/supplier-payments",
+        "/api/projects/{project_code}/purchase-orders/{order_id}/supplier-invoices",
+        "/api/projects/{project_code}/goods-receipts/{receipt_id}/reverse",
+        "/api/projects/{project_code}/procurement-lists/{list_id}/quote-exports",
+        "/api/projects/{project_code}/quote-exports/{export_id}/download",
+        "/api/inventory/items",
+        "/api/inventory/adjustments",
+        "/api/projects/{project_code}/inventory-issues",
+        "/api/workers",
+        "/api/workers/{worker_id}",
+        "/api/projects/{project_code}/crew-assignments",
+        "/api/projects/{project_code}/labor-entries",
+        "/api/projects/{project_code}/labor-entries/batch",
+        "/api/projects/{project_code}/site-daily-reports",
+        "/api/projects/{project_code}/site-daily-reports/{work_date}",
+        "/api/projects/{project_code}/site-daily-reports/{work_date}/confirm",
+        "/api/projects/{project_code}/site-daily-reports/{work_date}/reopen",
+        "/api/projects/{project_code}/material-advances",
+        "/api/projects/{project_code}/material-advances/{advance_id}",
+        "/api/projects/{project_code}/material-advances/{advance_id}/reimbursements",
+        "/api/projects/{project_code}/material-advances/{advance_id}/void",
+        "/api/projects/{project_code}/documents",
+        "/api/projects/{project_code}/quotes",
+        "/api/projects/{project_code}/quotes/{quote_id}",
+        "/api/projects/{project_code}/quotes/{quote_id}/transition",
+        "/api/projects/{project_code}/contracts",
+        "/api/projects/{project_code}/contracts/{contract_id}",
+        "/api/projects/{project_code}/contracts/{contract_id}/transition",
+        "/api/projects/{project_code}/payments",
+        "/api/projects/{project_code}/payment-terms/{milestone}",
+        "/api/projects/{project_code}/receipts",
+        "/api/projects/{project_code}/receipts/{receipt_id}",
+        "/api/projects/{project_code}/receipts/{receipt_id}/void",
+        "/api/dashboard",
+        "/api/projects/{project_code}/drawing-signoffs",
+        "/api/projects/{project_code}/commissioning-sessions",
+        "/api/projects/{project_code}/engineering-changes",
+        "/api/projects/{project_code}/acceptances",
+        "/api/projects/{project_code}/warranty",
+        "/api/projects/{project_code}/invoices",
+        "/api/projects/{project_code}/after-sales",
+        "/api/projects/{project_code}/delivery-summary",
+    }
+
+    assert expected_paths <= paths.keys()
 
 
 def test_create_app_serves_release_home_assets_and_keeps_api_priority(
@@ -211,6 +291,15 @@ def test_lifespan_applies_migrations_and_closes_every_owned_connection(
         "002_documents",
         "003_companies_projects",
         "004_project_code_identity",
+        "005_project_workflow_documents",
+        "006_commercial_finance",
+        "007_dashboard_indexes",
+        "008_procurement_inventory",
+        "009_workforce_delivery",
+        "010_site_report_events",
+        "011_procurement_audit",
+        "012_delivery_events",
+        "013_workforce_events",
     }
 
 

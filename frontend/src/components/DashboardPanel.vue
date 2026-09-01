@@ -1,10 +1,13 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, reactive, ref, watch } from 'vue'
 
 import type { BackupSettingsPayload, SystemOverview } from '../types'
 import CompanyCenter from './CompanyCenter.vue'
+import HomeWorkbench from './HomeWorkbench.vue'
 import ProjectCenter from './ProjectCenter.vue'
 import ProjectDashboard from './ProjectDashboard.vue'
+
+const InventoryCenter = defineAsyncComponent(() => import('./inventory/InventoryCenter.vue'))
 
 const props = defineProps<{
   overview: SystemOverview | null
@@ -26,10 +29,17 @@ const emit = defineEmits<{
   'session-expired': [message: string]
 }>()
 
-type WorkspacePage = 'projects' | 'companies' | 'system'
+type WorkspacePage =
+  | 'overview'
+  | 'projects'
+  | 'companies'
+  | 'inventory'
+  | 'system'
 
-const selectedPage = ref<WorkspacePage>('projects')
+const selectedPage = ref<WorkspacePage>('overview')
 const dashboardProjectCode = ref<string | null>(null)
+
+const workspacePages: WorkspacePage[] = ['overview', 'projects', 'companies', 'inventory', 'system']
 
 const backupForm = reactive({
   enabled: false,
@@ -100,9 +110,13 @@ function saveBackup(): void {
 }
 
 function selectPage(index: string): void {
-  if (index !== 'projects' && index !== 'companies' && index !== 'system') return
-  selectedPage.value = index
+  if (!workspacePages.includes(index as WorkspacePage)) return
+  selectedPage.value = index as WorkspacePage
   dashboardProjectCode.value = null
+}
+
+function navigate(page: 'projects' | 'companies' | 'system'): void {
+  selectPage(page)
 }
 
 function openProjectDashboard(projectCode: string): void {
@@ -112,43 +126,57 @@ function openProjectDashboard(projectCode: string): void {
 </script>
 
 <template>
-  <el-container data-testid="dashboard" direction="vertical">
-    <el-header>
-      <el-row justify="space-between" align="middle" :gutter="12">
-        <el-col :xs="24" :sm="16">
-          <el-space>
-            <el-tag type="warning" effect="dark">SY</el-tag>
-            <el-text tag="strong" size="large">SunYu ERP · 经营工作台</el-text>
-          </el-space>
-        </el-col>
-        <el-col :xs="24" :sm="8">
-          <el-row justify="end">
-            <el-button
-              data-testid="logout"
-              :loading="logoutBusy"
-              :disabled="logoutBusy || backupBusy || saveBusy"
-              @click="emit('logout')"
-            >
-              退出登录
-            </el-button>
-          </el-row>
-        </el-col>
-      </el-row>
-    </el-header>
+  <el-container data-testid="dashboard" class="workspace-shell">
+    <el-aside data-testid="nav-column" class="workspace-aside" width="216px">
+      <div class="brand-block">
+        <div class="brand-mark">SY</div>
+        <div>
+          <div class="brand-name">SunYu ERP</div>
+          <div class="brand-caption">工业项目工作台</div>
+        </div>
+      </div>
 
-    <el-row :gutter="16">
-      <el-col data-testid="nav-column" :xs="24" :sm="6" :lg="4">
-        <el-menu :default-active="selectedPage" @select="selectPage">
-          <el-menu-item data-testid="nav-projects" index="projects">项目中心</el-menu-item>
-          <el-menu-item data-testid="nav-companies" index="companies">客户与联系人</el-menu-item>
-          <el-menu-item data-testid="nav-system" index="system">系统与备份</el-menu-item>
-          <el-menu-item index="inventory" disabled>库存</el-menu-item>
-          <el-menu-item index="purchasing" disabled>采购</el-menu-item>
-        </el-menu>
-      </el-col>
+      <el-menu
+        :default-active="selectedPage"
+        class="workspace-menu"
+        background-color="transparent"
+        text-color="#aeb9c8"
+        active-text-color="#ffffff"
+        @select="selectPage"
+      >
+        <el-menu-item data-testid="nav-overview" index="overview">总览</el-menu-item>
+        <el-menu-item data-testid="nav-projects" index="projects">项目</el-menu-item>
+        <el-menu-item data-testid="nav-companies" index="companies">联系人</el-menu-item>
+        <el-menu-item v-if="InventoryCenter" data-testid="nav-inventory" index="inventory">库存</el-menu-item>
+        <el-menu-item data-testid="nav-system" index="system">设置</el-menu-item>
+      </el-menu>
 
-      <el-col data-testid="content-column" :xs="24" :sm="18" :lg="20">
-        <el-main>
+      <div class="aside-status">
+        <span class="status-dot" :class="{ 'status-dot--warning': !overview?.scheduler.alive }" />
+        <div>
+          <strong>{{ overview?.scheduler.alive ? '本地服务正常' : '系统状态待检查' }}</strong>
+          <small>数据保存在当前主机</small>
+        </div>
+      </div>
+    </el-aside>
+
+    <el-container class="workspace-main">
+      <el-header class="workspace-topbar">
+        <el-tag :type="overview?.scheduler.alive ? 'success' : 'warning'" effect="plain">
+          {{ overview?.scheduler.alive ? '本地服务正常' : '系统状态待检查' }}
+        </el-tag>
+        <el-button
+          data-testid="logout"
+          plain
+          :loading="logoutBusy"
+          :disabled="logoutBusy || backupBusy || saveBusy"
+          @click="emit('logout')"
+        >
+          退出登录
+        </el-button>
+      </el-header>
+
+      <el-main data-testid="content-column" class="workspace-content">
         <el-alert
           v-if="requestError"
           data-testid="request-error"
@@ -156,6 +184,12 @@ function openProjectDashboard(projectCode: string): void {
           type="error"
           show-icon
           :closable="false"
+        />
+        <HomeWorkbench
+          v-if="selectedPage === 'overview' && !dashboardProjectCode"
+          @navigate="navigate"
+          @open-project="openProjectDashboard"
+          @session-expired="emit('session-expired', $event)"
         />
         <ProjectDashboard
           v-if="dashboardProjectCode"
@@ -173,13 +207,34 @@ function openProjectDashboard(projectCode: string): void {
           v-if="selectedPage === 'companies'"
           @session-expired="emit('session-expired', $event)"
         />
+        <InventoryCenter
+          v-if="InventoryCenter && selectedPage === 'inventory'"
+        />
         <el-space
           v-show="selectedPage === 'system' && !dashboardProjectCode"
+          class="page-stack system-settings"
           direction="vertical"
           alignment="stretch"
           fill
           :size="16"
         >
+          <section class="page-heading">
+            <div>
+              <h1>系统设置</h1>
+              <p>本地数据与备份。</p>
+            </div>
+            <el-button
+              v-if="overview"
+              data-testid="backup-now"
+              type="primary"
+              size="large"
+              :loading="backupBusy"
+              :disabled="backupBusy || saveBusy || !overview.backup.enabled"
+              @click="emit('backupNow')"
+            >
+              立即备份
+            </el-button>
+          </section>
           <el-alert
             v-if="systemRequestError"
             data-testid="system-request-error"
@@ -255,15 +310,9 @@ function openProjectDashboard(projectCode: string): void {
                 <template #header>
                   <el-row justify="space-between" align="middle">
                     <el-text tag="strong">备份状态</el-text>
-                    <el-button
-                      data-testid="backup-now"
-                      type="primary"
-                      :loading="backupBusy"
-                      :disabled="backupBusy || saveBusy || !overview?.backup.enabled"
-                      @click="emit('backupNow')"
-                    >
-                      立即备份
-                    </el-button>
+                    <el-tag :type="overview.backup.enabled ? 'success' : 'info'">
+                      {{ overview.backup.enabled ? '策略有效' : '尚未启用' }}
+                    </el-tag>
                   </el-row>
                 </template>
                 <el-descriptions :column="1" border>
@@ -386,8 +435,20 @@ function openProjectDashboard(projectCode: string): void {
           </el-card>
           </template>
         </el-space>
-        </el-main>
-      </el-col>
-    </el-row>
+      </el-main>
+    </el-container>
   </el-container>
 </template>
+
+<style scoped>
+.system-settings,
+.system-settings > :deep(.el-space__item),
+.system-settings :deep(.el-card) { width: 100%; min-width: 0 !important; max-width: 100%; }
+.system-settings :deep(.el-descriptions__table) { width: 100%; table-layout: fixed; }
+.system-settings :deep(.el-descriptions__label) { width: 132px; }
+.system-settings :deep(.el-descriptions__content),
+.system-settings :deep(.el-text) { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+@media (max-width: 520px) {
+  .system-settings :deep(.el-descriptions__label) { width: 92px; }
+}
+</style>

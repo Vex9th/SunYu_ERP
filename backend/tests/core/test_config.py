@@ -34,6 +34,7 @@ def test_settings_has_only_the_declared_frozen_fields(tmp_path: Path) -> None:
         "host",
         "port",
         "session_secret",
+        "max_document_upload_mb",
     ]
     with pytest.raises(FrozenInstanceError):
         settings.port = 9000  # type: ignore[misc]
@@ -54,6 +55,7 @@ def test_missing_config_uses_relative_data_default_and_persists_secret(
     assert first.backup_retention_days == 30
     assert first.host == "0.0.0.0"
     assert first.port == 8765
+    assert first.max_document_upload_mb == 4096
     assert len(first.session_secret) >= 32
     assert second.session_secret == first.session_secret
     assert config_path.is_file()
@@ -272,6 +274,35 @@ def test_configured_backup_periods_are_loaded(tmp_path: Path) -> None:
 
     assert settings.backup_interval_hours == 12
     assert settings.backup_retention_days == 90
+
+
+def test_document_upload_limit_is_configurable_and_strict(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    write_config(
+        config_path,
+        max_document_upload_mb=512,
+        session_secret="test-secret",
+    )
+
+    assert load_settings(config_path).max_document_upload_mb == 512
+
+    for invalid in (False, 1.5, "512"):
+        write_config(
+            config_path,
+            max_document_upload_mb=invalid,
+            session_secret="test-secret",
+        )
+        with pytest.raises(TypeError, match="max_document_upload_mb"):
+            load_settings(config_path)
+
+    for invalid in (0, 16385):
+        write_config(
+            config_path,
+            max_document_upload_mb=invalid,
+            session_secret="test-secret",
+        )
+        with pytest.raises(ValueError, match="max_document_upload_mb"):
+            load_settings(config_path)
 
 
 def test_backup_settings_update_is_atomic_and_preserves_runtime_keys(

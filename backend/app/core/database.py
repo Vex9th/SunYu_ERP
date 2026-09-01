@@ -29,10 +29,27 @@ def connect_database(database_path: str | Path) -> sqlite3.Connection:
 
 @contextmanager
 def transaction(connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    with _transaction(connection, "BEGIN") as active_connection:
+        yield active_connection
+
+
+@contextmanager
+def transaction_immediate(
+    connection: sqlite3.Connection,
+) -> Iterator[sqlite3.Connection]:
+    with _transaction(connection, "BEGIN IMMEDIATE") as active_connection:
+        yield active_connection
+
+
+@contextmanager
+def _transaction(
+    connection: sqlite3.Connection,
+    begin_statement: str,
+) -> Iterator[sqlite3.Connection]:
     if connection.in_transaction:
         raise RuntimeError("Nested transactions are not supported")
 
-    connection.execute("BEGIN")
+    connection.execute(begin_statement)
     try:
         yield connection
         connection.commit()

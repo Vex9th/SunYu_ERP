@@ -1,7 +1,12 @@
-interface RequestOptions {
+export interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
+  headers?: HeadersInit
   body?: unknown
 }
+
+import type { ApiErrorPayload } from './domain/contracts'
+
+export type { ApiErrorPayload } from './domain/contracts'
 
 const knownErrorMessages: Record<string, string> = {
   'Authentication required': '登录状态已失效，请重新登录',
@@ -32,10 +37,17 @@ const knownErrorMessages: Record<string, string> = {
   'Project operation failed': '项目操作失败',
 }
 
+const knownErrorCodeMessages: Record<string, string> = {
+  REVISION_CONFLICT: '数据已被其他操作修改，请刷新后重试',
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly errorCode?: string,
+    readonly fieldErrors?: unknown,
+    readonly currentRevision?: number,
   ) {
     super(message)
     this.name = 'ApiError'
@@ -48,10 +60,16 @@ async function sendRequest(path: string, options: RequestOptions = {}): Promise<
     credentials: 'same-origin',
   }
 
+  const headers = normalizeHeaders(options.headers)
   if (options.body !== undefined) {
-    init.headers = { 'Content-Type': 'application/json' }
-    init.body = JSON.stringify(options.body)
+    if (options.body instanceof FormData || options.body instanceof Blob) {
+      init.body = options.body
+    } else {
+      if (!hasHeader(headers, 'Content-Type')) headers['Content-Type'] = 'application/json'
+      init.body = JSON.stringify(options.body)
+    }
   }
+  if (Object.keys(headers).length > 0) init.headers = headers
 
   let response: Response
   try {
@@ -75,7 +93,17 @@ async function responseError(response: Response): Promise<ApiError> {
       'detail' in payload &&
       typeof payload.detail === 'string'
     ) {
-      return new ApiError(knownErrorMessages[payload.detail] ?? payload.detail, response.status)
+      const structured = payload as Partial<ApiErrorPayload>
+      const errorCode = typeof structured.error_code === 'string' ? structured.error_code : undefined
+      return new ApiError(
+        (errorCode ? knownErrorCodeMessages[errorCode] : undefined)
+          ?? knownErrorMessages[payload.detail]
+          ?? payload.detail,
+        response.status,
+        errorCode,
+        structured.field_errors,
+        typeof structured.current_revision === 'number' ? structured.current_revision : undefined,
+      )
     }
   } catch {
     // FastAPI 之外的代理错误没有 JSON detail，统一使用状态码提示。
@@ -88,6 +116,7 @@ export async function requestJson<T>(
   options: RequestOptions = {},
 ): Promise<T> {
   const response = await sendRequest(path, options)
+  if (response.status === 204) return undefined as T
   return (await response.json()) as T
 }
 
@@ -96,4 +125,202 @@ export async function requestVoid(
   options: RequestOptions = {},
 ): Promise<void> {
   await sendRequest(path, options)
+}
+
+function requestPlannedPostJson<T>(
+  path: string,
+  body: unknown,
+  idempotencyKey: string,
+): Promise<T> {
+  return requestJson<T>(path, {
+    method: 'POST',
+    headers: { 'Idempotency-Key': idempotencyKey },
+    body,
+  })
+}
+
+export interface PlannedPostRequest<T> {
+  readonly idempotencyKey: string
+  send(): Promise<T>
+}
+
+export function createPlannedPostRequest<T>(
+  path: string,
+  body: unknown,
+  idempotencyKey = crypto.randomUUID(),
+): PlannedPostRequest<T> {
+  return {
+    idempotencyKey,
+    send: () => requestPlannedPostJson<T>(path, body, idempotencyKey),
+  }
+}
+
+export interface RetriablePostSender {
+  send<T>(path: string, body: unknown): Promise<T>
+  discard(path: string, body?: unknown): boolean
+}
+
+interface PendingPost {
+  readonly signature: string
+  readonly idempotencyKey: string
+  inFlight?: Promise<unknown>
+}
+
+export function createRetriablePostSender(): RetriablePostSender {
+  const pendingByPath = new Map<string, PendingPost>()
+
+  return {
+    send<T>(path: string, body: unknown): Promise<T> {
+      let signature: string
+      try {
+        signature = stableJsonSignature(body)
+      } catch (error) {
+        return Promise.reject(error)
+      }
+      let pending = pendingByPath.get(path)
+
+      if (pending?.inFlight) {
+        if (pending.signature === signature) return pending.inFlight as Promise<T>
+        return Promise.reject(new Error('该路径已有其他请求正在提交'))
+      }
+
+      if (!pending || pending.signature !== signature) {
+        pending = {
+          signature,
+          idempotencyKey: crypto.randomUUID(),
+        }
+        pendingByPath.set(path, pending)
+      }
+
+      const activePending = pending
+      const inFlight = requestPlannedPostJson<T>(path, body, activePending.idempotencyKey).then(
+        (result) => {
+          if (pendingByPath.get(path) === activePending) pendingByPath.delete(path)
+          return result
+        },
+        (error: unknown) => {
+          if (pendingByPath.get(path) === activePending) {
+            activePending.inFlight = undefined
+            if (isDefinitiveClientRejection(error)) pendingByPath.delete(path)
+          }
+          throw error
+        },
+      )
+      activePending.inFlight = inFlight
+      return inFlight
+    },
+    discard(path: string, body?: unknown): boolean {
+      const pending = pendingByPath.get(path)
+      if (!pending || pending.inFlight) return false
+      if (body !== undefined && pending.signature !== stableJsonSignature(body)) return false
+      return pendingByPath.delete(path)
+    },
+  }
+}
+
+function isDefinitiveClientRejection(error: unknown): boolean {
+  return error instanceof ApiError
+    && error.status >= 400
+    && error.status < 500
+    && ![408, 425, 429].includes(error.status)
+}
+
+function stableJsonSignature(value: unknown, ancestors = new Set<object>()): string {
+  if (value === null) return 'null'
+
+  switch (typeof value) {
+    case 'string':
+    case 'boolean':
+      return JSON.stringify(value)
+    case 'number':
+      if (Number.isFinite(value)) return JSON.stringify(value)
+      break
+    case 'object': {
+      if (ancestors.has(value)) break
+      ancestors.add(value)
+      try {
+        const ownKeys = Reflect.ownKeys(value)
+        const descriptors = Object.getOwnPropertyDescriptors(value)
+        if (Array.isArray(value)) {
+          if (ownKeys.length !== value.length + 1 || ownKeys.some((key) => typeof key !== 'string')) {
+            break
+          }
+          const items: string[] = []
+          for (let index = 0; index < value.length; index += 1) {
+            items.push(stableJsonSignature(jsonDataPropertyValue(descriptors[String(index)]), ancestors))
+          }
+          return `[${items.join(',')}]`
+        }
+
+        const prototype = Object.getPrototypeOf(value)
+        if (prototype !== Object.prototype && prototype !== null) break
+
+        const entries = ownKeys.map((key) => {
+          if (typeof key !== 'string') return invalidJsonBody()
+          return [key, jsonDataPropertyValue(descriptors[key])] as const
+        })
+        return `{${entries
+          .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+          .map(([key, item]) => `${JSON.stringify(key)}:${stableJsonSignature(item, ancestors)}`)
+          .join(',')}}`
+      } finally {
+        ancestors.delete(value)
+      }
+    }
+  }
+
+  return invalidJsonBody()
+}
+
+function jsonDataPropertyValue(descriptor: PropertyDescriptor | undefined): unknown {
+  if (!descriptor?.enumerable || !('value' in descriptor)) return invalidJsonBody()
+  return descriptor.value
+}
+
+function invalidJsonBody(): never {
+  throw new TypeError('POST 请求体必须是无循环引用的 JSON 兼容值')
+}
+
+export async function requestBlob(
+  path: string,
+  options: RequestOptions = {},
+): Promise<Blob> {
+  const response = await sendRequest(path, options)
+  return response.blob()
+}
+
+export function withQuery(
+  path: string,
+  params: Record<string, string | number | boolean | null | undefined>,
+): string {
+  const query = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== null && value !== undefined) query.set(key, String(value))
+  }
+  const encoded = query.toString()
+  return encoded ? `${path}?${encoded}` : path
+}
+
+function normalizeHeaders(input?: HeadersInit): Record<string, string> {
+  if (!input) return {}
+  const entries = input instanceof Headers
+    ? [...input.entries()]
+    : Array.isArray(input)
+      ? input
+      : Object.entries(input)
+  const normalized: Record<string, string> = {}
+  const actualNames = new Map<string, string>()
+  for (const [name, value] of entries) {
+    const key = name.toLowerCase()
+    const previousName = actualNames.get(key)
+    if (previousName) delete normalized[previousName]
+    actualNames.set(key, name)
+    normalized[name] = value
+  }
+  return normalized
+}
+
+function hasHeader(headers: Record<string, string>, name: string): boolean {
+  const expected = name.toLowerCase()
+  return Object.keys(headers).some((key) => key.toLowerCase() === expected)
 }

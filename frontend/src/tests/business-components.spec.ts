@@ -5,6 +5,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import CompanyCenter from '../components/CompanyCenter.vue'
 import ProjectCenter from '../components/ProjectCenter.vue'
 import ProjectDashboard from '../components/ProjectDashboard.vue'
+import ProjectCommercialPanel from '../components/project/ProjectCommercialPanel.vue'
+import ProjectOverviewPanel from '../components/project/ProjectOverviewPanel.vue'
+import { MockProjectRepository } from '../repositories/project.mock'
 
 type FetchMock = ReturnType<typeof vi.fn<typeof fetch>>
 
@@ -47,6 +50,23 @@ const project = {
   company_name: company.name,
 }
 
+async function projectDashboardBody(options: {
+  projectRecord?: typeof project & Record<string, unknown>
+  contacts?: typeof contact[]
+  documents?: { document_count: number; version_count: number; categories: Array<Record<string, unknown>> }
+} = {}): Promise<Record<string, unknown>> {
+  const projectRecord = options.projectRecord ?? project
+  const snapshot = (await new MockProjectRepository()
+    .getOperatingSnapshot(String(projectRecord.project_code))).data
+  return {
+    project: { closure_type: null, revision: 4, ...projectRecord },
+    company,
+    contacts: options.contacts ?? [contact],
+    documents: options.documents ?? { document_count: 0, version_count: 0, categories: [] },
+    ...snapshot,
+  }
+}
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -82,6 +102,7 @@ describe('CompanyCenter', () => {
   afterEach(() => {
     document.body.innerHTML = ''
     vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
     vi.restoreAllMocks()
   })
 
@@ -192,10 +213,18 @@ describe('CompanyCenter', () => {
 
     const wrapper = mountComponent(CompanyCenter)
     await settle()
+    expect(wrapper.find('.company-mobile-list').exists()).toBe(true)
     await wrapper.get('[data-testid="company-detail-1"]').trigger('click')
     await settle()
     expect(wrapper.get('[data-testid="company-detail-drawer"]').text()).toContain('年度框架客户')
     expect(wrapper.findAll('[data-testid^="contact-edit-"]')).toHaveLength(2)
+    expect(wrapper.get('[data-testid="contact-phone-value-11"]').classes()).toContain('contact-phone-value')
+    expect(wrapper.get('[data-testid="company-detail-drawer"]').attributes('style')).toContain('min(100vw, 760px)')
+    expect(wrapper.get('[data-testid="company-detail-content"]').classes()).toContain('company-detail-content')
+    expect(wrapper.get('[data-testid="company-contact-table"]').classes()).toContain('company-contact-table')
+    expect(wrapper.find('.contact-mobile-list').text()).toContain('13800138000')
+    expect(wrapper.get('[data-testid="contact-edit-11"]').element.closest('td')?.classList).not.toContain('el-table-fixed-column--right')
+    expect(wrapper.find('.company-contact-table-scroll').exists()).toBe(true)
 
     await wrapper.get('[data-testid="contact-create-open"]').trigger('click')
     await wrapper.get('[data-testid="contact-name"]').setValue(' 王工 ')
@@ -437,6 +466,7 @@ describe('ProjectCenter', () => {
   afterEach(() => {
     document.body.innerHTML = ''
     vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
     vi.restoreAllMocks()
   })
 
@@ -456,6 +486,11 @@ describe('ProjectCenter', () => {
       '/api/projects?status=active', '/api/companies',
     ]))
     expect(wrapper.text()).toContain('在建')
+    expect(wrapper.find('[data-testid="project-list-stack"]').exists()).toBe(true)
+    expect(wrapper.get('[data-testid="project-company-cell-21"]').text()).toContain(company.name)
+    expect(wrapper.get('[data-testid="project-mobile-card-21"]').text()).toContain('SY-2026-001')
+    expect(wrapper.get('[data-testid="project-mobile-card-21"]').text()).toContain(company.name)
+    expect(wrapper.get('[data-testid="project-mobile-open-SY-2026-001"]').text()).toContain('进入项目')
 
     await wrapper.get('[data-testid="project-filter"] input[value="archived"]').setValue(true)
     await settle()
@@ -509,6 +544,7 @@ describe('ProjectCenter', () => {
       project_code: 'SY-2026-002', company_id: 1, name: '新项目', description: null,
     }))
 
+    expect(wrapper.get('[data-testid="project-dashboard-SY-2026-001"]').text()).toBe('装配线改造')
     await wrapper.get('[data-testid="project-dashboard-SY-2026-001"]').trigger('click')
     expect(wrapper.emitted('open-dashboard')).toEqual([['SY-2026-001']])
 
@@ -649,55 +685,352 @@ describe('ProjectDashboard', () => {
   afterEach(() => {
     document.body.innerHTML = ''
     vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
     vi.restoreAllMocks()
   })
 
-  it('只展示真实项目资料、联系人和文档统计', async () => {
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
-      project,
-      company,
-      contacts: [contact],
+  it('成本完整度使用冻结状态，未接通时不标成完整', async () => {
+    const snapshot = (await new MockProjectRepository().getOperatingSnapshot('SY-2026-001')).data
+    snapshot.costs = {
+      material_consumed_cents: null,
+      labor_cents: null,
+      field_material_cents: null,
+      total_cents: null,
+      procurement_committed_cents: null,
+      procurement_received_cents: null,
+      procurement_paid_cents: null,
+      completeness: 'unavailable',
+    }
+    snapshot.profit.actual_cost_cents = null
+    snapshot.profit.actual_profit_cents = null
+    snapshot.profit.margin_basis_points = null
+
+    const wrapper = mountComponent(ProjectOverviewPanel, { operating: snapshot })
+
+    expect(wrapper.get('[data-testid="project-cost-completeness"]').text()).toContain('成本尚未接通')
+    expect(wrapper.get('[data-testid="project-demo-finance"]').text()).toContain('--')
+    expect(wrapper.text()).not.toContain('成本口径完整')
+  })
+
+  it('项目首页默认只显示阶段摘要，打开后可维护完整流程', async () => {
+    const snapshot = (await new MockProjectRepository().getOperatingSnapshot('SY-2026-001')).data
+    const wrapper = mountComponent(ProjectOverviewPanel, { operating: snapshot, projectCode: 'SY-2026-001' })
+
+    const summary = wrapper.get('[data-testid="project-stage-summary"]')
+    expect(summary.text()).toContain('当前阶段')
+    expect(summary.text()).toContain('机械设计')
+    expect(summary.text()).toContain('整体进度')
+    expect(summary.text()).toContain('6 / 18')
+    expect(summary.text()).toContain('下一步')
+    expect(summary.text()).toContain('电气设计')
+    expect(summary.text()).toContain('待办 2')
+    expect(wrapper.find('[data-testid="project-stages"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('编辑排期')
+    expect(wrapper.text()).not.toContain('变更状态')
+
+    await wrapper.get('[data-testid="project-stage-flow-open"]').trigger('click')
+    expect(wrapper.get('[data-testid="project-stages"]').isVisible()).toBe(true)
+    expect(wrapper.findAll('[data-testid^="stage-row-"]')).toHaveLength(18)
+    expect(wrapper.text()).toContain('编辑排期')
+    expect(wrapper.text()).toContain('变更状态')
+  })
+
+  it('所有阶段已完成或跳过时，当前阶段和下一步都明确表示流程完成', async () => {
+    const snapshot = (await new MockProjectRepository().getOperatingSnapshot('SY-2026-001')).data
+    snapshot.stages = snapshot.stages.map((stage, index) => ({
+      ...stage,
+      status: index === snapshot.stages.length - 1 ? 'skipped' : 'completed',
+    }))
+
+    const wrapper = mountComponent(ProjectOverviewPanel, { operating: snapshot })
+    const summary = wrapper.get('[data-testid="project-stage-summary"]')
+
+    expect(summary.get('[data-testid="project-current-stage"]').text()).toContain('已完成全部流程')
+    expect(summary.get('[data-testid="project-next-stage"]').text()).toContain('已完成全部流程')
+  })
+
+  it('阶段数组为空时，当前阶段和下一步都显示暂无数据', async () => {
+    const snapshot = (await new MockProjectRepository().getOperatingSnapshot('SY-2026-001')).data
+    snapshot.stages = []
+
+    const wrapper = mountComponent(ProjectOverviewPanel, { operating: snapshot })
+    const summary = wrapper.get('[data-testid="project-stage-summary"]')
+
+    expect(summary.get('[data-testid="project-current-stage"]').text()).toContain('暂无阶段数据')
+    expect(summary.get('[data-testid="project-next-stage"]').text()).toContain('暂无阶段数据')
+  })
+
+  it('末尾阶段阻塞且无后继时，不得误报全部完成', async () => {
+    const snapshot = (await new MockProjectRepository().getOperatingSnapshot('SY-2026-001')).data
+    snapshot.stages = snapshot.stages.map((stage, index) => ({
+      ...stage,
+      status: index === snapshot.stages.length - 1 ? 'blocked' : 'completed',
+    }))
+
+    const wrapper = mountComponent(ProjectOverviewPanel, { operating: snapshot })
+    const summary = wrapper.get('[data-testid="project-stage-summary"]')
+
+    expect(summary.get('[data-testid="project-current-stage"]').text()).toContain('收尾')
+    expect(summary.get('[data-testid="project-next-stage"]').text()).toContain('等待解除阻塞')
+    expect(summary.text()).not.toContain('已完成全部流程')
+  })
+
+  it('共享合同只汇总当前项目分摊，不带入其他项目收入', async () => {
+    const snapshot = (await new MockProjectRepository().getOperatingSnapshot('SY-2026-001')).data
+    snapshot.commercial.contracts[0]?.allocations.push({
+      id: 32,
+      contract_id: 21,
+      project_code: 'SY-2026-OTHER',
+      amount_cents: 50000000,
+    })
+
+    const wrapper = mountComponent(ProjectCommercialPanel, {
+      operating: snapshot,
+      projectCode: 'SY-2026-001',
+      customerCompany: { id: 1, name: '演示客户单位' },
+    })
+    await settle()
+
+    expect(wrapper.text()).toContain('¥2,680,000.00')
+    expect(wrapper.text()).not.toContain('¥3,180,000.00')
+  })
+
+  it('生产环境保留六个项目直达页并读取真实项目仪表台', async () => {
+    vi.stubEnv('DEV', false)
+    const dashboard = await projectDashboardBody()
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => (
+      String(input).includes('/documents?page=')
+        ? jsonResponse({ items: [], total: 0, page: 1, page_size: 100 })
+        : jsonResponse(dashboard)
+    ))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const wrapper = mountComponent(ProjectDashboard, { projectCode: project.project_code })
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-testid="project-live-notice"]').exists()).toBe(true)
+    })
+
+    expect(wrapper.find('[data-testid="project-demo-notice"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="project-live-notice"]').text()).toContain('真实后端')
+    expect(wrapper.findAll('[data-testid^="project-nav-"]').map((item) => item.text())).toEqual([
+      '项目首页', '资料与设计', '报价与收款', '采购', '施工与调试', '验收与售后',
+    ])
+    expect(wrapper.get('[data-testid="project-panel-overview"]').isVisible()).toBe(true)
+    await wrapper.get('[data-testid="project-nav-documents"]').trigger('click')
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-testid="project-records-panel"]').exists()).toBe(true)
+    })
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-testid="project-documents-panel"]').exists()).toBe(true)
+    })
+    expect(wrapper.get('[data-testid="project-records-panel"]').isVisible()).toBe(true)
+    expect(wrapper.get('[data-testid="project-records-panel"]').text()).not.toContain('项目文档统计')
+    expect(wrapper.get('[data-testid="project-nav-documents"]').text()).toBe('资料与设计')
+    expect(wrapper.find('.project-section-collapse').exists()).toBe(false)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('项目工作页可编辑基本资料并按完成或取消正常完结', async () => {
+    const dashboard = await projectDashboardBody()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/dashboard')) return jsonResponse(dashboard)
+      if (init?.method === 'PUT') {
+        return jsonResponse({
+          ...(dashboard.project as Record<string, unknown>),
+          name: '装配线整体升级',
+          description: '机械与电气同步改造',
+          revision: 5,
+        })
+      }
+      if (path.endsWith('/close')) {
+        return jsonResponse({
+          ...(dashboard.project as Record<string, unknown>),
+          status: 'archived',
+          closure_type: 'completed',
+          archive_reason: '项目已验收并完成收尾',
+          archived_at: '2026-08-31T10:00:00+08:00',
+          revision: 6,
+        })
+      }
+      throw new Error(`unexpected ${init?.method ?? 'GET'} ${path}`)
+    }))
+    const wrapper = mountComponent(ProjectDashboard, { projectCode: project.project_code })
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="project-edit-open"]').exists()).toBe(true))
+
+    await wrapper.get('[data-testid="project-edit-open"]').trigger('click')
+    await wrapper.get('[data-testid="project-edit-name"]').setValue('装配线整体升级')
+    await wrapper.get('[data-testid="project-edit-description"]').setValue('机械与电气同步改造')
+    await wrapper.get('[data-testid="project-edit-save"]').trigger('click')
+    await settle()
+    expect(wrapper.get('.project-identity').text()).toContain('装配线整体升级')
+    expect(wrapper.get('.project-identity').text()).toContain('机械与电气同步改造')
+
+    await wrapper.get('[data-testid="project-close-open"]').trigger('click')
+    await wrapper.get('[data-testid="project-close-reason"]').setValue('项目已验收并完成收尾')
+    await wrapper.get('[data-testid="project-close-save"]').trigger('click')
+    await settle()
+    expect(wrapper.get('[data-testid="project-status"]').text()).toContain('已完结')
+    expect(wrapper.text()).toContain('项目已验收并完成收尾')
+    expect(wrapper.text()).not.toContain('演示数据')
+  })
+
+  it('超长项目编号和金额保持完整渲染', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockReturnValue(new Promise<Response>(() => {})))
+    const longCode = `SY${'LONGCODE'.repeat(16)}`
+    const dashboard = mountComponent(ProjectDashboard, { projectCode: longCode })
+
+    const snapshot = (await new MockProjectRepository().getOperatingSnapshot(longCode)).data
+    snapshot.profit.actual_profit_cents = 9_000_000_000_000_000
+    const overview = mountComponent(ProjectOverviewPanel, { operating: snapshot })
+
+    expect(dashboard.get('.project-identity .el-text').text()).toContain(longCode)
+    expect(overview.findAll('.metric-value strong')[3]?.text()).toContain('90,000,000,000,000.00')
+  })
+
+  it('项目工作区以六个直达页承载真实资料，且不使用折叠区', async () => {
+    const dashboard = await projectDashboardBody({
       documents: {
         document_count: 2,
         version_count: 5,
         categories: [{ category: 'planning_notes', document_count: 2, version_count: 5 }],
       },
+    })
+    const operating = dashboard as Awaited<ReturnType<typeof projectDashboardBody>>
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.endsWith('/dashboard')) return jsonResponse({
+        ...dashboard,
       stored_relative_path: 'Projects/secret',
       original_filename: 'secret.pdf',
       hash: 'never-show',
       session_secret: 'never-show',
-    }))
+      })
+      if (path.includes('/quotes?page=')) {
+        const accepted = (operating.commercial as { accepted_quote: unknown }).accepted_quote
+        return jsonResponse({ items: accepted ? [accepted] : [], total: accepted ? 1 : 0, page: 1, page_size: 100 })
+      }
+      if (path.includes('/contracts?page=')) {
+        const contracts = (operating.commercial as { contracts: unknown[] }).contracts
+        return jsonResponse({ items: contracts, total: contracts.length, page: 1, page_size: 100 })
+      }
+      if (path.endsWith('/payments')) return jsonResponse(operating.receivables)
+      if (path.includes('/documents?page=')) return jsonResponse({ items: [], total: 0, page: 1, page_size: 100 })
+      if (path.endsWith('/drawing-signoffs')) return jsonResponse([])
+      if (path.endsWith('/warranty')) return jsonResponse(null)
+      if (['/commissioning-sessions?', '/engineering-changes?', '/acceptances?', '/invoices?', '/after-sales?']
+        .some((segment) => path.includes(segment))) {
+        return jsonResponse({ items: [], total: 0, page: 1, page_size: 200 })
+      }
+      return jsonResponse([])
+    })
     vi.stubGlobal('fetch', fetchMock)
     const wrapper = mountComponent(ProjectDashboard, { projectCode: project.project_code })
-    await settle()
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-testid="project-live-notice"]').exists()).toBe(true)
+    })
 
     expect(fetchMock).toHaveBeenCalledWith(
       '/api/projects/SY-2026-001/dashboard',
       expect.objectContaining({ credentials: 'same-origin' }),
     )
-    expect(wrapper.text()).toContain('当前展示已录入的项目基础资料与文档统计')
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/projects/SY-2026-001/dashboard',
+      expect.objectContaining({ credentials: 'same-origin' }),
+    )
+    expect(wrapper.get('[data-testid="project-live-notice"]').text()).toContain('真实后端')
+    expect(wrapper.find('[data-testid="project-demo-notice"]').exists()).toBe(false)
+    expect(wrapper.findAll('[data-testid^="project-nav-"]').map((item) => item.text())).toEqual([
+      '项目首页', '资料与设计', '报价与收款', '采购', '施工与调试', '验收与售后',
+    ])
+    expect(wrapper.find('.project-section-collapse').exists()).toBe(false)
     expect(wrapper.text()).toContain('装配线改造')
-    expect(wrapper.text()).toContain('王工')
-    expect(wrapper.text()).toContain('2')
-    expect(wrapper.text()).toContain('5')
     expect(wrapper.text()).not.toContain('Projects/secret')
     expect(wrapper.text()).not.toContain('secret.pdf')
     expect(wrapper.text()).not.toContain('never-show')
-    expect(wrapper.text()).not.toContain('利润')
+    expect(wrapper.get('[data-testid="project-demo-finance"]').text()).toContain('合同分摊额')
+    expect(wrapper.get('[data-testid="project-demo-finance"]').text()).toContain('实际成本')
+    expect(wrapper.get('[data-testid="project-demo-finance"]').text()).toContain('实际利润')
+    expect(wrapper.get('[data-testid="project-demo-costs"]').text()).toContain('已领用库存成本')
+    expect(wrapper.get('[data-testid="project-demo-costs"]').text()).toContain('采购承诺（不计利润）')
+    expect(wrapper.get('[data-testid="project-demo-todos"]').text()).toContain('严重 · 2026-09-02')
+    expect(wrapper.get('[data-testid="project-demo-todos"]').text()).toContain('警告 · 2026-11-30')
+    expect(wrapper.find('[data-testid="project-stages"]').exists()).toBe(false)
+
+    await wrapper.get('[data-testid="project-nav-workforce"]').trigger('click')
+    expect(wrapper.get('[data-testid="project-panel-overview"]').isVisible()).toBe(false)
+    expect(wrapper.find('[data-testid="project-stages"]').exists()).toBe(false)
+
+    await wrapper.get('[data-testid="project-nav-procurement"]').trigger('click')
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-testid="procurement-workspace"]').exists()).toBe(true)
+    })
+    expect(wrapper.get('[data-testid="procurement-workspace"]').isVisible()).toBe(true)
+
+    await wrapper.get('[data-testid="project-nav-workforce"]').trigger('click')
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-testid="workforce-center"]').exists()).toBe(true)
+    })
+    expect(wrapper.get('[data-testid="workforce-center"]').isVisible()).toBe(true)
+    expect(wrapper.get('[data-testid="field-workspace-nav"]').text()).toContain('今日施工')
+    expect(wrapper.get('[data-testid="field-workspace-nav"]').text()).toContain('调试与变更')
+    await wrapper.getComponent('[data-testid="field-workspace-nav"]').setValue('commissioning')
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-testid="delivery-commissioning-panel"]').exists()).toBe(true)
+    })
+    expect(wrapper.get('[data-testid="delivery-commissioning-panel"]').isVisible()).toBe(true)
+
+    await wrapper.get('[data-testid="project-nav-delivery"]').trigger('click')
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-testid="delivery-workspace"]').exists()).toBe(true)
+    })
+    expect(wrapper.get('[data-testid="delivery-workspace"]').isVisible()).toBe(true)
+    expect(wrapper.find('[data-testid="delivery-tab-commissioning"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="delivery-commissioning-panel"]').exists()).toBe(false)
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-testid="delivery-acceptance-panel"]').exists()).toBe(true)
+    })
+    expect(wrapper.get('[data-testid="delivery-tab-acceptance"]').isVisible()).toBe(true)
+    expect(wrapper.get('[data-testid="delivery-acceptance-panel"]').isVisible()).toBe(true)
+
+    await wrapper.get('[data-testid="project-nav-commercial"]').trigger('click')
+    expect(wrapper.get('[data-testid="project-demo-commercial"]').isVisible()).toBe(true)
+    expect(wrapper.get('[data-testid="project-demo-commercial"]').text()).toContain('SYHT-2026-018')
+    expect(wrapper.get('[data-testid="project-demo-receivables"]').text()).toContain('预付款')
+
+    await wrapper.get('[data-testid="project-nav-documents"]').trigger('click')
+    expect(wrapper.get('[data-testid="project-records-panel"]').isVisible()).toBe(true)
+    expect(wrapper.get('[data-testid="project-records-panel"]').text()).toContain('王工')
+    expect(wrapper.get('[data-testid="project-records-panel"]').text()).not.toContain('项目文档统计')
+
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-testid="project-documents-panel"]').exists()).toBe(true)
+    })
+    expect(wrapper.get('[data-testid="project-documents-panel"]').isVisible()).toBe(true)
+    expect(fetchMock.mock.calls.some(([path]) => String(path).includes('/documents?page='))).toBe(true)
   })
 
   it('展示联系人和文档空态，项目编号变更时重新读取', async () => {
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
-      project,
-      company,
+    const firstDashboard = await projectDashboardBody({ contacts: [] })
+    const secondDashboard = await projectDashboardBody({
+      projectRecord: { ...project, project_code: '测 试/002' },
       contacts: [],
-      documents: { document_count: 0, version_count: 0, categories: [] },
-    }))
+    })
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/projects/SY-2026-001/dashboard') return jsonResponse(firstDashboard)
+      if (path === '/api/projects/%E6%B5%8B%20%E8%AF%95%2F002/dashboard') return jsonResponse(secondDashboard)
+      if (path.includes('/documents?page=')) {
+        return jsonResponse({ items: [], total: 0, page: 1, page_size: 100 })
+      }
+      throw new Error(`unexpected GET ${path}`)
+    })
     vi.stubGlobal('fetch', fetchMock)
     const wrapper = mountComponent(ProjectDashboard, { projectCode: 'SY-2026-001' })
     await settle()
+    await wrapper.get('[data-testid="project-nav-documents"]').trigger('click')
     expect(wrapper.get('[data-testid="contacts-empty"]').text()).toContain('暂无联系人')
-    expect(wrapper.get('[data-testid="documents-empty"]').text()).toContain('暂无文档')
+    expect(wrapper.find('[data-testid="documents-empty"]').exists()).toBe(false)
 
     await wrapper.setProps({ projectCode: '测 试/002' })
     await settle()
@@ -706,6 +1039,98 @@ describe('ProjectDashboard', () => {
     )
     await wrapper.get('[data-testid="project-dashboard-back"]').trigger('click')
     expect(wrapper.emitted('back')).toHaveLength(1)
+  })
+
+  it('切换项目时立即清理旧项目和真实操作弹窗', async () => {
+    const firstDashboard = await projectDashboardBody({ contacts: [] })
+    const secondDashboard = await projectDashboardBody({
+      projectRecord: { ...project, project_code: 'SY-B', name: 'B 项目' },
+      contacts: [],
+    })
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(firstDashboard))
+      .mockResolvedValueOnce(jsonResponse(secondDashboard))
+    vi.stubGlobal('fetch', fetchMock)
+    const wrapper = mountComponent(ProjectDashboard, { projectCode: project.project_code })
+    await vi.waitFor(() => expect(wrapper.text()).toContain('装配线改造'))
+
+    expect(wrapper.get('[data-testid="project-edit-open"]').text()).toBe('编辑项目')
+    expect(wrapper.get('[data-testid="project-close-open"]').text()).toBe('完结项目')
+    await wrapper.get('[data-testid="project-edit-open"]').trigger('click')
+    expect(wrapper.get('[aria-label="编辑项目"]').isVisible()).toBe(true)
+
+    await wrapper.setProps({ projectCode: 'SY-B' })
+    expect(wrapper.get('.project-identity h1').text()).toBe('SY-B')
+    expect(wrapper.get('[aria-label="编辑项目"]').isVisible()).toBe(false)
+    await vi.waitFor(() => expect(wrapper.get('.project-identity h1').text()).toBe('B 项目'))
+  })
+
+  it('连续切换项目时重新挂载真实文档台账并读取 B 项目资料', async () => {
+    const firstDashboard = await projectDashboardBody({ contacts: [] })
+    const secondDashboard = await projectDashboardBody({
+      projectRecord: { ...project, project_code: 'SY-B', name: 'B 项目' },
+      contacts: [],
+    })
+    const documentBase = {
+      id: 101,
+      project_code: 'SY-B',
+      category: 'site_survey',
+      title: '现场测绘记录',
+      notes: null,
+      latest_version_number: 1,
+      archived_at: null,
+      revision: 1,
+      created_at: '2026-08-31T01:00:00+00:00',
+      updated_at: '2026-08-31T01:00:00+00:00',
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      const method = init?.method ?? 'GET'
+      if (path === '/api/projects/SY-2026-001/dashboard') return jsonResponse(firstDashboard)
+      if (path === '/api/projects/SY-B/dashboard') return jsonResponse(secondDashboard)
+      if (path.includes('/api/projects/SY-B/documents?page=')) {
+        return jsonResponse({ items: [documentBase], total: 1, page: 1, page_size: 100 })
+      }
+      if (path.includes('/documents?page=')) {
+        return jsonResponse({ items: [], total: 0, page: 1, page_size: 100 })
+      }
+      if (path.endsWith('/documents') && method === 'POST') {
+        return jsonResponse({ ...documentBase, id: 102, project_code: 'SY-2026-001', title: '仅属于 A 的文档' }, 201)
+      }
+      throw new Error(`unexpected ${method} ${path}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const wrapper = mountComponent(ProjectDashboard, { projectCode: project.project_code })
+
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-testid="project-nav-documents"]').exists()).toBe(true)
+    })
+    await wrapper.get('[data-testid="project-nav-documents"]').trigger('click')
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-testid="project-documents-panel"]').exists()).toBe(true)
+    })
+    await wrapper.get('[data-testid="document-create-open"]').trigger('click')
+    await wrapper.get('[data-testid="document-create-title"]').setValue('仅属于 A 的文档')
+    const createFile = wrapper.get('[data-testid="document-create-file"]')
+    Object.defineProperty(createFile.element, 'files', {
+      configurable: true,
+      value: [new File(['demo'], 'only-a.pdf', { type: 'application/pdf' })],
+    })
+    await createFile.trigger('change')
+    await wrapper.get('[data-testid="document-create-save"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('仅属于 A 的文档'))
+
+    await wrapper.setProps({ projectCode: 'SY-B' })
+    await vi.waitFor(() => {
+      expect(wrapper.text()).toContain('B 项目')
+    })
+    await wrapper.get('[data-testid="project-nav-documents"]').trigger('click')
+    await vi.waitFor(() => {
+      expect(wrapper.get('[data-testid="project-documents-panel"]').text()).toContain('现场测绘记录')
+    })
+
+    expect(wrapper.text()).not.toContain('仅属于 A 的文档')
+    expect(wrapper.get('[data-testid="project-documents-panel"]').text()).toContain('现场测绘记录')
   })
 
   it('仪表台 401 上报会话过期', async () => {
@@ -719,14 +1144,13 @@ describe('ProjectDashboard', () => {
 
   it('项目编号连续切换时忽略旧请求的迟到结果', async () => {
     let resolveFirst!: (response: Response) => void
+    const secondDashboard = await projectDashboardBody({
+      projectRecord: { ...project, project_code: 'SY-2026-002', name: '第二个项目' },
+      contacts: [],
+    })
     const fetchMock = vi.fn<typeof fetch>()
       .mockReturnValueOnce(new Promise<Response>((resolve) => { resolveFirst = resolve }))
-      .mockResolvedValueOnce(jsonResponse({
-        project: { ...project, project_code: 'SY-2026-002', name: '第二个项目' },
-        company,
-        contacts: [],
-        documents: { document_count: 0, version_count: 0, categories: [] },
-      }))
+      .mockResolvedValueOnce(jsonResponse(secondDashboard))
     vi.stubGlobal('fetch', fetchMock)
     const wrapper = mountComponent(ProjectDashboard, { projectCode: 'SY-2026-001' })
 
@@ -735,12 +1159,10 @@ describe('ProjectDashboard', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
     expect(wrapper.text()).toContain('第二个项目')
 
-    resolveFirst(jsonResponse({
-      project: { ...project, name: '迟到的旧项目' },
-      company,
+    resolveFirst(jsonResponse(await projectDashboardBody({
+      projectRecord: { ...project, name: '迟到的旧项目' },
       contacts: [],
-      documents: { document_count: 0, version_count: 0, categories: [] },
-    }))
+    })))
     await settle()
     expect(wrapper.text()).toContain('第二个项目')
     expect(wrapper.text()).not.toContain('迟到的旧项目')
@@ -748,14 +1170,13 @@ describe('ProjectDashboard', () => {
 
   it('切换到 B 后 A 请求迟到 401 仍上报会话过期', async () => {
     let resolveA!: (response: Response) => void
+    const secondDashboard = await projectDashboardBody({
+      projectRecord: { ...project, project_code: 'SY-B', name: 'B 项目' },
+      contacts: [],
+    })
     const fetchMock = vi.fn<typeof fetch>()
       .mockReturnValueOnce(new Promise<Response>((resolve) => { resolveA = resolve }))
-      .mockResolvedValueOnce(jsonResponse({
-        project: { ...project, project_code: 'SY-B', name: 'B 项目' },
-        company,
-        contacts: [],
-        documents: { document_count: 0, version_count: 0, categories: [] },
-      }))
+      .mockResolvedValueOnce(jsonResponse(secondDashboard))
     vi.stubGlobal('fetch', fetchMock)
     const wrapper = mountComponent(ProjectDashboard, { projectCode: 'SY-A' })
     await wrapper.setProps({ projectCode: 'SY-B' })

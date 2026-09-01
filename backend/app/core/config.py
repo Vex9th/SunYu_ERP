@@ -17,6 +17,7 @@ _ALLOWED_CONFIG_KEYS = frozenset(
         "host",
         "port",
         "session_secret",
+        "max_document_upload_mb",
     }
 )
 _MISSING = object()
@@ -33,6 +34,7 @@ class Settings:
     host: str
     port: int
     session_secret: str
+    max_document_upload_mb: int = 4096
 
 
 def load_settings(config_path: str | Path) -> Settings:
@@ -129,6 +131,7 @@ def _settings_from_config(
         host=host,
         port=port,
         session_secret=session_secret,
+        max_document_upload_mb=raw_config.get("max_document_upload_mb", 4096),
     )
 
 
@@ -166,6 +169,13 @@ def _validate_config(loaded_config: object) -> dict[str, object]:
         default=30,
         minimum=0,
         maximum=3650,
+    )
+    _validate_bounded_integer(
+        loaded_config,
+        "max_document_upload_mb",
+        default=4096,
+        minimum=1,
+        maximum=16384,
     )
 
     session_secret = loaded_config.get("session_secret", _MISSING)
