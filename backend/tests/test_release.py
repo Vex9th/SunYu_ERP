@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -8,6 +9,17 @@ from typing import Any
 import pytest
 
 import release
+
+
+def test_windows_runtime_declares_iana_timezone_database() -> None:
+    requirements = (
+        Path(__file__).resolve().parents[2] / "requirements.txt"
+    ).read_text(encoding="utf-8")
+
+    assert re.search(
+        r"(?m)^tzdata[^;]*;\s*sys_platform\s*==\s*['\"]win32['\"]\s*$",
+        requirements,
+    )
 
 
 def test_resolve_runtime_paths_uses_source_directory_for_all_roots(
