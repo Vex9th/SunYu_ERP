@@ -153,6 +153,27 @@ def _create_assignment(
     return cast(dict[str, Any], response.json())
 
 
+def _single_labor_payload(
+    assignment_id: int,
+    *,
+    work_date: str = "2026-08-29",
+    attendance_status: str = "present",
+    day_fraction: str | None = "1.000",
+    work_minutes: int | None = None,
+    work_summary: str | None = "设备安装",
+    notes: str | None = None,
+) -> dict[str, object]:
+    return {
+        "assignment_id": assignment_id,
+        "work_date": work_date,
+        "attendance_status": attendance_status,
+        "day_fraction": day_fraction,
+        "work_minutes": work_minutes,
+        "work_summary": work_summary,
+        "notes": notes,
+    }
+
+
 def test_migration_creates_workforce_and_later_delivery_tables(tmp_path: Path) -> None:
     database_path = tmp_path / "migration.sqlite3"
     connection = connect_database(database_path)
@@ -180,9 +201,11 @@ def test_migration_creates_workforce_and_later_delivery_tables(tmp_path: Path) -
         connection.close()
 
     assert "009_workforce_delivery" in applied
+    assert "013_workforce_events" in applied
     assert {
         "workers",
         "crew_assignments",
+        "crew_assignment_transition_events",
         "labor_entries",
         "site_daily_reports",
         "material_advances",
@@ -292,6 +315,49 @@ def test_deactivate_worker_preserves_assignment_history_and_is_idempotent(
     assert assignments.json()["items"][0]["id"] == assignment["id"]
 
 
+def test_inactive_worker_can_be_reactivated_with_revision_and_idempotency(
+    harness: WorkforceHarness,
+) -> None:
+    key = str(uuid.uuid4())
+    with harness.client() as client:
+        worker = _create_worker(client)
+        inactive = client.post(
+            f"/api/workers/{worker['id']}/deactivate",
+            headers=_idempotency_headers(),
+            json={
+                "effective_on": "2026-08-30",
+                "reason": "暂停接单",
+                "expected_revision": worker["revision"],
+            },
+        ).json()
+        stale = client.post(
+            f"/api/workers/{worker['id']}/reactivate",
+            headers=_idempotency_headers(),
+            json={"expected_revision": worker["revision"]},
+        )
+        active = client.post(
+            f"/api/workers/{worker['id']}/reactivate",
+            headers=_idempotency_headers(key),
+            json={"expected_revision": inactive["revision"]},
+        )
+        replay = client.post(
+            f"/api/workers/{worker['id']}/reactivate",
+            headers=_idempotency_headers(key),
+            json={"expected_revision": inactive["revision"]},
+        )
+
+    assert stale.status_code == 409
+    assert stale.json()["error_code"] == "REVISION_CONFLICT"
+    assert stale.json()["current_revision"] == inactive["revision"]
+    assert active.status_code == 200
+    assert active.json()["status"] == "active"
+    assert active.json()["inactive_on"] is None
+    assert active.json()["inactive_reason"] is None
+    assert active.json()["revision"] == inactive["revision"] + 1
+    assert replay.status_code == 200
+    assert replay.json() == active.json()
+
+
 def test_assignment_create_list_and_update_preserve_pay_rule(
     harness: WorkforceHarness,
 ) -> None:
@@ -319,6 +385,166 @@ def test_assignment_create_list_and_update_preserve_pay_rule(
     assert updated.status_code == 200
     assert updated.json()["rate_cents"] == 65_000
     assert updated.json()["revision"] == 2
+
+
+def test_assignment_transition_enforces_state_machine_revision_and_idempotency(
+    harness: WorkforceHarness,
+) -> None:
+    start_key = str(uuid.uuid4())
+    with harness.client() as client:
+        worker = _create_worker(client)
+        assignment = _create_assignment(client, worker["id"])
+        started = client.post(
+            f"/api/projects/P-001/crew-assignments/{assignment['id']}/transition",
+            headers=_idempotency_headers(start_key),
+            json={
+                "to_status": "active",
+                "effective_at": "2026-08-29T08:00:00+08:00",
+                "reason": None,
+                "expected_revision": assignment["revision"],
+            },
+        )
+        assert started.status_code == 200, started.text
+        replay = client.post(
+            f"/api/projects/P-001/crew-assignments/{assignment['id']}/transition",
+            headers=_idempotency_headers(start_key),
+            json={
+                "to_status": "active",
+                "effective_at": "2026-08-29T08:00:00+08:00",
+                "reason": None,
+                "expected_revision": assignment["revision"],
+            },
+        )
+        backwards = client.post(
+            f"/api/projects/P-001/crew-assignments/{assignment['id']}/transition",
+            headers=_idempotency_headers(),
+            json={
+                "to_status": "planned",
+                "effective_at": "2026-08-29T09:00:00+08:00",
+                "reason": None,
+                "expected_revision": started.json()["revision"],
+            },
+        )
+        completed = client.post(
+            f"/api/projects/P-001/crew-assignments/{assignment['id']}/transition",
+            headers=_idempotency_headers(),
+            json={
+                "to_status": "completed",
+                "effective_at": "2026-08-29T10:00:00+08:00",
+                "reason": "现场工作完成",
+                "expected_revision": started.json()["revision"],
+            },
+        )
+        terminal = client.post(
+            f"/api/projects/P-001/crew-assignments/{assignment['id']}/transition",
+            headers=_idempotency_headers(),
+            json={
+                "to_status": "cancelled",
+                "effective_at": "2026-08-29T10:15:00+08:00",
+                "reason": "不应再变更",
+                "expected_revision": completed.json()["revision"],
+            },
+        )
+
+    connection = connect_database(harness.database_path)
+    try:
+        events = connection.execute(
+            """
+            SELECT from_status, to_status, effective_at, reason
+            FROM crew_assignment_transition_events
+            WHERE assignment_id = ? ORDER BY id
+            """,
+            (assignment["id"],),
+        ).fetchall()
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE crew_assignment_transition_events SET reason = '篡改' WHERE assignment_id = ?",
+                (assignment["id"],),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "DELETE FROM crew_assignment_transition_events WHERE assignment_id = ?",
+                (assignment["id"],),
+            )
+    finally:
+        connection.close()
+
+    assert started.status_code == 200
+    assert started.json()["status"] == "active"
+    assert replay.status_code == 200
+    assert replay.json() == started.json()
+    assert backwards.status_code == 409
+    assert backwards.json()["error_code"] == "INVALID_ASSIGNMENT_TRANSITION"
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "completed"
+    assert terminal.status_code == 409
+    assert terminal.json()["error_code"] == "INVALID_ASSIGNMENT_TRANSITION"
+    assert [tuple(row) for row in events] == [
+        ("planned", "active", "2026-08-29T00:00:00+00:00", None),
+        ("active", "completed", "2026-08-29T02:00:00+00:00", "现场工作完成"),
+    ]
+
+
+def test_assignment_transition_rejects_future_time_and_cancel_without_reason(
+    harness: WorkforceHarness,
+) -> None:
+    with harness.client() as client:
+        worker = _create_worker(client)
+        assignment = _create_assignment(client, worker["id"])
+        future = client.post(
+            f"/api/projects/P-001/crew-assignments/{assignment['id']}/transition",
+            headers=_idempotency_headers(),
+            json={
+                "to_status": "active",
+                "effective_at": "2026-08-30T08:00:00+08:00",
+                "reason": None,
+                "expected_revision": assignment["revision"],
+            },
+        )
+        missing_reason = client.post(
+            f"/api/projects/P-001/crew-assignments/{assignment['id']}/transition",
+            headers=_idempotency_headers(),
+            json={
+                "to_status": "cancelled",
+                "effective_at": "2026-08-29T08:00:00+08:00",
+                "reason": None,
+                "expected_revision": assignment["revision"],
+            },
+        )
+        listed = client.get("/api/projects/P-001/crew-assignments")
+
+    assert future.status_code == 422
+    assert future.json()["error_code"] == "INVALID_ASSIGNMENT_TRANSITION"
+    assert future.json()["field_errors"] == {
+        "effective_at": "must not be in the future"
+    }
+    assert missing_reason.status_code == 422
+    assert missing_reason.json()["field_errors"] == {
+        "reason": "is required when cancelling an assignment"
+    }
+    assert listed.json()["items"][0]["status"] == "planned"
+
+
+def test_assignment_transition_rejects_revision_conflict(
+    harness: WorkforceHarness,
+) -> None:
+    with harness.client() as client:
+        worker = _create_worker(client)
+        assignment = _create_assignment(client, worker["id"])
+        response = client.post(
+            f"/api/projects/P-001/crew-assignments/{assignment['id']}/transition",
+            headers=_idempotency_headers(),
+            json={
+                "to_status": "cancelled",
+                "effective_at": "2026-08-29T08:00:00+08:00",
+                "reason": "项目取消",
+                "expected_revision": 99,
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "REVISION_CONFLICT"
+    assert response.json()["current_revision"] == assignment["revision"]
 
 
 def test_archived_project_rejects_new_assignment_but_keeps_existing_records(
@@ -960,6 +1186,218 @@ def test_labor_list_filters_by_date_worker_and_pages(
     assert listed.json()["total"] == 1
     assert listed.json()["items"][0]["work_date"] == "2026-08-29"
     assert listed.json()["items"][0]["cost_cents"] == 0
+
+
+def test_single_labor_create_update_void_preserves_cost_and_void_state(
+    harness: WorkforceHarness,
+) -> None:
+    create_key = str(uuid.uuid4())
+    void_key = str(uuid.uuid4())
+    with harness.client() as client:
+        worker = _create_worker(client)
+        assignment = _create_assignment(client, worker["id"], rate_cents=60_001)
+        payload = _single_labor_payload(
+            assignment["id"], day_fraction="0.500", work_summary="初次记录"
+        )
+        created = client.post(
+            "/api/projects/P-001/labor-entries",
+            headers=_idempotency_headers(create_key),
+            json=payload,
+        )
+        assert created.status_code == 201, created.text
+        replay = client.post(
+            "/api/projects/P-001/labor-entries",
+            headers=_idempotency_headers(create_key),
+            json=payload,
+        )
+        updated = client.put(
+            f"/api/projects/P-001/labor-entries/{created.json()['id']}",
+            json={
+                **payload,
+                "day_fraction": "1.000",
+                "work_summary": "改为全天",
+                "expected_revision": created.json()["revision"],
+            },
+        )
+        voided = client.post(
+            f"/api/projects/P-001/labor-entries/{created.json()['id']}/void",
+            headers=_idempotency_headers(void_key),
+            json={
+                "reason": "重复登记",
+                "expected_revision": updated.json()["revision"],
+            },
+        )
+        void_replay = client.post(
+            f"/api/projects/P-001/labor-entries/{created.json()['id']}/void",
+            headers=_idempotency_headers(void_key),
+            json={
+                "reason": "重复登记",
+                "expected_revision": updated.json()["revision"],
+            },
+        )
+        edit_voided = client.put(
+            f"/api/projects/P-001/labor-entries/{created.json()['id']}",
+            json={
+                **payload,
+                "expected_revision": voided.json()["revision"],
+            },
+        )
+        batch_overwrite_voided = client.post(
+            "/api/projects/P-001/labor-entries/batch",
+            headers=_idempotency_headers(),
+            json={
+                "work_date": payload["work_date"],
+                "entries": [
+                    {
+                        "assignment_id": assignment["id"],
+                        "attendance_status": "present",
+                        "day_fraction": "0.500",
+                        "work_minutes": None,
+                        "work_summary": "不应覆盖作废事实",
+                        "notes": None,
+                        "expected_revision": voided.json()["revision"],
+                    }
+                ],
+            },
+        )
+        listed = client.get("/api/projects/P-001/labor-entries")
+
+    assert created.status_code == 201
+    assert created.json()["cost_cents"] == 30_001
+    assert created.json()["pay_basis"] == "daily"
+    assert created.json()["rate_cents"] == 60_001
+    assert replay.status_code == 201
+    assert replay.json() == created.json()
+    assert updated.status_code == 200
+    assert updated.json()["cost_cents"] == 60_001
+    assert updated.json()["revision"] == created.json()["revision"] + 1
+    assert voided.status_code == 200
+    assert voided.json()["status"] == "voided"
+    assert voided.json()["void_reason"] == "重复登记"
+    assert voided.json()["cost_cents"] == 60_001
+    assert void_replay.status_code == 200
+    assert void_replay.json() == voided.json()
+    assert edit_voided.status_code == 409
+    assert edit_voided.json()["error_code"] == "LABOR_ENTRY_VOIDED"
+    assert batch_overwrite_voided.status_code == 409
+    assert batch_overwrite_voided.json()["error_code"] == "LABOR_ENTRY_VOIDED"
+    assert listed.json()["items"][0]["void_reason"] == "重复登记"
+    assert listed.json()["items"][0]["revision"] == voided.json()["revision"]
+
+
+def test_single_hourly_labor_uses_assignment_snapshot_and_revision_conflicts(
+    harness: WorkforceHarness,
+) -> None:
+    with harness.client() as client:
+        worker = _create_worker(client)
+        assignment = _create_assignment(
+            client, worker["id"], pay_basis="hourly", rate_cents=3_001
+        )
+        payload = _single_labor_payload(
+            assignment["id"],
+            day_fraction=None,
+            work_minutes=61,
+            work_summary=None,
+        )
+        created = client.post(
+            "/api/projects/P-001/labor-entries",
+            headers=_idempotency_headers(),
+            json=payload,
+        )
+        assert created.status_code == 201, created.text
+        conflict = client.put(
+            f"/api/projects/P-001/labor-entries/{created.json()['id']}",
+            json={**payload, "work_minutes": 120, "expected_revision": 99},
+        )
+
+    assert created.status_code == 201
+    assert created.json()["cost_cents"] == 3_051
+    assert conflict.status_code == 409
+    assert conflict.json()["error_code"] == "REVISION_CONFLICT"
+    assert conflict.json()["current_revision"] == created.json()["revision"]
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_code"),
+    [
+        (
+            {
+                "work_date": "2026/08/29",
+                "attendance_status": "present",
+                "day_fraction": "1.000",
+                "work_minutes": None,
+            },
+            "INVALID_LABOR_PAYLOAD",
+        ),
+        (
+            {
+                "work_date": "2026-08-29",
+                "attendance_status": "present",
+                "day_fraction": None,
+                "work_minutes": 60,
+            },
+            "INVALID_LABOR_PAYLOAD",
+        ),
+    ],
+)
+def test_single_daily_labor_rejects_invalid_date_or_paid_quantity(
+    harness: WorkforceHarness,
+    payload: dict[str, object],
+    expected_code: str,
+) -> None:
+    with harness.client() as client:
+        worker = _create_worker(client)
+        assignment = _create_assignment(client, worker["id"], pay_basis="daily")
+        response = client.post(
+            "/api/projects/P-001/labor-entries",
+            headers=_idempotency_headers(),
+            json={
+                **_single_labor_payload(assignment["id"]),
+                **payload,
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == expected_code
+
+
+def test_single_labor_rejects_wrong_assignment_inactive_worker_and_archived_project(
+    harness: WorkforceHarness,
+) -> None:
+    with harness.client() as client:
+        worker = _create_worker(client)
+        assignment = _create_assignment(client, worker["id"])
+        client.post(
+            f"/api/workers/{worker['id']}/deactivate",
+            headers=_idempotency_headers(),
+            json={
+                "effective_on": "2026-08-29",
+                "reason": "离场",
+                "expected_revision": worker["revision"],
+            },
+        )
+        inactive = client.post(
+            "/api/projects/P-001/labor-entries",
+            headers=_idempotency_headers(),
+            json=_single_labor_payload(assignment["id"]),
+        )
+        missing_assignment = client.post(
+            "/api/projects/P-001/labor-entries",
+            headers=_idempotency_headers(),
+            json=_single_labor_payload(999),
+        )
+        archived = client.post(
+            "/api/projects/P-ARCHIVED/labor-entries",
+            headers=_idempotency_headers(),
+            json=_single_labor_payload(assignment["id"]),
+        )
+
+    assert inactive.status_code == 409
+    assert inactive.json()["error_code"] == "WORKER_INACTIVE"
+    assert missing_assignment.status_code == 404
+    assert missing_assignment.json()["error_code"] == "ASSIGNMENT_NOT_FOUND"
+    assert archived.status_code == 409
+    assert archived.json()["error_code"] == "PROJECT_ARCHIVED"
 
 
 @pytest.mark.parametrize(

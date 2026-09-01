@@ -13,19 +13,19 @@
 
 接口前缀统一为 `/api`。除健康检查和认证接口外，全部使用登录后的 HttpOnly Session Cookie。
 
-### 1.1 当前真实可接入范围（2026-08-31）
+### 1.1 当前真实可接入范围（2026-09-01）
 
 除第 3 节原有接口外，当前后端已经实现并挂载以下子集：
 
 - 项目阶段：阶段列表、计划修改、带幂等键的状态流转；
 - 项目经营：文件版本、报价、合同、三段收款、项目仪表台与总仪表台；
 - 采购：官方 `.xlsx` 模板、上传预检与确认、采购清单与采购行、采购单、付款、到货、进项票、反冲审计、项目采购概览和隐藏成本报价单；
-- 库存：库存物品、期初库存、库存调整、不可变流水、项目领用；
-- 人员：施工员、停用、项目排单、当日上工查询和批量原子提交；
+- 库存：库存物品、期初库存、库存调整、不可变流水、项目领用和领用冲销；
+- 人员：施工员、停用/启用、项目排单状态流转、当日上工查询和批量原子提交、单条上工新增/编辑/作废；
 - 现场：施工日报确认与纠错审计、人员垫资、分次报销和作废；
 - 交付：图纸会签、调试、工程变更、验收、质保、发票、售后和交付汇总。
 
-本节只说明实现进度，不改变后文冻结的完整契约。当前仅“单条上工新增、编辑和作废”仍为规划；实际页面使用批量上工接口提交当天施工员，不得把上述已实现接口继续显示为“演示数据”。
+本节只说明实现进度，不改变后文冻结的完整契约。上述接口均已连接真实后端，页面不得继续显示为“演示数据”。
 
 ## 2. 全局约定
 
@@ -576,6 +576,7 @@ interface GlobalDashboard {
 | PUT | `/api/projects/{project_code}/procurement-lists/{list_id}` | `name`、`notes`、`expected_revision` |
 | POST | `/api/projects/{project_code}/procurement-lists/{list_id}/lines` | 采购行核心字段；返回 `201 ProcurementLine` |
 | PUT | `/api/projects/{project_code}/procurement-lists/{list_id}/lines/{line_id}` | 可编辑字段加 `expected_revision` |
+| DELETE | `/api/projects/{project_code}/procurement-lists/{list_id}/lines/{line_id}` | 删除草稿清单行；成功返回 `204` |
 | POST | `/api/projects/{project_code}/procurement-lists/{list_id}/confirm` | `expected_revision`，确认后普通编辑受限 |
 | GET | `/api/projects/{project_code}/procurement-overview` | 返回采购状态计数、金额和异常待办 |
 
@@ -646,25 +647,28 @@ P1 不允许超付款、超到货或超开票；超下单必须填写原因。�
 | POST | `/api/workers` | `name`、`phone`、`notes`；返回 `201 Worker` |
 | GET | `/api/workers/{worker_id}` | 返回 `Worker` |
 | PUT | `/api/workers/{worker_id}` | 档案字段加 `expected_revision` |
-| POST | `/api/workers/{worker_id}/deactivate` | `effective_on`、`reason`、`expected_revision` |
+| POST | `/api/workers/{worker_id}/deactivate` | Header `Idempotency-Key`；`effective_on`、`reason`、`expected_revision` |
+| POST | `/api/workers/{worker_id}/reactivate` | Header `Idempotency-Key`；`expected_revision` |
 | GET | `/api/projects/{project_code}/crew-assignments?page=&page_size=&status=` | 返回项目排单分页列表 |
 | POST | `/api/projects/{project_code}/crew-assignments` | `worker_id`、`role`、`scheduled_start_on`、`scheduled_end_on`、`pay_basis`、`rate_cents`、`notes` |
 | PUT | `/api/projects/{project_code}/crew-assignments/{assignment_id}` | 排单字段加 `expected_revision` |
-| POST | `/api/projects/{project_code}/crew-assignments/{assignment_id}/transition` | `to_status`、`effective_at`、`reason`、`expected_revision` |
+| POST | `/api/projects/{project_code}/crew-assignments/{assignment_id}/transition` | Header `Idempotency-Key`；`to_status`、`effective_at`、`reason`、`expected_revision`；`effective_at` 不得晚于当前时间，取消排单时 `reason` 必填 |
 
 `rate_cents` 在排单中固化：`daily` 表示分/日，`hourly` 表示分/小时。修改施工员档案不改写历史项目工资。
 
+排单状态变更与不可变事件记录在同一事务内提交；事件保留 `from_status`、`to_status`、`effective_at` 和 `reason`，不得更新或删除。
+
 ### 6.2 当日上工和施工日报
 
-> 实现状态：批量上工和施工日报已实现；单条上工维护仍为规划。
+> 实现状态：批量上工、单条上工维护和施工日报均已实现。
 
 | Method | Path | 请求/响应 |
 |---|---|---|
 | GET | `/api/projects/{project_code}/labor-entries?page=&page_size=&from=&to=&worker_id=` | 返回上工记录分页列表 |
 | POST | `/api/projects/{project_code}/labor-entries/batch` | Header `Idempotency-Key`；`work_date` 和 `entries[]`；按人员批量新增或覆盖当天上工记录，整批原子提交 |
-| POST | `/api/projects/{project_code}/labor-entries` | `assignment_id`、`work_date`、`attendance_status`、`day_fraction` 或 `work_minutes`、`work_summary`、`notes` |
+| POST | `/api/projects/{project_code}/labor-entries` | Header `Idempotency-Key`；`assignment_id`、`work_date`、`attendance_status`、`day_fraction` 或 `work_minutes`、`work_summary`、`notes` |
 | PUT | `/api/projects/{project_code}/labor-entries/{entry_id}` | 同上加 `expected_revision` |
-| POST | `/api/projects/{project_code}/labor-entries/{entry_id}/void` | `reason`、`expected_revision` |
+| POST | `/api/projects/{project_code}/labor-entries/{entry_id}/void` | Header `Idempotency-Key`；`reason`、`expected_revision` |
 | GET | `/api/projects/{project_code}/site-daily-reports?page=&page_size=&from=&to=` | 返回施工日报分页列表 |
 | PUT | `/api/projects/{project_code}/site-daily-reports/{work_date}` | `location`、`weather`、`work_summary`、`blockers`、`next_plan`、`notes`、`expected_revision`；首次传 `null` |
 | POST | `/api/projects/{project_code}/site-daily-reports/{work_date}/confirm` | `confirmed_at`、`expected_revision` |

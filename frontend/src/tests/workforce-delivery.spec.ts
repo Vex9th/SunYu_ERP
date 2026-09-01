@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import DeliveryWorkspace from '../components/delivery/DeliveryWorkspace.vue'
 import WorkforceCenter from '../components/workforce/WorkforceCenter.vue'
+import { localISODate } from '../domain/dates'
 import { resetDemoBusinessContext, useDemoBusinessContext } from '../repositories/demo-context'
 import { MockWorkforceRepository } from '../repositories/workforce'
 
@@ -240,6 +241,32 @@ describe('P1 Workforce 演示边界', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
+  it('当天已作废的施工员不再出现在今日上工可提交列表', async () => {
+    const repository = new MockWorkforceRepository()
+    const preview = await repository.getWorkforcePreview('SY-2026-001')
+    preview.data.labor_entries.unshift({
+      entry_id: 999,
+      assignment_id: 201,
+      work_date: localISODate(),
+      attendance_status: 'present',
+      day_fraction: '1.000',
+      work_minutes: null,
+      work_summary: '已作废记录',
+      notes: null,
+      cost_cents: 68000,
+      status: 'voided',
+      void_reason: '录入错误',
+    })
+    vi.spyOn(repository, 'getWorkforcePreview').mockResolvedValue(preview)
+
+    const wrapper = mountComponent(WorkforceCenter, 'SY-2026-001', repository)
+    await settle()
+
+    expect(wrapper.find('[data-testid="labor-select-201"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="labor-select-202"]').exists()).toBe(true)
+    expect(wrapper.text()).toContain('已作废记录')
+  })
+
   it('今日上工写入成功但刷新失败时，明确告知已保存且不重提', async () => {
     const repository = new MockWorkforceRepository()
     const saveSpy = vi.spyOn(repository, 'saveLaborEntriesBatch')
@@ -302,6 +329,26 @@ describe('P1 Workforce 演示边界', () => {
     await wrapper.get('[data-testid="material-advance-open"]').trigger('click')
     expect(wrapper.get('[data-testid="material-advance-dialog"]').text()).toContain('现场垫资')
     expect(wrapper.text()).not.toContain('暂为演示入口')
+  })
+
+  it('新增排单只能选择仍在职的施工员', async () => {
+    const repository = new MockWorkforceRepository()
+    await repository.getWorkforcePreview('SY-2026-001')
+    await repository.setWorkerStatus(102, 'inactive')
+    const wrapper = mountComponent(WorkforceCenter, 'SY-2026-001', repository)
+    await settle()
+
+    await wrapper.get('[data-testid="assignment-create-open"]').trigger('click')
+    await settle()
+    await wrapper
+      .get('[data-testid="assignment-create-dialog"] .el-select__wrapper')
+      .trigger('click')
+    await settle()
+    const options = Array.from(document.body.querySelectorAll('[role="option"]'))
+      .map((option) => option.textContent?.trim())
+
+    expect(options).toContain('王建国')
+    expect(options).not.toContain('陈志强')
   })
 
   it('现场业务日期默认当天并统一使用 Element Plus 日期选择器', async () => {
@@ -437,18 +484,111 @@ describe('P1 Workforce 演示边界', () => {
     expect(preview.material_advances[0]?.reimbursements).toHaveLength(2)
   })
 
-  it('施工管理只展示后端真实支持的操作，上工纠错走批量覆盖', async () => {
+  it('施工管理展示排单流转与历史上工编辑作废入口', async () => {
     const wrapper = mountComponent(WorkforceCenter)
     await settle()
 
     expect(wrapper.get('[data-testid="worker-edit-101"]').text()).toContain('编辑')
     expect(wrapper.get('[data-testid="worker-deactivate-101"]').text()).toContain('停用')
-    expect(wrapper.find('[data-testid="assignment-status-202"]').exists()).toBe(false)
-    expect(wrapper.find('[data-testid="labor-edit-301"]').exists()).toBe(false)
-    expect(wrapper.find('[data-testid="labor-void-301"]').exists()).toBe(false)
-    expect(wrapper.text()).toContain('重新批量保存')
+    expect(wrapper.get('[data-testid="assignment-start-202"]').text()).toContain('开始')
+    expect(wrapper.get('[data-testid="assignment-complete-201"]').text()).toContain('完成')
+    expect(wrapper.get('[data-testid="assignment-cancel-201"]').text()).toContain('取消')
+    expect(wrapper.get('[data-testid="labor-edit-301"]').text()).toContain('编辑')
+    expect(wrapper.get('[data-testid="labor-void-301"]').text()).toContain('作废')
     expect(wrapper.get('[data-testid="report-confirm-2026-09-09"]').text()).toContain('确认')
     expect(wrapper.get('[data-testid="reimbursement-open-401"]').text()).toContain('报销')
+  })
+
+  it('已停用施工员可重新启用，排单可开始并刷新页面状态', async () => {
+    const repository = new MockWorkforceRepository()
+    await repository.getWorkforcePreview('SY-2026-001')
+    await repository.setWorkerStatus(102, 'inactive')
+    const workerSpy = vi.spyOn(repository, 'setWorkerStatus')
+    const assignmentSpy = vi.spyOn(repository, 'setCrewAssignmentStatus')
+    const wrapper = mountComponent(WorkforceCenter, 'SY-2026-001', repository)
+    await settle()
+
+    await wrapper.get('[data-testid="worker-reactivate-102"]').trigger('click')
+    await settle()
+    await wrapper.get('[data-testid="assignment-start-202"]').trigger('click')
+    await settle()
+
+    expect(workerSpy).toHaveBeenCalledWith(102, 'active')
+    expect(assignmentSpy).toHaveBeenCalledWith('SY-2026-001', 202, 'active', null)
+  })
+
+  it('完成排单必须在对话框确认，原因留空时提交 null', async () => {
+    const repository = new MockWorkforceRepository()
+    const assignmentSpy = vi.spyOn(repository, 'setCrewAssignmentStatus')
+    const wrapper = mountComponent(WorkforceCenter, 'SY-2026-001', repository)
+    await settle()
+
+    await wrapper.get('[data-testid="assignment-complete-201"]').trigger('click')
+    await settle()
+    expect(assignmentSpy).not.toHaveBeenCalled()
+    expect(wrapper.get('[data-testid="assignment-transition-dialog"]').text()).toContain('确认完成排单')
+
+    await wrapper.get('[data-testid="assignment-transition-dialog"] form').trigger('submit')
+    await settle()
+
+    expect(assignmentSpy).toHaveBeenCalledWith(
+      'SY-2026-001',
+      201,
+      'completed',
+      null,
+    )
+  })
+
+  it('取消排单必须二次确认且填写真实原因', async () => {
+    const repository = new MockWorkforceRepository()
+    const assignmentSpy = vi.spyOn(repository, 'setCrewAssignmentStatus')
+    const wrapper = mountComponent(WorkforceCenter, 'SY-2026-001', repository)
+    await settle()
+
+    await wrapper.get('[data-testid="assignment-cancel-202"]').trigger('click')
+    await settle()
+    expect(assignmentSpy).not.toHaveBeenCalled()
+
+    await wrapper.get('[data-testid="assignment-transition-dialog"] form').trigger('submit')
+    await settle()
+    expect(assignmentSpy).not.toHaveBeenCalled()
+    expect(wrapper.get('[data-testid="assignment-transition-error"]').text()).toContain('请填写取消原因')
+
+    await wrapper.get('[data-testid="assignment-transition-reason"] textarea').setValue('客户要求暂停进场')
+    await wrapper.get('[data-testid="assignment-transition-dialog"] form').trigger('submit')
+    await settle()
+
+    expect(assignmentSpy).toHaveBeenCalledWith(
+      'SY-2026-001',
+      202,
+      'cancelled',
+      '客户要求暂停进场',
+    )
+  })
+
+  it('历史上工可编辑并作废，已作废记录不再显示操作', async () => {
+    const repository = new MockWorkforceRepository()
+    const updateSpy = vi.spyOn(repository, 'updateLaborEntry')
+    const voidSpy = vi.spyOn(repository, 'voidLaborEntry')
+    const wrapper = mountComponent(WorkforceCenter, 'SY-2026-001', repository)
+    await settle()
+
+    await wrapper.get('[data-testid="labor-edit-301"]').trigger('click')
+    expect(wrapper.get('[data-testid="labor-edit-dialog"]').text()).toContain('编辑上工记录')
+    await wrapper.get('[data-testid="labor-edit-summary"] textarea').setValue('已核对当日工作')
+    await wrapper.get('[data-testid="labor-edit-dialog"] form').trigger('submit')
+    await settle()
+    expect(updateSpy).toHaveBeenCalledWith('SY-2026-001', 301, expect.objectContaining({
+      work_summary: '已核对当日工作',
+    }))
+
+    await wrapper.get('[data-testid="labor-void-302"]').trigger('click')
+    await wrapper.get('[data-testid="labor-void-reason"] textarea').setValue('重复登记')
+    await wrapper.get('[data-testid="labor-void-dialog"] form').trigger('submit')
+    await settle()
+    expect(voidSpy).toHaveBeenCalledWith('SY-2026-001', 302, '重复登记')
+    expect(wrapper.find('[data-testid="labor-edit-302"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="labor-void-302"]').exists()).toBe(false)
   })
 })
 

@@ -4,7 +4,6 @@ import type {
   CrewAssignmentDto,
   CrewAssignmentInput,
   CrewAssignmentUpdateInput,
-  LaborBatchDto,
   LaborBatchInput,
   LaborEntryDto,
   PaginationQuery,
@@ -13,7 +12,11 @@ import type {
   WorkerInput,
   WorkerUpdateInput,
 } from '../domain/operations-api'
-import type { CrewAssignmentStatus, WorkerStatus } from '../domain/workforce'
+import type {
+  CrewAssignmentStatus,
+  LaborEntryUpdateInput,
+  WorkerStatus,
+} from '../domain/workforce'
 import type {
   DemoCrewAssignmentViewModel,
   DemoLaborEntryViewModel,
@@ -40,17 +43,52 @@ export interface LaborEntryListQuery extends PaginationQuery {
   worker_id?: number
 }
 
+export interface WorkerReactivateInput {
+  expected_revision: number
+}
+
+export interface CrewAssignmentTransitionInput {
+  to_status: CrewAssignmentStatus
+  effective_at: string
+  reason: string | null
+  expected_revision: number
+}
+
+export interface LaborEntryApiUpdateInput extends LaborEntryUpdateInput {
+  expected_revision: number
+}
+
+export interface LaborEntryVoidInput {
+  reason: string
+  expected_revision: number
+}
+
+export interface LiveLaborEntryDto extends LaborEntryDto {
+  void_reason: string | null
+  voided_at: string | null
+}
+
+export interface LiveLaborBatchDto {
+  work_date: string
+  items: LiveLaborEntryDto[]
+}
+
 export interface WorkforceHttpRepository {
   listWorkers(query?: WorkerListQuery): Promise<RepositoryResult<PagedResult<WorkerDto>>>
   createWorker(input: WorkerInput): Promise<RepositoryResult<WorkerDto>>
   getWorker(workerId: number): Promise<RepositoryResult<WorkerDto>>
   updateWorker(workerId: number, input: WorkerUpdateInput): Promise<RepositoryResult<WorkerDto>>
   deactivateWorker(workerId: number, input: WorkerDeactivateInput): Promise<RepositoryResult<WorkerDto>>
+  reactivateWorker(workerId: number, input: WorkerReactivateInput): Promise<RepositoryResult<WorkerDto>>
   listCrewAssignments(projectCode: string, query?: CrewAssignmentListQuery): Promise<RepositoryResult<PagedResult<CrewAssignmentDto>>>
   createCrewAssignment(projectCode: string, input: CrewAssignmentInput): Promise<RepositoryResult<CrewAssignmentDto>>
   updateCrewAssignment(projectCode: string, assignmentId: number, input: CrewAssignmentUpdateInput): Promise<RepositoryResult<CrewAssignmentDto>>
-  listLaborEntries(projectCode: string, query?: LaborEntryListQuery): Promise<RepositoryResult<PagedResult<LaborEntryDto>>>
-  saveLaborEntriesBatch(projectCode: string, input: LaborBatchInput): Promise<RepositoryResult<LaborBatchDto>>
+  transitionCrewAssignment(projectCode: string, assignmentId: number, input: CrewAssignmentTransitionInput): Promise<RepositoryResult<CrewAssignmentDto>>
+  listLaborEntries(projectCode: string, query?: LaborEntryListQuery): Promise<RepositoryResult<PagedResult<LiveLaborEntryDto>>>
+  createLaborEntry(projectCode: string, input: LaborEntryUpdateInput): Promise<RepositoryResult<LiveLaborEntryDto>>
+  updateLaborEntry(projectCode: string, entryId: number, input: LaborEntryApiUpdateInput): Promise<RepositoryResult<LiveLaborEntryDto>>
+  voidLaborEntry(projectCode: string, entryId: number, input: LaborEntryVoidInput): Promise<RepositoryResult<LiveLaborEntryDto>>
+  saveLaborEntriesBatch(projectCode: string, input: LaborBatchInput): Promise<RepositoryResult<LiveLaborBatchDto>>
   discardSaveLaborEntriesBatch(projectCode: string, input: LaborBatchInput): boolean
 }
 
@@ -77,6 +115,10 @@ class HttpWorkforceRepository implements WorkforceHttpRepository {
     return live(await this.postSender.send(`${workerPath(workerId)}/deactivate`, input))
   }
 
+  async reactivateWorker(workerId: number, input: WorkerReactivateInput): Promise<RepositoryResult<WorkerDto>> {
+    return live(await this.postSender.send(`${workerPath(workerId)}/reactivate`, input))
+  }
+
   async listCrewAssignments(projectCode: string, query: CrewAssignmentListQuery = {}): Promise<RepositoryResult<PagedResult<CrewAssignmentDto>>> {
     return live(await requestJson(withQuery(assignmentCollectionPath(projectCode), query)))
   }
@@ -92,11 +134,30 @@ class HttpWorkforceRepository implements WorkforceHttpRepository {
     }))
   }
 
-  async listLaborEntries(projectCode: string, query: LaborEntryListQuery = {}): Promise<RepositoryResult<PagedResult<LaborEntryDto>>> {
+  async transitionCrewAssignment(projectCode: string, assignmentId: number, input: CrewAssignmentTransitionInput): Promise<RepositoryResult<CrewAssignmentDto>> {
+    return live(await this.postSender.send(`${assignmentCollectionPath(projectCode)}/${assignmentId}/transition`, input))
+  }
+
+  async listLaborEntries(projectCode: string, query: LaborEntryListQuery = {}): Promise<RepositoryResult<PagedResult<LiveLaborEntryDto>>> {
     return live(await requestJson(withQuery(`${projectPath(projectCode)}/labor-entries`, query)))
   }
 
-  async saveLaborEntriesBatch(projectCode: string, input: LaborBatchInput): Promise<RepositoryResult<LaborBatchDto>> {
+  async createLaborEntry(projectCode: string, input: LaborEntryUpdateInput): Promise<RepositoryResult<LiveLaborEntryDto>> {
+    return live(await this.postSender.send(`${projectPath(projectCode)}/labor-entries`, input))
+  }
+
+  async updateLaborEntry(projectCode: string, entryId: number, input: LaborEntryApiUpdateInput): Promise<RepositoryResult<LiveLaborEntryDto>> {
+    return live(await requestJson(`${projectPath(projectCode)}/labor-entries/${entryId}`, {
+      method: 'PUT',
+      body: input,
+    }))
+  }
+
+  async voidLaborEntry(projectCode: string, entryId: number, input: LaborEntryVoidInput): Promise<RepositoryResult<LiveLaborEntryDto>> {
+    return live(await this.postSender.send(`${projectPath(projectCode)}/labor-entries/${entryId}/void`, input))
+  }
+
+  async saveLaborEntriesBatch(projectCode: string, input: LaborBatchInput): Promise<RepositoryResult<LiveLaborBatchDto>> {
     return live(await this.postSender.send(`${projectPath(projectCode)}/labor-entries/batch`, input))
   }
 
@@ -117,6 +178,8 @@ type WorkforceWorkspaceMethods = Pick<
   | 'updateWorker'
   | 'setWorkerStatus'
   | 'assignWorker'
+  | 'updateLaborEntry'
+  | 'voidLaborEntry'
   | 'saveSiteDailyReport'
   | 'confirmSiteDailyReport'
   | 'saveMaterialAdvance'
@@ -125,6 +188,12 @@ type WorkforceWorkspaceMethods = Pick<
 
 export interface WorkforceWorkspaceRepository extends WorkforceWorkspaceMethods {
   readonly source: 'live' | 'demo'
+  setCrewAssignmentStatus(
+    projectCode: string,
+    assignmentId: number,
+    status: CrewAssignmentStatus,
+    reason: string | null,
+  ): Promise<void>
 }
 
 interface SiteDailyReportDto extends DemoSiteDailyReportViewModel {
@@ -188,7 +257,8 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
   private readonly postSender = createRetriablePostSender()
   private workers = new Map<number, WorkerDto>()
   private assignments = new Map<number, CrewAssignmentDto>()
-  private laborByWorkerDate = new Map<string, LaborEntryDto>()
+  private laborByWorkerDate = new Map<string, LiveLaborEntryDto>()
+  private laborById = new Map<number, LiveLaborEntryDto>()
   private reports = new Map<string, SiteDailyReportDto>()
   private activeProjectKey: string | null = null
   private previewLoadVersion = 0
@@ -197,7 +267,7 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     const loadVersion = ++this.previewLoadVersion
     const project = projectPath(projectCode)
     const [workers, assignments, labor, reports, advanceSummaries] = await Promise.all([
-      this.api.listWorkers({ page: 1, page_size: 200 }),
+      this.api.listWorkers({ page: 1, page_size: 200, status: 'all' }),
       this.api.listCrewAssignments(projectCode, { page: 1, page_size: 200 }),
       this.listAllLaborEntries(projectCode),
       requestJson<PagedResult<SiteDailyReportDto>>(withQuery(`${project}/site-daily-reports`, { page: 1, page_size: 200 })),
@@ -212,6 +282,7 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
       this.workers = new Map(workers.data.items.map((item) => [item.id, item]))
       this.assignments = new Map(assignments.data.items.map((item) => [item.id, item]))
       this.laborByWorkerDate = new Map(labor.data.items.map((item) => [laborKey(item.work_date, item.worker_id), item]))
+      this.laborById = new Map(labor.data.items.map((item) => [item.id, item]))
       this.reports = new Map(reports.items.map((item) => [item.work_date, item]))
     }
 
@@ -244,7 +315,7 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     })
     if (this.hasProjectContext(projectCode)) {
       for (const item of response.data.items) {
-        this.laborByWorkerDate.set(laborKey(item.work_date, item.worker_id), item)
+        this.cacheLabor(item)
       }
     }
     return live(response.data.items.map(mapLabor))
@@ -263,13 +334,14 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
   }
 
   async setWorkerStatus(workerId: number, status: WorkerStatus): Promise<void> {
-    if (status !== 'inactive') throw new Error('后端暂不支持重新启用施工员')
     const current = (await this.api.getWorker(workerId)).data
-    const response = await this.api.deactivateWorker(workerId, {
-      effective_on: localBusinessDate(),
-      reason: '从施工人员页停用',
-      expected_revision: current.revision,
-    })
+    const response = status === 'active'
+      ? await this.api.reactivateWorker(workerId, { expected_revision: current.revision })
+      : await this.api.deactivateWorker(workerId, {
+        effective_on: localBusinessDate(),
+        reason: '从施工人员页停用',
+        expected_revision: current.revision,
+      })
     this.workers.set(workerId, response.data)
   }
 
@@ -278,6 +350,50 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     const response = await this.api.createCrewAssignment(projectCode, input)
     if (this.hasProjectContext(projectCode)) this.assignments.set(response.data.id, response.data)
     return live(mapAssignment(response.data))
+  }
+
+  async setCrewAssignmentStatus(
+    projectCode: string,
+    assignmentId: number,
+    status: CrewAssignmentStatus,
+    reason: string | null,
+  ): Promise<void> {
+    this.requireProjectContext(projectCode)
+    const current = this.assignments.get(assignmentId)
+    if (!current) throw new Error('项目排单不存在，请刷新后重试')
+    const response = await this.api.transitionCrewAssignment(projectCode, assignmentId, {
+      to_status: status,
+      effective_at: new Date().toISOString(),
+      reason,
+      expected_revision: current.revision,
+    })
+    if (this.hasProjectContext(projectCode)) this.assignments.set(assignmentId, response.data)
+  }
+
+  async updateLaborEntry(
+    projectCode: string,
+    entryId: number,
+    input: LaborEntryUpdateInput,
+  ): Promise<void> {
+    this.requireProjectContext(projectCode)
+    const current = this.laborById.get(entryId)
+    if (!current) throw new Error('上工记录不存在，请刷新后重试')
+    const response = await this.api.updateLaborEntry(projectCode, entryId, {
+      ...input,
+      expected_revision: current.revision,
+    })
+    if (this.hasProjectContext(projectCode)) this.cacheLabor(response.data)
+  }
+
+  async voidLaborEntry(projectCode: string, entryId: number, reason: string): Promise<void> {
+    this.requireProjectContext(projectCode)
+    const current = this.laborById.get(entryId)
+    if (!current) throw new Error('上工记录不存在，请刷新后重试')
+    const response = await this.api.voidLaborEntry(projectCode, entryId, {
+      reason,
+      expected_revision: current.revision,
+    })
+    if (this.hasProjectContext(projectCode)) this.cacheLabor(response.data)
   }
 
   async saveSiteDailyReport(projectCode: string, input: Parameters<WorkforceRepository['saveSiteDailyReport']>[1]): ReturnType<WorkforceRepository['saveSiteDailyReport']> {
@@ -323,7 +439,7 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     )
   }
 
-  private async listAllLaborEntries(projectCode: string): Promise<RepositoryResult<PagedResult<LaborEntryDto>>> {
+  private async listAllLaborEntries(projectCode: string): Promise<RepositoryResult<PagedResult<LiveLaborEntryDto>>> {
     const first = await this.api.listLaborEntries(projectCode, { page: 1, page_size: 200 })
     const pageSize = first.data.page_size > 0 ? first.data.page_size : 200
     const pageCount = Math.ceil(first.data.total / pageSize)
@@ -347,6 +463,13 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     if (!this.hasProjectContext(projectCode)) {
       throw new Error('项目施工数据已切换，请刷新后重试')
     }
+  }
+
+  private cacheLabor(item: LiveLaborEntryDto): void {
+    const previous = this.laborById.get(item.id)
+    if (previous) this.laborByWorkerDate.delete(laborKey(previous.work_date, previous.worker_id))
+    this.laborById.set(item.id, item)
+    this.laborByWorkerDate.set(laborKey(item.work_date, item.worker_id), item)
   }
 }
 
@@ -392,7 +515,7 @@ function mapAssignment(item: CrewAssignmentDto): DemoCrewAssignmentViewModel {
   }
 }
 
-function mapLabor(item: LaborEntryDto): DemoLaborEntryViewModel {
+function mapLabor(item: LiveLaborEntryDto): DemoLaborEntryViewModel {
   return {
     entry_id: item.id,
     assignment_id: item.assignment_id,
@@ -404,7 +527,7 @@ function mapLabor(item: LaborEntryDto): DemoLaborEntryViewModel {
     notes: item.notes,
     cost_cents: item.cost_cents,
     status: item.status,
-    void_reason: null,
+    void_reason: item.void_reason ?? null,
   }
 }
 

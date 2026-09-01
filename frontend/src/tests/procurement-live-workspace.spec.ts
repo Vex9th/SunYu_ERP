@@ -1,5 +1,5 @@
 import { mount, type VueWrapper } from '@vue/test-utils'
-import ElementPlus from 'element-plus'
+import ElementPlus, { ElMessageBox, type MessageBoxData } from 'element-plus'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import ProcurementWorkspace from '../components/procurement/ProcurementWorkspace.vue'
@@ -443,29 +443,58 @@ describe('采购工作台真实接口', () => {
     expect(readLateData).not.toHaveBeenCalled()
   })
 
-  it('读取错误明确展示，分页结果超过首屏时分别警告', async () => {
+  it('读取错误明确展示', async () => {
     const failedRepository = createRepository()
     vi.mocked(failedRepository.listProcurementLists).mockRejectedValueOnce(new Error('采购清单接口失败'))
     const failedWrapper = mountWorkspace(failedRepository)
     await settle()
     expect(failedWrapper.get('[data-testid="procurement-load-error"]').text()).toContain('采购清单接口失败')
-    unmountWorkspace(failedWrapper)
+  })
 
-    const pagedRepository = createRepository()
-    const detail = listDetail()
-    const order = purchaseOrder()
-    vi.mocked(pagedRepository.listProcurementLists).mockResolvedValueOnce(liveResult({
-      items: [listSummary(detail)], total: 101, page: 1, page_size: 100,
+  it('采购清单和采购单独立翻页，每页数变更回到第一页并展示服务端总数', async () => {
+    const repository = createRepository()
+    const firstList = listDetail()
+    const secondList = { ...listDetail(), id: 12, name: '第二页采购清单' }
+    const firstOrder = purchaseOrder()
+    const secondOrder = { ...purchaseOrder(), id: 92, order_no: 'PO-PAGE-2' }
+    vi.mocked(repository.listProcurementLists).mockImplementation(async (_projectCode, query = {}) => liveResult({
+      items: [listSummary(query.page === 2 ? secondList : firstList)],
+      total: 205,
+      page: query.page ?? 1,
+      page_size: query.page_size ?? 100,
     }))
-    vi.mocked(pagedRepository.listPurchaseOrders).mockResolvedValueOnce(liveResult({
-      items: [order], total: 205, page: 1, page_size: 100,
+    vi.mocked(repository.getProcurementList).mockImplementation(async (_projectCode, id) => (
+      liveResult(id === 12 ? secondList : firstList)
+    ))
+    vi.mocked(repository.listPurchaseOrders).mockImplementation(async (_projectCode, query = {}) => liveResult({
+      items: [query.page === 2 ? secondOrder : firstOrder],
+      total: 121,
+      page: query.page ?? 1,
+      page_size: query.page_size ?? 100,
     }))
-    const pagedWrapper = mountWorkspace(pagedRepository)
+
+    const wrapper = mountWorkspace(repository)
     await settle()
-    const warnings = pagedWrapper.findAll('[data-testid="procurement-pagination-warning"]')
-    expect(warnings).toHaveLength(2)
-    expect(warnings[0]!.text()).toContain('采购清单共 101 条，当前仅展示前 100 条')
-    expect(warnings[1]!.text()).toContain('采购单共 205 条，当前仅展示前 100 条')
+    expect(wrapper.get('[data-testid="procurement-list-page-info"]').text()).toContain('第 1 / 3 页，共 205 条')
+    expect(wrapper.get('[data-testid="purchase-order-page-info"]').text()).toContain('第 1 / 2 页，共 121 条')
+
+    wrapper.findAllComponents({ name: 'ElPagination' })[0]!.vm.$emit('current-change', 2)
+    await settle()
+    expect(repository.listProcurementLists).toHaveBeenLastCalledWith('SY-001', { page: 2, page_size: 100 })
+    expect(repository.listPurchaseOrders).toHaveBeenLastCalledWith('SY-001', { page: 1, page_size: 100 })
+    expect(wrapper.text()).toContain('第二页采购清单')
+    expect(wrapper.get('[data-testid="procurement-list-page-info"]').text()).toContain('第 2 / 3 页')
+
+    wrapper.findAllComponents({ name: 'ElPagination' })[1]!.vm.$emit('current-change', 2)
+    await settle()
+    expect(repository.listPurchaseOrders).toHaveBeenLastCalledWith('SY-001', { page: 2, page_size: 100 })
+    expect(wrapper.text()).toContain('PO-PAGE-2')
+
+    wrapper.findAllComponents({ name: 'ElPagination' })[0]!.vm.$emit('size-change', 50)
+    await settle()
+    expect(repository.listProcurementLists).toHaveBeenLastCalledWith('SY-001', { page: 1, page_size: 50 })
+    expect(repository.listPurchaseOrders).toHaveBeenLastCalledWith('SY-001', { page: 2, page_size: 100 })
+    expect(wrapper.get('[data-testid="procurement-list-page-info"]').text()).toContain('第 1 / 5 页，共 205 条')
   })
 
   it('清单与采购单各自展示空态，概览和供应商区域不随业务列表消失', async () => {
@@ -616,6 +645,135 @@ describe('采购工作台真实接口', () => {
     expect(repository.createProcurementLine).toHaveBeenCalledWith('SY-001', 11, input)
     expectWorkspaceReadCount(repository, 2)
     expect(wrapper.text()).toContain('刷新后空开')
+  })
+
+  it('草稿采购行可编辑全部核心字段，使用当前 revision 并刷新当前页', async () => {
+    const repository = createRepository()
+    const updatedLine = {
+      ...line,
+      sequence_no: 2,
+      category: '机械',
+      name: '伺服驱动器',
+      specification: '3kW',
+      brand: '汇川技术',
+      model: 'SV680',
+      quantity: '3.500',
+      unit: '件',
+      unit_cost_cents: 120050,
+      quoted_unit_price_cents: 150075,
+      revision: 3,
+    }
+    const refreshed = { ...listDetail(), lines: [updatedLine] }
+    vi.mocked(repository.updateProcurementLine).mockResolvedValue(liveResult(updatedLine))
+    vi.mocked(repository.getProcurementList)
+      .mockResolvedValueOnce(liveResult(listDetail()))
+      .mockResolvedValueOnce(liveResult(refreshed))
+    const wrapper = mountWorkspace(repository)
+    await settle()
+
+    await wrapper.get('[data-testid="procurement-line-edit-101"]').trigger('click')
+    const dialog = wrapper.get('[data-testid="procurement-line-dialog"]')
+    await dialog.get('[data-testid="procurement-line-sequence"] input').setValue('2')
+    await dialog.get('[data-testid="procurement-line-category"]').setValue('机械')
+    await dialog.get('[data-testid="procurement-line-name"]').setValue('伺服驱动器')
+    await dialog.get('[data-testid="procurement-line-specification"]').setValue('3kW')
+    await dialog.get('[data-testid="procurement-line-brand"]').setValue('汇川技术')
+    await dialog.get('[data-testid="procurement-line-model"]').setValue('SV680')
+    await dialog.get('[data-testid="procurement-line-quantity"]').setValue('3.500')
+    await dialog.get('[data-testid="procurement-line-unit"]').setValue('件')
+    await dialog.get('[data-testid="procurement-line-cost-price"]').setValue('1200.50')
+    await dialog.get('[data-testid="procurement-line-quote-price"]').setValue('1500.75')
+    await dialog.get('[data-testid="procurement-line-submit"]').trigger('click')
+    await settle()
+
+    expect(repository.updateProcurementLine).toHaveBeenCalledWith('SY-001', 11, 101, {
+      sequence_no: 2,
+      category: '机械',
+      name: '伺服驱动器',
+      specification: '3kW',
+      brand: '汇川技术',
+      model: 'SV680',
+      quantity: '3.500',
+      unit: '件',
+      unit_cost_cents: 120050,
+      quoted_unit_price_cents: 150075,
+      expected_revision: 2,
+    })
+    expect(repository.listProcurementLists).toHaveBeenLastCalledWith('SY-001', { page: 1, page_size: 100 })
+    expect(wrapper.get('[data-testid="procurement-line-dialog"]').isVisible()).toBe(false)
+    expect(wrapper.text()).toContain('伺服驱动器')
+  })
+
+  it('删除草稿采购行必须通过 Element Plus 二次确认，写入中不重复请求并刷新', async () => {
+    const repository = createRepository()
+    const refreshed = { ...listDetail(), line_count: 0, lines: [] }
+    let resolveDelete!: () => void
+    vi.mocked(repository.deleteProcurementLine).mockReturnValue(new Promise<void>((resolve) => {
+      resolveDelete = resolve
+    }))
+    vi.mocked(repository.getProcurementList)
+      .mockResolvedValueOnce(liveResult(listDetail()))
+      .mockResolvedValueOnce(liveResult(refreshed))
+    const confirm = vi.spyOn(ElMessageBox, 'confirm')
+      .mockResolvedValue({ value: '', action: 'confirm' } as unknown as MessageBoxData)
+    const wrapper = mountWorkspace(repository)
+    await settle()
+
+    const deleteButton = wrapper.get('[data-testid="procurement-line-delete-101"]')
+    await deleteButton.trigger('click')
+    await Promise.resolve()
+    await deleteButton.trigger('click')
+    expect(confirm).toHaveBeenCalledWith(
+      '删除后无法恢复，确定删除“伺服电机”吗？',
+      '删除采购行',
+      expect.objectContaining({ type: 'warning' }),
+    )
+    expect(repository.deleteProcurementLine).toHaveBeenCalledTimes(1)
+
+    resolveDelete()
+    await settle()
+    expect(repository.deleteProcurementLine).toHaveBeenCalledWith('SY-001', 11, 101)
+    expect(repository.listProcurementLists).toHaveBeenLastCalledWith('SY-001', { page: 1, page_size: 100 })
+    expect(wrapper.text()).not.toContain('伺服电机')
+  })
+
+  it('采购行编辑或删除成功后刷新失败，明确提示但不重复写入', async () => {
+    const updateRepository = createRepository()
+    vi.mocked(updateRepository.listProcurementLists)
+      .mockResolvedValueOnce(liveResult({ items: [listSummary(listDetail())], total: 1, page: 1, page_size: 100 }))
+      .mockRejectedValueOnce(new Error('编辑后刷新失败'))
+    const updateWrapper = mountWorkspace(updateRepository)
+    await settle()
+    await updateWrapper.get('[data-testid="procurement-line-edit-101"]').trigger('click')
+    await updateWrapper.get('[data-testid="procurement-line-submit"]').trigger('click')
+    await settle()
+    expect(updateRepository.updateProcurementLine).toHaveBeenCalledTimes(1)
+    expect(updateWrapper.get('[data-testid="procurement-line-dialog"]').isVisible()).toBe(false)
+    expect(updateWrapper.get('[data-testid="procurement-action-error"]').text())
+      .toContain('操作已保存，但刷新失败：编辑后刷新失败')
+    unmountWorkspace(updateWrapper)
+
+    const deleteRepository = createRepository()
+    vi.mocked(deleteRepository.listProcurementLists)
+      .mockResolvedValueOnce(liveResult({ items: [listSummary(listDetail())], total: 1, page: 1, page_size: 100 }))
+      .mockRejectedValueOnce(new Error('删除后刷新失败'))
+    vi.spyOn(ElMessageBox, 'confirm')
+      .mockResolvedValue({ value: '', action: 'confirm' } as unknown as MessageBoxData)
+    const deleteWrapper = mountWorkspace(deleteRepository)
+    await settle()
+    await deleteWrapper.get('[data-testid="procurement-line-delete-101"]').trigger('click')
+    await settle()
+    expect(deleteRepository.deleteProcurementLine).toHaveBeenCalledTimes(1)
+    expect(deleteWrapper.get('[data-testid="procurement-action-error"]').text())
+      .toContain('操作已删除，但刷新失败：删除后刷新失败')
+  })
+
+  it('已确认清单行不显示编辑和删除入口', async () => {
+    const wrapper = mountWorkspace(createRepository({ listStatus: 'confirmed' }))
+    await settle()
+    expect(wrapper.find('[data-testid="procurement-line-edit-101"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="procurement-line-delete-101"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="procurement-list-confirm-11"]').exists()).toBe(false)
   })
 
   it('清单确认成功后重新读取当前项目并展示确认后的刷新结果', async () => {
@@ -773,6 +931,90 @@ describe('采购工作台真实接口', () => {
       document_version_ids: [],
     }
     expect(repository.createPurchaseOrder).toHaveBeenCalledWith('SY-001', input)
+  })
+
+  it('草稿采购单可逐行修改数量、成本价和超采原因，并提交完整 PUT DTO', async () => {
+    const repository = createRepository({ listStatus: 'confirmed', orderStatus: 'draft' })
+    const editableList = listDetail('SY-001', 'confirmed')
+    editableList.lines.push({
+      ...editableList.lines[0]!, id: 102, name: '接触器', quantity: '4.000', ordered_quantity: '1.000',
+    })
+    const editableOrder = purchaseOrder('SY-001', 'draft')
+    editableOrder.lines.push({
+      ...editableOrder.lines[0]!, id: 902, procurement_line_id: 102, quantity: '1.000', unit_cost_cents: 8800,
+    })
+    vi.mocked(repository.getProcurementList).mockResolvedValue(liveResult(editableList))
+    vi.mocked(repository.getPurchaseOrder).mockResolvedValue(liveResult(editableOrder))
+    const wrapper = mountWorkspace(repository)
+    await settle()
+
+    await wrapper.get('[data-testid="purchase-order-detail-open"]').trigger('click')
+    await settle()
+    await wrapper.get('[data-testid="purchase-order-edit"]').trigger('click')
+    const dialog = wrapper.get('[data-testid="purchase-order-edit-dialog"]')
+    expect((dialog.get('[data-testid="purchase-order-edit-line-quantity-901"]').element as HTMLInputElement).value)
+      .toBe('2.000')
+    expect((dialog.get('[data-testid="purchase-order-edit-line-cost-901"]').element as HTMLInputElement).value)
+      .toBe('1289.00')
+
+    await dialog.get('[data-testid="purchase-order-edit-line-quantity-901"]').setValue('8.500')
+    await dialog.get('[data-testid="purchase-order-edit-line-cost-901"]').setValue('1250.50')
+    await dialog.get('[data-testid="purchase-order-edit-line-overage-901"]').setValue('  客户追加备件  ')
+    await dialog.get('[data-testid="purchase-order-edit-line-quantity-902"]').setValue('3.000')
+    await dialog.get('[data-testid="purchase-order-edit-line-cost-902"]').setValue('88.00')
+    await dialog.get('[data-testid="purchase-order-edit-submit"]').trigger('click')
+    await settle()
+
+    expect(repository.updatePurchaseOrder).toHaveBeenCalledWith('SY-001', 91, {
+      order_no: 'PO-2026-001',
+      supplier_company_id: 8,
+      ordered_on: '2026-08-29',
+      expected_delivery_on: '2026-09-05',
+      lines: [{
+        procurement_line_id: 101,
+        quantity: '8.500',
+        unit_cost_cents: 125050,
+        overage_reason: '客户追加备件',
+      }, {
+        procurement_line_id: 102,
+        quantity: '3.000',
+        unit_cost_cents: 8800,
+        overage_reason: null,
+      }],
+      notes: null,
+      document_version_ids: [],
+      expected_revision: 2,
+    })
+  })
+
+  it('草稿采购单编辑拒绝非正数数量、负成本价和无原因超采', async () => {
+    const repository = createRepository({ listStatus: 'confirmed', orderStatus: 'draft' })
+    const wrapper = mountWorkspace(repository)
+    await settle()
+
+    await wrapper.get('[data-testid="purchase-order-detail-open"]').trigger('click')
+    await settle()
+    await wrapper.get('[data-testid="purchase-order-edit"]').trigger('click')
+    const dialog = wrapper.get('[data-testid="purchase-order-edit-dialog"]')
+    const quantity = dialog.get('[data-testid="purchase-order-edit-line-quantity-901"]')
+    const cost = dialog.get('[data-testid="purchase-order-edit-line-cost-901"]')
+    const reason = dialog.get('[data-testid="purchase-order-edit-line-overage-901"]')
+
+    await quantity.setValue('0')
+    await dialog.get('[data-testid="purchase-order-edit-submit"]').trigger('click')
+    expect(wrapper.get('[data-testid="procurement-action-error"]').text()).toContain('数量必须大于 0')
+
+    await quantity.setValue('2.000')
+    await cost.setValue('-1')
+    await dialog.get('[data-testid="purchase-order-edit-submit"]').trigger('click')
+    expect(wrapper.get('[data-testid="procurement-action-error"]').text()).toContain('成本价必须是非负金额')
+
+    await cost.setValue('1289.00')
+    await quantity.setValue('8.001')
+    await reason.setValue('   ')
+    await dialog.get('[data-testid="purchase-order-edit-submit"]').trigger('click')
+    expect(wrapper.get('[data-testid="procurement-action-error"]').text()).toContain('超采必须填写原因')
+    expect(repository.updatePurchaseOrder).not.toHaveBeenCalled()
   })
 
   it.each(['abc', '-1', '1.0001'])(

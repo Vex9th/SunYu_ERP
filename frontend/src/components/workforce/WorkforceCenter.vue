@@ -49,9 +49,16 @@ const reportDialogVisible = ref(false)
 const advanceDialogVisible = ref(false)
 const workerEditVisible = ref(false)
 const reimbursementVisible = ref(false)
+const laborEditVisible = ref(false)
+const laborVoidVisible = ref(false)
+const assignmentTransitionVisible = ref(false)
 const formBusy = ref(false)
 const selectedWorkerId = ref(0)
 const selectedAdvanceId = ref(0)
+const selectedLaborEntryId = ref(0)
+const selectedAssignmentId = ref(0)
+const assignmentTransitionStatus = ref<Extract<CrewAssignmentStatus, 'completed' | 'cancelled'>>('completed')
+const assignmentTransitionError = ref('')
 let loadVersion = 0
 
 const workerForm = reactive({ name: '', phone: '', notes: '' })
@@ -64,6 +71,17 @@ const advanceForm = reactive({
 })
 const workerEditForm = reactive({ name: '', phone: '', notes: '' })
 const reimbursementForm = reactive({ amountYuan: '', reimbursedOn: localISODate(), paymentMethod: 'bank_transfer' as 'bank_transfer' | 'cash' | 'other', notes: '' })
+const laborEditForm = reactive({
+  assignmentId: 0,
+  workDate: localISODate(),
+  attendanceStatus: 'present' as AttendanceStatus,
+  dayFraction: '1.000',
+  hours: 8,
+  workSummary: '',
+  notes: '',
+})
+const laborVoidForm = reactive({ reason: '' })
+const assignmentTransitionForm = reactive({ reason: '' })
 
 const attendanceLabels: Record<AttendanceStatus, string> = {
   present: '到场',
@@ -85,10 +103,25 @@ const assignmentWorkers = computed(() => new Map(
 const activeWorkerIds = computed(() => new Set(
   model.value?.workers.filter((worker) => worker.status === 'active').map((worker) => worker.worker_id) ?? [],
 ))
+const activeWorkers = computed(() => model.value?.workers.filter(
+  (worker) => worker.status === 'active',
+) ?? [])
+const voidedWorkerIdsForWorkDate = computed(() => {
+  const workforce = model.value
+  if (!workforce) return new Set<number>()
+  const assignmentWorkerIds = new Map(workforce.crew_assignments.map(
+    (assignment) => [assignment.assignment_id, assignment.worker_id],
+  ))
+  return new Set(workforce.labor_entries
+    .filter((entry) => entry.work_date === workDate.value && entry.status === 'voided')
+    .map((entry) => assignmentWorkerIds.get(entry.assignment_id))
+    .filter((workerId): workerId is number => workerId !== undefined))
+})
 const activeAssignments = computed(() => model.value?.crew_assignments.filter(
   (assignment) => (
     (assignment.status === 'active' || assignment.status === 'planned')
     && activeWorkerIds.value.has(assignment.worker_id)
+    && !voidedWorkerIdsForWorkDate.value.has(assignment.worker_id)
     && assignment.scheduled_start_on <= workDate.value
     && assignment.scheduled_end_on >= workDate.value
   ),
@@ -380,8 +413,121 @@ function saveWorkerEdit(): Promise<void> {
 }
 
 function changeWorkerStatus(worker: DemoWorkerViewModel): Promise<void> {
-  if (worker.status !== 'active') return Promise.resolve()
-  return runForm(() => repository.setWorkerStatus(worker.worker_id, 'inactive'), () => {}, '施工员已停用')
+  const nextStatus = worker.status === 'active' ? 'inactive' : 'active'
+  return runForm(
+    () => repository.setWorkerStatus(worker.worker_id, nextStatus),
+    () => {},
+    nextStatus === 'active' ? '施工员已重新启用' : '施工员已停用',
+  )
+}
+
+function changeAssignmentStatus(
+  assignmentId: number,
+  status: CrewAssignmentStatus,
+  reason: string | null,
+): Promise<void> {
+  const labels: Record<CrewAssignmentStatus, string> = {
+    planned: '排单已恢复计划',
+    active: '排单已开始',
+    completed: '排单已完成',
+    cancelled: '排单已取消',
+  }
+  return runForm(
+    () => repository.setCrewAssignmentStatus(props.projectCode, assignmentId, status, reason),
+    () => {},
+    labels[status],
+  )
+}
+
+function requestAssignmentStatus(
+  assignmentId: number,
+  status: Extract<CrewAssignmentStatus, 'active' | 'completed' | 'cancelled'>,
+): Promise<void> | void {
+  if (status === 'active') return changeAssignmentStatus(assignmentId, status, null)
+  selectedAssignmentId.value = assignmentId
+  assignmentTransitionStatus.value = status
+  assignmentTransitionForm.reason = ''
+  assignmentTransitionError.value = ''
+  assignmentTransitionVisible.value = true
+}
+
+function saveAssignmentTransition(): Promise<void> {
+  const reason = optionalText(assignmentTransitionForm.reason)
+  if (assignmentTransitionStatus.value === 'cancelled' && reason === null) {
+    assignmentTransitionError.value = '请填写取消原因'
+    return Promise.resolve()
+  }
+  assignmentTransitionError.value = ''
+  return runForm(
+    () => repository.setCrewAssignmentStatus(
+      props.projectCode,
+      selectedAssignmentId.value,
+      assignmentTransitionStatus.value,
+      reason,
+    ),
+    () => { assignmentTransitionVisible.value = false },
+    assignmentTransitionStatus.value === 'completed' ? '排单已完成' : '排单已取消',
+  )
+}
+
+function openLaborEdit(entry: DemoLaborEntryViewModel): void {
+  selectedLaborEntryId.value = entry.entry_id
+  Object.assign(laborEditForm, {
+    assignmentId: entry.assignment_id,
+    workDate: entry.work_date,
+    attendanceStatus: entry.attendance_status,
+    dayFraction: entry.day_fraction ?? '1.000',
+    hours: entry.work_minutes === null ? 8 : Number((entry.work_minutes / 60).toFixed(2)),
+    workSummary: entry.work_summary ?? '',
+    notes: entry.notes ?? '',
+  })
+  laborEditVisible.value = true
+}
+
+function saveLaborEdit(): Promise<void> {
+  const assignment = model.value?.crew_assignments.find(
+    (item) => item.assignment_id === laborEditForm.assignmentId,
+  )
+  if (!assignment) {
+    errorNotice.value = '项目排单不存在'
+    return Promise.resolve()
+  }
+  const isPresent = laborEditForm.attendanceStatus === 'present'
+  return runForm(() => repository.updateLaborEntry(
+    props.projectCode,
+    selectedLaborEntryId.value,
+    {
+      assignment_id: laborEditForm.assignmentId,
+      work_date: laborEditForm.workDate,
+      attendance_status: laborEditForm.attendanceStatus,
+      day_fraction: isPresent && assignment.pay_basis === 'daily'
+        ? laborEditForm.dayFraction
+        : null,
+      work_minutes: isPresent && assignment.pay_basis === 'hourly'
+        ? Math.round(laborEditForm.hours * 60)
+        : null,
+      work_summary: optionalText(laborEditForm.workSummary),
+      notes: optionalText(laborEditForm.notes),
+    },
+  ), () => { laborEditVisible.value = false }, '上工记录已更新')
+}
+
+function openLaborVoid(entry: DemoLaborEntryViewModel): void {
+  selectedLaborEntryId.value = entry.entry_id
+  laborVoidForm.reason = ''
+  laborVoidVisible.value = true
+}
+
+function saveLaborVoid(): Promise<void> {
+  return runForm(
+    () => repository.voidLaborEntry(
+      props.projectCode,
+      selectedLaborEntryId.value,
+      laborVoidForm.reason,
+    ),
+    () => { laborVoidVisible.value = false },
+    '上工记录已作废',
+  )
 }
 
 function confirmReport(workDate: string): Promise<void> {
@@ -499,7 +645,32 @@ watch(workDate, () => {
                   <span v-else>暂无记录</span>
                   <small>{{ scope.row.laborCount }} 次 · {{ formatMoney(scope.row.laborCostCents) }}</small>
                 </div>
-                <el-tag size="small" effect="plain">{{ assignmentStatusLabel(scope.row.assignment.status) }}</el-tag>
+                <div class="assignment-actions">
+                  <el-tag size="small" effect="plain">{{ assignmentStatusLabel(scope.row.assignment.status) }}</el-tag>
+                  <div class="compact-actions">
+                    <el-button
+                      v-if="scope.row.assignment.status === 'planned'"
+                      :data-testid="`assignment-start-${scope.row.assignment.assignment_id}`"
+                      link
+                      type="primary"
+                      @click="requestAssignmentStatus(scope.row.assignment.assignment_id, 'active')"
+                    >开始</el-button>
+                    <el-button
+                      v-if="scope.row.assignment.status === 'planned' || scope.row.assignment.status === 'active'"
+                      :data-testid="`assignment-complete-${scope.row.assignment.assignment_id}`"
+                      link
+                      type="success"
+                      @click="requestAssignmentStatus(scope.row.assignment.assignment_id, 'completed')"
+                    >完成</el-button>
+                    <el-button
+                      v-if="scope.row.assignment.status === 'planned' || scope.row.assignment.status === 'active'"
+                      :data-testid="`assignment-cancel-${scope.row.assignment.assignment_id}`"
+                      link
+                      type="danger"
+                      @click="requestAssignmentStatus(scope.row.assignment.assignment_id, 'cancelled')"
+                    >取消</el-button>
+                  </div>
+                </div>
               </div>
             </template>
           </el-table-column>
@@ -510,7 +681,7 @@ watch(workDate, () => {
               <el-table-column prop="name" label="施工员" min-width="110" />
               <el-table-column prop="phone" label="电话" min-width="130"><template #default="scope">{{ scope.row.phone ?? '未填写' }}</template></el-table-column>
               <el-table-column label="状态" min-width="80"><template #default="scope"><el-tag size="small" :type="scope.row.status === 'active' ? 'success' : 'info'">{{ scope.row.status === 'active' ? '在职' : '已停用' }}</el-tag></template></el-table-column>
-              <el-table-column label="操作" min-width="150" fixed="right"><template #default="scope"><div class="compact-actions"><el-button :data-testid="`worker-edit-${scope.row.worker_id}`" link type="primary" @click="openWorkerEdit(scope.row)">编辑</el-button><el-button v-if="scope.row.status === 'active'" :data-testid="`worker-deactivate-${scope.row.worker_id}`" link type="danger" @click="changeWorkerStatus(scope.row)">停用</el-button></div></template></el-table-column>
+              <el-table-column label="操作" min-width="170" fixed="right"><template #default="scope"><div class="compact-actions"><el-button :data-testid="`worker-edit-${scope.row.worker_id}`" link type="primary" @click="openWorkerEdit(scope.row)">编辑</el-button><el-button v-if="scope.row.status === 'active'" :data-testid="`worker-deactivate-${scope.row.worker_id}`" link type="danger" @click="changeWorkerStatus(scope.row)">停用</el-button><el-button v-else :data-testid="`worker-reactivate-${scope.row.worker_id}`" link type="primary" @click="changeWorkerStatus(scope.row)">重新启用</el-button></div></template></el-table-column>
             </el-table>
           </el-collapse-item>
         </el-collapse>
@@ -634,7 +805,7 @@ watch(workDate, () => {
 
       <el-card shadow="never" class="labor-history-card">
         <template #header><strong>最近上工记录</strong></template>
-        <el-alert title="当天记录需要纠错时，请在上方选择日期后重新批量保存" type="info" :closable="false" />
+        <el-alert title="当天多人可继续批量覆盖；历史单条记录也可直接编辑或作废" type="info" :closable="false" />
         <div class="table-scroll">
           <el-table :data="model.labor_entries" row-key="entry_id" size="small">
             <el-table-column prop="work_date" label="日期" min-width="108" />
@@ -644,6 +815,15 @@ watch(workDate, () => {
             <el-table-column label="人工成本" min-width="110"><template #default="scope"><strong>{{ formatMoney(scope.row.cost_cents) }}</strong></template></el-table-column>
             <el-table-column prop="work_summary" label="工作内容" min-width="180"><template #default="scope">{{ scope.row.work_summary ?? '未填写' }}</template></el-table-column>
             <el-table-column label="记录状态" min-width="100"><template #default="scope"><el-tag size="small" :type="scope.row.status === 'voided' ? 'info' : 'success'">{{ scope.row.status === 'voided' ? '已作废' : '有效' }}</el-tag></template></el-table-column>
+            <el-table-column label="操作" min-width="120" fixed="right">
+              <template #default="scope">
+                <div v-if="scope.row.status === 'active'" class="compact-actions">
+                  <el-button :data-testid="`labor-edit-${scope.row.entry_id}`" link type="primary" @click="openLaborEdit(scope.row)">编辑</el-button>
+                  <el-button :data-testid="`labor-void-${scope.row.entry_id}`" link type="danger" @click="openLaborVoid(scope.row)">作废</el-button>
+                </div>
+                <el-text v-else type="info">—</el-text>
+              </template>
+            </el-table-column>
           </el-table>
         </div>
       </el-card>
@@ -675,6 +855,62 @@ watch(workDate, () => {
 
     <el-dialog v-model="workerEditVisible" :teleported="false" title="编辑施工员" width="min(94vw, 520px)"><el-form label-position="top" @submit.prevent="saveWorkerEdit"><el-form-item label="姓名" required><el-input v-model="workerEditForm.name" /></el-form-item><el-form-item label="电话"><el-input v-model="workerEditForm.phone" /></el-form-item><el-form-item label="备注"><el-input v-model="workerEditForm.notes" type="textarea" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存人员</el-button></el-form></el-dialog>
 
+    <el-dialog v-model="laborEditVisible" data-testid="labor-edit-dialog" :teleported="false" title="编辑上工记录" width="min(94vw, 620px)">
+      <el-form label-position="top" @submit.prevent="saveLaborEdit">
+        <el-row :gutter="12">
+          <el-col :xs="24" :sm="12"><el-form-item label="排单" required><el-select v-model="laborEditForm.assignmentId" style="width:100%"><el-option v-for="assignment in model?.crew_assignments ?? []" :key="assignment.assignment_id" :label="`${workerNames.get(assignment.worker_id)} · ${assignment.role}`" :value="assignment.assignment_id" /></el-select></el-form-item></el-col>
+          <el-col :xs="24" :sm="12"><el-form-item label="上工日期" required><el-date-picker v-model="laborEditForm.workDate" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item></el-col>
+        </el-row>
+        <el-form-item label="到场状态"><el-select v-model="laborEditForm.attendanceStatus" style="width:100%"><el-option v-for="(label, value) in attendanceLabels" :key="value" :label="label" :value="value" /></el-select></el-form-item>
+        <el-form-item v-if="laborEditForm.attendanceStatus === 'present' && model?.crew_assignments.find((item) => item.assignment_id === laborEditForm.assignmentId)?.pay_basis === 'daily'" label="上工量"><el-select v-model="laborEditForm.dayFraction" style="width:100%"><el-option label="全天" value="1.000" /><el-option label="半天" value="0.500" /></el-select></el-form-item>
+        <el-form-item v-else-if="laborEditForm.attendanceStatus === 'present'" label="小时数"><el-input-number v-model="laborEditForm.hours" :min="0.02" :max="24" :step="0.5" :precision="2" controls-position="right" /></el-form-item>
+        <el-form-item data-testid="labor-edit-summary" label="工作内容"><el-input v-model="laborEditForm.workSummary" type="textarea" /></el-form-item>
+        <el-form-item label="备注"><el-input v-model="laborEditForm.notes" type="textarea" /></el-form-item>
+        <el-button type="primary" native-type="submit" :loading="formBusy">保存修改</el-button>
+      </el-form>
+    </el-dialog>
+
+    <el-dialog v-model="laborVoidVisible" data-testid="labor-void-dialog" :teleported="false" title="作废上工记录" width="min(94vw, 520px)">
+      <el-form label-position="top" @submit.prevent="saveLaborVoid">
+        <el-alert title="作废后不再计入项目人工成本，原记录仍保留可追溯" type="warning" :closable="false" />
+        <el-form-item data-testid="labor-void-reason" label="作废原因" required><el-input v-model="laborVoidForm.reason" type="textarea" /></el-form-item>
+        <el-button type="danger" native-type="submit" :loading="formBusy">确认作废</el-button>
+      </el-form>
+    </el-dialog>
+
+    <el-dialog
+      v-model="assignmentTransitionVisible"
+      data-testid="assignment-transition-dialog"
+      :teleported="false"
+      :title="assignmentTransitionStatus === 'completed' ? '确认完成排单' : '确认取消排单'"
+      width="min(94vw, 520px)"
+    >
+      <el-form label-position="top" @submit.prevent="saveAssignmentTransition">
+        <el-alert
+          v-if="assignmentTransitionError"
+          data-testid="assignment-transition-error"
+          :title="assignmentTransitionError"
+          type="error"
+          :closable="false"
+        />
+        <el-alert
+          :title="assignmentTransitionStatus === 'completed' ? '确认后该排单将进入已完成状态' : '确认后该排单将进入已取消状态'"
+          type="warning"
+          :closable="false"
+        />
+        <el-form-item
+          data-testid="assignment-transition-reason"
+          :label="assignmentTransitionStatus === 'completed' ? '完成说明（选填）' : '取消原因'"
+          :required="assignmentTransitionStatus === 'cancelled'"
+        ><el-input v-model="assignmentTransitionForm.reason" type="textarea" /></el-form-item>
+        <el-button
+          :type="assignmentTransitionStatus === 'completed' ? 'primary' : 'danger'"
+          native-type="submit"
+          :loading="formBusy"
+        >{{ assignmentTransitionStatus === 'completed' ? '确认完成' : '确认取消' }}</el-button>
+      </el-form>
+    </el-dialog>
+
     <el-dialog v-model="reimbursementVisible" :teleported="false" title="记录报销" width="min(94vw, 560px)"><el-form label-position="top" @submit.prevent="saveReimbursement"><el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item label="报销金额（元）" required><el-input v-model="reimbursementForm.amountYuan" inputmode="decimal" placeholder="0.00" /></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item label="报销日期" required><el-date-picker v-model="reimbursementForm.reimbursedOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item></el-col></el-row><el-form-item label="支付方式"><el-select v-model="reimbursementForm.paymentMethod" style="width:100%"><el-option label="银行转账" value="bank_transfer" /><el-option label="现金" value="cash" /><el-option label="其他" value="other" /></el-select></el-form-item><el-form-item label="备注"><el-input v-model="reimbursementForm.notes" /></el-form-item><el-button type="primary" native-type="submit" :loading="formBusy">保存报销</el-button></el-form></el-dialog>
 
     <el-dialog v-model="workerDialogVisible" data-testid="worker-create-dialog" :teleported="false" title="新建施工员" width="min(94vw, 520px)">
@@ -688,7 +924,7 @@ watch(workDate, () => {
 
     <el-dialog v-model="assignmentDialogVisible" data-testid="assignment-create-dialog" :teleported="false" title="添加项目工人" width="min(94vw, 620px)">
       <el-form label-position="top" @submit.prevent="saveAssignment">
-        <el-form-item label="施工员" required><el-select v-model="assignmentForm.workerId" style="width:100%"><el-option v-for="worker in model?.workers ?? []" :key="worker.worker_id" :label="worker.name" :value="worker.worker_id" /></el-select></el-form-item>
+        <el-form-item label="施工员" required><el-select v-model="assignmentForm.workerId" style="width:100%"><el-option v-for="worker in activeWorkers" :key="worker.worker_id" :label="worker.name" :value="worker.worker_id" /></el-select></el-form-item>
         <el-form-item label="岗位" required><el-input v-model="assignmentForm.role" /></el-form-item>
         <el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item data-testid="assignment-start-date" label="开始日期" required><el-date-picker v-model="assignmentForm.startOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item data-testid="assignment-end-date" label="结束日期" required><el-date-picker v-model="assignmentForm.endOn" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width:100%" /></el-form-item></el-col></el-row>
         <el-row :gutter="12"><el-col :xs="24" :sm="12"><el-form-item label="计薪方式"><el-select v-model="assignmentForm.payBasis" style="width:100%"><el-option value="daily" label="日薪" /><el-option value="hourly" label="时薪" /></el-select></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item :label="`${assignmentForm.payBasis === 'daily' ? '日薪' : '时薪'}（元）`"><el-input v-model="assignmentForm.rateYuan" inputmode="decimal" placeholder="0.00" /></el-form-item></el-col></el-row>
@@ -880,6 +1116,7 @@ watch(workDate, () => {
 }
 
 .crew-summary-item { display: grid; gap: 3px; }
+.assignment-actions { display: grid; justify-items: start; gap: 4px; }
 .crew-summary-item small { color: var(--el-text-color-secondary); }
 .worker-directory { margin-top: 12px; border-top: 1px solid var(--el-border-color-lighter); }
 .worker-directory :deep(.el-collapse-item__header) { padding: 0 12px; }

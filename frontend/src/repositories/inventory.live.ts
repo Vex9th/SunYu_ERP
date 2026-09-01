@@ -5,6 +5,7 @@ import type {
   InventoryAdjustmentInput,
   InventoryIssueDto,
   InventoryIssueInput,
+  InventoryIssueReversalInput,
   InventoryItemDetailDto,
   InventoryItemDto,
   InventoryItemInput,
@@ -27,9 +28,11 @@ export interface InventoryHttpRepository {
   listInventoryMovements(itemId: number, query?: PaginationQuery): Promise<RepositoryResult<PagedResult<InventoryMovementDto>>>
   createInventoryAdjustment(input: InventoryAdjustmentInput): Promise<RepositoryResult<InventoryAdjustmentDto>>
   createProjectInventoryIssue(projectCode: string, input: InventoryIssueInput): Promise<RepositoryResult<InventoryIssueDto>>
+  reverseProjectInventoryIssue(projectCode: string, issueId: number, input: InventoryIssueReversalInput): Promise<RepositoryResult<InventoryIssueDto>>
   discardCreateInventoryItem(input: InventoryItemInput): boolean
   discardCreateInventoryAdjustment(input: InventoryAdjustmentInput): boolean
   discardCreateProjectInventoryIssue(projectCode: string, input: InventoryIssueInput): boolean
+  discardReverseProjectInventoryIssue(projectCode: string, issueId: number, input: InventoryIssueReversalInput): boolean
 }
 
 class HttpInventoryRepository implements InventoryHttpRepository {
@@ -63,6 +66,10 @@ class HttpInventoryRepository implements InventoryHttpRepository {
     return live(await this.postSender.send(projectInventoryIssuesPath(projectCode), input))
   }
 
+  async reverseProjectInventoryIssue(projectCode: string, issueId: number, input: InventoryIssueReversalInput): Promise<RepositoryResult<InventoryIssueDto>> {
+    return live(await this.postSender.send(projectInventoryIssueReversePath(projectCode, issueId), input))
+  }
+
   discardCreateInventoryItem(input: InventoryItemInput): boolean {
     return this.postSender.discard(INVENTORY_ITEMS_PATH, input)
   }
@@ -73,6 +80,10 @@ class HttpInventoryRepository implements InventoryHttpRepository {
 
   discardCreateProjectInventoryIssue(projectCode: string, input: InventoryIssueInput): boolean {
     return this.postSender.discard(projectInventoryIssuesPath(projectCode), input)
+  }
+
+  discardReverseProjectInventoryIssue(projectCode: string, issueId: number, input: InventoryIssueReversalInput): boolean {
+    return this.postSender.discard(projectInventoryIssueReversePath(projectCode, issueId), input)
   }
 }
 
@@ -89,6 +100,10 @@ function itemPath(itemId: number): string {
 
 function projectInventoryIssuesPath(projectCode: string): string {
   return `/api/projects/${encodeURIComponent(projectCode)}/inventory-issues`
+}
+
+function projectInventoryIssueReversePath(projectCode: string, issueId: number): string {
+  return `${projectInventoryIssuesPath(projectCode)}/${issueId}/reverse`
 }
 
 function live<T>(data: T): RepositoryResult<T> {

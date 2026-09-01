@@ -53,7 +53,7 @@ describe('施工现场真实 API 仓储', () => {
       site_daily_reports: [], material_advances: [],
     })
     expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
-      '/api/workers?page=1&page_size=200',
+      '/api/workers?page=1&page_size=200&status=all',
       '/api/projects/SY%2F2026-001/crew-assignments?page=1&page_size=200',
       '/api/projects/SY%2F2026-001/labor-entries?page=1&page_size=200',
       '/api/projects/SY%2F2026-001/site-daily-reports?page=1&page_size=200',
@@ -100,6 +100,87 @@ describe('施工现场真实 API 仓储', () => {
     expect(requestHeaders(fetchMock, 5)['Idempotency-Key']).toBe(key)
     expect(requestBody(fetchMock, 5)).toMatchObject({
       entries: [expect.objectContaining({ expected_revision: 3 })],
+    })
+  })
+
+  it('重新启用、排单流转、单条编辑和作废都使用当前资源 revision', async () => {
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue(key)
+    const inactiveWorker = {
+      id: 8, name: '李工', phone: null, notes: null, status: 'inactive',
+      inactive_on: '2026-08-30', inactive_reason: '暂停接单', revision: 4,
+      created_at: '', updated_at: '',
+    }
+    const assignment = {
+      id: 3, project_code: 'SY-001', worker_id: 8, worker_name: '李工',
+      worker_phone: null, role: '电工', scheduled_start_on: '2026-08-01',
+      scheduled_end_on: null, pay_basis: 'daily', rate_cents: 50000, notes: null,
+      status: 'planned', revision: 5, created_at: '', updated_at: '',
+    }
+    const labor = {
+      id: 9, assignment_id: 3, worker_id: 8, worker_name: '李工',
+      work_date: '2026-08-29', attendance_status: 'present', day_fraction: '1.000',
+      work_minutes: null, pay_basis: 'daily', rate_cents: 50000, cost_cents: 50000,
+      work_summary: '旧记录', notes: null, status: 'active', void_reason: null,
+      voided_at: null, revision: 6, project_code: 'SY-001', created_at: '', updated_at: '',
+    }
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response({ items: [inactiveWorker], total: 1, page: 1, page_size: 200 }))
+      .mockResolvedValueOnce(response({ items: [assignment], total: 1, page: 1, page_size: 200 }))
+      .mockResolvedValueOnce(response({ items: [labor], total: 1, page: 1, page_size: 200 }))
+      .mockResolvedValueOnce(response({ items: [], total: 0, page: 1, page_size: 200 }))
+      .mockResolvedValueOnce(response({ items: [], total: 0, page: 1, page_size: 200 }))
+      .mockResolvedValueOnce(response(inactiveWorker))
+      .mockResolvedValueOnce(response({ ...inactiveWorker, status: 'active', inactive_on: null, inactive_reason: null, revision: 5 }))
+      .mockResolvedValueOnce(response({ ...assignment, status: 'active', revision: 6 }))
+      .mockResolvedValueOnce(response({ ...labor, day_fraction: '0.500', cost_cents: 25000, revision: 7 }))
+      .mockResolvedValueOnce(response({ ...labor, status: 'voided', void_reason: '重复登记', revision: 8 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const repository = createHttpWorkforceWorkspaceRepository()
+    await repository.getWorkforcePreview('SY-001')
+
+    await repository.setWorkerStatus(8, 'active')
+    await repository.setCrewAssignmentStatus('SY-001', 3, 'active', null)
+    await repository.updateLaborEntry('SY-001', 9, {
+      assignment_id: 3, work_date: '2026-08-29', attendance_status: 'present',
+      day_fraction: '0.500', work_minutes: null, work_summary: '改为半天', notes: null,
+    })
+    await repository.voidLaborEntry('SY-001', 9, '重复登记')
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/workers?page=1&page_size=200&status=all')
+    expect(requestBody(fetchMock, 6)).toEqual({ expected_revision: 4 })
+    expect(requestBody(fetchMock, 7)).toMatchObject({ to_status: 'active', expected_revision: 5 })
+    expect(requestBody(fetchMock, 8)).toMatchObject({ expected_revision: 6, day_fraction: '0.500' })
+    expect(requestBody(fetchMock, 9)).toEqual({ reason: '重复登记', expected_revision: 7 })
+    expect(requestHeaders(fetchMock, 6)['Idempotency-Key']).toBe(key)
+    expect(requestHeaders(fetchMock, 7)['Idempotency-Key']).toBe(key)
+    expect(requestHeaders(fetchMock, 9)['Idempotency-Key']).toBe(key)
+  })
+
+  it('取消排单将用户填写的原因原样交给 transition API', async () => {
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue(key)
+    const assignment = {
+      id: 3, project_code: 'SY-001', worker_id: 8, worker_name: '李工',
+      worker_phone: null, role: '电工', scheduled_start_on: '2026-08-01',
+      scheduled_end_on: null, pay_basis: 'daily', rate_cents: 50000, notes: null,
+      status: 'planned', revision: 5, created_at: '', updated_at: '',
+    }
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response({ items: [], total: 0, page: 1, page_size: 200 }))
+      .mockResolvedValueOnce(response({ items: [assignment], total: 1, page: 1, page_size: 200 }))
+      .mockResolvedValueOnce(response({ items: [], total: 0, page: 1, page_size: 200 }))
+      .mockResolvedValueOnce(response({ items: [], total: 0, page: 1, page_size: 200 }))
+      .mockResolvedValueOnce(response({ items: [], total: 0, page: 1, page_size: 200 }))
+      .mockResolvedValueOnce(response({ ...assignment, status: 'cancelled', revision: 6 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const repository = createHttpWorkforceWorkspaceRepository()
+    await repository.getWorkforcePreview('SY-001')
+
+    await repository.setCrewAssignmentStatus('SY-001', 3, 'cancelled', '客户要求暂停进场')
+
+    expect(requestBody(fetchMock, 5)).toMatchObject({
+      to_status: 'cancelled',
+      reason: '客户要求暂停进场',
+      expected_revision: 5,
     })
   })
 

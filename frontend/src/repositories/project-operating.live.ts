@@ -184,7 +184,7 @@ class HttpProjectOperatingRepository implements ProjectOperatingRepository {
   }
 
   listDocuments(projectCode: string): Promise<PagedResult<DocumentSummary>> {
-    return requestJson(withQuery(`${projectPath(projectCode)}/documents`, { page: 1, page_size: 100 }))
+    return requestAllPages(`${projectPath(projectCode)}/documents`)
   }
 
   getDocument(projectCode: string, documentId: number): Promise<DocumentDetail> {
@@ -254,7 +254,7 @@ class HttpProjectOperatingRepository implements ProjectOperatingRepository {
   }
 
   listQuotes(projectCode: string): Promise<PagedResult<Quote>> {
-    return requestJson(withQuery(`${projectPath(projectCode)}/quotes`, { page: 1, page_size: 100 }))
+    return requestAllPages(`${projectPath(projectCode)}/quotes`)
   }
 
   createQuote(projectCode: string, input: QuoteInput): Promise<Quote> {
@@ -274,7 +274,7 @@ class HttpProjectOperatingRepository implements ProjectOperatingRepository {
   }
 
   listContracts(projectCode: string): Promise<PagedResult<Contract>> {
-    return requestJson(withQuery(`${projectPath(projectCode)}/contracts`, { page: 1, page_size: 100 }))
+    return requestAllPages(`${projectPath(projectCode)}/contracts`)
   }
 
   createContract(projectCode: string, input: ContractInput): Promise<Contract> {
@@ -332,6 +332,21 @@ class HttpProjectOperatingRepository implements ProjectOperatingRepository {
 
   voidReceipt(projectCode: string, receiptId: number, input: ReceiptVoidInput): Promise<Receipt> {
     return this.posts.send(`${projectPath(projectCode)}/receipts/${receiptId}/void`, input)
+  }
+}
+
+async function requestAllPages<T>(path: string): Promise<PagedResult<T>> {
+  const first = await requestJson<PagedResult<T>>(withQuery(path, { page: 1, page_size: 100 }))
+  const pageCount = Math.ceil(first.total / first.page_size)
+  if (pageCount <= 1) return first
+  const remaining = await Promise.all(
+    Array.from({ length: pageCount - 1 }, (_, index) => (
+      requestJson<PagedResult<T>>(withQuery(path, { page: index + 2, page_size: first.page_size }))
+    )),
+  )
+  return {
+    ...first,
+    items: [first, ...remaining].flatMap((page) => page.items),
   }
 }
 

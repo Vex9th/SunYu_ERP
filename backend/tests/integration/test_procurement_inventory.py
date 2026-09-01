@@ -321,3 +321,163 @@ def test_receipt_adds_inventory_once_and_issue_records_actual_project_cost(
         assert receipt_after_archive.json() == received.json()
         assert issue_after_archive.status_code == 201
         assert issue_after_archive.json() == issue.json()
+
+
+def test_inventory_issue_reversal_restores_frozen_cost_once_and_updates_usage(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        prepared = _prepare_order(client, harness)
+        order = prepared["order"]
+        receipt = client.post(
+            f"/api/projects/{harness.project_code}/purchase-orders/"
+            f"{order['id']}/goods-receipts",
+            headers={"Idempotency-Key": "71000000-0000-4000-8000-000000000001"},
+            json={
+                "received_on": "2026-08-29",
+                "warehouse_name": "主仓",
+                "lines": [{
+                    "purchase_order_line_id": order["lines"][0]["id"],
+                    "quantity": "5.000",
+                }],
+                "notes": None,
+            },
+        )
+        assert receipt.status_code == 201, receipt.text
+        inventory_item_id = receipt.json()["lines"][0]["inventory_item_id"]
+        issue = client.post(
+            f"/api/projects/{harness.project_code}/inventory-issues",
+            headers={"Idempotency-Key": "71000000-0000-4000-8000-000000000002"},
+            json={
+                "issued_on": "2026-08-29",
+                "worker_id": None,
+                "lines": [{
+                    "inventory_item_id": inventory_item_id,
+                    "procurement_line_id": prepared["procurement_line_id"],
+                    "quantity": "2.000",
+                }],
+                "notes": "现场领用",
+            },
+        )
+        assert issue.status_code == 201, issue.text
+        issue_body = issue.json()
+
+        invalid = client.post(
+            f"/api/projects/{harness.project_code}/inventory-issues/"
+            f"{issue_body['id']}/reverse",
+            headers={"Idempotency-Key": "71000000-0000-4000-8000-000000000003"},
+            json={"reason": "  ", "expected_revision": issue_body["revision"]},
+        )
+        assert invalid.status_code == 422
+        assert invalid.json()["error_code"] == "VALIDATION_ERROR"
+
+        stale = client.post(
+            f"/api/projects/{harness.project_code}/inventory-issues/"
+            f"{issue_body['id']}/reverse",
+            headers={"Idempotency-Key": "71000000-0000-4000-8000-000000000004"},
+            json={"reason": "领用单录错项目", "expected_revision": 99},
+        )
+        assert stale.status_code == 409
+        assert stale.json() == {
+            "detail": "Resource was modified",
+            "error_code": "REVISION_CONFLICT",
+            "field_errors": {},
+            "current_revision": issue_body["revision"],
+        }
+
+        reverse_headers = {
+            "Idempotency-Key": "71000000-0000-4000-8000-000000000005"
+        }
+        reverse_payload = {
+            "reason": "领用单录错项目",
+            "expected_revision": issue_body["revision"],
+        }
+        reversed_issue = client.post(
+            f"/api/projects/{harness.project_code}/inventory-issues/"
+            f"{issue_body['id']}/reverse",
+            headers=reverse_headers,
+            json=reverse_payload,
+        )
+        replay = client.post(
+            f"/api/projects/{harness.project_code}/inventory-issues/"
+            f"{issue_body['id']}/reverse",
+            headers=reverse_headers,
+            json=reverse_payload,
+        )
+        assert reversed_issue.status_code == replay.status_code == 200
+        assert reversed_issue.json() == replay.json()
+        assert reversed_issue.json() == {
+            **issue_body,
+            "status": "reversed",
+            "revision": issue_body["revision"] + 1,
+            "updated_at": NOW.isoformat(),
+        }
+
+        stock = client.get(f"/api/inventory/items/{inventory_item_id}").json()
+        assert stock["quantity"] == "5.000"
+        assert stock["inventory_value_cents"] == 5000
+        movements = client.get(
+            f"/api/inventory/items/{inventory_item_id}/movements"
+        ).json()["items"]
+        assert [movement["movement_type"] for movement in movements] == [
+            "reversal",
+            "project_issue",
+            "goods_receipt",
+        ]
+        assert movements[0] == {
+            **movements[0],
+            "project_code": harness.project_code,
+            "issue_status": "reversed",
+            "issue_revision": issue_body["revision"] + 1,
+            "quantity_delta": "2.000",
+            "value_delta_cents": 2000,
+            "quantity_after": "5.000",
+            "value_after_cents": 5000,
+            "source_type": "inventory_issue_reversal",
+            "source_id": issue_body["id"],
+            "reason": "领用单录错项目",
+        }
+        assert movements[1]["source_type"] == "inventory_issue"
+        assert movements[1]["quantity_delta"] == "-2.000"
+
+        procurement_list = client.get(
+            f"/api/projects/{harness.project_code}/procurement-lists/"
+            f"{prepared['list_id']}"
+        ).json()
+        assert procurement_list["lines"][0]["usage_status"] == "unused"
+        overview = client.get(
+            f"/api/projects/{harness.project_code}/procurement-overview"
+        ).json()
+        assert overview["material_consumed_cents"] == 0
+
+        conflicting_replay = client.post(
+            f"/api/projects/{harness.project_code}/inventory-issues/"
+            f"{issue_body['id']}/reverse",
+            headers=reverse_headers,
+            json={**reverse_payload, "reason": "不同原因"},
+        )
+        assert conflicting_replay.status_code == 409
+        assert conflicting_replay.json()["error_code"] == "IDEMPOTENCY_KEY_REUSED"
+
+        repeated = client.post(
+            f"/api/projects/{harness.project_code}/inventory-issues/"
+            f"{issue_body['id']}/reverse",
+            headers={"Idempotency-Key": "71000000-0000-4000-8000-000000000006"},
+            json={
+                "reason": "重复冲销",
+                "expected_revision": reversed_issue.json()["revision"],
+            },
+        )
+        assert repeated.status_code == 409
+        assert repeated.json()["error_code"] == "INVENTORY_ISSUE_ALREADY_REVERSED"
+        assert client.get(
+            f"/api/inventory/items/{inventory_item_id}/movements"
+        ).json()["total"] == 3
+
+        missing = client.post(
+            f"/api/projects/{harness.project_code}/inventory-issues/999999/reverse",
+            headers={"Idempotency-Key": "71000000-0000-4000-8000-000000000007"},
+            json={"reason": "不存在", "expected_revision": 1},
+        )
+        assert missing.status_code == 404

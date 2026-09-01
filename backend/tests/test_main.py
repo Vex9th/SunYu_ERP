@@ -299,6 +299,7 @@ def test_lifespan_applies_migrations_and_closes_every_owned_connection(
         "010_site_report_events",
         "011_procurement_audit",
         "012_delivery_events",
+        "013_workforce_events",
     }
 
 

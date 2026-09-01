@@ -44,10 +44,31 @@ _LABOR_ENTRY_FIELDS = (
     "notes",
     "expected_revision",
 )
+_LABOR_CREATE_FIELDS = (
+    "assignment_id",
+    "work_date",
+    "attendance_status",
+    "day_fraction",
+    "work_minutes",
+    "work_summary",
+    "notes",
+)
+_ASSIGNMENT_TRANSITION_FIELDS = (
+    "to_status",
+    "effective_at",
+    "reason",
+    "expected_revision",
+)
 _WORKER_STATUSES = frozenset({"active", "inactive", "all"})
 _ASSIGNMENT_STATUSES = frozenset({"planned", "active", "completed", "cancelled", "all"})
 _ATTENDANCE_STATUSES = frozenset({"present", "absent", "leave"})
 _PAY_BASES = frozenset({"daily", "hourly"})
+_ASSIGNMENT_TRANSITIONS = {
+    "planned": frozenset({"active", "completed", "cancelled"}),
+    "active": frozenset({"completed", "cancelled"}),
+    "completed": frozenset(),
+    "cancelled": frozenset(),
+}
 
 Clock = Callable[[], datetime]
 
@@ -235,6 +256,47 @@ def create_workforce_router(
             connection, request, key, payload, 200, operation, timestamp
         )
 
+    @router.post("/api/workers/{worker_id}/reactivate")
+    async def reactivate_worker(
+        request: Request,
+        worker_id: str,
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        identifier = _parse_identifier(worker_id)
+        raw = await _read_json_object(
+            request, ("expected_revision",), "INVALID_REACTIVATION_PAYLOAD"
+        )
+        payload = {
+            "expected_revision": _positive_integer(
+                raw["expected_revision"],
+                "expected_revision",
+                "INVALID_REACTIVATION_PAYLOAD",
+            )
+        }
+        key = _read_idempotency_key(request)
+        timestamp = _timestamp(now)
+
+        def operation() -> dict[str, object]:
+            current = _require_worker(connection, identifier)
+            _require_revision(current, int(payload["expected_revision"]))
+            if current["status"] == "active":
+                return current
+            connection.execute(
+                """
+                UPDATE workers
+                SET status = 'active', inactive_on = NULL, inactive_reason = NULL,
+                    revision = revision + 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (timestamp, identifier),
+            )
+            return _require_worker(connection, identifier)
+
+        return _idempotent_operation(
+            connection, request, key, payload, 200, operation, timestamp
+        )
+
     @router.get("/api/projects/{project_code}/crew-assignments")
     def list_assignments(
         request: Request,
@@ -353,6 +415,100 @@ def create_workforce_router(
             )
             return _require_assignment(connection, int(project["id"]), identifier)
 
+    @router.post(
+        "/api/projects/{project_code}/crew-assignments/{assignment_id}/transition"
+    )
+    async def transition_assignment(
+        request: Request,
+        project_code: str,
+        assignment_id: str,
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        identifier = _parse_identifier(assignment_id)
+        raw = await _read_json_object(
+            request, _ASSIGNMENT_TRANSITION_FIELDS, "INVALID_ASSIGNMENT_TRANSITION"
+        )
+        payload = {
+            "to_status": _enum_value(
+                raw["to_status"],
+                "to_status",
+                frozenset(_ASSIGNMENT_TRANSITIONS),
+                "INVALID_ASSIGNMENT_TRANSITION",
+            ),
+            "effective_at": _aware_datetime(
+                raw["effective_at"],
+                "effective_at",
+                "INVALID_ASSIGNMENT_TRANSITION",
+            ),
+            "reason": _optional_text(
+                raw["reason"], "reason", "INVALID_ASSIGNMENT_TRANSITION"
+            ),
+            "expected_revision": _positive_integer(
+                raw["expected_revision"],
+                "expected_revision",
+                "INVALID_ASSIGNMENT_TRANSITION",
+            ),
+        }
+        timestamp = _timestamp(now)
+        if str(payload["effective_at"]) > timestamp:
+            raise _validation_error(
+                "INVALID_ASSIGNMENT_TRANSITION",
+                "effective_at",
+                "must not be in the future",
+            )
+        if payload["to_status"] == "cancelled" and payload["reason"] is None:
+            raise _validation_error(
+                "INVALID_ASSIGNMENT_TRANSITION",
+                "reason",
+                "is required when cancelling an assignment",
+            )
+        key = _read_idempotency_key(request)
+
+        def operation() -> dict[str, object]:
+            project = _require_project(connection, project_code)
+            _require_open_project(project)
+            current = _require_assignment(connection, int(project["id"]), identifier)
+            _require_revision(current, int(payload["expected_revision"]))
+            current_status = str(current["status"])
+            target_status = str(payload["to_status"])
+            if target_status not in _ASSIGNMENT_TRANSITIONS[current_status]:
+                raise WorkforceApiError(
+                    status.HTTP_409_CONFLICT,
+                    "Crew assignment transition is not allowed",
+                    "INVALID_ASSIGNMENT_TRANSITION",
+                )
+            connection.execute(
+                """
+                UPDATE crew_assignments
+                SET status = ?, revision = revision + 1, updated_at = ?
+                WHERE id = ? AND project_id = ?
+                """,
+                (target_status, timestamp, identifier, project["id"]),
+            )
+            connection.execute(
+                """
+                INSERT INTO crew_assignment_transition_events
+                    (project_id, assignment_id, from_status, to_status,
+                     effective_at, reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project["id"],
+                    identifier,
+                    current_status,
+                    target_status,
+                    payload["effective_at"],
+                    payload["reason"],
+                    timestamp,
+                ),
+            )
+            return _require_assignment(connection, int(project["id"]), identifier)
+
+        return _idempotent_operation(
+            connection, request, key, payload, 200, operation, timestamp
+        )
+
     @router.get("/api/projects/{project_code}/labor-entries")
     def list_labor_entries(
         request: Request,
@@ -377,6 +533,153 @@ def create_workforce_router(
             date_from,
             date_to,
             worker_id,
+        )
+
+    @router.post(
+        "/api/projects/{project_code}/labor-entries",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_labor_entry(
+        request: Request,
+        project_code: str,
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        raw = await _read_json_object(
+            request, _LABOR_CREATE_FIELDS, "INVALID_LABOR_PAYLOAD"
+        )
+        payload = _normalize_single_labor(raw)
+        key = _read_idempotency_key(request)
+        timestamp = _timestamp(now)
+
+        def operation() -> dict[str, object]:
+            project = _require_project(connection, project_code)
+            _require_open_project(project)
+            project_id = int(project["id"])
+            work_date = str(payload["work_date"])
+            assignment = _require_assignment_for_labor(
+                connection, project_id, int(payload["assignment_id"])
+            )
+            _require_worker_available_for_date(assignment, work_date)
+            _require_labor_slot_available(
+                connection,
+                project_id,
+                int(assignment["id"]),
+                int(assignment["worker_id"]),
+                work_date,
+            )
+            values = _labor_values(
+                payload,
+                assignment,
+                None,
+                error_code="INVALID_LABOR_PAYLOAD",
+                field="body",
+            )
+            entry_id = _insert_labor_entry(
+                connection, project_id, work_date, values, timestamp
+            )
+            return _require_labor_entry(connection, project_id, entry_id)
+
+        return _idempotent_operation(
+            connection, request, key, payload, 201, operation, timestamp
+        )
+
+    @router.put("/api/projects/{project_code}/labor-entries/{entry_id}")
+    async def update_single_labor_entry(
+        request: Request,
+        project_code: str,
+        entry_id: str,
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        identifier = _parse_identifier(entry_id)
+        raw = await _read_json_object(
+            request,
+            (*_LABOR_CREATE_FIELDS, "expected_revision"),
+            "INVALID_LABOR_PAYLOAD",
+        )
+        payload = _normalize_single_labor(raw, include_revision=True)
+        timestamp = _timestamp(now)
+        with transaction_immediate(connection):
+            project = _require_project(connection, project_code)
+            project_id = int(project["id"])
+            current = _require_labor_entry(connection, project_id, identifier)
+            _require_active_labor(current)
+            _require_revision(current, int(payload["expected_revision"]))
+            assignment = _require_assignment_for_labor(
+                connection, project_id, int(payload["assignment_id"])
+            )
+            work_date = str(payload["work_date"])
+            _require_worker_available_for_date(assignment, work_date)
+            _require_labor_slot_available(
+                connection,
+                project_id,
+                int(assignment["id"]),
+                int(assignment["worker_id"]),
+                work_date,
+                excluding_entry_id=identifier,
+            )
+            snapshot = (
+                current
+                if int(current["assignment_id"]) == int(assignment["id"])
+                else None
+            )
+            values = _labor_values(
+                payload,
+                assignment,
+                snapshot,
+                error_code="INVALID_LABOR_PAYLOAD",
+                field="body",
+            )
+            _replace_labor_entry(
+                connection, identifier, work_date, values, timestamp
+            )
+            return _require_labor_entry(connection, project_id, identifier)
+
+    @router.post("/api/projects/{project_code}/labor-entries/{entry_id}/void")
+    async def void_labor_entry(
+        request: Request,
+        project_code: str,
+        entry_id: str,
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        identifier = _parse_identifier(entry_id)
+        raw = await _read_json_object(
+            request, ("reason", "expected_revision"), "INVALID_LABOR_VOID_PAYLOAD"
+        )
+        payload = {
+            "reason": _required_text(
+                raw["reason"], "reason", "INVALID_LABOR_VOID_PAYLOAD"
+            ),
+            "expected_revision": _positive_integer(
+                raw["expected_revision"],
+                "expected_revision",
+                "INVALID_LABOR_VOID_PAYLOAD",
+            ),
+        }
+        key = _read_idempotency_key(request)
+        timestamp = _timestamp(now)
+
+        def operation() -> dict[str, object]:
+            project = _require_project(connection, project_code)
+            project_id = int(project["id"])
+            current = _require_labor_entry(connection, project_id, identifier)
+            _require_active_labor(current)
+            _require_revision(current, int(payload["expected_revision"]))
+            connection.execute(
+                """
+                UPDATE labor_entries
+                SET status = 'voided', void_reason = ?, voided_at = ?,
+                    revision = revision + 1, updated_at = ?
+                WHERE id = ? AND project_id = ?
+                """,
+                (payload["reason"], timestamp, timestamp, identifier, project_id),
+            )
+            return _require_labor_entry(connection, project_id, identifier)
+
+        return _idempotent_operation(
+            connection, request, key, payload, 200, operation, timestamp
         )
 
     @router.post("/api/projects/{project_code}/labor-entries/batch")
@@ -572,6 +875,7 @@ def _save_labor_entries(
                 )
             )
         else:
+            _require_active_labor(existing)
             _require_labor_revision(existing, entry)
             _update_labor_entry(connection, int(existing["id"]), values, timestamp)
             saved_ids.append(int(existing["id"]))
@@ -584,6 +888,9 @@ def _labor_values(
     entry: dict[str, object],
     assignment: dict[str, object],
     existing: dict[str, object] | None,
+    *,
+    error_code: str = "INVALID_LABOR_BATCH_PAYLOAD",
+    field: str = "entries",
 ) -> dict[str, object]:
     pay_basis = str(
         existing["pay_basis"] if existing is not None else assignment["pay_basis"]
@@ -597,37 +904,37 @@ def _labor_values(
     if attendance == "present" and pay_basis == "daily":
         if day_fraction_milli is None or work_minutes is not None:
             raise _validation_error(
-                "INVALID_LABOR_BATCH_PAYLOAD",
-                "entries",
+                error_code,
+                field,
                 "daily work requires day_fraction only",
             )
         cost_cents = (rate_cents * int(day_fraction_milli) + 500) // 1000
     elif attendance == "present" and pay_basis == "hourly":
         if work_minutes is None or day_fraction_milli is not None:
             raise _validation_error(
-                "INVALID_LABOR_BATCH_PAYLOAD",
-                "entries",
+                error_code,
+                field,
                 "hourly work requires work_minutes only",
             )
         cost_cents = (rate_cents * int(work_minutes) + 30) // 60
     elif attendance in {"absent", "leave"}:
         if day_fraction_milli is not None or work_minutes is not None:
             raise _validation_error(
-                "INVALID_LABOR_BATCH_PAYLOAD",
-                "entries",
+                error_code,
+                field,
                 "absence or leave cannot contain paid quantity",
             )
         cost_cents = 0
     else:
         raise _validation_error(
-            "INVALID_LABOR_BATCH_PAYLOAD",
+            error_code,
             "attendance_status",
             "is incompatible with assignment pay basis",
         )
     if cost_cents > _SQLITE_MAX_INTEGER:
         raise _validation_error(
-            "INVALID_LABOR_BATCH_PAYLOAD",
-            "entries",
+            error_code,
+            field,
             "calculated cost is outside the supported range",
         )
     return {
@@ -697,6 +1004,40 @@ def _update_labor_entry(
             values["attendance_status"],
             values["day_fraction_milli"],
             values["work_minutes"],
+            values["cost_cents"],
+            values["work_summary"],
+            values["notes"],
+            timestamp,
+            entry_id,
+        ),
+    )
+
+
+def _replace_labor_entry(
+    connection: sqlite3.Connection,
+    entry_id: int,
+    work_date: str,
+    values: dict[str, object],
+    timestamp: str,
+) -> None:
+    connection.execute(
+        """
+        UPDATE labor_entries
+        SET assignment_id = ?, worker_id = ?, work_date = ?,
+            attendance_status = ?, day_fraction_milli = ?, work_minutes = ?,
+            pay_basis = ?, rate_cents = ?, cost_cents = ?, work_summary = ?,
+            notes = ?, revision = revision + 1, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            values["assignment_id"],
+            values["worker_id"],
+            work_date,
+            values["attendance_status"],
+            values["day_fraction_milli"],
+            values["work_minutes"],
+            values["pay_basis"],
+            values["rate_cents"],
             values["cost_cents"],
             values["work_summary"],
             values["notes"],
@@ -806,6 +1147,46 @@ def _normalize_labor_batch(payload: dict[str, object]) -> dict[str, object]:
         seen_assignments.add(assignment_id)
         normalized.append(item)
     return {"work_date": work_date, "entries": normalized}
+
+
+def _normalize_single_labor(
+    payload: dict[str, object],
+    *,
+    include_revision: bool = False,
+) -> dict[str, object]:
+    error_code = "INVALID_LABOR_PAYLOAD"
+    day_fraction, day_fraction_milli = _optional_day_fraction(
+        payload["day_fraction"], "day_fraction", error_code
+    )
+    work_minutes = payload["work_minutes"]
+    if work_minutes is not None:
+        work_minutes = _bounded_integer(
+            work_minutes, "work_minutes", 1, 1440, error_code
+        )
+    normalized: dict[str, object] = {
+        "assignment_id": _positive_integer(
+            payload["assignment_id"], "assignment_id", error_code
+        ),
+        "work_date": _business_date(payload["work_date"], "work_date", error_code),
+        "attendance_status": _enum_value(
+            payload["attendance_status"],
+            "attendance_status",
+            _ATTENDANCE_STATUSES,
+            error_code,
+        ),
+        "day_fraction": day_fraction,
+        "day_fraction_milli": day_fraction_milli,
+        "work_minutes": work_minutes,
+        "work_summary": _optional_text(
+            payload["work_summary"], "work_summary", error_code
+        ),
+        "notes": _optional_text(payload["notes"], "notes", error_code),
+    }
+    if include_revision:
+        normalized["expected_revision"] = _positive_integer(
+            payload["expected_revision"], "expected_revision", error_code
+        )
+    return normalized
 
 
 def _normalize_labor_entry(
@@ -1201,6 +1582,54 @@ def _labor_by_worker_date(
     return {field: row[field] for field in ("id", "assignment_id")}
 
 
+def _require_labor_slot_available(
+    connection: sqlite3.Connection,
+    project_id: int,
+    assignment_id: int,
+    worker_id: int,
+    work_date: str,
+    *,
+    excluding_entry_id: int | None = None,
+) -> None:
+    exclusion = "" if excluding_entry_id is None else " AND id <> ?"
+    parameters: tuple[object, ...] = (
+        (assignment_id, work_date)
+        if excluding_entry_id is None
+        else (assignment_id, work_date, excluding_entry_id)
+    )
+    assignment_entry = connection.execute(
+        f"""
+        SELECT id FROM labor_entries
+        WHERE assignment_id = ? AND work_date = ?{exclusion}
+        """,
+        parameters,
+    ).fetchone()
+    if assignment_entry is not None:
+        raise WorkforceApiError(
+            status.HTTP_409_CONFLICT,
+            "Crew assignment already has a labor entry for this date",
+            "ASSIGNMENT_LABOR_ENTRY_EXISTS",
+        )
+    worker_parameters: tuple[object, ...] = (
+        (project_id, worker_id, work_date)
+        if excluding_entry_id is None
+        else (project_id, worker_id, work_date, excluding_entry_id)
+    )
+    worker_entry = connection.execute(
+        f"""
+        SELECT id FROM labor_entries
+        WHERE project_id = ? AND worker_id = ? AND work_date = ?{exclusion}
+        """,
+        worker_parameters,
+    ).fetchone()
+    if worker_entry is not None:
+        raise WorkforceApiError(
+            status.HTTP_409_CONFLICT,
+            "Worker already has a labor entry for this project and date",
+            "WORKER_LABOR_ENTRY_EXISTS",
+        )
+
+
 def _require_labor_entry(
     connection: sqlite3.Connection,
     project_id: int,
@@ -1214,8 +1643,21 @@ def _require_labor_entry(
         (entry_id, project_id),
     ).fetchone()
     if row is None:
-        raise sqlite3.DatabaseError("saved labor entry is missing")
+        raise WorkforceApiError(
+            status.HTTP_404_NOT_FOUND,
+            "Labor entry not found",
+            "LABOR_ENTRY_NOT_FOUND",
+        )
     return _labor_response(row)
+
+
+def _require_active_labor(entry: dict[str, object]) -> None:
+    if entry["status"] != "active":
+        raise WorkforceApiError(
+            status.HTTP_409_CONFLICT,
+            "Voided labor entry cannot be changed",
+            "LABOR_ENTRY_VOIDED",
+        )
 
 
 def _worker_response(row: sqlite3.Row) -> dict[str, object]:
@@ -1271,6 +1713,8 @@ def _labor_response(row: sqlite3.Row) -> dict[str, object]:
         "work_summary",
         "notes",
         "status",
+        "void_reason",
+        "voided_at",
         "revision",
         "created_at",
         "updated_at",
@@ -1418,29 +1862,44 @@ def _parse_ascii_integer(value: str, field: str, error_code: str) -> int:
 def _optional_day_fraction(
     value: object,
     field: str,
+    error_code: str = "INVALID_LABOR_BATCH_PAYLOAD",
 ) -> tuple[str | None, int | None]:
     if value is None:
         return None, None
     if not isinstance(value, str):
         raise _validation_error(
-            "INVALID_LABOR_BATCH_PAYLOAD", field, "must be a decimal string"
+            error_code, field, "must be a decimal string"
         )
     try:
         parsed = Decimal(value)
     except InvalidOperation:
         raise _validation_error(
-            "INVALID_LABOR_BATCH_PAYLOAD", field, "must be a decimal string"
+            error_code, field, "must be a decimal string"
         ) from None
     if not parsed.is_finite() or parsed <= 0 or parsed > 1:
         raise _validation_error(
-            "INVALID_LABOR_BATCH_PAYLOAD", field, "must be greater than 0 and at most 1"
+            error_code, field, "must be greater than 0 and at most 1"
         )
     milli = parsed * 1000
     if milli != milli.to_integral_value():
         raise _validation_error(
-            "INVALID_LABOR_BATCH_PAYLOAD", field, "supports at most 3 decimal places"
+            error_code, field, "supports at most 3 decimal places"
         )
     return f"{parsed:.3f}", int(milli)
+
+
+def _aware_datetime(value: object, field: str, error_code: str) -> str:
+    if not isinstance(value, str):
+        raise _validation_error(error_code, field, "must be an ISO 8601 datetime")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise _validation_error(
+            error_code, field, "must be an ISO 8601 datetime"
+        ) from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise _validation_error(error_code, field, "must include a timezone")
+    return parsed.astimezone(timezone.utc).isoformat()
 
 
 def _last_insert_id(cursor: sqlite3.Cursor) -> int:
@@ -1475,7 +1934,8 @@ _LABOR_SELECT = """
 SELECT e.id, p.project_code, e.assignment_id, e.worker_id,
        w.name AS worker_name, e.work_date, e.attendance_status,
        e.day_fraction_milli, e.work_minutes, e.pay_basis, e.rate_cents,
-       e.cost_cents, e.work_summary, e.notes, e.status, e.revision,
+       e.cost_cents, e.work_summary, e.notes, e.status, e.void_reason,
+       e.voided_at, e.revision,
        e.created_at, e.updated_at
 FROM labor_entries e
 JOIN projects p ON p.id = e.project_id

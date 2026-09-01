@@ -213,7 +213,7 @@ export interface InventoryItemDto {
   updated_at: ISODateTime
 }
 
-export type InventoryMovementType = 'opening' | 'goods_receipt' | 'adjustment' | 'project_issue'
+export type InventoryMovementType = 'opening' | 'goods_receipt' | 'adjustment' | 'project_issue' | 'reversal'
 
 export interface InventoryMovementDto {
   id: number
@@ -230,6 +230,9 @@ export interface InventoryMovementDto {
   occurred_on: ISODate
   reason: string | null
   created_at: ISODateTime
+  project_code?: string | null
+  issue_status?: 'active' | 'reversed' | null
+  issue_revision?: Revision | null
 }
 
 export interface InventoryItemDetailDto extends InventoryItemDto {
@@ -263,13 +266,18 @@ export interface InventoryIssueInput {
   notes: string | null
 }
 
+export interface InventoryIssueReversalInput {
+  reason: string
+  expected_revision: Revision
+}
+
 export interface InventoryIssueDto {
   id: number
   project_id: number
   issued_on: ISODate
   worker_id: number | null
   notes: string | null
-  status: 'active'
+  status: 'active' | 'reversed'
   total_cost_cents: MoneyCents
   revision: Revision
   lines: Array<{

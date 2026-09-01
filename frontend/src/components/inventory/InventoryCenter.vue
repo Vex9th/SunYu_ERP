@@ -7,6 +7,7 @@ import { formatMoney } from '../../domain/formatters'
 import type {
   InventoryAdjustmentInput,
   InventoryIssueInput,
+  InventoryIssueReversalInput,
   InventoryItemDto,
   InventoryItemInput,
   InventoryMovementDto,
@@ -17,7 +18,7 @@ import {
   type InventoryListQuery,
 } from '../../repositories/inventory.live'
 
-type InventoryAction = 'create' | 'edit' | 'adjust' | 'issue'
+type InventoryAction = 'create' | 'edit' | 'adjust' | 'issue' | 'reverse'
 
 const props = defineProps<{ repository?: InventoryHttpRepository }>()
 const defaultRepository = createHttpInventoryRepository()
@@ -38,7 +39,9 @@ const adjustVisible = ref(false)
 const issueVisible = ref(false)
 const detailVisible = ref(false)
 const editVisible = ref(false)
+const reverseVisible = ref(false)
 const selectedItem = ref<InventoryItemDto | null>(null)
+const selectedIssueMovement = ref<InventoryMovementDto | null>(null)
 const moreInformation = ref<string[]>([])
 let listGeneration = 0
 let detailGeneration = 0
@@ -52,6 +55,7 @@ const createForm = reactive({ ...createFormDefaults })
 const adjustForm = reactive({ quantityDelta: '', reason: '', occurredOn: localISODate() })
 const issueForm = reactive({ projectCode: '', issuedOn: localISODate(), quantity: '', notes: '' })
 const editForm = reactive({ brand: '', name: '', model: '', specification: '', unit: '', notes: '' })
+const reverseForm = reactive({ reason: '' })
 
 const items = computed(() => inventoryPage.value.items)
 const selectedItemLabel = computed(() => selectedItem.value
@@ -303,8 +307,67 @@ async function issueItem(): Promise<void> {
   })
 }
 
+function canReverseIssue(movement: InventoryMovementDto): boolean {
+  return movement.movement_type === 'project_issue'
+    && movement.source_type === 'inventory_issue'
+    && typeof movement.project_code === 'string'
+    && movement.project_code.length > 0
+    && movement.issue_status === 'active'
+    && typeof movement.issue_revision === 'number'
+    && movement.issue_revision > 0
+}
+
+function openIssueReverse(movement: InventoryMovementDto): void {
+  if (!canReverseIssue(movement)) return
+  clearFeedback()
+  selectedIssueMovement.value = movement
+  reverseForm.reason = ''
+  reverseVisible.value = true
+}
+
+function reversalPayload(): { projectCode: string; issueId: number; input: InventoryIssueReversalInput } {
+  const movement = selectedIssueMovement.value
+  if (!movement || !canReverseIssue(movement)) throw new Error('该领用记录已不能冲销，请刷新后重试')
+  if (!reverseForm.reason.trim()) throw new Error('请填写冲销原因')
+  return {
+    projectCode: movement.project_code!,
+    issueId: movement.source_id,
+    input: {
+      reason: reverseForm.reason.trim(),
+      expected_revision: movement.issue_revision!,
+    },
+  }
+}
+
+async function reverseIssue(): Promise<void> {
+  let payload: ReturnType<typeof reversalPayload>
+  try { payload = reversalPayload() } catch (error) { actionError.value = errorMessage(error); return }
+  await runInventoryMutation(
+    'reverse',
+    () => repository.value.reverseProjectInventoryIssue(payload.projectCode, payload.issueId, payload.input),
+    () => {
+      reverseVisible.value = false
+      selectedIssueMovement.value = null
+      notice.value = '库存领用已冲销'
+    },
+  )
+}
+
+function cancelIssueReverse(): void {
+  if (busyAction.value) return
+  try {
+    const payload = reversalPayload()
+    repository.value.discardReverseProjectInventoryIssue(payload.projectCode, payload.issueId, payload.input)
+  } catch { /* invalid form has no pending request */ }
+  reverseVisible.value = false
+  selectedIssueMovement.value = null
+}
+
 function movementLabel(kind: InventoryMovementDto['movement_type']): string {
-  return { opening: '期初库存', goods_receipt: '采购到货', adjustment: '库存调整', project_issue: '项目领用' }[kind]
+  return {
+    opening: '期初库存', goods_receipt: '采购到货', adjustment: '库存调整',
+    project_issue: '项目领用', reversal: '领用冲销',
+  }[kind]
 }
 
 function handleRowCommand(command: string, item: InventoryItemDto): void {
@@ -372,7 +435,6 @@ onBeforeUnmount(() => {
           <el-descriptions-item label="品牌 / 型号">{{ [selectedItem.brand, selectedItem.model].filter(Boolean).join(' / ') || '—' }}</el-descriptions-item>
         </el-descriptions>
         <div class="movement-heading"><strong>库存流水</strong><small>流水只追加，不改写历史记录。</small></div>
-        <el-alert data-testid="inventory-reversal-unavailable" title="后端暂未提供领用冲销；为避免制造假状态，此处只读。" type="info" :closable="false" />
         <el-empty v-if="movementsPage.items.length === 0" description="暂无库存流水" />
         <div v-else class="table-scroll movement-scroll">
           <el-table :data="movementsPage.items" row-key="id" size="small" class="movement-table">
@@ -381,6 +443,7 @@ onBeforeUnmount(() => {
             <el-table-column label="数量变化" min-width="110"><template #default="scope"><strong>{{ scope.row.quantity_delta }} {{ selectedItem.unit }}</strong></template></el-table-column>
             <el-table-column label="关联来源" min-width="150"><template #default="scope">{{ scope.row.source_type }} #{{ scope.row.source_id }}</template></el-table-column>
             <el-table-column label="原因" min-width="180"><template #default="scope">{{ scope.row.reason || '—' }}</template></el-table-column>
+            <el-table-column label="操作" width="76" fixed="right"><template #default="scope"><el-button v-if="canReverseIssue(scope.row)" :data-testid="`inventory-issue-reverse-open-${scope.row.id}`" link type="danger" :disabled="Boolean(busyAction)" @click="openIssueReverse(scope.row)">冲销</el-button></template></el-table-column>
           </el-table>
         </div>
         <el-pagination v-if="movementsPage.total > movementsPage.page_size" layout="prev, pager, next, total" :current-page="movementsPage.page" :page-size="movementsPage.page_size" :total="movementsPage.total" @current-change="selectedItem && loadDetail(selectedItem.id, $event)" />
@@ -410,6 +473,11 @@ onBeforeUnmount(() => {
       <el-alert title="施工员不在库存接口中硬编码；如需归属到具体人员，请从项目施工记录录入。" type="info" :closable="false" />
       <el-form label-position="top" @submit.prevent="issueItem"><el-form-item label="库存物料"><strong>{{ selectedItemLabel }}</strong></el-form-item><el-row :gutter="14"><el-col :xs="24" :sm="12"><el-form-item label="项目编号" required><el-input v-model="issueForm.projectCode" data-testid="inventory-issue-project" /></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item label="领用日期"><el-date-picker v-model="issueForm.issuedOn" data-testid="inventory-issue-date" type="date" value-format="YYYY-MM-DD" /></el-form-item></el-col><el-col :xs="24" :sm="12"><el-form-item label="领用数量" required><el-input v-model="issueForm.quantity" data-testid="inventory-issue-quantity" /></el-form-item></el-col></el-row><el-form-item label="备注"><el-input v-model="issueForm.notes" type="textarea" /></el-form-item><div class="dialog-actions"><el-button :disabled="busyAction === 'issue'" @click="issueVisible = false">取消</el-button><el-button data-testid="inventory-issue-submit" type="primary" native-type="submit" :loading="busyAction === 'issue'">确认领用</el-button></div></el-form>
     </el-dialog>
+
+    <el-dialog v-model="reverseVisible" data-testid="inventory-issue-reverse-dialog" :teleported="false" title="冲销项目领用" width="min(92vw, 520px)" :close-on-click-modal="!busyAction" :close-on-press-escape="!busyAction">
+      <el-alert title="冲销后会恢复该领用记录冻结的库存数量和成本，并新增一条不可修改的反向流水。" type="warning" :closable="false" />
+      <el-form label-position="top" @submit.prevent="reverseIssue"><el-form-item label="领用记录"><strong>{{ selectedIssueMovement?.project_code }} / #{{ selectedIssueMovement?.source_id }}</strong></el-form-item><el-form-item label="冲销原因" required><el-input v-model="reverseForm.reason" data-testid="inventory-issue-reverse-reason" type="textarea" :rows="3" /></el-form-item><div class="dialog-actions"><el-button :disabled="busyAction === 'reverse'" @click="cancelIssueReverse">取消</el-button><el-button data-testid="inventory-issue-reverse-submit" type="danger" native-type="submit" :loading="busyAction === 'reverse'">确认冲销</el-button></div></el-form>
+    </el-dialog>
   </section>
 </template>
 
@@ -433,7 +501,7 @@ onBeforeUnmount(() => {
 .inventory-descriptions { margin-top: 16px; }
 .movement-heading { margin: 22px 0 10px; }
 .movement-scroll { max-width: 100%; margin-top: 10px; }
-.movement-table { min-width: 660px; }
+.movement-table { min-width: 736px; }
 .el-pagination { justify-content: flex-end; margin-top: 14px; }
 @media (max-width: 700px) {
   .inventory-heading, .table-heading, .detail-heading, .movement-heading { align-items: stretch; flex-direction: column; }

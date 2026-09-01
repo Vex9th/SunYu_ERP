@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import InventoryCenter from '../components/inventory/InventoryCenter.vue'
 import ProcurementWorkspace from '../components/procurement/ProcurementWorkspace.vue'
+import { createHttpInventoryRepository } from '../repositories/inventory.live'
 import { createHttpProcurementRepository } from '../repositories/procurement.live'
 
 function jsonResponse(body: unknown = {}, status = 200): Response {
@@ -124,7 +125,30 @@ describe('采购扩展真实 Repository 契约', () => {
 })
 
 describe('库存中心真实接口', () => {
-  it('按后端分页搜索并打开真实流水，明确禁用不存在的领用冲销', async () => {
+  it('领用冲销未知结果重试复用同一 URL、DTO 和幂等键', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValueOnce(jsonResponse({ id: 19, status: 'reversed', revision: 2 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const repository = createHttpInventoryRepository()
+    const input = { reason: '领用单录错项目', expected_revision: 1 }
+
+    await expect(repository.reverseProjectInventoryIssue('SY/001', 19, input))
+      .rejects.toThrow('无法连接本地服务')
+    const [firstUrl, firstInit] = lastRequest(fetchMock)
+    const firstKey = (firstInit.headers as Record<string, string>)['Idempotency-Key']
+    expect(firstUrl).toBe('/api/projects/SY%2F001/inventory-issues/19/reverse')
+    expect(firstInit.method).toBe('POST')
+    expect(JSON.parse(String(firstInit.body))).toEqual(input)
+    expect(firstKey).toMatch(/^[0-9a-f-]{36}$/i)
+
+    await repository.reverseProjectInventoryIssue('SY/001', 19, input)
+    const [, retryInit] = lastRequest(fetchMock)
+    expect(retryInit.body).toBe(firstInit.body)
+    expect((retryInit.headers as Record<string, string>)['Idempotency-Key']).toBe(firstKey)
+  })
+
+  it('按后端分页搜索并在 active 项目领用流水展示真实冲销入口', async () => {
     const item = {
       id: 5, brand: '汇川', name: '伺服电机', model: 'MS1H2', specification: '2kW', unit: '台',
       quantity: '3.500', average_unit_cost_cents: 128900, inventory_value_cents: 451150,
@@ -135,6 +159,7 @@ describe('库存中心真实接口', () => {
       movement_type: 'project_issue', quantity_delta: '-1.000', value_delta_cents: -128900,
       quantity_after: '3.500', value_after_cents: 451150, source_type: 'inventory_issue',
       source_id: 19, occurred_on: '2026-08-31', reason: null, created_at: '2026-08-31T08:00:00+08:00',
+      project_code: 'SY-001', issue_status: 'active', issue_revision: 1,
     }
     const fetchMock = vi.fn<typeof fetch>(async (input) => {
       const url = String(input)
@@ -172,8 +197,76 @@ describe('库存中心真实接口', () => {
       expect.anything(),
     )
     expect(wrapper.get('[data-testid="inventory-detail-drawer"]').text()).toContain('项目领用')
-    expect(wrapper.get('[data-testid="inventory-reversal-unavailable"]').text()).toContain('后端暂未提供领用冲销')
+    expect(wrapper.get('[data-testid="inventory-issue-reverse-open-41"]').text()).toContain('冲销')
+    expect(wrapper.find('[data-testid="inventory-reversal-unavailable"]').exists()).toBe(false)
     expect(wrapper.text()).not.toContain('演示数据')
+  })
+
+  it('从真实领用流水提交冲销，成功后关闭表单刷新余额且不再提供重复动作', async () => {
+    let reversed = false
+    const item = () => ({
+      id: 5, brand: '汇川', name: '伺服电机', model: 'MS1H2', specification: '2kW', unit: '台',
+      quantity: reversed ? '4.500' : '3.500', average_unit_cost_cents: 128900,
+      inventory_value_cents: reversed ? 580050 : 451150,
+      notes: null, revision: reversed ? 3 : 2,
+      created_at: '2026-08-31T08:00:00+08:00', updated_at: '2026-08-31T08:00:00+08:00',
+    })
+    const issueMovement = () => ({
+      id: 41, inventory_item_id: 5, project_id: 7, procurement_line_id: null,
+      movement_type: 'project_issue', quantity_delta: '-1.000', value_delta_cents: -128900,
+      quantity_after: '3.500', value_after_cents: 451150, source_type: 'inventory_issue',
+      source_id: 19, occurred_on: '2026-08-31', reason: null,
+      created_at: '2026-08-31T08:00:00+08:00', project_code: 'SY-001',
+      issue_status: reversed ? 'reversed' : 'active', issue_revision: reversed ? 2 : 1,
+    })
+    const reversalMovement = () => ({
+      id: 42, inventory_item_id: 5, project_id: 7, procurement_line_id: null,
+      movement_type: 'reversal', quantity_delta: '1.000', value_delta_cents: 128900,
+      quantity_after: '4.500', value_after_cents: 580050, source_type: 'inventory_issue_reversal',
+      source_id: 19, occurred_on: '2026-09-01', reason: '领用单录错项目',
+      created_at: '2026-09-01T08:00:00+08:00', project_code: 'SY-001',
+      issue_status: 'reversed', issue_revision: 2,
+    })
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input)
+      if (url.startsWith('/api/inventory/items?')) {
+        return jsonResponse({ items: [item()], total: 1, page: 1, page_size: 20 })
+      }
+      if (url === '/api/inventory/items/5') {
+        return jsonResponse({ ...item(), movements: reversed ? [reversalMovement(), issueMovement()] : [issueMovement()] })
+      }
+      if (url === '/api/inventory/items/5/movements?page=1&page_size=20') {
+        const movements = reversed ? [reversalMovement(), issueMovement()] : [issueMovement()]
+        return jsonResponse({ items: movements, total: movements.length, page: 1, page_size: 20 })
+      }
+      if (url === '/api/projects/SY-001/inventory-issues/19/reverse' && init?.method === 'POST') {
+        reversed = true
+        return jsonResponse({ id: 19, status: 'reversed', revision: 2 })
+      }
+      return jsonResponse({ detail: `unexpected ${url}` }, 404)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const wrapper = mountWithElementPlus(InventoryCenter)
+    await settle()
+
+    await wrapper.get('[data-testid="inventory-detail-open-5"]').trigger('click')
+    await settle()
+    await wrapper.get('[data-testid="inventory-issue-reverse-open-41"]').trigger('click')
+    await wrapper.get('[data-testid="inventory-issue-reverse-reason"]').setValue('领用单录错项目')
+    await wrapper.get('[data-testid="inventory-issue-reverse-submit"]').trigger('click')
+    await settle()
+
+    const reverseCalls = fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/inventory-issues/19/reverse'))
+    expect(reverseCalls).toHaveLength(1)
+    const [, reverseInit] = reverseCalls[0] as [string, RequestInit]
+    expect(JSON.parse(String(reverseInit.body))).toEqual({
+      reason: '领用单录错项目', expected_revision: 1,
+    })
+    expect((reverseInit.headers as Record<string, string>)['Idempotency-Key']).toBeTruthy()
+    expect(wrapper.get('[data-testid="inventory-issue-reverse-dialog"]').isVisible()).toBe(false)
+    expect(wrapper.find('[data-testid="inventory-issue-reverse-open-41"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="inventory-detail-drawer"]').text()).toContain('领用冲销')
+    expect(wrapper.get('[data-testid="inventory-detail-drawer"]').text()).toContain('4.500 台')
   })
 
   it('新增、编辑、调整与项目领用均提交真实接口并携带 revision/幂等键', async () => {

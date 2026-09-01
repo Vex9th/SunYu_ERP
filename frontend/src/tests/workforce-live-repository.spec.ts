@@ -59,6 +59,13 @@ describe('HttpWorkforceRepository 幂等重试', () => {
       }),
     },
     {
+      name: '重新启用施工员',
+      path: '/api/workers/3/reactivate',
+      send: (repository) => repository.reactivateWorker(3, {
+        expected_revision: 2,
+      }),
+    },
+    {
       name: '添加项目排单',
       path: '/api/projects/SY%2F2026-001/crew-assignments',
       send: (repository) => repository.createCrewAssignment('SY/2026-001', {
@@ -75,6 +82,37 @@ describe('HttpWorkforceRepository 幂等重试', () => {
       name: '批量保存上工',
       path: '/api/projects/SY%2F2026-001/labor-entries/batch',
       send: (repository) => repository.saveLaborEntriesBatch('SY/2026-001', laborBatchInput()),
+    },
+    {
+      name: '单条新建上工',
+      path: '/api/projects/SY%2F2026-001/labor-entries',
+      send: (repository) => repository.createLaborEntry('SY/2026-001', {
+        assignment_id: 7,
+        work_date: '2026-08-31',
+        attendance_status: 'present',
+        day_fraction: '1.000',
+        work_minutes: null,
+        work_summary: '控制柜接线',
+        notes: null,
+      }),
+    },
+    {
+      name: '作废单条上工',
+      path: '/api/projects/SY%2F2026-001/labor-entries/9/void',
+      send: (repository) => repository.voidLaborEntry('SY/2026-001', 9, {
+        reason: '重复登记',
+        expected_revision: 3,
+      }),
+    },
+    {
+      name: '流转项目排单',
+      path: '/api/projects/SY%2F2026-001/crew-assignments/7/transition',
+      send: (repository) => repository.transitionCrewAssignment('SY/2026-001', 7, {
+        to_status: 'active',
+        effective_at: '2026-08-31T08:00:00.000Z',
+        reason: null,
+        expected_revision: 1,
+      }),
     },
   ])('$name 在网络结果未知后原请求重试会复用 Idempotency-Key', async ({ path, send }) => {
     const randomUUID = vi.spyOn(crypto, 'randomUUID').mockReturnValue(firstIdempotencyKey)
@@ -124,5 +162,29 @@ describe('HttpWorkforceRepository 幂等重试', () => {
     expect(randomUUID).toHaveBeenCalledTimes(2)
     expect(idempotencyKey(fetchMock, 0)).toBe(firstIdempotencyKey)
     expect(idempotencyKey(fetchMock, 1)).toBe(secondIdempotencyKey)
+  })
+
+  it('单条上工编辑使用 PUT 且原样携带 expected_revision', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ id: 9, revision: 4 }), { status: 200 }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const repository = createHttpWorkforceRepository()
+    const input = {
+      assignment_id: 7,
+      work_date: '2026-08-31',
+      attendance_status: 'present' as const,
+      day_fraction: '0.500',
+      work_minutes: null,
+      work_summary: '改为半天',
+      notes: null,
+      expected_revision: 3,
+    }
+
+    await repository.updateLaborEntry('SY/2026-001', 9, input)
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/projects/SY%2F2026-001/labor-entries/9')
+    expect((fetchMock.mock.calls[0]?.[1] as RequestInit | undefined)?.method).toBe('PUT')
+    expect(JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit | undefined)?.body))).toEqual(input)
   })
 })

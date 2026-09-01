@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { ElMessageBox } from 'element-plus'
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 
 import type { CompanyRecord, PagedResult } from '../../domain/contracts'
@@ -7,6 +8,7 @@ import { centsToYuan, yuanToCents } from '../../domain/formatters'
 import type {
   GoodsReceiptInput,
   ProcurementLineInput,
+  ProcurementLineUpdateInput,
   ProcurementListDetailDto,
   ProcurementListInput,
   ProcurementListSummaryDto,
@@ -39,6 +41,8 @@ const companies = ref<CompanyRecord[]>([])
 const procurementLists = ref<ProcurementListDetailDto[]>([])
 const procurementListPage = ref<PagedResult<ProcurementListSummaryDto> | null>(null)
 const purchaseOrderPage = ref<PagedResult<PurchaseOrderDto> | null>(null)
+const procurementListPagination = reactive({ page: 1, pageSize: 100 })
+const purchaseOrderPagination = reactive({ page: 1, pageSize: 100 })
 const overview = ref<ProcurementOverviewDto | null>(null)
 const actionError = ref<string | null>(null)
 const actionBusy = ref(false)
@@ -59,6 +63,7 @@ const invoiceDialogVisible = ref(false)
 const quoteDialogVisible = ref(false)
 const importInput = ref<HTMLInputElement | null>(null)
 const selectedLineListId = ref(0)
+const selectedLineId = ref<number | null>(null)
 const selectedOrderLine = ref<ProcurementListDetailDto['lines'][number] | null>(null)
 const selectedOrder = ref<PurchaseOrderDto | null>(null)
 const selectedOrderFacts = computed(() => selectedOrder.value as PurchaseOrderRecordDto | null)
@@ -91,7 +96,23 @@ const receiptForm = reactive({
   notes: '',
 })
 const receiptQuantities = reactive<Record<number, string>>({})
-const editOrderForm = reactive({ orderNo: '', supplierCompanyId: 0, orderedOn: '', expectedDeliveryOn: '', notes: '' })
+interface PurchaseOrderLineEditDraft {
+  id: number
+  procurementLineId: number
+  quantity: string
+  unitCostYuan: string
+  overageReason: string
+  requirementQuantity: string | null
+}
+
+const editOrderForm = reactive({
+  orderNo: '',
+  supplierCompanyId: 0,
+  orderedOn: '',
+  expectedDeliveryOn: '',
+  notes: '',
+  lines: [] as PurchaseOrderLineEditDraft[],
+})
 const cancelOrderReason = ref('')
 const paymentForm = reactive({ paidOn: localISODate(), amountYuan: '', paymentMethod: '银行转账', referenceNo: '', notes: '' })
 const invoiceForm = reactive({ invoiceNo: '', invoicedOn: localISODate(), amountYuan: '', documentVersionIds: '' })
@@ -153,16 +174,13 @@ const pendingReceiptCreates = new Set<PendingReceiptCreate>()
 const purchaseOrders = computed(() => purchaseOrderPage.value?.items ?? [])
 const draftProcurementLists = computed(() => procurementLists.value.filter((list) => list.status === 'draft'))
 const canWrite = computed(() => !loading.value && !loadError.value && !actionBusy.value)
-const paginationWarnings = computed(() => {
-  const warnings: string[] = []
-  if (procurementListPage.value && procurementListPage.value.total > procurementListPage.value.page_size) {
-    warnings.push(`采购清单共 ${procurementListPage.value.total} 条，当前仅展示前 ${procurementListPage.value.page_size} 条`)
-  }
-  if (purchaseOrderPage.value && purchaseOrderPage.value.total > purchaseOrderPage.value.page_size) {
-    warnings.push(`采购单共 ${purchaseOrderPage.value.total} 条，当前仅展示前 ${purchaseOrderPage.value.page_size} 条`)
-  }
-  return warnings
-})
+const procurementListPageCount = computed(() => pageCount(procurementListPage.value))
+const purchaseOrderPageCount = computed(() => pageCount(purchaseOrderPage.value))
+
+function pageCount(page: PagedResult<unknown> | null): number {
+  if (!page || page.page_size <= 0) return 1
+  return Math.max(1, Math.ceil(page.total / page.page_size))
+}
 
 function clearWorkspace(): void {
   companies.value = []
@@ -219,15 +237,16 @@ function actionErrorMessage(error: unknown): string {
 async function refreshAfterCommittedAction(
   context: ActionContext,
   refresh: () => Promise<void>,
+  committedMessage = '操作已保存',
 ): Promise<void> {
   try {
     await refresh()
     if (isSameActionTarget(context) && loadError.value) {
-      actionError.value = `操作已保存，但刷新失败：${loadError.value}`
+      actionError.value = `${committedMessage}，但刷新失败：${loadError.value}`
     }
   } catch (error) {
     if (isSameActionTarget(context)) {
-      actionError.value = `操作已保存，但刷新失败：${actionErrorMessage(error)}`
+      actionError.value = `${committedMessage}，但刷新失败：${actionErrorMessage(error)}`
     }
   }
 }
@@ -237,13 +256,21 @@ async function loadWorkspace(
   repository: ProcurementHttpRepository = currentRepository(),
 ): Promise<void> {
   const currentGeneration = ++generation
+  const listQuery = {
+    page: procurementListPagination.page,
+    page_size: procurementListPagination.pageSize,
+  }
+  const orderQuery = {
+    page: purchaseOrderPagination.page,
+    page_size: purchaseOrderPagination.pageSize,
+  }
   clearWorkspace()
   loading.value = true
   try {
     const [companyResult, listResult, orderResult, overviewResult] = await Promise.all([
       repository.listSupplierCompanies(),
-      repository.listProcurementLists(projectCode, { page: 1, page_size: 100 }),
-      repository.listPurchaseOrders(projectCode, { page: 1, page_size: 100 }),
+      repository.listProcurementLists(projectCode, listQuery),
+      repository.listPurchaseOrders(projectCode, orderQuery),
       repository.getProcurementOverview(projectCode),
     ])
     if (!isCurrent(currentGeneration)) return
@@ -253,8 +280,12 @@ async function loadWorkspace(
     if (!isCurrent(currentGeneration)) return
     companies.value = companyResult.data
     procurementListPage.value = listResult.data
+    procurementListPagination.page = listResult.data.page
+    procurementListPagination.pageSize = listResult.data.page_size
     procurementLists.value = detailResults.map((result) => result.data)
     purchaseOrderPage.value = orderResult.data
+    purchaseOrderPagination.page = orderResult.data.page
+    purchaseOrderPagination.pageSize = orderResult.data.page_size
     overview.value = overviewResult.data
   } catch (error) {
     if (isCurrent(currentGeneration)) {
@@ -263,6 +294,32 @@ async function loadWorkspace(
   } finally {
     if (isCurrent(currentGeneration)) loading.value = false
   }
+}
+
+function changeProcurementListPage(page: number): void {
+  if (loading.value || page < 1 || page === procurementListPagination.page) return
+  procurementListPagination.page = page
+  void loadWorkspace(props.projectCode, currentRepository())
+}
+
+function changeProcurementListPageSize(pageSize: number): void {
+  if (loading.value || pageSize < 1 || pageSize === procurementListPagination.pageSize) return
+  procurementListPagination.page = 1
+  procurementListPagination.pageSize = pageSize
+  void loadWorkspace(props.projectCode, currentRepository())
+}
+
+function changePurchaseOrderPage(page: number): void {
+  if (loading.value || page < 1 || page === purchaseOrderPagination.page) return
+  purchaseOrderPagination.page = page
+  void loadWorkspace(props.projectCode, currentRepository())
+}
+
+function changePurchaseOrderPageSize(pageSize: number): void {
+  if (loading.value || pageSize < 1 || pageSize === purchaseOrderPagination.pageSize) return
+  purchaseOrderPagination.page = 1
+  purchaseOrderPagination.pageSize = pageSize
+  void loadWorkspace(props.projectCode, currentRepository())
 }
 
 function abandonListCreate(pending: PendingListCreate): void {
@@ -340,6 +397,7 @@ function resetActionsForContextChange(): void {
   importPreview.value = null
   importListName.value = ''
   selectedLineListId.value = 0
+  selectedLineId.value = null
   selectedOrderLine.value = null
   selectedOrder.value = null
   for (const pending of pendingListCreates) abandonListCreate(pending)
@@ -436,6 +494,7 @@ function openLineDialog(): void {
   if (!list) return
   lineDialogVersion += 1
   selectedLineListId.value = list.id
+  selectedLineId.value = null
   Object.assign(lineForm, {
     sequenceNo: Math.max(0, ...list.lines.map((line) => line.sequence_no)) + 1,
     category: '其他',
@@ -447,6 +506,30 @@ function openLineDialog(): void {
     unit: '',
     unitCostYuan: '',
     quotedUnitPriceYuan: '',
+  })
+  actionError.value = null
+  lineDialogVisible.value = true
+}
+
+function openEditLine(
+  list: ProcurementListDetailDto,
+  line: ProcurementListDetailDto['lines'][number],
+): void {
+  if (!canWrite.value || list.status !== 'draft') return
+  lineDialogVersion += 1
+  selectedLineListId.value = list.id
+  selectedLineId.value = line.id
+  Object.assign(lineForm, {
+    sequenceNo: line.sequence_no,
+    category: line.category,
+    name: line.name,
+    specification: line.specification ?? '',
+    brand: line.brand ?? '',
+    model: line.model ?? '',
+    quantity: line.quantity,
+    unit: line.unit,
+    unitCostYuan: centsToYuan(line.unit_cost_cents),
+    quotedUnitPriceYuan: centsToYuan(line.quoted_unit_price_cents),
   })
   actionError.value = null
   lineDialogVisible.value = true
@@ -541,6 +624,84 @@ async function createLine(): Promise<void> {
       return
     }
     actionError.value = actionErrorMessage(error)
+  } finally {
+    if (isCurrentAction(context)) actionBusy.value = false
+  }
+}
+
+async function updateLine(): Promise<void> {
+  if (actionBusy.value || selectedLineId.value === null) return
+  const list = draftProcurementLists.value.find((item) => item.id === selectedLineListId.value)
+  const line = list?.lines.find((item) => item.id === selectedLineId.value)
+  const payload = linePayload()
+  if (!list || !line || !payload) {
+    if (!list || !line) actionError.value = '采购行已变更，请刷新后重试'
+    return
+  }
+  const input: ProcurementLineUpdateInput = {
+    ...payload,
+    expected_revision: line.revision,
+  }
+  const context = startAction()
+  actionBusy.value = true
+  actionError.value = null
+  try {
+    await context.repository.updateProcurementLine(
+      context.projectCode,
+      list.id,
+      line.id,
+      input,
+    )
+    if (!isCurrentAction(context)) return
+    lineDialogVisible.value = false
+    selectedLineId.value = null
+    actionBusy.value = false
+    await refreshAfterCommittedAction(context, () => loadWorkspace(context.projectCode, context.repository))
+  } catch (error) {
+    if (isCurrentAction(context)) actionError.value = actionErrorMessage(error)
+  } finally {
+    if (isCurrentAction(context)) actionBusy.value = false
+  }
+}
+
+function saveLine(): Promise<void> {
+  return selectedLineId.value === null ? createLine() : updateLine()
+}
+
+async function deleteLine(
+  list: ProcurementListDetailDto,
+  line: ProcurementListDetailDto['lines'][number],
+): Promise<void> {
+  if (!canWrite.value || list.status !== 'draft') return
+  const context = startAction()
+  actionBusy.value = true
+  actionError.value = null
+  try {
+    await ElMessageBox.confirm(
+      `删除后无法恢复，确定删除“${line.name}”吗？`,
+      '删除采购行',
+      {
+        type: 'warning',
+        confirmButtonText: '确认删除',
+        cancelButtonText: '取消',
+      },
+    )
+  } catch {
+    if (isCurrentAction(context)) actionBusy.value = false
+    return
+  }
+  if (!isCurrentAction(context)) return
+  try {
+    await context.repository.deleteProcurementLine(context.projectCode, list.id, line.id)
+    if (!isCurrentAction(context)) return
+    actionBusy.value = false
+    await refreshAfterCommittedAction(
+      context,
+      () => loadWorkspace(context.projectCode, context.repository),
+      '操作已删除',
+    )
+  } catch (error) {
+    if (isCurrentAction(context)) actionError.value = actionErrorMessage(error)
   } finally {
     if (isCurrentAction(context)) actionBusy.value = false
   }
@@ -908,9 +1069,30 @@ function openEditOrder(): void {
     orderedOn: order.ordered_on,
     expectedDeliveryOn: order.expected_delivery_on ?? '',
     notes: order.notes ?? '',
+    lines: order.lines.map((line) => ({
+      id: line.id,
+      procurementLineId: line.procurement_line_id,
+      quantity: line.quantity,
+      unitCostYuan: centsToYuan(line.unit_cost_cents),
+      overageReason: line.overage_reason ?? '',
+      requirementQuantity: procurementLine(line.procurement_line_id)?.quantity ?? null,
+    })),
   })
   actionError.value = null
   editOrderDialogVisible.value = true
+}
+
+function procurementLine(lineId: number): ProcurementListDetailDto['lines'][number] | null {
+  for (const list of procurementLists.value) {
+    const line = list.lines.find((item) => item.id === lineId)
+    if (line) return line
+  }
+  return null
+}
+
+function procurementLineLabel(lineId: number): string {
+  const line = procurementLine(lineId)
+  return line ? `${line.name}（${line.specification ?? '无规格'}）` : `采购行 #${lineId}`
 }
 
 function orderUpdatePayload(order: PurchaseOrderDto): PurchaseOrderUpdateInput | null {
@@ -922,17 +1104,46 @@ function orderUpdatePayload(order: PurchaseOrderDto): PurchaseOrderUpdateInput |
     actionError.value = '请选择有效供应商'
     return null
   }
+  const lines: PurchaseOrderUpdateInput['lines'] = []
+  for (const [index, draft] of editOrderForm.lines.entries()) {
+    let quantityMilli: bigint
+    try {
+      quantityMilli = decimalToMilli(draft.quantity.trim())
+    } catch {
+      actionError.value = `第 ${index + 1} 行数量格式不正确`
+      return null
+    }
+    if (quantityMilli <= 0n) {
+      actionError.value = `第 ${index + 1} 行数量必须大于 0`
+      return null
+    }
+    let unitCostCents: number
+    try {
+      unitCostCents = yuanToCents(draft.unitCostYuan)
+    } catch {
+      actionError.value = `第 ${index + 1} 行成本价必须是非负金额，最多两位小数`
+      return null
+    }
+    const overageReason = optionalText(draft.overageReason)
+    if (draft.requirementQuantity !== null
+      && quantityMilli > decimalToMilli(draft.requirementQuantity)
+      && !overageReason) {
+      actionError.value = `第 ${index + 1} 行超采必须填写原因`
+      return null
+    }
+    lines.push({
+      procurement_line_id: draft.procurementLineId,
+      quantity: milliToDecimal(quantityMilli),
+      unit_cost_cents: unitCostCents,
+      overage_reason: overageReason,
+    })
+  }
   return {
     order_no: editOrderForm.orderNo.trim(),
     supplier_company_id: editOrderForm.supplierCompanyId,
     ordered_on: editOrderForm.orderedOn,
     expected_delivery_on: optionalText(editOrderForm.expectedDeliveryOn),
-    lines: order.lines.map((line) => ({
-      procurement_line_id: line.procurement_line_id,
-      quantity: line.quantity,
-      unit_cost_cents: line.unit_cost_cents,
-      overage_reason: line.overage_reason,
-    })),
+    lines,
     notes: optionalText(editOrderForm.notes),
     document_version_ids: order.document_version_ids,
     expected_revision: order.revision,
@@ -1257,6 +1468,8 @@ watch(
   [() => props.projectCode, () => props.repository],
   ([projectCode]) => {
     resetActionsForContextChange()
+    procurementListPagination.page = 1
+    purchaseOrderPagination.page = 1
     void loadWorkspace(projectCode, currentRepository())
   },
   { immediate: true },
@@ -1358,15 +1571,6 @@ onBeforeUnmount(() => {
       data-testid="procurement-load-error"
     />
     <template v-else>
-      <el-alert
-        v-for="warning in paginationWarnings"
-        :key="warning"
-        :title="warning"
-        type="warning"
-        :closable="false"
-        show-icon
-        data-testid="procurement-pagination-warning"
-      />
       <div class="workspace-grid">
         <article class="workspace-panel">
           <h3>采购清单</h3>
@@ -1394,8 +1598,25 @@ onBeforeUnmount(() => {
                     {{ orderForLine(line.id)?.order_no }}
                   </span>
                 </div>
+                <span v-if="list.status === 'draft'" class="line-actions">
+                  <el-button
+                    :data-testid="`procurement-line-edit-${line.id}`"
+                    link
+                    type="primary"
+                    :disabled="!canWrite"
+                    @click="openEditLine(list, line)"
+                  >编辑</el-button>
+                  <el-button
+                    :data-testid="`procurement-line-delete-${line.id}`"
+                    link
+                    type="danger"
+                    :loading="actionBusy"
+                    :disabled="!canWrite"
+                    @click="deleteLine(list, line)"
+                  >删除</el-button>
+                </span>
                 <el-button
-                  v-if="list.status === 'confirmed'"
+                  v-else-if="list.status === 'confirmed'"
                   :data-testid="`purchase-order-create-${line.id}`"
                   link
                   type="primary"
@@ -1406,6 +1627,24 @@ onBeforeUnmount(() => {
             </ul>
             <p v-else class="secondary-text">清单内暂无物料</p>
           </section>
+          <footer v-if="procurementListPage" class="pagination-footer">
+            <span class="secondary-text" data-testid="procurement-list-page-info">
+              第 {{ procurementListPage.page }} / {{ procurementListPageCount }} 页，共 {{ procurementListPage.total }} 条
+            </span>
+            <el-pagination
+              data-testid="procurement-list-pagination"
+              background
+              size="small"
+              layout="sizes, prev, pager, next"
+              :current-page="procurementListPage.page"
+              :page-size="procurementListPage.page_size"
+              :page-sizes="[20, 50, 100]"
+              :total="procurementListPage.total"
+              :disabled="loading || actionBusy"
+              @current-change="changeProcurementListPage"
+              @size-change="changeProcurementListPageSize"
+            />
+          </footer>
         </article>
         <article class="workspace-panel">
           <h3>采购单</h3>
@@ -1425,6 +1664,24 @@ onBeforeUnmount(() => {
             </li>
           </ul>
           <p v-else class="secondary-text" data-testid="purchase-order-empty">暂无采购单</p>
+          <footer v-if="purchaseOrderPage" class="pagination-footer">
+            <span class="secondary-text" data-testid="purchase-order-page-info">
+              第 {{ purchaseOrderPage.page }} / {{ purchaseOrderPageCount }} 页，共 {{ purchaseOrderPage.total }} 条
+            </span>
+            <el-pagination
+              data-testid="purchase-order-pagination"
+              background
+              size="small"
+              layout="sizes, prev, pager, next"
+              :current-page="purchaseOrderPage.page"
+              :page-size="purchaseOrderPage.page_size"
+              :page-sizes="[20, 50, 100]"
+              :total="purchaseOrderPage.total"
+              :disabled="loading || actionBusy"
+              @current-change="changePurchaseOrderPage"
+              @size-change="changePurchaseOrderPageSize"
+            />
+          </footer>
         </article>
         <article v-if="overview" class="workspace-panel" data-testid="procurement-overview">
           <h3>采购概览</h3>
@@ -1484,13 +1741,13 @@ onBeforeUnmount(() => {
       v-model="lineDialogVisible"
       data-testid="procurement-line-dialog"
       :teleported="false"
-      title="新增采购行"
+      :title="selectedLineId === null ? '新增采购行' : '编辑采购行'"
       width="min(94vw, 760px)"
       :before-close="beforeLineDialogClose"
     >
-      <el-form label-position="top" @submit.prevent="createLine">
+      <el-form label-position="top" @submit.prevent="saveLine">
         <el-form-item label="采购清单" required>
-          <el-select v-model="selectedLineListId" style="width: 100%" :disabled="actionBusy">
+          <el-select v-model="selectedLineListId" style="width: 100%" :disabled="actionBusy || selectedLineId !== null">
             <el-option
               v-for="list in draftProcurementLists"
               :key="list.id"
@@ -1502,12 +1759,12 @@ onBeforeUnmount(() => {
         <el-row :gutter="14">
           <el-col :xs="24" :sm="8">
             <el-form-item label="序号" required>
-              <el-input-number v-model="lineForm.sequenceNo" :min="1" :disabled="actionBusy" />
+              <el-input-number v-model="lineForm.sequenceNo" data-testid="procurement-line-sequence" :min="1" :disabled="actionBusy" />
             </el-form-item>
           </el-col>
           <el-col :xs="24" :sm="8">
             <el-form-item label="类别" required>
-              <el-input v-model="lineForm.category" :disabled="actionBusy" />
+              <el-input v-model="lineForm.category" data-testid="procurement-line-category" :disabled="actionBusy" />
             </el-form-item>
           </el-col>
           <el-col :xs="24" :sm="8">
@@ -1517,17 +1774,17 @@ onBeforeUnmount(() => {
           </el-col>
           <el-col :xs="24" :sm="12">
             <el-form-item label="规格">
-              <el-input v-model="lineForm.specification" :disabled="actionBusy" />
+              <el-input v-model="lineForm.specification" data-testid="procurement-line-specification" :disabled="actionBusy" />
             </el-form-item>
           </el-col>
           <el-col :xs="24" :sm="6">
             <el-form-item label="品牌">
-              <el-input v-model="lineForm.brand" :disabled="actionBusy" />
+              <el-input v-model="lineForm.brand" data-testid="procurement-line-brand" :disabled="actionBusy" />
             </el-form-item>
           </el-col>
           <el-col :xs="24" :sm="6">
             <el-form-item label="型号">
-              <el-input v-model="lineForm.model" :disabled="actionBusy" />
+              <el-input v-model="lineForm.model" data-testid="procurement-line-model" :disabled="actionBusy" />
             </el-form-item>
           </el-col>
           <el-col :xs="24" :sm="8">
@@ -1581,7 +1838,7 @@ onBeforeUnmount(() => {
             native-type="submit"
             :loading="actionBusy"
             :disabled="actionBusy"
-          >加入清单</el-button>
+          >{{ selectedLineId === null ? '加入清单' : '保存修改' }}</el-button>
         </div>
       </el-form>
     </el-dialog>
@@ -1751,13 +2008,40 @@ onBeforeUnmount(() => {
       </template>
     </el-drawer>
 
-    <el-dialog v-model="editOrderDialogVisible" data-testid="purchase-order-edit-dialog" :teleported="false" title="编辑采购单" width="min(94vw, 680px)">
-      <el-form label-position="top" @submit.prevent="updateOrder"><el-row :gutter="14">
-        <el-col :xs="24" :sm="12"><el-form-item label="采购单号" required><el-input v-model="editOrderForm.orderNo" data-testid="purchase-order-edit-number" /></el-form-item></el-col>
-        <el-col :xs="24" :sm="12"><el-form-item label="供应商" required><el-select v-model="editOrderForm.supplierCompanyId" style="width: 100%"><el-option v-for="company in companies" :key="company.id" :label="company.name" :value="company.id" /></el-select></el-form-item></el-col>
-        <el-col :xs="24" :sm="12"><el-form-item label="下单日期" required><el-input v-model="editOrderForm.orderedOn" /></el-form-item></el-col>
-        <el-col :xs="24" :sm="12"><el-form-item label="预计到货日期"><el-input v-model="editOrderForm.expectedDeliveryOn" /></el-form-item></el-col>
-      </el-row><el-form-item label="备注"><el-input v-model="editOrderForm.notes" type="textarea" /></el-form-item><el-alert title="编辑会保留当前采购行、数量和成本；采购内容调整请另建采购单。" type="info" :closable="false" /><div class="dialog-actions"><el-button @click="editOrderDialogVisible = false">取消</el-button><el-button data-testid="purchase-order-edit-submit" type="primary" native-type="submit" :loading="actionBusy">保存修改</el-button></div></el-form>
+    <el-dialog v-model="editOrderDialogVisible" data-testid="purchase-order-edit-dialog" :teleported="false" title="编辑采购单" width="min(94vw, 760px)">
+      <el-form label-position="top" @submit.prevent="updateOrder">
+        <el-row :gutter="14">
+          <el-col :xs="24" :sm="12"><el-form-item label="采购单号" required><el-input v-model="editOrderForm.orderNo" data-testid="purchase-order-edit-number" /></el-form-item></el-col>
+          <el-col :xs="24" :sm="12"><el-form-item label="供应商" required><el-select v-model="editOrderForm.supplierCompanyId" style="width: 100%"><el-option v-for="company in companies" :key="company.id" :label="company.name" :value="company.id" /></el-select></el-form-item></el-col>
+          <el-col :xs="24" :sm="12"><el-form-item label="下单日期" required><el-input v-model="editOrderForm.orderedOn" /></el-form-item></el-col>
+          <el-col :xs="24" :sm="12"><el-form-item label="预计到货日期"><el-input v-model="editOrderForm.expectedDeliveryOn" /></el-form-item></el-col>
+        </el-row>
+        <el-scrollbar max-height="45vh">
+          <section v-for="(line, index) in editOrderForm.lines" :key="line.id" class="order-line-editor">
+            <strong>{{ index + 1 }}. {{ procurementLineLabel(line.procurementLineId) }}</strong>
+            <el-row :gutter="14">
+              <el-col :xs="24" :sm="8">
+                <el-form-item label="采购数量" required>
+                  <el-input v-model="line.quantity" :data-testid="`purchase-order-edit-line-quantity-${line.id}`" inputmode="decimal" />
+                </el-form-item>
+              </el-col>
+              <el-col :xs="24" :sm="8">
+                <el-form-item label="成本价（元）" required>
+                  <el-input v-model="line.unitCostYuan" :data-testid="`purchase-order-edit-line-cost-${line.id}`" inputmode="decimal" />
+                </el-form-item>
+              </el-col>
+              <el-col :xs="24" :sm="8">
+                <el-form-item label="超采原因">
+                  <el-input v-model="line.overageReason" :data-testid="`purchase-order-edit-line-overage-${line.id}`" placeholder="数量超过清单时必填" />
+                </el-form-item>
+              </el-col>
+            </el-row>
+          </section>
+        </el-scrollbar>
+        <el-form-item label="备注"><el-input v-model="editOrderForm.notes" type="textarea" /></el-form-item>
+        <el-alert title="只有草稿采购单可编辑；数量超过采购清单时必须填写超采原因。" type="info" :closable="false" />
+        <div class="dialog-actions"><el-button @click="editOrderDialogVisible = false">取消</el-button><el-button data-testid="purchase-order-edit-submit" type="primary" native-type="submit" :loading="actionBusy">保存修改</el-button></div>
+      </el-form>
     </el-dialog>
 
     <el-dialog v-model="cancelOrderDialogVisible" data-testid="purchase-order-cancel-dialog" :teleported="false" title="取消采购单" width="min(92vw, 520px)">
@@ -1943,6 +2227,12 @@ onBeforeUnmount(() => {
   gap: 4px;
 }
 
+.line-actions {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
 .dialog-actions,
 .drawer-actions {
   display: flex;
@@ -1955,6 +2245,28 @@ onBeforeUnmount(() => {
   margin-top: 16px;
 }
 
+.pagination-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.order-line-editor {
+  margin-bottom: 14px;
+  padding: 14px;
+  border: 1px solid var(--el-border-color-light);
+  border-radius: var(--el-border-radius-base);
+  background: var(--el-fill-color-lighter);
+}
+
+.order-line-editor strong {
+  display: block;
+  margin-bottom: 10px;
+}
+
 @media (max-width: 640px) {
   .workspace-header {
     align-items: flex-start;
@@ -1963,6 +2275,11 @@ onBeforeUnmount(() => {
 
   .workspace-actions {
     flex-wrap: wrap;
+  }
+
+  .pagination-footer {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .import-confirm, .import-retry { align-items: stretch; flex-direction: column; }

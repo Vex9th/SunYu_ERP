@@ -56,6 +56,7 @@ _ADJUSTMENT_FIELDS = {
 }
 _ISSUE_FIELDS = {"issued_on", "worker_id", "lines", "notes"}
 _ISSUE_LINE_FIELDS = {"inventory_item_id", "procurement_line_id", "quantity"}
+_ISSUE_REVERSAL_FIELDS = {"reason", "expected_revision"}
 _QUANTITY_PATTERN = re.compile(r"^-?(?:0|[1-9]\d{0,8})(?:\.\d{1,3})?$")
 _MAX_PAGE_SIZE = 200
 _SQLITE_MAX_INTEGER = 2**63 - 1
@@ -229,9 +230,18 @@ def create_inventory_router(
             raise _not_found("Inventory item not found")
         movements = connection.execute(
             """
-            SELECT * FROM inventory_movements
-            WHERE inventory_item_id = ?
-            ORDER BY created_at DESC, id DESC
+            SELECT movements.*, projects.project_code,
+                   issues.status AS issue_status,
+                   issues.revision AS issue_revision
+            FROM inventory_movements AS movements
+            LEFT JOIN projects ON projects.id = movements.project_id
+            LEFT JOIN inventory_issues AS issues
+              ON issues.id = movements.source_id
+             AND movements.source_type IN (
+                 'inventory_issue', 'inventory_issue_reversal'
+             )
+            WHERE movements.inventory_item_id = ?
+            ORDER BY movements.created_at DESC, movements.id DESC
             LIMIT 20
             """,
             (identifier,),
@@ -304,9 +314,18 @@ def create_inventory_router(
         ).fetchone()[0]
         rows = connection.execute(
             """
-            SELECT * FROM inventory_movements
-            WHERE inventory_item_id = ?
-            ORDER BY created_at DESC, id DESC
+            SELECT movements.*, projects.project_code,
+                   issues.status AS issue_status,
+                   issues.revision AS issue_revision
+            FROM inventory_movements AS movements
+            LEFT JOIN projects ON projects.id = movements.project_id
+            LEFT JOIN inventory_issues AS issues
+              ON issues.id = movements.source_id
+             AND movements.source_type IN (
+                 'inventory_issue', 'inventory_issue_reversal'
+             )
+            WHERE movements.inventory_item_id = ?
+            ORDER BY movements.created_at DESC, movements.id DESC
             LIMIT ? OFFSET ?
             """,
             (identifier, page_size, (page - 1) * page_size),
@@ -511,6 +530,92 @@ def create_inventory_router(
                 response_status=status.HTTP_201_CREATED,
                 resource_type="inventory_issue",
                 resource_id=issue_id,
+                created_at=timestamp,
+            )
+            return response
+
+    @router.post(
+        "/api/projects/{project_code}/inventory-issues/{issue_id}/reverse"
+    )
+    async def reverse_project_issue(
+        project_code: str,
+        issue_id: str,
+        request: Request,
+        idempotency_key: str = Header(alias="Idempotency-Key"),
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        identifier = _parse_identifier(issue_id)
+        key = _validate_idempotency_key(idempotency_key)
+        payload = await _read_json(
+            request,
+            _ISSUE_REVERSAL_FIELDS,
+            "Invalid inventory issue reversal payload",
+        )
+        normalized = _normalize_issue_reversal(payload)
+        request_hash = _request_hash(normalized)
+        scope = idempotency_scope(request)
+        timestamp = _timestamp(now)
+        project_key = _normalize_project_path(project_code)
+        with transaction_immediate(connection):
+            restored = restore_idempotent_response(
+                connection,
+                scope=scope,
+                key=key,
+                request_hash=request_hash,
+            )
+            if restored is not None:
+                return restored
+            project = _active_project(connection, project_key)
+            issue = _project_issue_row(
+                connection,
+                issue_id=identifier,
+                project_id=int(project["id"]),
+            )
+            if issue is None:
+                raise _not_found("Inventory issue not found")
+            if issue["status"] != "active":
+                raise _business_conflict(
+                    "Inventory issue is already reversed",
+                    "INVENTORY_ISSUE_ALREADY_REVERSED",
+                )
+            expected_revision = int(normalized["expected_revision"])
+            if int(issue["revision"]) != expected_revision:
+                raise _revision_conflict(int(issue["revision"]))
+            _reverse_issue_inventory(
+                connection,
+                issue=issue,
+                project_id=int(project["id"]),
+                reason=str(normalized["reason"]),
+                timestamp=timestamp,
+            )
+            updated = connection.execute(
+                """
+                UPDATE inventory_issues
+                SET status = 'reversed', revision = revision + 1, updated_at = ?
+                WHERE id = ? AND status = 'active' AND revision = ?
+                """,
+                (timestamp, identifier, expected_revision),
+            )
+            if updated.rowcount != 1:
+                raise sqlite3.DatabaseError("inventory issue reversal update failed")
+            reversed_issue = _project_issue_row(
+                connection,
+                issue_id=identifier,
+                project_id=int(project["id"]),
+            )
+            if reversed_issue is None:
+                raise sqlite3.DatabaseError("reversed inventory issue is missing")
+            response = _issue_response(connection, reversed_issue)
+            save_idempotent_response(
+                connection,
+                scope=scope,
+                key=key,
+                request_hash=request_hash,
+                response=response,
+                response_status=status.HTTP_200_OK,
+                resource_type="inventory_issue",
+                resource_id=identifier,
                 created_at=timestamp,
             )
             return response
@@ -757,6 +862,73 @@ def _normalize_issue(payload: dict[str, Any]) -> dict[str, object]:
     }
 
 
+def _normalize_issue_reversal(payload: dict[str, Any]) -> dict[str, object]:
+    return {
+        "reason": _required_text(
+            payload["reason"], "Invalid inventory issue reversal payload"
+        ),
+        "expected_revision": _positive_integer(
+            payload["expected_revision"],
+            "Invalid inventory issue reversal payload",
+        ),
+    }
+
+
+def _reverse_issue_inventory(
+    connection: sqlite3.Connection,
+    *,
+    issue: sqlite3.Row,
+    project_id: int,
+    reason: str,
+    timestamp: str,
+) -> None:
+    lines = connection.execute(
+        """
+        SELECT * FROM inventory_issue_lines
+        WHERE inventory_issue_id = ? ORDER BY id
+        """,
+        (issue["id"],),
+    ).fetchall()
+    for line in lines:
+        item = _item_row(connection, int(line["inventory_item_id"]))
+        if item is None:
+            raise sqlite3.DatabaseError("inventory issue item is missing")
+        quantity_after = int(item["quantity_milli"]) + int(line["quantity_milli"])
+        value_after = int(item["inventory_value_cents"]) + int(line["cost_cents"])
+        if quantity_after > _SQLITE_MAX_INTEGER or value_after > _SQLITE_MAX_INTEGER:
+            raise _business_conflict(
+                "Inventory issue reversal exceeds storage capacity",
+                "INVENTORY_ISSUE_REVERSAL_OVERFLOW",
+            )
+        _insert_movement(
+            connection,
+            item_id=int(item["id"]),
+            project_id=project_id,
+            procurement_line_id=(
+                None
+                if line["procurement_line_id"] is None
+                else int(line["procurement_line_id"])
+            ),
+            movement_type="reversal",
+            quantity_delta_milli=int(line["quantity_milli"]),
+            value_delta_cents=int(line["cost_cents"]),
+            quantity_after_milli=quantity_after,
+            value_after_cents=value_after,
+            source_type="inventory_issue_reversal",
+            source_id=int(issue["id"]),
+            occurred_on=timestamp[:10],
+            reason=reason,
+            created_at=timestamp,
+        )
+        _update_balance(
+            connection,
+            int(item["id"]),
+            quantity_after,
+            value_after,
+            timestamp,
+        )
+
+
 def _post_issue_line(
     connection: sqlite3.Connection,
     *,
@@ -944,6 +1116,7 @@ def _item_response(row: sqlite3.Row) -> dict[str, object]:
 
 
 def _movement_response(row: sqlite3.Row) -> dict[str, object]:
+    columns = set(row.keys())
     return {
         "id": row["id"],
         "inventory_item_id": row["inventory_item_id"],
@@ -959,6 +1132,11 @@ def _movement_response(row: sqlite3.Row) -> dict[str, object]:
         "occurred_on": row["occurred_on"],
         "reason": row["reason"],
         "created_at": row["created_at"],
+        "project_code": row["project_code"] if "project_code" in columns else None,
+        "issue_status": row["issue_status"] if "issue_status" in columns else None,
+        "issue_revision": (
+            row["issue_revision"] if "issue_revision" in columns else None
+        ),
     }
 
 
@@ -1022,6 +1200,18 @@ def _item_row(connection: sqlite3.Connection, item_id: int) -> sqlite3.Row | Non
     return connection.execute(
         "SELECT * FROM inventory_items WHERE id = ?",
         (item_id,),
+    ).fetchone()
+
+
+def _project_issue_row(
+    connection: sqlite3.Connection,
+    *,
+    issue_id: int,
+    project_id: int,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        "SELECT * FROM inventory_issues WHERE id = ? AND project_id = ?",
+        (issue_id, project_id),
     ).fetchone()
 
 

@@ -182,6 +182,45 @@ describe('项目经营真实 Repository 契约', () => {
     expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY%2F001/documents/12/versions/31/download')
   })
 
+  it('文档、报价和合同会读取全部分页而不是只取前100条', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      const page = path.includes('page=2') ? 2 : 1
+      const resource = path.includes('/documents')
+        ? 'document'
+        : path.includes('/quotes')
+          ? 'quote'
+          : 'contract'
+      return jsonResponse({
+        items: [{ id: page, resource }],
+        total: 101,
+        page,
+        page_size: 100,
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const repository = createHttpProjectOperatingRepository()
+
+    await expect(repository.listDocuments('SY-001')).resolves.toMatchObject({
+      items: [{ id: 1 }, { id: 2 }], total: 101, page: 1, page_size: 100,
+    })
+    await expect(repository.listQuotes('SY-001')).resolves.toMatchObject({
+      items: [{ id: 1 }, { id: 2 }], total: 101, page: 1, page_size: 100,
+    })
+    await expect(repository.listContracts('SY-001')).resolves.toMatchObject({
+      items: [{ id: 1 }, { id: 2 }], total: 101, page: 1, page_size: 100,
+    })
+
+    expect(fetchMock.mock.calls.map(([path]) => String(path))).toEqual([
+      '/api/projects/SY-001/documents?page=1&page_size=100',
+      '/api/projects/SY-001/documents?page=2&page_size=100',
+      '/api/projects/SY-001/quotes?page=1&page_size=100',
+      '/api/projects/SY-001/quotes?page=2&page_size=100',
+      '/api/projects/SY-001/contracts?page=1&page_size=100',
+      '/api/projects/SY-001/contracts?page=2&page_size=100',
+    ])
+  })
+
   it('报价、合同、付款计划和到账接口提交精确字段', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () => jsonResponse())
     vi.stubGlobal('fetch', fetchMock)
