@@ -157,13 +157,14 @@ describe('项目经营真实 Repository 契约', () => {
   })
 
   it('文档列表、详情、编辑、归档和下载使用当前项目路径', async () => {
-    const file = new Blob(['download'], { type: 'application/pdf' })
     const fetchMock = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(jsonResponse({ items: [], total: 0, page: 1, page_size: 100 }))
       .mockResolvedValueOnce(jsonResponse({ id: 12 }))
       .mockResolvedValueOnce(jsonResponse({ id: 12 }))
       .mockResolvedValueOnce(jsonResponse({ id: 12 }))
-      .mockResolvedValueOnce(new Response(file))
+      .mockResolvedValueOnce(new Response('download', {
+        headers: { 'Content-Type': 'application/pdf' },
+      }))
     vi.stubGlobal('fetch', fetchMock)
     const repository = createHttpProjectOperatingRepository()
 
@@ -178,7 +179,11 @@ describe('项目经营真实 Repository 契约', () => {
     await repository.archiveDocument('SY/001', 12, { reason: '已替代', expected_revision: 3 })
     expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY%2F001/documents/12/archive')
     expectUuidKey(lastRequest(fetchMock)[1])
-    await expect(repository.downloadDocumentVersion('SY/001', 12, 31)).resolves.toBeInstanceOf(Blob)
+    const downloaded = await repository.downloadDocumentVersion('SY/001', 12, 31)
+    expect({ size: downloaded.size, type: downloaded.type }).toEqual({
+      size: 8,
+      type: 'application/pdf',
+    })
     expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY%2F001/documents/12/versions/31/download')
   })
 

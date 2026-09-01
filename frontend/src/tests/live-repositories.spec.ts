@@ -99,10 +99,12 @@ describe('真实 P0 Repository 契约', () => {
   })
 
   it('采购 Repository 覆盖模板、清单、采购单、到货、概览与扩展动作', async () => {
-    const workbook = new Blob(['xlsx'], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+    const workbookType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () => jsonResponse())
     fetchMock.mockResolvedValueOnce(jsonResponse([]))
-    fetchMock.mockResolvedValueOnce(new Response(workbook))
+    fetchMock.mockResolvedValueOnce(new Response('xlsx', {
+      headers: { 'Content-Type': workbookType },
+    }))
     fetchMock.mockResolvedValueOnce(jsonResponse({ items: [], total: 0, page: 2, page_size: 20 }))
     vi.stubGlobal('fetch', fetchMock)
     const repository = createHttpProcurementRepository()
@@ -110,7 +112,8 @@ describe('真实 P0 Repository 契约', () => {
     await repository.listSupplierCompanies()
     expect(lastRequest(fetchMock)[0]).toBe('/api/companies')
 
-    await expect(repository.downloadImportTemplate()).resolves.toBeInstanceOf(Blob)
+    const workbook = await repository.downloadImportTemplate()
+    expect({ size: workbook.size, type: workbook.type }).toEqual({ size: 4, type: workbookType })
     expect(lastRequest(fetchMock)[0]).toBe('/api/procurement/import-template.xlsx')
 
     await repository.listProcurementLists('SY/001', { page: 2, page_size: 20 })
