@@ -189,6 +189,32 @@ def test_create_app_serves_release_home_assets_and_keeps_api_priority(
     }
 
 
+def test_release_frontend_routes_fall_back_to_index_without_hiding_missing_api_or_assets(
+    tmp_path: Path,
+) -> None:
+    release_root = tmp_path / "release"
+    frontend_dist = release_root / "frontend" / "dist"
+    _write_frontend_dist(frontend_dist)
+    application = main_module.create_app(
+        config_path=release_root / "config.json",
+        migrations_dir=PROJECT_MIGRATIONS_DIR,
+        frontend_dist=frontend_dist,
+    )
+
+    with TestClient(application) as client:
+        document_preview = client.get(
+            "/projects/SY-2026-001/documents/12?version=31",
+            headers={"Accept": "text/html"},
+        )
+        missing_api = client.get("/api/not-a-real-route")
+        missing_asset = client.get("/assets/not-found.js")
+
+    assert document_preview.status_code == 200
+    assert "SunYu ERP Release" in document_preview.text
+    assert missing_api.status_code == 404
+    assert missing_asset.status_code == 404
+
+
 def test_release_app_restart_preserves_config_database_and_login(
     tmp_path: Path,
 ) -> None:

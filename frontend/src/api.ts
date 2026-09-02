@@ -2,6 +2,7 @@ export interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
   headers?: HeadersInit
   body?: unknown
+  signal?: AbortSignal
 }
 
 import type { ApiErrorPayload } from './domain/contracts'
@@ -59,6 +60,7 @@ async function sendRequest(path: string, options: RequestOptions = {}): Promise<
     method: options.method ?? 'GET',
     credentials: 'same-origin',
   }
+  if (options.signal) init.signal = options.signal
 
   const headers = normalizeHeaders(options.headers)
   if (options.body !== undefined) {

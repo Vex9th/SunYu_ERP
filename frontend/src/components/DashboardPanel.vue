@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, reactive, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, inject, reactive, ref, watch } from 'vue'
+import { routeLocationKey, routerKey } from 'vue-router'
 
 import type { BackupSettingsPayload, SystemOverview } from '../types'
 import CompanyCenter from './CompanyCenter.vue'
@@ -36,10 +37,31 @@ type WorkspacePage =
   | 'inventory'
   | 'system'
 
+const route = inject(routeLocationKey, null)
+const router = inject(routerKey, null)
 const selectedPage = ref<WorkspacePage>('overview')
 const dashboardProjectCode = ref<string | null>(null)
 
 const workspacePages: WorkspacePage[] = ['overview', 'projects', 'companies', 'inventory', 'system']
+
+function routedProjectCode(): string | null {
+  const projectCode = route?.params.projectCode
+  return typeof projectCode === 'string' ? projectCode : null
+}
+
+watch(
+  () => route?.fullPath,
+  () => {
+    const projectCode = routedProjectCode()
+    if (projectCode) {
+      selectedPage.value = 'projects'
+      dashboardProjectCode.value = projectCode
+      return
+    }
+    dashboardProjectCode.value = null
+  },
+  { immediate: true },
+)
 
 const backupForm = reactive({
   enabled: false,
@@ -113,6 +135,7 @@ function selectPage(index: string): void {
   if (!workspacePages.includes(index as WorkspacePage)) return
   selectedPage.value = index as WorkspacePage
   dashboardProjectCode.value = null
+  if (routedProjectCode()) void router?.push({ name: 'home' })
 }
 
 function navigate(page: 'projects' | 'companies' | 'system'): void {
@@ -122,6 +145,13 @@ function navigate(page: 'projects' | 'companies' | 'system'): void {
 function openProjectDashboard(projectCode: string): void {
   selectedPage.value = 'projects'
   dashboardProjectCode.value = projectCode
+  void router?.push({ name: 'project', params: { projectCode } })
+}
+
+function closeProjectDashboard(): void {
+  selectedPage.value = 'projects'
+  dashboardProjectCode.value = null
+  if (routedProjectCode()) void router?.push({ name: 'home' })
 }
 </script>
 
@@ -194,7 +224,7 @@ function openProjectDashboard(projectCode: string): void {
         <ProjectDashboard
           v-if="dashboardProjectCode"
           :project-code="dashboardProjectCode"
-          @back="dashboardProjectCode = null"
+          @back="closeProjectDashboard"
           @session-expired="emit('session-expired', $event)"
         />
         <ProjectCenter

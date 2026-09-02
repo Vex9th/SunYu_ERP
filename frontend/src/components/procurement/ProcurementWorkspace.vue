@@ -2,6 +2,7 @@
 import { ElMessageBox } from 'element-plus'
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 
+import DragUploadField from '../common/DragUploadField.vue'
 import type { CompanyRecord, PagedResult } from '../../domain/contracts'
 import { localISODate } from '../../domain/dates'
 import { centsToYuan, yuanToCents } from '../../domain/formatters'
@@ -61,7 +62,6 @@ const cancelOrderDialogVisible = ref(false)
 const paymentDialogVisible = ref(false)
 const invoiceDialogVisible = ref(false)
 const quoteDialogVisible = ref(false)
-const importInput = ref<HTMLInputElement | null>(null)
 const selectedLineListId = ref(0)
 const selectedLineId = ref<number | null>(null)
 const selectedOrderLine = ref<ProcurementListDetailDto['lines'][number] | null>(null)
@@ -1327,11 +1327,18 @@ async function createInvoice(): Promise<void> {
   }
 }
 
-async function previewImport(event: Event): Promise<void> {
-  const input = event.target as HTMLInputElement
-  const file = input.files?.[0]
-  if (!file || actionBusy.value) {
-    input.value = ''
+async function previewImport(file: File | null): Promise<void> {
+  if (actionBusy.value) return
+  if (!file) {
+    if (importFile.value && importProjectCode.value && importRepository) {
+      importRepository.discardPreviewProcurementImport(importProjectCode.value, importFile.value)
+    }
+    importFile.value = null
+    importPreview.value = null
+    importProjectCode.value = null
+    importRepository = null
+    importListName.value = ''
+    actionError.value = null
     return
   }
   if (importFile.value && importProjectCode.value && importRepository && importFile.value !== file) {
@@ -1352,7 +1359,6 @@ async function previewImport(event: Event): Promise<void> {
   } catch (error) {
     if (isCurrentAction(context)) actionError.value = actionErrorMessage(error)
   } finally {
-    input.value = ''
     if (isCurrentAction(context)) actionBusy.value = false
   }
 }
@@ -1372,10 +1378,6 @@ async function retryImportPreview(): Promise<void> {
   } finally {
     if (isCurrentAction(context)) actionBusy.value = false
   }
-}
-
-function openImportPicker(): void {
-  if (canWrite.value) importInput.value?.click()
 }
 
 async function confirmImport(): Promise<void> {
@@ -1514,10 +1516,6 @@ onBeforeUnmount(() => {
           :disabled="!canWrite"
           @click="downloadTemplate"
         >下载采购模板</el-button>
-        <span data-testid="procurement-import-upload">
-          <input ref="importInput" class="visually-hidden" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" @change="previewImport">
-          <el-button data-testid="procurement-excel-import" :loading="actionBusy" :disabled="!canWrite" @click="openImportPicker">导入 Excel</el-button>
-        </span>
         <el-button
           data-testid="procurement-quote-action"
           :disabled="!canWrite || !procurementLists.some((list) => list.status === 'confirmed') || companies.length === 0"
@@ -1526,6 +1524,16 @@ onBeforeUnmount(() => {
       </div>
     </header>
     <p class="capability-note">Excel 会先预览校验，确认后才写入采购清单。</p>
+    <DragUploadField
+      :model-value="importFile"
+      accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      test-id="procurement-import-upload"
+      title="拖入采购 Excel，或点击选择"
+      hint="只支持 XLSX；系统会先逐行校验，确认后才正式写入"
+      :busy="actionBusy"
+      :disabled="loading || Boolean(loadError)"
+      @update:model-value="previewImport"
+    />
     <div v-if="importFile && !importPreview && actionError" class="import-retry">
       <span>{{ importFile.name }} 的预览结果未知，可安全复用原请求重试。</span>
       <el-button data-testid="procurement-import-retry" :loading="actionBusy" @click="retryImportPreview">重试预览</el-button>
@@ -2195,18 +2203,7 @@ onBeforeUnmount(() => {
   color: var(--el-text-color-secondary);
 }
 
-.visually-hidden {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
-  border: 0;
-}
-
-.import-preview { margin-bottom: 16px; }
+.import-preview { margin: 16px 0; }
 .import-errors { margin: 8px 0 0; padding-left: 20px; }
 .import-confirm { display: flex; align-items: center; gap: 12px; }
 .import-retry { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 12px 0; color: var(--el-text-color-secondary); }

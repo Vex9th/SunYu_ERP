@@ -1,11 +1,14 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, inject, reactive, ref, watch } from 'vue'
+import { routeLocationKey, routerKey } from 'vue-router'
 
+import DragUploadField from '../common/DragUploadField.vue'
 import type { DocumentDetail, DocumentSummary } from '../../domain/contracts'
 import {
   createHttpProjectOperatingRepository,
   type ProjectOperatingRepository,
 } from '../../repositories/project-operating.live'
+import ProjectDocumentPreview from './ProjectDocumentPreview.vue'
 
 const props = defineProps<{
   projectCode: string
@@ -13,6 +16,8 @@ const props = defineProps<{
 }>()
 
 const repository = props.repository ?? createHttpProjectOperatingRepository()
+const route = inject(routeLocationKey, null)
+const router = inject(routerKey, null)
 const documents = ref<DocumentSummary[]>([])
 const loading = ref(true)
 const loadError = ref<string | null>(null)
@@ -37,6 +42,8 @@ const historyDetail = ref<DocumentDetail | null>(null)
 const historyLoading = ref(false)
 const historyError = ref<string | null>(null)
 const historyProjectCode = ref<string | null>(null)
+const previewDocumentId = ref<number | null>(null)
+const localPreviewVersionId = ref<number | null>(null)
 const documentCount = computed(() => documents.value.length)
 const versionCount = computed(() => documents.value.reduce(
   (total, document) => total + document.latest_version_number,
@@ -111,6 +118,12 @@ const createForm = reactive({ category: 'other', title: '', notes: '' })
 const editForm = reactive({ category: 'other', title: '', notes: '' })
 const versionNotes = ref('')
 const archiveReason = ref('')
+const previewVersionId = computed(() => {
+  if (!route || route.name !== 'project-document') return localPreviewVersionId.value
+  const raw = route.query.version
+  const versionId = typeof raw === 'string' ? Number(raw) : Number.NaN
+  return Number.isInteger(versionId) && versionId > 0 ? versionId : null
+})
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '文档操作失败'
@@ -154,6 +167,72 @@ function openCreateMinutes(): void {
   minutesContent.value = ''
   validationError.value = null
   minutesVisible.value = true
+}
+
+function routedProjectCode(): string | null {
+  const projectCode = route?.params.projectCode
+  return typeof projectCode === 'string' ? projectCode : null
+}
+
+function routedDocumentId(): number | null {
+  if (
+    !route
+    || route.name !== 'project-document'
+    || routedProjectCode() !== props.projectCode
+  ) return null
+  const raw = route.params.documentId
+  const documentId = typeof raw === 'string' ? Number(raw) : Number.NaN
+  return Number.isInteger(documentId) && documentId > 0 ? documentId : null
+}
+
+function synchronizePreviewRoute(): void {
+  previewDocumentId.value = routedDocumentId()
+  if (previewDocumentId.value === null) {
+    localPreviewVersionId.value = null
+  }
+}
+
+function openPreview(document: DocumentSummary): void {
+  if (router) {
+    void router.push({
+      name: 'project-document',
+      params: { projectCode: props.projectCode, documentId: document.id },
+    })
+    return
+  }
+  previewDocumentId.value = document.id
+  localPreviewVersionId.value = null
+}
+
+function navigatePreview(documentId: number, versionId: number | null): void {
+  if (router) {
+    void router.push({
+      name: 'project-document',
+      params: { projectCode: props.projectCode, documentId },
+      query: versionId === null ? {} : { version: String(versionId) },
+    })
+    return
+  }
+  previewDocumentId.value = documentId
+  localPreviewVersionId.value = versionId
+}
+
+function resolvePreviewVersion(versionId: number): void {
+  localPreviewVersionId.value = versionId
+  if (!router || previewDocumentId.value === null) return
+  void router.replace({
+    name: 'project-document',
+    params: { projectCode: props.projectCode, documentId: previewDocumentId.value },
+    query: { version: String(versionId) },
+  })
+}
+
+function closePreview(): void {
+  previewDocumentId.value = null
+  localPreviewVersionId.value = null
+  if (router && route?.name === 'project-document') {
+    void router.push({ name: 'project-documents', params: { projectCode: props.projectCode } })
+  }
 }
 
 function openMinutesVersion(document: DocumentSummary): void {
@@ -245,10 +324,6 @@ async function saveMinutes(): Promise<void> {
       busy.value = false
     }
   }
-}
-
-function selectCreateFile(event: Event): void {
-  selectedCreateFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
 }
 
 async function openHistory(documentId: number): Promise<void> {
@@ -389,10 +464,6 @@ function openVersion(documentId: number): void {
   versionVisible.value = true
 }
 
-function selectVersionFile(event: Event): void {
-  selectedVersionFile.value = (event.target as HTMLInputElement).files?.[0] ?? null
-}
-
 async function saveVersion(): Promise<void> {
   const document = documents.value.find((item) => item.id === selectedDocumentId.value)
   if (!document || !selectedVersionFile.value) {
@@ -513,12 +584,19 @@ watch(() => props.projectCode, () => {
   editVisible.value = false
   versionVisible.value = false
   archiveVisible.value = false
+  synchronizePreviewRoute()
+  localPreviewVersionId.value = null
   actionError.value = null
   refreshWarning.value = null
   validationError.value = null
   notice.value = '文档文件保存在当前项目的独立目录中。'
   void loadDocuments()
 }, { immediate: true })
+
+watch(() => route?.fullPath, () => {
+  if (!route) return
+  synchronizePreviewRoute()
+})
 </script>
 
 <template>
@@ -581,6 +659,13 @@ watch(() => props.projectCode, () => {
             <el-space wrap :data-testid="`document-row-${scope.row.id}`">
               <el-tag type="info">V{{ scope.row.latest_version_number }}</el-tag>
               <el-button
+                :data-testid="`document-preview-open-${scope.row.id}`"
+                link
+                type="primary"
+                :disabled="busy"
+                @click="openPreview(scope.row)"
+              >预览</el-button>
+              <el-button
                 :data-testid="`document-history-open-${scope.row.id}`"
                 link
                 :disabled="busy"
@@ -631,7 +716,16 @@ watch(() => props.projectCode, () => {
         </el-form-item>
         <el-form-item label="标题" required><el-input data-testid="document-create-title" v-model="createForm.title" /></el-form-item>
         <el-form-item label="备注"><el-input v-model="createForm.notes" type="textarea" /></el-form-item>
-        <el-form-item label="文件" required><input data-testid="document-create-file" type="file" @change="selectCreateFile" /></el-form-item>
+        <el-form-item label="文件" required>
+          <DragUploadField
+            v-model="selectedCreateFile"
+            test-id="document-create-dropzone"
+            input-test-id="document-create-file"
+            title="拖入项目文件，或点击选择"
+            hint="支持图片、PDF、Word、Excel、CAD 和压缩包等项目资料"
+            :busy="busy"
+          />
+        </el-form-item>
         <el-button data-testid="document-create-save" type="primary" native-type="submit" :loading="busy">上传首版</el-button>
       </el-form>
     </el-dialog>
@@ -711,7 +805,16 @@ watch(() => props.projectCode, () => {
     <el-dialog v-model="versionVisible" title="追加文档版本" :teleported="false" width="min(92vw, 520px)">
       <el-alert v-if="validationError" :title="validationError" type="error" :closable="false" />
       <el-form label-position="top" @submit.prevent="saveVersion">
-        <el-form-item label="文件" required><input data-testid="document-version-file" type="file" @change="selectVersionFile" /></el-form-item>
+        <el-form-item label="文件" required>
+          <DragUploadField
+            v-model="selectedVersionFile"
+            test-id="document-version-dropzone"
+            input-test-id="document-version-file"
+            title="拖入新版本，或点击选择"
+            hint="当前文件不会被覆盖，新文件将作为下一版本保存"
+            :busy="busy"
+          />
+        </el-form-item>
         <el-form-item label="备注"><el-input v-model="versionNotes" type="textarea" /></el-form-item>
         <el-button data-testid="document-version-save" type="primary" native-type="submit" :loading="busy">上传新版本</el-button>
       </el-form>
@@ -724,5 +827,17 @@ watch(() => props.projectCode, () => {
         <el-button data-testid="document-archive-save" type="danger" native-type="submit" :loading="busy">确认归档</el-button>
       </el-form>
     </el-dialog>
+
+    <ProjectDocumentPreview
+      v-if="previewDocumentId !== null"
+      :project-code="projectCode"
+      :document-id="previewDocumentId"
+      :version-id="previewVersionId"
+      :documents="documents"
+      :repository="repository"
+      @close="closePreview"
+      @navigate="navigatePreview"
+      @resolved-version="resolvePreviewVersion"
+    />
   </el-space>
 </template>

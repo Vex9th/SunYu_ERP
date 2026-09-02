@@ -307,6 +307,7 @@ describe('项目经营真实组件', () => {
 
     await wrapper.get('[data-testid="document-create-open"]').trigger('click')
     await wrapper.get('[data-testid="document-create-title"]').setValue('技术协议')
+    expect(wrapper.get('[data-testid="document-create-dropzone"] .el-upload-dragger').classes()).toContain('el-upload-dragger')
     const createFile = wrapper.get('[data-testid="document-create-file"]')
     Object.defineProperty(createFile.element, 'files', {
       configurable: true,
@@ -320,6 +321,7 @@ describe('项目经营真实组件', () => {
     expect((create?.[1]?.headers as Record<string, string>)['Idempotency-Key']).toMatch(/^[0-9a-f-]{36}$/i)
 
     await wrapper.get('[data-testid="document-version-open-12"]').trigger('click')
+    expect(wrapper.get('[data-testid="document-version-dropzone"] .el-upload-dragger').classes()).toContain('el-upload-dragger')
     const versionFile = wrapper.get('[data-testid="document-version-file"]')
     Object.defineProperty(versionFile.element, 'files', {
       configurable: true,

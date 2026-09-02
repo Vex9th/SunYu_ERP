@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { defineAsyncComponent, reactive, ref, watch } from 'vue'
+import { defineAsyncComponent, inject, reactive, ref, watch } from 'vue'
+import { routeLocationKey, routerKey } from 'vue-router'
 
 import { ApiError } from '../api'
 import type {
@@ -45,7 +46,22 @@ type ProjectWorkspaceTab =
   | 'procurement'
   | 'workforce'
   | 'delivery'
-const initialTab = (): ProjectWorkspaceTab => 'home'
+const route = inject(routeLocationKey, null)
+const router = inject(routerKey, null)
+
+function routedProjectCode(): string | null {
+  const projectCode = route?.params.projectCode
+  return typeof projectCode === 'string' ? projectCode : null
+}
+
+function routeUsesDocuments(): boolean {
+  return (
+    routedProjectCode() === props.projectCode &&
+    (route?.name === 'project-documents' || route?.name === 'project-document')
+  )
+}
+
+const initialTab = (): ProjectWorkspaceTab => routeUsesDocuments() ? 'documents' : 'home'
 const activeTab = ref<ProjectWorkspaceTab>(initialTab())
 const fieldView = ref<'site' | 'commissioning'>('site')
 let loadVersion = 0
@@ -55,15 +71,39 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '请求失败，请稍后重试'
 }
 
+async function canonicalizeProjectRoute(
+  requestedProjectCode: string,
+  canonicalProjectCode: string,
+): Promise<void> {
+  if (!router || !route || routedProjectCode() !== requestedProjectCode) return
+  const routeName = route.name
+  if (
+    routeName !== 'project'
+    && routeName !== 'project-documents'
+    && routeName !== 'project-document'
+  ) return
+  if (requestedProjectCode === canonicalProjectCode) return
+  await router.replace({
+    name: routeName,
+    params: { ...route.params, projectCode: canonicalProjectCode },
+    query: route.query,
+    hash: route.hash,
+  })
+}
+
 async function loadDashboard(): Promise<void> {
   const version = ++loadVersion
+  const requestedProjectCode = props.projectCode
   loading.value = true
   loadError.value = null
   data.value = null
   operating.value = null
   projectPreview.value = null
   try {
-    const result = await repository.getProjectDashboard(props.projectCode)
+    const result = await repository.getProjectDashboard(requestedProjectCode)
+    if (version === loadVersion) {
+      await canonicalizeProjectRoute(requestedProjectCode, result.project.project_code)
+    }
     if (version === loadVersion) {
       data.value = result
       operating.value = {
@@ -179,8 +219,32 @@ watch(
   { immediate: true },
 )
 
+watch(
+  () => route?.fullPath,
+  () => {
+    if (routedProjectCode() !== props.projectCode) return
+    if (routeUsesDocuments()) {
+      activeTab.value = 'documents'
+    } else if (route?.name === 'project' && activeTab.value === 'documents') {
+      activeTab.value = 'home'
+    }
+  },
+)
+
 watch(activeTab, (tab) => {
   if (tab !== 'workforce') fieldView.value = 'site'
+  if (!router) return
+
+  if (tab === 'documents') {
+    if (!routeUsesDocuments()) {
+      void router.push({ name: 'project-documents', params: { projectCode: props.projectCode } })
+    }
+    return
+  }
+
+  if (routeUsesDocuments()) {
+    void router.push({ name: 'project', params: { projectCode: props.projectCode } })
+  }
 })
 </script>
 

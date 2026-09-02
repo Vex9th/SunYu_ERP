@@ -1232,6 +1232,7 @@ describe('采购工作台真实接口', () => {
     const wrapper = mountWorkspace(repositoryA, 'SY-A')
     await settle()
     const file = new File(['xlsx'], 'A.xlsx')
+    expect(wrapper.get('[data-testid="procurement-import-upload"] .el-upload-dragger').classes()).toContain('el-upload-dragger')
     const upload = wrapper.get('[data-testid="procurement-import-upload"] input[type="file"]')
     Object.defineProperty(upload.element, 'files', { configurable: true, value: [file] })
 
@@ -1264,7 +1265,7 @@ describe('采购工作台真实接口', () => {
     expect(repository.downloadImportTemplate).toHaveBeenCalledTimes(1)
     expect(anchorClick).toHaveBeenCalledTimes(1)
     expect(wrapper.text()).toContain('Excel 会先预览校验，确认后才写入采购清单')
-    expect(wrapper.get('[data-testid="procurement-excel-import"]').attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('[data-testid="procurement-import-upload"] .el-upload-dragger').classes()).toContain('el-upload-dragger')
 
     await wrapper.get('[data-testid="purchase-order-detail-open"]').trigger('click')
     await settle()

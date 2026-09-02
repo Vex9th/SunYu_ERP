@@ -146,7 +146,12 @@ export interface ProjectOperatingRepository {
   updateDocument(projectCode: string, documentId: number, input: DocumentUpdateInput): Promise<DocumentDetail>
   addDocumentVersion(projectCode: string, documentId: number, input: DocumentVersionInput): Promise<DocumentDetail['versions'][number]>
   archiveDocument(projectCode: string, documentId: number, input: DocumentArchiveInput): Promise<DocumentDetail>
-  downloadDocumentVersion(projectCode: string, documentId: number, versionId: number): Promise<Blob>
+  downloadDocumentVersion(
+    projectCode: string,
+    documentId: number,
+    versionId: number,
+    signal?: AbortSignal,
+  ): Promise<Blob>
   listDocumentVersionOptions(projectCode: string): Promise<DocumentVersionOption[]>
   listQuotes(projectCode: string): Promise<PagedResult<Quote>>
   createQuote(projectCode: string, input: QuoteInput): Promise<Quote>
@@ -240,8 +245,12 @@ class HttpProjectOperatingRepository implements ProjectOperatingRepository {
     projectCode: string,
     documentId: number,
     versionId: number,
+    signal?: AbortSignal,
   ): Promise<Blob> {
-    return requestBlob(`${documentPath(projectCode, documentId)}/versions/${versionId}/download`)
+    return requestBlob(
+      `${documentPath(projectCode, documentId)}/versions/${versionId}/download`,
+      { signal },
+    )
   }
 
   async listDocumentVersionOptions(projectCode: string): Promise<DocumentVersionOption[]> {

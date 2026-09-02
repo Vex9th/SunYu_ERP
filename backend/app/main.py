@@ -8,6 +8,9 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import Response
+from starlette.types import Scope
 
 from backend.app.core.config import Settings, load_settings
 from backend.app.core.database import connect_database
@@ -42,6 +45,29 @@ from backend.app.features.workforce import create_workforce_router
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_CONFIG_PATH = _PROJECT_ROOT / "config.json"
 _MIGRATIONS_DIR = _PROJECT_ROOT / "backend" / "migrations"
+
+
+class FrontendStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        try:
+            response = await super().get_response(path, scope)
+        except StarletteHTTPException as error:
+            if error.status_code != 404 or not _is_frontend_navigation(path, scope):
+                raise
+        else:
+            if response.status_code != 404 or not _is_frontend_navigation(path, scope):
+                return response
+        return await super().get_response("index.html", scope)
+
+
+def _is_frontend_navigation(path: str, scope: Scope) -> bool:
+    if scope.get("method") not in {"GET", "HEAD"}:
+        return False
+    headers = {
+        key.decode("latin-1").lower(): value.decode("latin-1")
+        for key, value in scope.get("headers", [])
+    }
+    return "text/html" in headers.get("accept", "") and path.startswith("projects/")
 
 
 def create_app(
@@ -195,7 +221,7 @@ def create_app(
     if frontend_dist is not None:
         application.mount(
             "/",
-            StaticFiles(directory=Path(frontend_dist), html=True),
+            FrontendStaticFiles(directory=Path(frontend_dist), html=True),
             name="frontend",
         )
 

@@ -179,12 +179,14 @@ describe('项目经营真实 Repository 契约', () => {
     await repository.archiveDocument('SY/001', 12, { reason: '已替代', expected_revision: 3 })
     expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY%2F001/documents/12/archive')
     expectUuidKey(lastRequest(fetchMock)[1])
-    const downloaded = await repository.downloadDocumentVersion('SY/001', 12, 31)
+    const controller = new AbortController()
+    const downloaded = await repository.downloadDocumentVersion('SY/001', 12, 31, controller.signal)
     expect({ size: downloaded.size, type: downloaded.type }).toEqual({
       size: 8,
       type: 'application/pdf',
     })
     expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY%2F001/documents/12/versions/31/download')
+    expect(lastRequest(fetchMock)[1].signal).toBe(controller.signal)
   })
 
   it('文档、报价和合同会读取全部分页而不是只取前100条', async () => {

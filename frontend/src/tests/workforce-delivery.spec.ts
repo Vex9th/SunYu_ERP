@@ -1,6 +1,6 @@
 import { mount, type VueWrapper } from '@vue/test-utils'
 import ElementPlus from 'element-plus'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import DeliveryWorkspace from '../components/delivery/DeliveryWorkspace.vue'
 import WorkforceCenter from '../components/workforce/WorkforceCenter.vue'
@@ -25,11 +25,17 @@ function mountComponent(
   })
 }
 
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  vi.setSystemTime(new Date('2026-09-10T09:00:00+08:00'))
+})
+
 afterEach(() => {
   resetDemoBusinessContext()
   document.body.innerHTML = ''
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
+  vi.useRealTimers()
 })
 
 describe('P1 Workforce 演示边界', () => {
