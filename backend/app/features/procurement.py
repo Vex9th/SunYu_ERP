@@ -18,6 +18,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from backend.app.core.config import Settings
 from backend.app.core.database import transaction_immediate
 from backend.app.core.storage_paths import normalize_project_code, project_code_identity
+from backend.app.features import business_attachments
 from backend.app.features.api_common import (
     ApiError,
     ApiErrorRoute,
@@ -52,6 +53,7 @@ _LINE_FIELDS = {
 }
 _LINE_UPDATE_FIELDS = {*_LINE_FIELDS, "expected_revision"}
 _CONFIRM_FIELDS = {"expected_revision"}
+_COPY_LIST_FIELDS = {"expected_revision"}
 _ORDER_FIELDS = {
     "order_no",
     "supplier_company_id",
@@ -410,10 +412,16 @@ def create_procurement_router(
                 if row is None:
                     raise _not_found("Procurement line not found")
                 _require_revision(row, expected_revision)
+                inventory_item_id = (
+                    None
+                    if _procurement_inventory_identity(row)
+                    != _procurement_inventory_identity(normalized)
+                    else row["inventory_item_id"]
+                )
                 connection.execute(
                     """
                     UPDATE procurement_lines
-                    SET sequence_no = ?, category = ?, name = ?,
+                    SET inventory_item_id = ?, sequence_no = ?, category = ?, name = ?,
                         specification = ?, brand = ?, model = ?,
                         quantity_milli = ?, unit = ?, unit_cost_cents = ?,
                         quoted_unit_price_cents = ?, revision = revision + 1,
@@ -421,6 +429,7 @@ def create_procurement_router(
                     WHERE id = ? AND revision = ?
                     """,
                     (
+                        inventory_item_id,
                         normalized["sequence_no"],
                         normalized["category"],
                         normalized["name"],
@@ -574,6 +583,122 @@ def create_procurement_router(
             )
             return response
 
+    @router.post(
+        "/api/projects/{project_code}/procurement-lists/{list_id}/copy-as-draft",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def copy_procurement_list_as_draft(
+        project_code: str,
+        list_id: str,
+        request: Request,
+        idempotency_key: str = Header(alias="Idempotency-Key"),
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        identifier = _parse_identifier(list_id)
+        key = _validate_idempotency_key(idempotency_key)
+        payload = await _read_json(
+            request, _COPY_LIST_FIELDS, "Invalid procurement payload"
+        )
+        expected_revision = _positive_integer(
+            payload["expected_revision"], "Invalid procurement payload"
+        )
+        normalized = {"expected_revision": expected_revision}
+        request_hash = _request_hash(normalized)
+        timestamp = _timestamp(now)
+        with transaction_immediate(connection):
+            project = _project(connection, _normalize_project_path(project_code))
+            scope = (
+                f"POST:/api/projects/{project['project_code']}/procurement-lists/"
+                f"{identifier}/copy-as-draft"
+            )
+            restored = restore_idempotent_response(
+                connection,
+                scope=scope,
+                key=key,
+                request_hash=request_hash,
+            )
+            if restored is not None:
+                return restored
+            if project["status"] != "active":
+                raise _business_conflict("Project is archived", "PROJECT_ARCHIVED")
+            source = _list_row(connection, identifier, int(project["id"]))
+            if source is None:
+                raise _not_found("Procurement list not found")
+            if source["status"] != "confirmed":
+                raise _business_conflict(
+                    "Only confirmed procurement lists can be copied",
+                    "PROCUREMENT_LIST_NOT_CONFIRMED",
+                )
+            _require_revision(source, expected_revision)
+            storage_key = idempotency_storage_key(scope, key)
+            cursor = connection.execute(
+                """
+                INSERT INTO procurement_lists
+                    (project_id, name, notes, status, revision,
+                     create_idempotency_key, create_request_hash,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, 'draft', 1, ?, ?, ?, ?)
+                """,
+                (
+                    project["id"],
+                    f"{source['name']}（修订草稿）",
+                    source["notes"],
+                    storage_key,
+                    request_hash,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            copied_id = _last_insert_id(cursor)
+            for line in _list_line_rows(connection, identifier):
+                connection.execute(
+                    """
+                    INSERT INTO procurement_lines
+                        (procurement_list_id, inventory_item_id, sequence_no,
+                         category, name, specification, brand, model,
+                         quantity_milli, unit, unit_cost_cents,
+                         quoted_unit_price_cents, revision,
+                         create_idempotency_key, create_request_hash,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                    """,
+                    (
+                        copied_id,
+                        line["inventory_item_id"],
+                        line["sequence_no"],
+                        line["category"],
+                        line["name"],
+                        line["specification"],
+                        line["brand"],
+                        line["model"],
+                        line["quantity_milli"],
+                        line["unit"],
+                        line["unit_cost_cents"],
+                        line["quoted_unit_price_cents"],
+                        f"{storage_key}:line:{line['id']}",
+                        request_hash,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            copied = _list_row(connection, copied_id, int(project["id"]))
+            if copied is None:
+                raise sqlite3.DatabaseError("copied procurement list is missing")
+            response = _list_detail(connection, copied, str(project["project_code"]))
+            save_idempotent_response(
+                connection,
+                scope=scope,
+                key=key,
+                request_hash=request_hash,
+                response=response,
+                response_status=status.HTTP_201_CREATED,
+                resource_type="procurement_list",
+                resource_id=copied_id,
+                created_at=timestamp,
+            )
+            return response
+
     @router.get("/api/projects/{project_code}/purchase-orders")
     def list_purchase_orders(
         project_code: str,
@@ -625,127 +750,186 @@ def create_procurement_router(
     async def create_purchase_order(
         project_code: str,
         request: Request,
-        idempotency_key: str = Header(alias="Idempotency-Key"),
         _: None = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
+        settings: Settings = settings_dependency,
     ) -> dict[str, object]:
-        key = _validate_idempotency_key(idempotency_key)
-        payload = await _read_json(
-            request, _ORDER_FIELDS, "Invalid purchase order payload"
-        )
-        normalized = _normalize_order(payload)
-        request_hash = _request_hash(normalized)
-        scope = idempotency_scope(request)
-        storage_key = idempotency_storage_key(scope, key)
-        timestamp = _timestamp(now)
+        key = _read_idempotency_key(request)
+        if business_attachments.is_multipart_request(request):
+            payload, attachment_batch = await business_attachments.read_multipart_batch(
+                request,
+                data_dir=settings.data_dir,
+                max_file_size_bytes=settings.max_document_upload_mb * 1024 * 1024,
+                invalid=_order_attachment_error,
+                too_large=_attachment_too_large,
+                batch_too_large=_attachment_batch_too_large,
+            )
+        else:
+            payload = await _read_json(
+                request, _ORDER_FIELDS, "Invalid purchase order payload"
+            )
+            attachment_batch = business_attachments.AttachmentBatch(
+                [], settings.data_dir
+            )
         try:
-            with transaction_immediate(connection):
-                restored = restore_idempotent_response(
-                    connection,
-                    scope=scope,
-                    key=key,
-                    request_hash=request_hash,
+            with attachment_batch:
+                if set(payload) != _ORDER_FIELDS:
+                    raise _invalid_payload("Invalid purchase order payload")
+                normalized = _normalize_order(payload)
+                request_hash = _request_hash(
+                    attachment_batch.hash_payload(normalized)
                 )
-                if restored is not None:
-                    return restored
-                project = _active_project(
-                    connection, _normalize_project_path(project_code)
-                )
-                if (
-                    connection.execute(
-                        "SELECT 1 FROM companies WHERE id = ?",
-                        (normalized["supplier_company_id"],),
-                    ).fetchone()
-                    is None
-                ):
-                    raise _not_found("Company not found")
-                _validate_document_versions(
-                    connection,
-                    str(project["project_code"]),
-                    normalized["document_version_ids"],
-                )
-                cursor = connection.execute(
-                    """
-                    INSERT INTO purchase_orders
-                        (project_id, order_no, supplier_company_id, ordered_on,
-                         expected_delivery_on, notes, status, revision,
-                         create_idempotency_key, create_request_hash,
-                         created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'draft', 1, ?, ?, ?, ?)
-                    """,
-                    (
-                        project["id"],
-                        normalized["order_no"],
-                        normalized["supplier_company_id"],
-                        normalized["ordered_on"],
-                        normalized["expected_delivery_on"],
-                        normalized["notes"],
-                        storage_key,
-                        request_hash,
-                        timestamp,
-                        timestamp,
-                    ),
-                )
-                order_id = _last_insert_id(cursor)
-                for line in normalized["lines"]:
-                    procurement_line = _confirmed_procurement_line(
-                        connection,
-                        int(line["procurement_line_id"]),
-                        int(project["id"]),
+                timestamp = _timestamp(now)
+                with transaction_immediate(connection):
+                    project = _project(
+                        connection, _normalize_project_path(project_code)
                     )
-                    if (
-                        int(line["quantity_milli"])
-                        > int(procurement_line["quantity_milli"])
-                        and line["overage_reason"] is None
-                    ):
+                    scope = (
+                        f"POST:/api/projects/{project['project_code']}/purchase-orders"
+                    )
+                    restored = restore_idempotent_response(
+                        connection,
+                        scope=scope,
+                        key=key,
+                        request_hash=request_hash,
+                    )
+                    if restored is not None:
+                        return restored
+                    if project["status"] != "active":
                         raise _business_conflict(
-                            "Over-ordering requires a reason",
-                            "OVER_ORDER_REASON_REQUIRED",
+                            "Project is archived", "PROJECT_ARCHIVED"
                         )
-                    connection.execute(
+                    if (
+                        connection.execute(
+                            "SELECT 1 FROM companies WHERE id = ?",
+                            (normalized["supplier_company_id"],),
+                        ).fetchone()
+                        is None
+                    ):
+                        raise _not_found("Company not found")
+                    _validate_document_versions(
+                        connection,
+                        str(project["project_code"]),
+                        normalized["document_version_ids"],
+                    )
+                    storage_key = idempotency_storage_key(scope, key)
+                    cursor = connection.execute(
                         """
-                        INSERT INTO purchase_order_lines
-                            (purchase_order_id, procurement_line_id,
-                             quantity_milli, received_quantity_milli,
-                             unit_cost_cents, overage_reason, created_at)
-                        VALUES (?, ?, ?, 0, ?, ?, ?)
+                        INSERT INTO purchase_orders
+                            (project_id, order_no, supplier_company_id, ordered_on,
+                             expected_delivery_on, notes, status, revision,
+                             create_idempotency_key, create_request_hash,
+                             created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, 'draft', 1, ?, ?, ?, ?)
                         """,
                         (
-                            order_id,
-                            line["procurement_line_id"],
-                            line["quantity_milli"],
-                            line["unit_cost_cents"],
-                            line["overage_reason"],
+                            project["id"],
+                            normalized["order_no"],
+                            normalized["supplier_company_id"],
+                            normalized["ordered_on"],
+                            normalized["expected_delivery_on"],
+                            normalized["notes"],
+                            storage_key,
+                            request_hash,
+                            timestamp,
                             timestamp,
                         ),
                     )
-                for document_id in normalized["document_version_ids"]:
-                    connection.execute(
-                        """
-                        INSERT INTO purchase_order_documents
-                            (purchase_order_id, document_version_id)
-                        VALUES (?, ?)
-                        """,
-                        (order_id, document_id),
+                    order_id = _last_insert_id(cursor)
+                    for line in normalized["lines"]:
+                        procurement_line = _confirmed_procurement_line(
+                            connection,
+                            int(line["procurement_line_id"]),
+                            int(project["id"]),
+                        )
+                        if (
+                            int(line["quantity_milli"])
+                            > int(procurement_line["quantity_milli"])
+                            and line["overage_reason"] is None
+                        ):
+                            raise _business_conflict(
+                                "Over-ordering requires a reason",
+                                "OVER_ORDER_REASON_REQUIRED",
+                            )
+                        connection.execute(
+                            """
+                            INSERT INTO purchase_order_lines
+                                (purchase_order_id, procurement_line_id,
+                                 quantity_milli, received_quantity_milli,
+                                 unit_cost_cents, overage_reason, created_at)
+                            VALUES (?, ?, ?, 0, ?, ?, ?)
+                            """,
+                            (
+                                order_id,
+                                line["procurement_line_id"],
+                                line["quantity_milli"],
+                                line["unit_cost_cents"],
+                                line["overage_reason"],
+                                timestamp,
+                            ),
+                        )
+                    uploaded_version_ids = attachment_batch.publish_documents(
+                        connection,
+                        project_code=str(project["project_code"]),
+                        category="procurement_contract",
+                        documents=[
+                            business_attachments.ManagedDocument(
+                                title=(
+                                    f"采购合同 {normalized['order_no']}"
+                                    f" 附件 {index:02d}（采购单记录 {order_id}）"
+                                ),
+                                managed_filename=business_attachments.managed_filename(
+                                    project["project_code"],
+                                    "采购合同",
+                                    normalized["order_no"],
+                                    business_attachments.compact_iso_date(
+                                        str(normalized["ordered_on"])
+                                    ),
+                                    f"{index:02d}",
+                                    original_filename=attachment.original_filename,
+                                    preserve_last_parts=3,
+                                ),
+                            )
+                            for index, attachment in enumerate(
+                                attachment_batch.attachments, start=1
+                            )
+                        ],
+                        notes=normalized["notes"],
+                        timestamp=timestamp,
                     )
-                order = _order_row(connection, order_id, int(project["id"]))
-                if order is None:
-                    raise sqlite3.DatabaseError("created purchase order is missing")
-                response = _order_response(
-                    connection, order, str(project["project_code"])
-                )
-                save_idempotent_response(
-                    connection,
-                    scope=scope,
-                    key=key,
-                    request_hash=request_hash,
-                    response=response,
-                    response_status=status.HTTP_201_CREATED,
-                    resource_type="purchase_order",
-                    resource_id=order_id,
-                    created_at=timestamp,
-                )
-                return response
+                    document_version_ids = [
+                        *normalized["document_version_ids"],
+                        *uploaded_version_ids,
+                    ]
+                    for document_id in document_version_ids:
+                        connection.execute(
+                            """
+                            INSERT INTO purchase_order_documents
+                                (purchase_order_id, document_version_id)
+                            VALUES (?, ?)
+                            """,
+                            (order_id, document_id),
+                        )
+                    order = _order_row(connection, order_id, int(project["id"]))
+                    if order is None:
+                        raise sqlite3.DatabaseError(
+                            "created purchase order is missing"
+                        )
+                    response = _order_response(
+                        connection, order, str(project["project_code"])
+                    )
+                    save_idempotent_response(
+                        connection,
+                        scope=scope,
+                        key=key,
+                        request_hash=request_hash,
+                        response=response,
+                        response_status=status.HTTP_201_CREATED,
+                        resource_type="purchase_order",
+                        resource_id=order_id,
+                        created_at=timestamp,
+                    )
+                    return response
         except sqlite3.IntegrityError as exc:
             if _is_unique_constraint(exc):
                 raise _business_conflict(
@@ -1576,8 +1760,17 @@ def _receipt_response(
 ) -> dict[str, object]:
     lines = connection.execute(
         """
-        SELECT * FROM goods_receipt_lines
-        WHERE goods_receipt_id = ? ORDER BY id
+        SELECT receipt_lines.*,
+               procurement_lines.name AS material_name,
+               procurement_lines.model AS material_model,
+               procurement_lines.unit
+        FROM goods_receipt_lines AS receipt_lines
+        JOIN purchase_order_lines AS order_lines
+          ON order_lines.id = receipt_lines.purchase_order_line_id
+        JOIN procurement_lines
+          ON procurement_lines.id = order_lines.procurement_line_id
+        WHERE receipt_lines.goods_receipt_id = ?
+        ORDER BY receipt_lines.id
         """,
         (row["id"],),
     ).fetchall()
@@ -1596,6 +1789,9 @@ def _receipt_response(
                 "id": line["id"],
                 "purchase_order_line_id": line["purchase_order_line_id"],
                 "inventory_item_id": line["inventory_item_id"],
+                "material_name": line["material_name"],
+                "material_model": line["material_model"],
+                "unit": line["unit"],
                 "quantity": format_quantity(int(line["quantity_milli"])),
                 "value_cents": line["value_cents"],
                 "movement_id": line["movement_id"],
@@ -1787,6 +1983,18 @@ def _list_line_rows(connection: sqlite3.Connection, list_id: int) -> list[sqlite
         """,
         (list_id,),
     ).fetchall()
+
+
+def _procurement_inventory_identity(
+    record: sqlite3.Row | dict[str, object],
+) -> tuple[object, ...]:
+    return (
+        str(record["name"]).casefold(),
+        str(record["unit"]).casefold(),
+        record["brand"],
+        record["model"],
+        record["specification"],
+    )
 
 
 def _project_line_rows(
@@ -1989,6 +2197,13 @@ def _validate_idempotency_key(value: str) -> str:
     return canonical
 
 
+def _read_idempotency_key(request: Request) -> str:
+    values = request.headers.getlist("Idempotency-Key")
+    if len(values) != 1:
+        raise _invalid_payload("Invalid Idempotency-Key")
+    return _validate_idempotency_key(values[0])
+
+
 def _request_hash(payload: object) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -2039,6 +2254,42 @@ def _utc_now() -> datetime:
 def _is_unique_constraint(failure: sqlite3.IntegrityError) -> bool:
     return (
         getattr(failure, "sqlite_errorcode", None) == sqlite3.SQLITE_CONSTRAINT_UNIQUE
+    )
+
+
+def _order_attachment_error(field: str, message: str) -> ApiError:
+    return ApiError(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "Invalid purchase order payload",
+        "VALIDATION_ERROR",
+        field_errors={field: [message]},
+    )
+
+
+def _attachment_too_large(max_size_bytes: int) -> ApiError:
+    return ApiError(
+        status.HTTP_413_CONTENT_TOO_LARGE,
+        "Document file is too large",
+        "DOCUMENT_FILE_TOO_LARGE",
+        field_errors={
+            "files": [f"must not exceed {max_size_bytes // (1024 * 1024)} MB"]
+        },
+    )
+
+
+def _attachment_batch_too_large(max_size_bytes: int) -> ApiError:
+    return ApiError(
+        status.HTTP_413_CONTENT_TOO_LARGE,
+        "Document attachment batch is too large",
+        "DOCUMENT_BATCH_TOO_LARGE",
+        field_errors={
+            "files": [
+                (
+                    "must contain at most 20 files whose combined size does not "
+                    f"exceed {max_size_bytes // (1024 * 1024)} MB"
+                )
+            ]
+        },
     )
 
 

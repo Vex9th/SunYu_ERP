@@ -3,11 +3,38 @@ export interface RequestOptions {
   headers?: HeadersInit
   body?: unknown
   signal?: AbortSignal
+  timeoutMs?: number
 }
 
 import type { ApiErrorPayload } from './domain/contracts'
 
 export type { ApiErrorPayload } from './domain/contracts'
+
+export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
+
+export interface ProtectedSessionExpiredNotice {
+  readonly message: string
+  readonly path: string
+}
+
+interface ProtectedSessionObserver {
+  active: boolean
+  readonly notify: (notice: ProtectedSessionExpiredNotice) => void
+}
+
+let protectedSessionObserver: ProtectedSessionObserver | null = null
+
+export function subscribeProtectedSessionExpired(
+  notify: (notice: ProtectedSessionExpiredNotice) => void,
+): () => void {
+  if (protectedSessionObserver) protectedSessionObserver.active = false
+  const observer: ProtectedSessionObserver = { active: true, notify }
+  protectedSessionObserver = observer
+  return () => {
+    observer.active = false
+    if (protectedSessionObserver === observer) protectedSessionObserver = null
+  }
+}
 
 const knownErrorMessages: Record<string, string> = {
   'Authentication required': '登录状态已失效，请重新登录',
@@ -56,11 +83,22 @@ export class ApiError extends Error {
 }
 
 async function sendRequest(path: string, options: RequestOptions = {}): Promise<Response> {
+  const sessionObserver = protectedSessionObserver
+  const controller = new AbortController()
+  let timedOut = false
+  const timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
+  const timeout = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, timeoutMs)
+  const abortFromCaller = (): void => controller.abort(options.signal?.reason)
+  if (options.signal?.aborted) abortFromCaller()
+  else options.signal?.addEventListener('abort', abortFromCaller, { once: true })
   const init: RequestInit = {
     method: options.method ?? 'GET',
     credentials: 'same-origin',
+    signal: controller.signal,
   }
-  if (options.signal) init.signal = options.signal
 
   const headers = normalizeHeaders(options.headers)
   if (options.body !== undefined) {
@@ -77,13 +115,35 @@ async function sendRequest(path: string, options: RequestOptions = {}): Promise<
   try {
     response = await fetch(path, init)
   } catch {
+    if (timedOut) throw new ApiError('请求超时，请重试', 0, 'REQUEST_TIMEOUT')
+    if (options.signal?.aborted) throw new ApiError('请求已取消', 0, 'REQUEST_ABORTED')
     throw new ApiError('无法连接本地服务，请确认服务仍在运行', 0)
+  } finally {
+    clearTimeout(timeout)
+    options.signal?.removeEventListener('abort', abortFromCaller)
   }
 
   if (!response.ok) {
-    throw await responseError(response)
+    const error = await responseError(response)
+    if (
+      response.status === 401
+      && isProtectedApiPath(path)
+      && sessionObserver?.active
+    ) {
+      sessionObserver.notify({ message: error.message, path })
+    }
+    throw error
   }
   return response
+}
+
+function isProtectedApiPath(path: string): boolean {
+  const pathname = path.split('?', 1)[0]
+  return pathname.startsWith('/api/') && ![
+    '/api/auth/session',
+    '/api/auth/setup',
+    '/api/auth/login',
+  ].includes(pathname)
 }
 
 async function responseError(response: Response): Promise<ApiError> {
@@ -162,6 +222,11 @@ export interface RetriablePostSender {
   discard(path: string, body?: unknown): boolean
 }
 
+export interface RetriableMultipartPostSender {
+  send<T>(path: string, payload: unknown, files: readonly File[], form?: FormData): Promise<T>
+  discard(path: string, payload?: unknown, files?: readonly File[]): boolean
+}
+
 interface PendingPost {
   readonly signature: string
   readonly idempotencyKey: string
@@ -186,7 +251,11 @@ export function createRetriablePostSender(): RetriablePostSender {
         return Promise.reject(new Error('该路径已有其他请求正在提交'))
       }
 
-      if (!pending || pending.signature !== signature) {
+      if (pending && pending.signature !== signature) {
+        return Promise.reject(new Error('上一笔请求结果未知，只能原样重试或先明确放弃'))
+      }
+
+      if (!pending) {
         pending = {
           signature,
           idempotencyKey: crypto.randomUUID(),
@@ -218,6 +287,103 @@ export function createRetriablePostSender(): RetriablePostSender {
       return pendingByPath.delete(path)
     },
   }
+}
+
+export function createRetriableMultipartPostSender(): RetriableMultipartPostSender {
+  const pendingByPath = new Map<string, PendingPost>()
+  const fileTokens = new WeakMap<File, number>()
+  let nextFileToken = 1
+
+  const signatureFor = (payload: unknown, files: readonly File[]): string => multipartSignature(
+    payload,
+    files,
+    (file) => {
+      const existing = fileTokens.get(file)
+      if (existing !== undefined) return existing
+      const token = nextFileToken
+      nextFileToken += 1
+      fileTokens.set(file, token)
+      return token
+    },
+  )
+
+  return {
+    send<T>(path: string, payload: unknown, files: readonly File[], suppliedForm?: FormData): Promise<T> {
+      let signature: string
+      try {
+        signature = signatureFor(payload, files)
+      } catch (error) {
+        return Promise.reject(error)
+      }
+      let pending = pendingByPath.get(path)
+
+      if (pending?.inFlight) {
+        if (pending.signature === signature) return pending.inFlight as Promise<T>
+        return Promise.reject(new Error('该路径已有其他文件正在上传'))
+      }
+
+      if (pending && pending.signature !== signature) {
+        return Promise.reject(new Error('上一笔上传结果未知，只能原样重试或先明确放弃'))
+      }
+
+      if (!pending) {
+        pending = { signature, idempotencyKey: crypto.randomUUID() }
+        pendingByPath.set(path, pending)
+      }
+
+      const form = suppliedForm ?? businessAttachmentForm(payload, files)
+      const activePending = pending
+      const inFlight = requestJson<T>(path, {
+        method: 'POST',
+        headers: { 'Idempotency-Key': activePending.idempotencyKey },
+        body: form,
+      }).then(
+        (result) => {
+          if (pendingByPath.get(path) === activePending) pendingByPath.delete(path)
+          return result
+        },
+        (error: unknown) => {
+          if (pendingByPath.get(path) === activePending) {
+            activePending.inFlight = undefined
+            if (isDefinitiveClientRejection(error)) pendingByPath.delete(path)
+          }
+          throw error
+        },
+      )
+      activePending.inFlight = inFlight
+      return inFlight
+    },
+    discard(path: string, payload?: unknown, files: readonly File[] = []): boolean {
+      const pending = pendingByPath.get(path)
+      if (!pending || pending.inFlight) return false
+      if (payload !== undefined && pending.signature !== signatureFor(payload, files)) return false
+      return pendingByPath.delete(path)
+    },
+  }
+}
+
+function businessAttachmentForm(payload: unknown, files: readonly File[]): FormData {
+  const form = new FormData()
+  form.set('payload', JSON.stringify(payload))
+  for (const file of files) form.append('files', file, file.name)
+  return form
+}
+
+function multipartSignature(
+  payload: unknown,
+  files: readonly File[],
+  identityToken: (file: File) => number,
+): string {
+  return stableJsonSignature({
+    payload,
+    files: files.map((file) => ({
+      identity: identityToken(file),
+      name: file.name,
+      size: file.size,
+      type: file.type,
+      lastModified: file.lastModified,
+    })),
+  })
 }
 
 function isDefinitiveClientRejection(error: unknown): boolean {

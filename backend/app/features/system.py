@@ -43,6 +43,7 @@ class SettingsStore:
     def update_backup(
         self,
         *,
+        enabled: bool | None = None,
         directory: str | None,
         interval_hours: int,
         retention_days: int,
@@ -50,6 +51,7 @@ class SettingsStore:
         with self._lock:
             updated = update_backup_settings(
                 self._settings.config_path,
+                enabled=enabled,
                 directory=directory,
                 interval_hours=interval_hours,
                 retention_days=retention_days,
@@ -142,7 +144,7 @@ class BackupScheduler:
         try:
             now = _require_aware_datetime(self._clock())
             settings = self._settings_store.get()
-            if settings.backup_dir is None:
+            if not settings.automatic_backup_enabled or settings.backup_dir is None:
                 return False
             if self._retry_not_before is not None and now < self._retry_not_before:
                 return False
@@ -241,6 +243,7 @@ class BackupScheduler:
 
 @dataclass(frozen=True, slots=True)
 class BackupSettingsUpdate:
+    enabled: bool
     directory: str | None
     interval_hours: int
     retention_days: int
@@ -313,6 +316,7 @@ def create_system_router(
     ) -> dict[str, object]:
         try:
             updated = update_settings(
+                enabled=payload.enabled,
                 directory=payload.directory,
                 interval_hours=payload.interval_hours,
                 retention_days=payload.retention_days,
@@ -384,20 +388,29 @@ async def _read_backup_settings_update(request: Request) -> BackupSettingsUpdate
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Invalid backup settings",
         ) from None
-    if not isinstance(payload, dict) or set(payload) != {
-        "directory",
-        "interval_hours",
-        "retention_days",
-    }:
+    required_fields = {"directory", "interval_hours", "retention_days"}
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Invalid backup settings",
+        )
+    payload_fields = set(payload)
+    if payload_fields not in (required_fields, required_fields | {"enabled"}):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Invalid backup settings",
         )
     directory = payload["directory"]
+    enabled = payload.get("enabled", directory is not None)
     interval_hours = payload["interval_hours"]
     retention_days = payload["retention_days"]
-    if directory is not None and (
-        not isinstance(directory, str) or not directory.strip()
+    if (
+        not isinstance(enabled, bool)
+        or (enabled and directory is None)
+        or (
+            directory is not None
+            and (not isinstance(directory, str) or not directory.strip())
+        )
     ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -415,7 +428,7 @@ async def _read_backup_settings_update(request: Request) -> BackupSettingsUpdate
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Invalid backup settings",
         )
-    return BackupSettingsUpdate(directory, interval_hours, retention_days)
+    return BackupSettingsUpdate(enabled, directory, interval_hours, retention_days)
 
 
 def _overview(
@@ -449,7 +462,7 @@ def _overview(
 
 def _backup_settings_response(settings: Settings) -> dict[str, object]:
     return {
-        "enabled": settings.backup_dir is not None,
+        "enabled": settings.automatic_backup_enabled,
         "directory": None if settings.backup_dir is None else str(settings.backup_dir),
         "interval_hours": settings.backup_interval_hours,
         "retention_days": settings.backup_retention_days,

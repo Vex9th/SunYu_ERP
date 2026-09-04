@@ -1,5 +1,5 @@
 import { mount, type VueWrapper } from '@vue/test-utils'
-import ElementPlus from 'element-plus'
+import ElementPlus, { ElDialog, ElMessageBox } from 'element-plus'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import ProjectStagesPanel from '../components/project/ProjectStagesPanel.vue'
@@ -37,6 +37,7 @@ function mountPanel(props: {
   projectCode?: string
   stages: ProjectStage[]
   repository?: ProjectStageRepository
+  readonly?: boolean
   onChanged?: (stages: ProjectStage[]) => void
 }): VueWrapper {
   return mount(ProjectStagesPanel, {
@@ -85,6 +86,40 @@ describe('项目阶段真实读取', () => {
     )
     expect(wrapper.get('[data-testid="stage-row-planning"]').text()).toContain('进行中')
     expect(wrapper.text()).not.toContain('演示')
+  })
+
+  it('完整流程只在页头提供当前阶段操作，不为十八个阶段重复堆按钮', async () => {
+    const stages = [
+      stage('planning', 'completed'),
+      stage('site_survey', 'in_progress'),
+      stage('quotation', 'pending'),
+    ]
+    const repository: ProjectStageRepository = {
+      listProjectStages: vi.fn(async () => ({ source: 'live' as const, data: stages })),
+      updateStageSchedule: vi.fn(),
+      transitionStage: vi.fn(),
+    }
+    const wrapper = mountPanel({ projectCode: 'SY-A', stages, repository })
+    await settle()
+
+    expect(wrapper.findAll('.stage-row__actions')).toHaveLength(0)
+    expect(wrapper.get('[data-testid="stage-schedule-site_survey"]').text()).toContain('维护排期')
+    expect(wrapper.get('[data-testid="stage-transition-site_survey"]').text()).toContain('更新当前阶段')
+    expect(wrapper.find('[data-testid="stage-schedule-planning"]').exists()).toBe(false)
+  })
+
+  it('归档项目的阶段页不显示维护按钮', async () => {
+    const repository: ProjectStageRepository = {
+      listProjectStages: vi.fn(async () => ({ source: 'live' as const, data: [stage('planning', 'in_progress')] })),
+      updateStageSchedule: vi.fn(),
+      transitionStage: vi.fn(),
+    }
+    const wrapper = mountPanel({ projectCode: 'SY-A', stages: [], repository, readonly: true })
+    await settle()
+
+    expect(wrapper.find('[data-testid="stage-schedule-planning"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="stage-transition-planning"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('项目已归档，仅供查看')
   })
 
   it('项目编号变化时重新读取并显示新项目阶段', async () => {
@@ -233,6 +268,7 @@ describe('项目阶段真实读取', () => {
     await wrapper.get('[data-testid="stage-schedule-planning"]').trigger('click')
     await wrapper.get('[data-testid="stage-schedule-save"]').trigger('click')
     expect(repository.updateStageSchedule).toHaveBeenCalledTimes(1)
+    expect(wrapper.get('[data-testid="stage-schedule-cancel"]').attributes('disabled')).toBeDefined()
 
     wrapper.unmount()
     oldWrite.resolve({ source: 'live', data: lateStage })
@@ -276,5 +312,227 @@ describe('项目阶段真实读取', () => {
     expect(listProjectStages).toHaveBeenCalledWith('SY-INJECTED')
     expect(fetchMock).not.toHaveBeenCalled()
     expect(wrapper.get('[data-testid="stage-row-planning"]').text()).toContain('已完成')
+  })
+
+  it('阻塞阶段显示解决阻塞与跳过两种合法动作，并强制填写处理说明', async () => {
+    const blocked = {
+      ...stage('planning', 'blocked', 3),
+      status_reason: '等待客户提供接口资料',
+      started_at: '2026-09-01T00:00:00Z',
+      blocked_at: '2026-09-02T00:00:00Z',
+    }
+    const transitionStage = vi.fn(async () => ({
+      source: 'live' as const,
+      data: { ...blocked, status: 'in_progress' as const, status_reason: '资料已收到', revision: 4 },
+    }))
+    const repository: ProjectStageRepository = {
+      listProjectStages: vi.fn(async () => ({ source: 'live' as const, data: [blocked] })),
+      updateStageSchedule: vi.fn(),
+      transitionStage,
+    }
+    const wrapper = mountPanel({ projectCode: 'SY-A', stages: [blocked], repository })
+    await settle()
+
+    expect(wrapper.get('[data-testid="stage-transition-planning"]').text()).toContain('处理阻塞')
+    await wrapper.get('[data-testid="stage-transition-planning"]').trigger('click')
+    const dialog = wrapper.get('[aria-label="处理阶段阻塞"]')
+    expect(dialog.text()).toContain('解决阻塞')
+    expect(dialog.text()).toContain('跳过本阶段')
+    expect(dialog.text()).toContain('不会删除原阻塞记录')
+    expect(dialog.get('[data-testid="stage-transition-save"]').attributes('disabled')).toBeDefined()
+
+    await dialog.get('[data-testid="stage-transition-reason"]').setValue('资料已收到')
+    expect(dialog.get('[data-testid="stage-transition-save"]').attributes('disabled')).toBeUndefined()
+    await dialog.get('[data-testid="stage-transition-save"]').trigger('click')
+    await settle()
+
+    expect(transitionStage).toHaveBeenCalledWith('SY-A', 'planning', expect.objectContaining({
+      to_status: 'in_progress',
+      reason: '资料已收到',
+      expected_revision: 3,
+    }))
+  })
+
+  it('阶段排期和状态弹窗干净直接关闭，改动后才确认放弃', async () => {
+    const stages = [stage('planning', 'in_progress', 2)]
+    const repository: ProjectStageRepository = {
+      listProjectStages: vi.fn(async () => ({ source: 'live' as const, data: stages })),
+      updateStageSchedule: vi.fn(),
+      transitionStage: vi.fn(),
+    }
+    const confirm = vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue('confirm' as never)
+    const wrapper = mountPanel({ projectCode: 'SY-A', stages, repository })
+    await settle()
+
+    await wrapper.get('[data-testid="stage-schedule-planning"]').trigger('click')
+    await wrapper.get('[data-testid="stage-schedule-cancel"]').trigger('click')
+    await settle()
+    expect(confirm).not.toHaveBeenCalled()
+    expect(wrapper.get('[aria-label="编辑阶段排期"]').isVisible()).toBe(false)
+
+    await wrapper.get('[data-testid="stage-schedule-planning"]').trigger('click')
+    await wrapper.get('[data-testid="stage-schedule-notes"]').setValue('项目排期已调整')
+    await wrapper.get('[data-testid="stage-schedule-cancel"]').trigger('click')
+    await settle()
+    expect(confirm).toHaveBeenCalledTimes(1)
+    expect(wrapper.get('[aria-label="编辑阶段排期"]').isVisible()).toBe(false)
+
+    await wrapper.get('[data-testid="stage-transition-planning"]').trigger('click')
+    await wrapper.get('[data-testid="stage-transition-cancel"]').trigger('click')
+    await settle()
+    expect(confirm).toHaveBeenCalledTimes(1)
+    expect(wrapper.get('[aria-label="变更阶段状态"]').isVisible()).toBe(false)
+
+    await wrapper.get('[data-testid="stage-transition-planning"]').trigger('click')
+    await wrapper.get('[data-testid="stage-transition-reason"]').setValue('状态调整原因')
+    const transitionDialog = wrapper.findAllComponents(ElDialog)
+      .find((candidate) => candidate.props('title') === '变更阶段状态')
+    if (!transitionDialog) throw new Error('未找到阶段状态弹窗')
+    const beforeClose = transitionDialog.props('beforeClose')
+    if (typeof beforeClose !== 'function') throw new Error('阶段状态弹窗缺少 beforeClose')
+    const done = vi.fn()
+    beforeClose(done)
+    await settle()
+    expect(confirm).toHaveBeenCalledTimes(2)
+    expect(done).toHaveBeenCalledTimes(1)
+  })
+
+  it('已完成和已跳过的历史阶段提供独立重开入口并保留纠错原因', async () => {
+    const completed = { ...stage('planning', 'completed', 4), completed_at: '2026-09-01T00:00:00Z' }
+    const skipped = {
+      ...stage('site_survey', 'skipped', 2),
+      status_reason: '沿用客户图纸',
+      completed_at: '2026-09-01T00:00:00Z',
+    }
+    const current = { ...stage('quotation', 'in_progress', 2), started_at: '2026-09-02T00:00:00Z' }
+    const transitionStage = vi.fn(async () => ({
+      source: 'live' as const,
+      data: { ...completed, status: 'in_progress' as const, status_reason: '报价依据遗漏', revision: 5 },
+    }))
+    const repository: ProjectStageRepository = {
+      listProjectStages: vi.fn(async () => ({ source: 'live' as const, data: [completed, skipped, current] })),
+      updateStageSchedule: vi.fn(),
+      transitionStage,
+    }
+    const wrapper = mountPanel({ projectCode: 'SY-A', stages: [], repository })
+    await settle()
+
+    expect(wrapper.get('[data-testid="stage-reopen-planning"]').text()).toContain('重新打开')
+    expect(wrapper.get('[data-testid="stage-reopen-site_survey"]').text()).toContain('重新打开')
+    await wrapper.get('[data-testid="stage-reopen-planning"]').trigger('click')
+    const dialog = wrapper.get('[aria-label="重新打开阶段"]')
+    expect(dialog.text()).toContain('原完成记录会保留')
+    expect(dialog.get('[data-testid="stage-transition-save"]').attributes('disabled')).toBeDefined()
+    await dialog.get('[data-testid="stage-transition-reason"]').setValue('报价依据遗漏')
+    await dialog.get('[data-testid="stage-transition-save"]').trigger('click')
+    await settle()
+
+    expect(transitionStage).toHaveBeenCalledWith('SY-A', 'planning', expect.objectContaining({
+      to_status: 'in_progress',
+      reason: '报价依据遗漏',
+      expected_revision: 4,
+    }))
+  })
+
+  it('阶段写入结果未知时锁定原请求并以同一幂等键原样重试', async () => {
+    const requests: Array<[string, RequestInit | undefined]> = []
+    let transitionAttempt = 0
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      requests.push([path, init])
+      if (init?.method !== 'POST') return jsonResponse([stage('planning')])
+      transitionAttempt += 1
+      if (transitionAttempt === 1) return jsonResponse({ detail: '暂时不可用' }, 503)
+      return jsonResponse({ ...stage('planning', 'in_progress', 2), started_at: '2026-09-03T00:00:00Z' })
+    }))
+    const wrapper = mountPanel({ projectCode: 'SY-A', stages: [stage('planning')] })
+    await settle()
+
+    await wrapper.get('[data-testid="stage-transition-planning"]').trigger('click')
+    const dialog = wrapper.get('[aria-label="变更阶段状态"]')
+    await dialog.get('[data-testid="stage-transition-save"]').trigger('click')
+    await settle()
+
+    expect(dialog.text()).toContain('结果未知')
+    expect(dialog.get('[data-testid="stage-transition-status"] .el-select__wrapper').classes()).toContain('is-disabled')
+    expect(dialog.get('[data-testid="stage-transition-cancel"]').attributes('disabled')).toBeDefined()
+    expect(dialog.get('[data-testid="stage-transition-original-retry"]').attributes('disabled')).toBeUndefined()
+    await dialog.get('[data-testid="stage-transition-original-retry"]').trigger('click')
+    await vi.waitFor(() => {
+      expect(requests.filter(([, init]) => init?.method === 'POST')).toHaveLength(2)
+    })
+
+    const posts = requests.filter(([, init]) => init?.method === 'POST')
+    expect(posts).toHaveLength(2)
+    expect(posts[0]?.[1]?.body).toBe(posts[1]?.[1]?.body)
+    expect((posts[0]?.[1]?.headers as Record<string, string>)['Idempotency-Key'])
+      .toBe((posts[1]?.[1]?.headers as Record<string, string>)['Idempotency-Key'])
+  })
+
+  it('阶段写入收到 2xx 非法 JSON 时锁定原请求并以同一幂等键重试', async () => {
+    const requests: Array<[string, RequestInit | undefined]> = []
+    let transitionAttempt = 0
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      requests.push([path, init])
+      if (init?.method !== 'POST') return jsonResponse([stage('planning')])
+      transitionAttempt += 1
+      if (transitionAttempt === 1) {
+        return new Response('{malformed', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return jsonResponse({ ...stage('planning', 'in_progress', 2), started_at: '2026-09-03T00:00:00Z' })
+    }))
+    const wrapper = mountPanel({ projectCode: 'SY-A', stages: [stage('planning')] })
+    await settle()
+
+    await wrapper.get('[data-testid="stage-transition-planning"]').trigger('click')
+    const dialog = wrapper.get('[aria-label="变更阶段状态"]')
+    await dialog.get('[data-testid="stage-transition-save"]').trigger('click')
+    await settle()
+
+    expect(dialog.text()).toContain('结果未知')
+    await dialog.get('[data-testid="stage-transition-original-retry"]').trigger('click')
+    await vi.waitFor(() => {
+      expect(requests.filter(([, init]) => init?.method === 'POST')).toHaveLength(2)
+    })
+
+    const posts = requests.filter(([, init]) => init?.method === 'POST')
+    expect(posts[0]?.[1]?.body).toBe(posts[1]?.[1]?.body)
+    expect((posts[0]?.[1]?.headers as Record<string, string>)['Idempotency-Key'])
+      .toBe((posts[1]?.[1]?.headers as Record<string, string>)['Idempotency-Key'])
+  })
+
+  it('切换阶段仓储后忽略旧仓储迟到的状态响应', async () => {
+    const oldWrite = deferred<RepositoryResult<ProjectStage>>()
+    const oldRepository: ProjectStageRepository = {
+      listProjectStages: vi.fn(async () => ({ source: 'live' as const, data: [stage('planning', 'in_progress', 2)] })),
+      updateStageSchedule: vi.fn(),
+      transitionStage: vi.fn(async () => oldWrite.promise),
+    }
+    const nextRepository: ProjectStageRepository = {
+      listProjectStages: vi.fn(async () => ({ source: 'live' as const, data: [stage('planning', 'completed', 7)] })),
+      updateStageSchedule: vi.fn(),
+      transitionStage: vi.fn(),
+    }
+    const wrapper = mountPanel({ projectCode: 'SY-A', stages: [], repository: oldRepository })
+    await settle()
+
+    await wrapper.get('[data-testid="stage-transition-planning"]').trigger('click')
+    await wrapper.get('[data-testid="stage-transition-status"] .el-select__wrapper').trigger('click')
+    await settle()
+    Array.from(document.body.querySelectorAll<HTMLElement>('.el-select-dropdown__item'))
+      .find((item) => item.textContent?.includes('已完成'))?.click()
+    await wrapper.get('[data-testid="stage-transition-save"]').trigger('click')
+    await wrapper.setProps({ repository: nextRepository })
+    await settle()
+
+    oldWrite.resolve({ source: 'live', data: stage('planning', 'completed', 3) })
+    await settle()
+    expect(wrapper.get('[data-testid="stage-row-planning"]').text()).toContain('已完成')
+    expect(wrapper.emitted('changed')).toBeUndefined()
+    expect(nextRepository.transitionStage).not.toHaveBeenCalled()
   })
 })

@@ -200,6 +200,11 @@ describe('真实 P0 Repository 契约', () => {
     expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY-001/purchase-orders/9/goods-receipts')
     expectPlannedPost(lastRequest(fetchMock)[1], receiptInput)
 
+    const receiptReversalInput = { reason: '数量登记错误', expected_revision: 2 }
+    await repository.reverseGoodsReceipt('SY/001', 19, receiptReversalInput)
+    expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY%2F001/goods-receipts/19/reverse')
+    expectPlannedPost(lastRequest(fetchMock)[1], receiptReversalInput)
+
     await repository.getProcurementOverview('SY-001')
     expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY-001/procurement-overview')
     expect(repository.previewProcurementImport).toBeTypeOf('function')
@@ -292,6 +297,26 @@ describe('真实 P0 Repository 契约', () => {
     await repository.createProjectInventoryIssue('SY/001', issue)
     expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY%2F001/inventory-issues')
     expectPlannedPost(lastRequest(fetchMock)[1], issue)
+
+    fetchMock.mockResolvedValueOnce(jsonResponse([{
+      project_code: 'SY-001', name: '产线改造', id: 1, company_id: 2, company_name: '汇川',
+      description: null, status: 'active', archive_reason: null, archived_at: null,
+      created_at: '', updated_at: '',
+    }]))
+    expect((await repository.listIssueProjects()).data).toEqual([{ project_code: 'SY-001', name: '产线改造' }])
+    expect(lastRequest(fetchMock)[0]).toBe('/api/projects?status=active')
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      items: [{
+        worker_id: 2, worker_name: '王师傅', role: '电工', status: 'active',
+      }, {
+        worker_id: 3, worker_name: '李师傅', role: '钳工', status: 'completed',
+      }],
+      total: 2, page: 1, page_size: 200,
+    }))
+    expect((await repository.listProjectIssueWorkers('SY/001')).data)
+      .toEqual([{ worker_id: 2, name: '王师傅', role: '电工' }])
+    expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY%2F001/crew-assignments?page=1&page_size=200&status=all')
   })
 
   it('库存物料 POST 未知结果重试复用幂等键，明确放弃后才使用新键', async () => {

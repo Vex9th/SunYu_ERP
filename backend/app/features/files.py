@@ -121,6 +121,10 @@ class StagedFileVersion:
     sha256: str
 
 
+class StagedFileTooLarge(ValueError):
+    """Raised when a streamed upload exceeds its configured per-file limit."""
+
+
 def store_version(
     source_path: str | Path,
     data_dir: str | Path,
@@ -188,6 +192,76 @@ def stage_version(
     )
 
 
+def stage_stream(
+    source_file: BinaryIO,
+    data_dir: str | Path,
+    *,
+    original_name: str,
+    max_size_bytes: int,
+) -> StagedFileVersion:
+    """Stream an upload directly into ``Data/Temp`` with hash and size checks."""
+    if not isinstance(original_name, str) or not original_name:
+        raise ValueError("original_name must not be empty")
+    if isinstance(max_size_bytes, bool) or not isinstance(max_size_bytes, int):
+        raise TypeError("max_size_bytes must be an integer")
+    if max_size_bytes < 1:
+        raise ValueError("max_size_bytes must be positive")
+    sanitized_name = _sanitize_filename(original_name)
+    data_root, temp_dir = _prepare_data_root(Path(data_dir))
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".upload-",
+        suffix=".tmp",
+        dir=temp_dir,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        temporary_identity = _file_identity(os.fstat(descriptor))
+    except BaseException as primary:
+        _cleanup_new_temporary_after_failure(primary, descriptor, temporary_path)
+        raise
+    try:
+        destination = os.fdopen(descriptor, "wb")
+        digest = hashlib.sha256()
+        size_bytes = 0
+        operation_failure: BaseException | None = None
+        try:
+            source_file.seek(0)
+            while chunk := source_file.read(_COPY_CHUNK_SIZE):
+                size_bytes += len(chunk)
+                if size_bytes > max_size_bytes:
+                    raise StagedFileTooLarge(
+                        "source exceeded configured upload size"
+                    )
+                destination.write(chunk)
+                digest.update(chunk)
+            _flush_and_sync(destination)
+        except BaseException as failure:  # noqa: BLE001 - preserve interrupts
+            operation_failure = failure
+        try:
+            destination.close()
+        except BaseException as close_failure:  # noqa: BLE001 - keep primary
+            if operation_failure is None:
+                operation_failure = close_failure
+            else:
+                operation_failure.add_note(
+                    f"temporary close failed: {close_failure}"
+                )
+        if operation_failure is not None:
+            raise operation_failure.with_traceback(operation_failure.__traceback__)
+        return StagedFileVersion(
+            path=temporary_path,
+            data_root=data_root,
+            identity=temporary_identity,
+            original_name=original_name,
+            sanitized_name=sanitized_name,
+            size_bytes=size_bytes,
+            sha256=digest.hexdigest(),
+        )
+    except BaseException as primary:
+        _cleanup_after_failure(primary, temporary_path, temporary_identity)
+        raise
+
+
 def publish_staged_version(
     staged: StagedFileVersion,
     project_code: str,
@@ -195,6 +269,8 @@ def publish_staged_version(
     *,
     document_id: int | None = None,
     verify_content: bool = True,
+    managed_name: str | None = None,
+    version_number: int | None = None,
 ) -> StoredFileVersion:
     """Atomically publish a previously staged file into one project directory."""
     project_code = normalize_project_code(project_code)
@@ -204,6 +280,13 @@ def publish_staged_version(
             raise TypeError("document_id must be an integer")
         if document_id < 1:
             raise ValueError("document_id must be positive")
+    if version_number is not None:
+        if isinstance(version_number, bool) or not isinstance(version_number, int):
+            raise TypeError("version_number must be an integer")
+        if version_number < 1:
+            raise ValueError("version_number must be positive")
+    if managed_name is not None and version_number is None:
+        raise ValueError("managed publication requires version_number")
     try:
         destination_dir = _prepare_category_directory(
             staged.data_root,
@@ -221,10 +304,18 @@ def publish_staged_version(
             staged.identity,
             staged.data_root,
             destination_dir,
-            staged.sanitized_name,
+            (
+                staged.sanitized_name
+                if managed_name is None
+                else _sanitize_filename(managed_name)
+            ),
             created_at,
             staged.size_bytes,
             staged.sha256 if verify_content else None,
+            exact_name=(
+                None if managed_name is None else _sanitize_filename(managed_name)
+            ),
+            requested_version=version_number,
         )
         relative_path = target_path.relative_to(staged.data_root)
         return StoredFileVersion(
@@ -248,6 +339,22 @@ def publish_staged_version(
 def discard_staged_version(staged: StagedFileVersion) -> None:
     """Discard one unpublished staged file without touching another writer's file."""
     _unlink_owned_path(staged.path, staged.path, staged.identity)
+
+
+def sanitize_filename(
+    filename: str,
+    *,
+    preserve_stem_tail: str = "",
+) -> str:
+    """Return the Windows/NAS-safe filename used by project storage."""
+    if not isinstance(filename, str) or not filename:
+        raise ValueError("filename must not be empty")
+    if not isinstance(preserve_stem_tail, str):
+        raise TypeError("preserve_stem_tail must be a string")
+    return _sanitize_filename(
+        filename,
+        preserve_stem_tail=preserve_stem_tail,
+    )
 
 
 def cleanup_stale_staged_versions(data_dir: str | Path) -> None:
@@ -302,9 +409,11 @@ def reconcile_document_versions(
         for name in binding.names():
             if name in referenced_names:
                 continue
-            if _VERSIONED_FILENAME.match(name) is None and _VERSION_RESERVATION.fullmatch(
-                name
-            ) is None:
+            if (
+                name.startswith(".")
+                and _VERSIONED_FILENAME.match(name) is None
+                and _VERSION_RESERVATION.fullmatch(name) is None
+            ):
                 continue
             try:
                 file_stat = binding.stat(name)
@@ -677,18 +786,33 @@ def _publish_staged_file(
     created_at: datetime,
     expected_size: int,
     expected_sha256: str | None,
+    exact_name: str | None,
+    requested_version: int | None,
 ) -> tuple[int, Path]:
     binding = _open_bound_directory(data_root, category_dir)
     try:
-        result = _publish_in_bound_directory(
-            temporary_path,
-            temporary_identity,
-            binding,
-            sanitized_name,
-            created_at,
-            expected_size,
-            expected_sha256,
-        )
+        if exact_name is None:
+            result = _publish_in_bound_directory(
+                temporary_path,
+                temporary_identity,
+                binding,
+                sanitized_name,
+                created_at,
+                expected_size,
+                expected_sha256,
+            )
+        else:
+            if requested_version is None:
+                raise ValueError("exact publication requires version_number")
+            result = _publish_exact_in_bound_directory(
+                temporary_path,
+                temporary_identity,
+                binding,
+                exact_name,
+                requested_version,
+                expected_size,
+                expected_sha256,
+            )
     except BaseException as primary:
         try:
             binding.close()
@@ -706,6 +830,53 @@ def _publish_staged_file(
         )
         raise
     return result
+
+
+def _publish_exact_in_bound_directory(
+    temporary_path: Path,
+    temporary_identity: _FileIdentity,
+    binding: _BoundDirectory,
+    target_name: str,
+    version_number: int,
+    expected_size: int,
+    expected_sha256: str | None,
+) -> tuple[int, Path]:
+    binding.require_current()
+    reservation_name = f".version-{version_number:012d}.reserve"
+    target_created = False
+    try:
+        binding.link(temporary_path, reservation_name)
+        _require_bound_name_owned(
+            binding, reservation_name, temporary_identity
+        )
+        binding.link(temporary_path, target_name)
+        target_created = True
+        _require_bound_name_owned(binding, target_name, temporary_identity)
+        _require_final_target_integrity(
+            binding,
+            target_name,
+            temporary_identity,
+            expected_size,
+            expected_sha256,
+        )
+        _complete_publication(
+            temporary_path,
+            temporary_identity,
+            binding,
+            reservation_name,
+            target_name,
+        )
+        return version_number, binding.path / target_name
+    except BaseException as primary:
+        _cleanup_bound_after_failure(
+            primary,
+            binding,
+            temporary_path,
+            temporary_identity,
+            reservation_name,
+            target_name if target_created else None,
+        )
+        raise
 
 
 def _publish_in_bound_directory(
@@ -1082,7 +1253,11 @@ def _next_bound_version(binding: _BoundDirectory) -> int:
     return highest_version + 1
 
 
-def _sanitize_filename(original_name: str) -> str:
+def _sanitize_filename(
+    original_name: str,
+    *,
+    preserve_stem_tail: str = "",
+) -> str:
     sanitized = "".join(
         "_"
         if character in _INVALID_WINDOWS_FILENAME_CHARACTERS
@@ -1095,10 +1270,18 @@ def _sanitize_filename(original_name: str) -> str:
     device_name = sanitized.split(".", maxsplit=1)[0].upper()
     if device_name in _WINDOWS_DEVICE_NAMES:
         sanitized = f"_{sanitized}"
-    return _truncate_filename(sanitized)
+    return _truncate_filename(
+        sanitized,
+        preserve_stem_tail=preserve_stem_tail,
+    )
 
 
-def _truncate_filename(filename: str, max_utf8_bytes: int = 120) -> str:
+def _truncate_filename(
+    filename: str,
+    max_utf8_bytes: int = 120,
+    *,
+    preserve_stem_tail: str = "",
+) -> str:
     encoded = filename.encode("utf-8")
     if len(encoded) <= max_utf8_bytes:
         return filename
@@ -1108,11 +1291,27 @@ def _truncate_filename(filename: str, max_utf8_bytes: int = 120) -> str:
     if len(suffix_bytes) >= max_utf8_bytes // 2:
         suffix = ""
         suffix_bytes = b""
-    available = max_utf8_bytes - len(suffix_bytes)
     stem = filename[: -len(suffix)] if suffix else filename
-    while len(stem.encode("utf-8")) > available:
-        stem = stem[:-1]
-    return f"{stem}{suffix}" or "unnamed"
+    preserved_tail = (
+        preserve_stem_tail
+        if preserve_stem_tail and stem.endswith(preserve_stem_tail)
+        else ""
+    )
+    truncation_hash = (
+        f"_{hashlib.sha256(filename.encode('utf-8')).hexdigest()[:10]}"
+        if preserved_tail
+        else ""
+    )
+    preserved_bytes = f"{truncation_hash}{preserved_tail}".encode()
+    if len(preserved_bytes) + len(suffix_bytes) >= max_utf8_bytes:
+        preserved_tail = ""
+        truncation_hash = ""
+        preserved_bytes = b""
+    prefix = stem[: -len(preserved_tail)] if preserved_tail else stem
+    available = max_utf8_bytes - len(suffix_bytes) - len(preserved_bytes)
+    while len(prefix.encode("utf-8")) > available:
+        prefix = prefix[:-1]
+    return f"{prefix}{truncation_hash}{preserved_tail}{suffix}" or "unnamed"
 
 
 def _is_control(character: str) -> bool:

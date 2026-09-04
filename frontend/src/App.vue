@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { ElMessage } from 'element-plus'
-import { onMounted, ref } from 'vue'
+import { inject, onMounted, ref } from 'vue'
+import { routeLocationKey } from 'vue-router'
 
 import { ApiError, requestJson, requestVoid } from './api'
 import AuthPanel from './components/AuthPanel.vue'
 import DashboardPanel from './components/DashboardPanel.vue'
+import NotFoundPage from './components/NotFoundPage.vue'
 import type {
   BackupCreated,
   BackupSettingsPayload,
@@ -25,6 +27,7 @@ const overviewLoading = ref(false)
 const backupBusy = ref(false)
 const saveBusy = ref(false)
 const successNotice = ref<string | null>(null)
+const route = inject(routeLocationKey, null)
 let sessionEpoch = 0
 let overviewRequestVersion = 0
 let backupOperationVersion = 0
@@ -261,6 +264,8 @@ onMounted(loadSession)
     :request-error="requestError"
     @submit="authenticate"
   />
+
+  <NotFoundPage v-else-if="route?.name === 'not-found'" />
 
   <DashboardPanel
     v-else

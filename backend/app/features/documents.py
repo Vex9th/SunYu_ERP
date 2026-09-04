@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import quote
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -35,6 +36,7 @@ from backend.app.features.api_common import (
     save_idempotent_response,
 )
 from backend.app.features.auth import require_authenticated_session
+from backend.app.features.business_attachments import document_managed_filename
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,8 @@ _CATEGORIES = frozenset(
     }
 )
 _MAX_PAGE_SIZE = 200
+_MAX_SEARCH_LENGTH = 200
+_TEXT_SEARCH_FILE_LIMIT_BYTES = 5 * 1024 * 1024
 _SQLITE_MAX_INTEGER = 2**63 - 1
 _COPY_CHUNK_SIZE = 64 * 1024
 _MAX_MULTIPART_OVERHEAD_BYTES = 1024 * 1024
@@ -81,6 +85,7 @@ _VERSION_FIELDS = (
     "id",
     "version_number",
     "original_filename",
+    "managed_filename",
     "content_type",
     "size_bytes",
     "sha256",
@@ -181,15 +186,42 @@ def create_documents_router(
         request: Request,
         _: None = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
+        settings: Settings = settings_dependency,
     ) -> dict[str, object]:
         project = _require_project(connection, project_code)
         category = _read_category_filter(request)
+        archive_filter = _read_archive_filter(request)
+        search = _read_search_filter(request)
         page, page_size = _read_pagination(request)
         clauses = ["documents.project_code = ? COLLATE NOCASE"]
         parameters: list[object] = [project["project_code"]]
         if category is not None:
             clauses.append("documents.category = ?")
             parameters.append(category)
+        if archive_filter == "active":
+            clauses.append("documents.archived_at IS NULL")
+        elif archive_filter == "archived":
+            clauses.append("documents.archived_at IS NOT NULL")
+        search_matches: dict[int, str | None] = {}
+        if search is not None:
+            search_matches = _document_search_matches(
+                connection,
+                settings,
+                project_code=str(project["project_code"]),
+                search=search,
+                category=category,
+                archive_filter=archive_filter,
+            )
+            if not search_matches:
+                return {
+                    "items": [],
+                    "total": 0,
+                    "page": page,
+                    "page_size": page_size,
+                }
+            placeholders = ", ".join("?" for _ in search_matches)
+            clauses.append(f"documents.id IN ({placeholders})")
+            parameters.extend(search_matches)
         where_clause = " AND ".join(clauses)
         total = int(
             connection.execute(
@@ -207,11 +239,53 @@ def create_documents_router(
             (*parameters, page_size, (page - 1) * page_size),
         ).fetchall()
         return {
-            "items": [_document_summary(row) for row in rows],
+            "items": [
+                _document_list_item(
+                    row,
+                    search_excerpt=search_matches.get(int(row["id"])),
+                    include_excerpt=search is not None,
+                )
+                for row in rows
+            ],
             "total": total,
             "page": page,
             "page_size": page_size,
         }
+
+    @router.get("/{project_code}/document-version-options")
+    def list_document_version_options(
+        project_code: str,
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> list[dict[str, object]]:
+        project = _require_project(connection, project_code)
+        rows = connection.execute(
+            """
+            SELECT
+                document_versions.id,
+                document_versions.version_number,
+                document_versions.original_filename,
+                document_versions.managed_filename,
+                documents.logical_name AS title
+            FROM document_versions
+            JOIN documents ON documents.id = document_versions.document_id
+            WHERE documents.project_code = ? COLLATE NOCASE
+                AND documents.archived_at IS NULL
+            ORDER BY
+                documents.created_at DESC,
+                documents.id DESC,
+                document_versions.version_number DESC,
+                document_versions.id DESC
+            """,
+            (project["project_code"],),
+        ).fetchall()
+        return [
+            {
+                "value": int(row["id"]),
+                "label": _document_version_option_label(row),
+            }
+            for row in rows
+        ]
 
     @router.post(
         "/{project_code}/documents",
@@ -290,6 +364,14 @@ def create_documents_router(
                         ),
                     )
                     document_id = _last_insert_id(cursor)
+                    managed_filename = document_managed_filename(
+                        project_code=str(project["project_code"]),
+                        category=category,
+                        title=title,
+                        business_date=_managed_business_date(timestamp),
+                        version_number=1,
+                        original_filename=staged.original_filename,
+                    )
                     files.reconcile_document_versions(
                         settings.data_dir,
                         str(project["project_code"]),
@@ -303,6 +385,8 @@ def create_documents_router(
                         category,
                         document_id=document_id,
                         verify_content=False,
+                        managed_name=managed_filename,
+                        version_number=1,
                     )
                     if stored.version_number != 1:
                         raise sqlite3.DatabaseError(
@@ -312,13 +396,14 @@ def create_documents_router(
                         """
                         INSERT INTO document_versions
                             (document_id, version_number, original_filename,
-                             content_type, stored_relative_path, size_bytes,
-                             sha256, notes, created_at)
-                        VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
+                             managed_filename, content_type, stored_relative_path,
+                             size_bytes, sha256, notes, created_at)
+                        VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             document_id,
-                            stored.original_name,
+                            staged.original_filename,
+                            managed_filename,
                             staged.content_type,
                             str(stored.relative_path),
                             stored.size_bytes,
@@ -504,6 +589,14 @@ def create_documents_router(
                     _require_editable_document(current)
                     _require_revision(current, expected_revision)
                     next_version = int(current["latest_version_number"]) + 1
+                    managed_filename = document_managed_filename(
+                        project_code=str(project["project_code"]),
+                        category=str(current["category"]),
+                        title=str(current["title"]),
+                        business_date=_managed_business_date(timestamp),
+                        version_number=next_version,
+                        original_filename=staged.original_filename,
+                    )
                     files.reconcile_document_versions(
                         settings.data_dir,
                         str(project["project_code"]),
@@ -517,6 +610,8 @@ def create_documents_router(
                         str(current["category"]),
                         document_id=identifier,
                         verify_content=False,
+                        managed_name=managed_filename,
+                        version_number=next_version,
                     )
                     if stored.version_number != next_version:
                         raise sqlite3.DatabaseError(
@@ -526,14 +621,15 @@ def create_documents_router(
                         """
                         INSERT INTO document_versions
                             (document_id, version_number, original_filename,
-                             content_type, stored_relative_path, size_bytes,
-                             sha256, notes, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             managed_filename, content_type, stored_relative_path,
+                             size_bytes, sha256, notes, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             identifier,
                             next_version,
-                            stored.original_name,
+                            staged.original_filename,
+                            managed_filename,
                             staged.content_type,
                             str(stored.relative_path),
                             stored.size_bytes,
@@ -604,7 +700,8 @@ def create_documents_router(
         row = connection.execute(
             """
             SELECT
-                document_versions.original_filename,
+                document_versions.document_id,
+                document_versions.managed_filename,
                 document_versions.content_type,
                 document_versions.stored_relative_path,
                 document_versions.size_bytes,
@@ -619,23 +716,44 @@ def create_documents_router(
         ).fetchone()
         if row is None:
             raise _not_found("Document version not found", "DOCUMENT_VERSION_NOT_FOUND")
-        file_handle = _open_download_file(
-            settings.data_dir,
-            str(project["project_code"]),
-            str(row["category"]),
-            document_identifier,
-            str(row["stored_relative_path"]),
-            int(row["size_bytes"]),
+        return _document_download_response(
+            settings,
+            project_code=str(project["project_code"]),
+            row=row,
         )
-        return StreamingResponse(
-            _stream_file(file_handle),
-            media_type=str(row["content_type"]),
-            headers={
-                "Content-Disposition": _content_disposition(
-                    str(row["original_filename"])
-                ),
-                "Content-Length": str(row["size_bytes"]),
-            },
+
+    @router.get("/{project_code}/document-versions/{version_id}/download")
+    def download_document_version_by_id(
+        project_code: str,
+        version_id: str,
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+        settings: Settings = settings_dependency,
+    ) -> StreamingResponse:
+        version_identifier = _path_identifier(version_id, "version_id")
+        project = _require_project(connection, project_code)
+        row = connection.execute(
+            """
+            SELECT
+                document_versions.document_id,
+                document_versions.managed_filename,
+                document_versions.content_type,
+                document_versions.stored_relative_path,
+                document_versions.size_bytes,
+                documents.category
+            FROM document_versions
+            JOIN documents ON documents.id = document_versions.document_id
+            WHERE documents.project_code = ? COLLATE NOCASE
+                AND document_versions.id = ?
+            """,
+            (project["project_code"], version_identifier),
+        ).fetchone()
+        if row is None:
+            raise _not_found("Document version not found", "DOCUMENT_VERSION_NOT_FOUND")
+        return _document_download_response(
+            settings,
+            project_code=str(project["project_code"]),
+            row=row,
         )
 
     @router.post("/{project_code}/documents/{document_id}/archive")
@@ -953,6 +1071,36 @@ def _read_category_filter(request: Request) -> str | None:
     return _normalize_category(values[0])
 
 
+def _read_archive_filter(request: Request) -> str:
+    values = request.query_params.getlist("archived")
+    if not values:
+        return "active"
+    if len(values) != 1:
+        raise _validation_error("archived", "must occur once")
+    if values[0] not in {"active", "archived", "all"}:
+        raise _validation_error("archived", "must be active, archived, or all")
+    return values[0]
+
+
+def _read_search_filter(request: Request) -> str | None:
+    values = request.query_params.getlist("search")
+    if not values:
+        return None
+    if len(values) != 1:
+        raise _validation_error("search", "must occur once")
+    search = values[0].strip()
+    if not search:
+        return None
+    if len(search) > _MAX_SEARCH_LENGTH:
+        raise _validation_error(
+            "search",
+            f"must not exceed {_MAX_SEARCH_LENGTH} characters",
+        )
+    if any(unicodedata.category(character) == "Cc" for character in search):
+        raise _validation_error("search", "contains invalid characters")
+    return search
+
+
 def _read_pagination(request: Request) -> tuple[int, int]:
     page = _read_query_integer(
         request,
@@ -1158,8 +1306,8 @@ def _require_document_detail(
     rows = connection.execute(
         """
         SELECT
-            id, version_number, original_filename, content_type, size_bytes,
-            sha256, notes, created_at
+            id, version_number, original_filename, managed_filename,
+            content_type, size_bytes, sha256, notes, created_at
         FROM document_versions
         WHERE document_id = ?
         ORDER BY version_number, id
@@ -1178,8 +1326,8 @@ def _require_version(
     row = connection.execute(
         """
         SELECT
-            id, version_number, original_filename, content_type, size_bytes,
-            sha256, notes, created_at
+            id, version_number, original_filename, managed_filename,
+            content_type, size_bytes, sha256, notes, created_at
         FROM document_versions
         WHERE document_id = ? AND id = ?
         """,
@@ -1207,6 +1355,177 @@ def _document_stored_paths(
 
 def _document_summary(row: sqlite3.Row) -> dict[str, object]:
     return {field: row[field] for field in _DOCUMENT_SUMMARY_FIELDS}
+
+
+def _document_list_item(
+    row: sqlite3.Row,
+    *,
+    search_excerpt: str | None,
+    include_excerpt: bool,
+) -> dict[str, object]:
+    item = _document_summary(row)
+    if include_excerpt:
+        item["search_excerpt"] = search_excerpt
+    return item
+
+
+def _document_search_matches(
+    connection: sqlite3.Connection,
+    settings: Settings,
+    *,
+    project_code: str,
+    search: str,
+    category: str | None,
+    archive_filter: str,
+) -> dict[int, str | None]:
+    rows = _document_search_rows(
+        connection,
+        project_code=project_code,
+        category=category,
+        archive_filter=archive_filter,
+    )
+    needle = search.casefold()
+    matches: dict[int, str | None] = {}
+    content_matches: set[int] = set()
+    for row in rows:
+        document_id = int(row["id"])
+        metadata_match, metadata_excerpt = _metadata_search_match(row, search)
+        if metadata_match:
+            matches.setdefault(document_id, metadata_excerpt)
+        if document_id in content_matches or not _is_searchable_minutes_version(row):
+            continue
+        content = _read_minutes_search_text(
+            row,
+            settings,
+            project_code=project_code,
+            document_id=document_id,
+        )
+        if content is not None and needle in content.casefold():
+            matches[document_id] = _search_excerpt(content, search)
+            content_matches.add(document_id)
+    return matches
+
+
+def _document_search_rows(
+    connection: sqlite3.Connection,
+    *,
+    project_code: str,
+    category: str | None,
+    archive_filter: str,
+) -> list[sqlite3.Row]:
+    clauses = ["documents.project_code = ? COLLATE NOCASE"]
+    parameters: list[object] = [project_code]
+    if category is not None:
+        clauses.append("documents.category = ?")
+        parameters.append(category)
+    if archive_filter == "active":
+        clauses.append("documents.archived_at IS NULL")
+    elif archive_filter == "archived":
+        clauses.append("documents.archived_at IS NOT NULL")
+    rows = connection.execute(
+        f"""
+        SELECT
+            documents.id,
+            documents.category,
+            documents.logical_name,
+            documents.notes AS document_notes,
+            document_versions.original_filename,
+            document_versions.managed_filename,
+            document_versions.content_type,
+            document_versions.stored_relative_path,
+            document_versions.size_bytes,
+            document_versions.notes AS version_notes
+        FROM documents
+        LEFT JOIN document_versions
+            ON document_versions.document_id = documents.id
+        WHERE {' AND '.join(clauses)}
+        ORDER BY
+            documents.created_at DESC,
+            documents.id DESC,
+            document_versions.version_number DESC,
+            document_versions.id DESC
+        """,
+        parameters,
+    ).fetchall()
+    return list(rows)
+
+
+def _metadata_search_match(
+    row: sqlite3.Row,
+    search: str,
+) -> tuple[bool, str | None]:
+    needle = search.casefold()
+    if needle in str(row["logical_name"]).casefold():
+        return True, None
+    for prefix, value in (
+        ("", row["document_notes"]),
+        ("文件：", row["managed_filename"]),
+        ("原文件名：", row["original_filename"]),
+        ("版本说明：", row["version_notes"]),
+    ):
+        if value is not None and needle in str(value).casefold():
+            return True, f"{prefix}{_search_excerpt(str(value), search)}"
+    return False, None
+
+
+def _is_searchable_minutes_version(row: sqlite3.Row) -> bool:
+    return (
+        row["category"] == "planning_minutes"
+        and row["stored_relative_path"] is not None
+        and row["content_type"] == "text/plain"
+        and int(row["size_bytes"]) <= _TEXT_SEARCH_FILE_LIMIT_BYTES
+    )
+
+
+def _read_minutes_search_text(
+    row: sqlite3.Row,
+    settings: Settings,
+    *,
+    project_code: str,
+    document_id: int,
+) -> str | None:
+    try:
+        with _open_download_file(
+            settings.data_dir,
+            project_code,
+            "planning_minutes",
+            document_id,
+            str(row["stored_relative_path"]),
+            int(row["size_bytes"]),
+        ) as file_handle:
+            return file_handle.read(_TEXT_SEARCH_FILE_LIMIT_BYTES).decode(
+                "utf-8",
+                errors="replace",
+            )
+    except (ApiError, OSError):
+        logger.warning(
+            "Skipping unavailable meeting-minutes file during search (document_id=%s)",
+            document_id,
+        )
+        return None
+
+
+def _search_excerpt(value: str, search: str) -> str:
+    normalized = " ".join(value.split())
+    position = normalized.casefold().find(search.casefold())
+    if position < 0:
+        return normalized[:120]
+    start = max(position - 36, 0)
+    end = min(position + len(search) + 64, len(normalized))
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(normalized) else ""
+    return f"{prefix}{normalized[start:end]}{suffix}"
+
+
+def _document_version_option_label(row: sqlite3.Row) -> str:
+    original_filename = str(row["original_filename"])
+    managed_filename = str(row["managed_filename"] or "").strip()
+    filename = managed_filename or original_filename
+    if filename != original_filename:
+        filename = f"{filename}（原文件名：{original_filename}）"
+    return (
+        f"{row['title']} V{int(row['version_number'])} · {filename}"
+    )
 
 
 def _version_response(row: sqlite3.Row) -> dict[str, object]:
@@ -1265,6 +1584,32 @@ def _open_download_file(
     return file_handle
 
 
+def _document_download_response(
+    settings: Settings,
+    *,
+    project_code: str,
+    row: sqlite3.Row,
+) -> StreamingResponse:
+    file_handle = _open_download_file(
+        settings.data_dir,
+        project_code,
+        str(row["category"]),
+        int(row["document_id"]),
+        str(row["stored_relative_path"]),
+        int(row["size_bytes"]),
+    )
+    return StreamingResponse(
+        _stream_file(file_handle),
+        media_type=str(row["content_type"]),
+        headers={
+            "Content-Disposition": _content_disposition(
+                str(row["managed_filename"])
+            ),
+            "Content-Length": str(row["size_bytes"]),
+        },
+    )
+
+
 def _stream_file(file_handle: BinaryIO) -> Iterator[bytes]:
     try:
         while chunk := file_handle.read(_COPY_CHUNK_SIZE):
@@ -1316,6 +1661,14 @@ def _timestamp(clock: Clock) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("clock must return an aware datetime")
     return value.astimezone(timezone.utc).isoformat()
+
+
+def _managed_business_date(timestamp: str) -> str:
+    return (
+        datetime.fromisoformat(timestamp)
+        .astimezone(ZoneInfo("Asia/Shanghai"))
+        .strftime("%Y%m%d")
+    )
 
 
 def _utc_now() -> datetime:

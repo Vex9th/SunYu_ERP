@@ -150,12 +150,14 @@ def create_app(
 
     def update_settings(
         *,
+        enabled: bool | None = None,
         directory: str | None,
         interval_hours: int,
         retention_days: int,
     ) -> Settings:
         store: SettingsStore = application.state.settings
         return store.update_backup(
+            enabled=enabled,
             directory=directory,
             interval_hours=interval_hours,
             retention_days=retention_days,

@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from backend.app.core.config import Settings
 from backend.app.core.database import transaction, transaction_immediate
 from backend.app.core.storage_paths import normalize_project_code, project_code_identity
+from backend.app.features import business_attachments
 from backend.app.features.api_common import (
     ApiError,
     ApiErrorRoute,
@@ -152,85 +153,163 @@ def create_delivery_router(
         request: Request,
         _: None = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
+        settings: Settings = settings_dependency,
     ) -> dict[str, object]:
         if discipline not in _DISCIPLINES:
             raise _invalid(
                 "INVALID_SIGNOFF_PAYLOAD", "discipline", "has an invalid value"
             )
-        raw = await _json(
-            request,
-            (
-                "status",
-                "confirmed_on",
-                "not_required_reason",
-                "notes",
-                "document_version_ids",
-                "expected_revision",
-            ),
-            "INVALID_SIGNOFF_PAYLOAD",
-        )
-        payload = _signoff_payload(raw)
-        timestamp = _timestamp(now)
-        with transaction_immediate(connection):
-            project = _active_project(connection, project_code)
-            _validate_documents(connection, project, payload["document_version_ids"])
-            row = connection.execute(
-                "SELECT * FROM drawing_signoffs WHERE project_id = ? AND discipline = ?",
-                (project["id"], discipline),
-            ).fetchone()
-            if row is None:
-                if payload["expected_revision"] is not None:
-                    raise _revision(None)
-                cursor = connection.execute(
-                    """
-                    INSERT INTO drawing_signoffs
-                        (project_id, discipline, status, confirmed_on,
-                         not_required_reason, notes, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        project["id"],
-                        discipline,
-                        payload["status"],
-                        payload["confirmed_on"],
-                        payload["not_required_reason"],
-                        payload["notes"],
-                        timestamp,
-                        timestamp,
-                    ),
-                )
-                resource_id = _last_id(cursor)
-            else:
-                _require_revision(row, payload["expected_revision"])
-                resource_id = int(row["id"])
-                connection.execute(
-                    """
-                    UPDATE drawing_signoffs
-                    SET status = ?, confirmed_on = ?, not_required_reason = ?, notes = ?,
-                        revision = revision + 1, updated_at = ? WHERE id = ?
-                    """,
-                    (
-                        payload["status"],
-                        payload["confirmed_on"],
-                        payload["not_required_reason"],
-                        payload["notes"],
-                        timestamp,
-                        resource_id,
-                    ),
-                )
-            _replace_links(
-                connection,
-                project,
-                "drawing_signoff",
-                resource_id,
-                payload["document_version_ids"],
-                timestamp,
+        multipart = business_attachments.is_multipart_request(request)
+        if multipart:
+            key = _idempotency_key(request)
+            raw, attachment_batch = await business_attachments.read_multipart_batch(
+                request,
+                data_dir=settings.data_dir,
+                max_file_size_bytes=settings.max_document_upload_mb * 1024 * 1024,
+                invalid=_signoff_attachment_error,
+                too_large=_attachment_too_large,
+                batch_too_large=_attachment_batch_too_large,
             )
-            row = connection.execute(
-                "SELECT * FROM drawing_signoffs WHERE id = ?", (resource_id,)
-            ).fetchone()
-            response = _signoff_response(connection, row, project, discipline)
-        return response
+        else:
+            key = None
+            raw = await _json(
+                request, _SIGNOFF_FIELDS, "INVALID_SIGNOFF_PAYLOAD"
+            )
+            attachment_batch = business_attachments.AttachmentBatch(
+                [], settings.data_dir
+            )
+        with attachment_batch:
+            if set(raw) != set(_SIGNOFF_FIELDS):
+                raise _invalid(
+                    "INVALID_SIGNOFF_PAYLOAD", "body", "has invalid fields"
+                )
+            payload = _signoff_payload(raw)
+            timestamp = _timestamp(now)
+            idempotent_payload = attachment_batch.hash_payload(payload)
+            with transaction_immediate(connection):
+                project = _project(connection, project_code)
+                scope = (
+                    f"PUT:/api/projects/{project['id']}/drawing-signoffs/{discipline}"
+                )
+                request_hash = _request_hash(idempotent_payload)
+                if key is not None:
+                    restored = restore_idempotent_response(
+                        connection,
+                        scope=scope,
+                        key=key,
+                        request_hash=request_hash,
+                    )
+                    if restored is not None:
+                        return restored
+                _require_active_project_row(project)
+                _validate_documents(
+                    connection, project, payload["document_version_ids"]
+                )
+                row = connection.execute(
+                    "SELECT * FROM drawing_signoffs WHERE project_id = ? AND discipline = ?",
+                    (project["id"], discipline),
+                ).fetchone()
+                if row is None:
+                    if payload["expected_revision"] is not None:
+                        raise _revision(None)
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO drawing_signoffs
+                            (project_id, discipline, status, confirmed_on,
+                             not_required_reason, notes, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            project["id"],
+                            discipline,
+                            payload["status"],
+                            payload["confirmed_on"],
+                            payload["not_required_reason"],
+                            payload["notes"],
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                    resource_id = _last_id(cursor)
+                else:
+                    _require_revision(row, payload["expected_revision"])
+                    resource_id = int(row["id"])
+                    connection.execute(
+                        """
+                        UPDATE drawing_signoffs
+                        SET status = ?, confirmed_on = ?, not_required_reason = ?, notes = ?,
+                            revision = revision + 1, updated_at = ? WHERE id = ?
+                        """,
+                        (
+                            payload["status"],
+                            payload["confirmed_on"],
+                            payload["not_required_reason"],
+                            payload["notes"],
+                            timestamp,
+                            resource_id,
+                        ),
+                    )
+                discipline_label = (
+                    "机械会签" if discipline == "mechanical" else "电气会签"
+                )
+                confirmed_identity = business_attachments.compact_iso_date(
+                    str(payload["confirmed_on"] or timestamp[:10])
+                )
+                uploaded_version_ids = attachment_batch.publish_documents(
+                    connection,
+                    project_code=str(project["project_code"]),
+                    category=f"{discipline}_signoff",
+                    documents=[
+                        business_attachments.ManagedDocument(
+                            title=(
+                                f"{discipline_label} 最终图纸 {index:02d}"
+                                f"（会签记录 {resource_id}）"
+                            ),
+                            managed_filename=business_attachments.managed_filename(
+                                project["project_code"],
+                                discipline_label,
+                                confirmed_identity,
+                                f"{index:02d}",
+                                original_filename=attachment.original_filename,
+                                preserve_last_parts=2,
+                            ),
+                        )
+                        for index, attachment in enumerate(
+                            attachment_batch.attachments, start=1
+                        )
+                    ],
+                    notes=payload["notes"],
+                    timestamp=timestamp,
+                )
+                document_version_ids = [
+                    *payload["document_version_ids"],
+                    *uploaded_version_ids,
+                ]
+                _replace_links(
+                    connection,
+                    project,
+                    "drawing_signoff",
+                    resource_id,
+                    document_version_ids,
+                    timestamp,
+                )
+                row = connection.execute(
+                    "SELECT * FROM drawing_signoffs WHERE id = ?", (resource_id,)
+                ).fetchone()
+                response = _signoff_response(connection, row, project, discipline)
+                if key is not None:
+                    _save_idempotent(
+                        connection,
+                        scope=scope,
+                        key=key,
+                        request_hash=request_hash,
+                        response=response,
+                        response_status=200,
+                        resource_type="drawing_signoff",
+                        resource_id=resource_id,
+                        timestamp=timestamp,
+                    )
+            return response
 
     @router.get("/api/projects/{project_code}/commissioning-sessions")
     @_deferred_snapshot
@@ -267,66 +346,126 @@ def create_delivery_router(
         request: Request,
         _: None = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
+        settings: Settings = settings_dependency,
     ) -> dict[str, object]:
-        payload = _commissioning_payload(
-            await _json(
+        if business_attachments.is_multipart_request(request):
+            raw, attachment_batch = await business_attachments.read_multipart_batch(
+                request,
+                data_dir=settings.data_dir,
+                max_file_size_bytes=settings.max_document_upload_mb * 1024 * 1024,
+                invalid=_commissioning_attachment_error,
+                too_large=_attachment_too_large,
+                batch_too_large=_attachment_batch_too_large,
+            )
+        else:
+            raw = await _json(
                 request, _COMMISSIONING_FIELDS, "INVALID_COMMISSIONING_PAYLOAD"
-            ),
-            updating=False,
-        )
-        key = _idempotency_key(request)
-        timestamp = _timestamp(now)
-        with transaction_immediate(connection):
-            project, scope, request_hash, restored = _start_idempotent(
-                connection, project_code, "commissioning-sessions", key, payload
             )
-            if restored is not None:
-                return restored
-            _require_active_project_row(project)
-            _validate_documents(connection, project, payload["document_version_ids"])
-            cursor = connection.execute(
-                """
-                INSERT INTO commissioning_sessions
-                    (project_id, started_at, ended_at, status, summary, issues,
-                     next_action, notes, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    project["id"],
-                    payload["started_at"],
-                    payload["ended_at"],
-                    payload["status"],
-                    payload["summary"],
-                    payload["issues"],
-                    payload["next_action"],
-                    payload["notes"],
+            attachment_batch = business_attachments.AttachmentBatch(
+                [], settings.data_dir
+            )
+        with attachment_batch:
+            if set(raw) != set(_COMMISSIONING_FIELDS):
+                raise _invalid(
+                    "INVALID_COMMISSIONING_PAYLOAD", "body", "has invalid fields"
+                )
+            payload = _commissioning_payload(raw, updating=False)
+            key = _idempotency_key(request)
+            timestamp = _timestamp(now)
+            with transaction_immediate(connection):
+                project, scope, request_hash, restored = _start_idempotent(
+                    connection,
+                    project_code,
+                    "commissioning-sessions",
+                    key,
+                    attachment_batch.hash_payload(payload),
+                )
+                if restored is not None:
+                    return restored
+                _require_active_project_row(project)
+                _validate_documents(
+                    connection, project, payload["document_version_ids"]
+                )
+                cursor = connection.execute(
+                    """
+                    INSERT INTO commissioning_sessions
+                        (project_id, started_at, ended_at, status, summary, issues,
+                         next_action, notes, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        project["id"],
+                        payload["started_at"],
+                        payload["ended_at"],
+                        payload["status"],
+                        payload["summary"],
+                        payload["issues"],
+                        payload["next_action"],
+                        payload["notes"],
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                resource_id = _last_id(cursor)
+                started_identity = business_attachments.compact_iso_date(
+                    datetime.fromisoformat(str(payload["started_at"]))
+                    .astimezone(_BUSINESS_TIMEZONE)
+                    .date()
+                    .isoformat()
+                )
+                uploaded_version_ids = attachment_batch.publish_documents(
+                    connection,
+                    project_code=str(project["project_code"]),
+                    category="commissioning",
+                    documents=[
+                        business_attachments.ManagedDocument(
+                            title=(
+                                f"调试资料 {started_identity} 附件 {index:02d}"
+                                f"（调试记录 {resource_id}）"
+                            ),
+                            managed_filename=business_attachments.managed_filename(
+                                project["project_code"],
+                                "调试",
+                                started_identity,
+                                f"{index:02d}",
+                                original_filename=attachment.original_filename,
+                            ),
+                        )
+                        for index, attachment in enumerate(
+                            attachment_batch.attachments, start=1
+                        )
+                    ],
+                    notes=payload["notes"],
+                    timestamp=timestamp,
+                )
+                document_version_ids = [
+                    *payload["document_version_ids"],
+                    *uploaded_version_ids,
+                ]
+                _replace_links(
+                    connection,
+                    project,
+                    "commissioning_session",
+                    resource_id,
+                    document_version_ids,
                     timestamp,
-                    timestamp,
-                ),
-            )
-            resource_id = _last_id(cursor)
-            _replace_links(
-                connection,
-                project,
-                "commissioning_session",
-                resource_id,
-                payload["document_version_ids"],
-                timestamp,
-            )
-            row = _owned_row(connection, "commissioning_sessions", project, resource_id)
-            response = _commissioning_response(connection, row, project)
-            _save_idempotent(
-                connection,
-                scope=scope,
-                key=key,
-                request_hash=request_hash,
-                response=response,
-                response_status=201,
-                resource_type="commissioning_session",
-                resource_id=resource_id,
-                timestamp=timestamp,
-            )
-        return response
+                )
+                row = _owned_row(
+                    connection, "commissioning_sessions", project, resource_id
+                )
+                response = _commissioning_response(connection, row, project)
+                _save_idempotent(
+                    connection,
+                    scope=scope,
+                    key=key,
+                    request_hash=request_hash,
+                    response=response,
+                    response_status=201,
+                    resource_type="commissioning_session",
+                    resource_id=resource_id,
+                    timestamp=timestamp,
+                )
+            return response
 
     @router.put("/api/projects/{project_code}/commissioning-sessions/{session_id}")
     async def update_commissioning(
@@ -417,74 +556,131 @@ def create_delivery_router(
         request: Request,
         _: None = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
+        settings: Settings = settings_dependency,
     ) -> dict[str, object]:
-        payload = _change_payload(
-            await _json(request, _CHANGE_FIELDS, "INVALID_CHANGE_PAYLOAD"),
-            updating=False,
-        )
-        key = _idempotency_key(request)
-        timestamp = _timestamp(now)
-        with transaction_immediate(connection):
-            project, scope, request_hash, restored = _start_idempotent(
-                connection, project_code, "engineering-changes", key, payload
+        if business_attachments.is_multipart_request(request):
+            raw, attachment_batch = await business_attachments.read_multipart_batch(
+                request,
+                data_dir=settings.data_dir,
+                max_file_size_bytes=settings.max_document_upload_mb * 1024 * 1024,
+                invalid=_change_attachment_error,
+                too_large=_attachment_too_large,
+                batch_too_large=_attachment_batch_too_large,
             )
-            if restored is not None:
-                return restored
-            _require_active_project_row(project)
-            _validate_documents(connection, project, payload["document_version_ids"])
-            number = int(
-                connection.execute(
-                    "SELECT COALESCE(MAX(change_number), 0) + 1 FROM engineering_changes WHERE project_id = ?",
-                    (project["id"],),
-                ).fetchone()[0]
+        else:
+            raw = await _json(request, _CHANGE_FIELDS, "INVALID_CHANGE_PAYLOAD")
+            attachment_batch = business_attachments.AttachmentBatch(
+                [], settings.data_dir
             )
-            cursor = connection.execute(
-                """
-                INSERT INTO engineering_changes
-                    (project_id, change_number, source, title, description, reason,
-                     contract_delta_cents, estimated_cost_delta_cents,
-                     schedule_delta_days, proposed_on, notes, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    project["id"],
-                    number,
-                    payload["source"],
-                    payload["title"],
-                    payload["description"],
-                    payload["reason"],
-                    payload["contract_delta_cents"],
-                    payload["estimated_cost_delta_cents"],
-                    payload["schedule_delta_days"],
-                    payload["proposed_on"],
-                    payload["notes"],
+        with attachment_batch:
+            if set(raw) != set(_CHANGE_FIELDS):
+                raise _invalid(
+                    "INVALID_CHANGE_PAYLOAD", "body", "has invalid fields"
+                )
+            payload = _change_payload(raw, updating=False)
+            key = _idempotency_key(request)
+            timestamp = _timestamp(now)
+            with transaction_immediate(connection):
+                project, scope, request_hash, restored = _start_idempotent(
+                    connection,
+                    project_code,
+                    "engineering-changes",
+                    key,
+                    attachment_batch.hash_payload(payload),
+                )
+                if restored is not None:
+                    return restored
+                _require_active_project_row(project)
+                _validate_documents(
+                    connection, project, payload["document_version_ids"]
+                )
+                number = int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(change_number), 0) + 1 FROM engineering_changes WHERE project_id = ?",
+                        (project["id"],),
+                    ).fetchone()[0]
+                )
+                cursor = connection.execute(
+                    """
+                    INSERT INTO engineering_changes
+                        (project_id, change_number, source, title, description, reason,
+                         contract_delta_cents, estimated_cost_delta_cents,
+                         schedule_delta_days, proposed_on, notes, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        project["id"],
+                        number,
+                        payload["source"],
+                        payload["title"],
+                        payload["description"],
+                        payload["reason"],
+                        payload["contract_delta_cents"],
+                        payload["estimated_cost_delta_cents"],
+                        payload["schedule_delta_days"],
+                        payload["proposed_on"],
+                        payload["notes"],
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                resource_id = _last_id(cursor)
+                change_identity = business_attachments.compact_iso_date(
+                    str(payload["proposed_on"])
+                )
+                uploaded_version_ids = attachment_batch.publish_documents(
+                    connection,
+                    project_code=str(project["project_code"]),
+                    category="technical_agreement",
+                    documents=[
+                        business_attachments.ManagedDocument(
+                            title=(
+                                f"工程变更 {number:02d} 附件 {index:02d}"
+                                f"（变更记录 {resource_id}）"
+                            ),
+                            managed_filename=business_attachments.managed_filename(
+                                project["project_code"],
+                                "工程变更",
+                                change_identity,
+                                f"{index:02d}",
+                                original_filename=attachment.original_filename,
+                            ),
+                        )
+                        for index, attachment in enumerate(
+                            attachment_batch.attachments, start=1
+                        )
+                    ],
+                    notes=payload["notes"],
+                    timestamp=timestamp,
+                )
+                document_version_ids = [
+                    *payload["document_version_ids"],
+                    *uploaded_version_ids,
+                ]
+                _replace_links(
+                    connection,
+                    project,
+                    "engineering_change",
+                    resource_id,
+                    document_version_ids,
                     timestamp,
-                    timestamp,
-                ),
-            )
-            resource_id = _last_id(cursor)
-            _replace_links(
-                connection,
-                project,
-                "engineering_change",
-                resource_id,
-                payload["document_version_ids"],
-                timestamp,
-            )
-            row = _owned_row(connection, "engineering_changes", project, resource_id)
-            response = _change_response(connection, row, project)
-            _save_idempotent(
-                connection,
-                scope=scope,
-                key=key,
-                request_hash=request_hash,
-                response=response,
-                response_status=201,
-                resource_type="engineering_change",
-                resource_id=resource_id,
-                timestamp=timestamp,
-            )
-        return response
+                )
+                row = _owned_row(
+                    connection, "engineering_changes", project, resource_id
+                )
+                response = _change_response(connection, row, project)
+                _save_idempotent(
+                    connection,
+                    scope=scope,
+                    key=key,
+                    request_hash=request_hash,
+                    response=response,
+                    response_status=201,
+                    resource_type="engineering_change",
+                    resource_id=resource_id,
+                    timestamp=timestamp,
+                )
+            return response
 
     @router.put("/api/projects/{project_code}/engineering-changes/{change_id}")
     async def update_change(
@@ -729,8 +925,10 @@ def create_delivery_router(
             )
         return response
 
-    @router.post("/api/projects/{project_code}/acceptances/{acceptance_id}/complete")
-    async def complete_acceptance(
+    @router.post(
+        "/api/projects/{project_code}/acceptances/{acceptance_id}/reschedule"
+    )
+    async def reschedule_acceptance(
         project_code: str,
         acceptance_id: str,
         request: Request,
@@ -740,46 +938,41 @@ def create_delivery_router(
         raw = await _json(
             request,
             (
-                "performed_on",
-                "result",
+                "acceptance_type",
+                "scheduled_on",
                 "notes",
-                "document_version_ids",
-                "warranty",
+                "reason",
                 "expected_revision",
             ),
-            "INVALID_ACCEPTANCE_COMPLETION",
+            "INVALID_ACCEPTANCE_RESCHEDULE",
         )
-        performed_on = _business_date(
-            raw["performed_on"], "performed_on", "INVALID_ACCEPTANCE_COMPLETION"
+        acceptance_type = _enum(
+            raw["acceptance_type"],
+            "acceptance_type",
+            _ACCEPTANCE_TYPES,
+            "INVALID_ACCEPTANCE_RESCHEDULE",
         )
-        result = _enum(
-            raw["result"],
-            "result",
-            _ACCEPTANCE_RESULTS,
-            "INVALID_ACCEPTANCE_COMPLETION",
+        scheduled_on = _business_date(
+            raw["scheduled_on"],
+            "scheduled_on",
+            "INVALID_ACCEPTANCE_RESCHEDULE",
         )
-        notes = _optional_text(raw["notes"], "notes", "INVALID_ACCEPTANCE_COMPLETION")
-        documents = _document_ids(
-            raw["document_version_ids"], "INVALID_ACCEPTANCE_COMPLETION"
+        notes = _optional_text(
+            raw["notes"], "notes", "INVALID_ACCEPTANCE_RESCHEDULE"
+        )
+        reason = _required_text(
+            raw["reason"], "reason", "INVALID_ACCEPTANCE_RESCHEDULE"
         )
         expected = _positive(
             raw["expected_revision"],
             "expected_revision",
-            "INVALID_ACCEPTANCE_COMPLETION",
-        )
-        warranty_payload = (
-            _warranty_payload(
-                raw["warranty"], "INVALID_ACCEPTANCE_COMPLETION", include_revision=False
-            )
-            if raw["warranty"] is not None
-            else None
+            "INVALID_ACCEPTANCE_RESCHEDULE",
         )
         payload = {
-            "performed_on": performed_on,
-            "result": result,
+            "acceptance_type": acceptance_type,
+            "scheduled_on": scheduled_on,
             "notes": notes,
-            "document_version_ids": documents,
-            "warranty": warranty_payload,
+            "reason": reason,
             "expected_revision": expected,
         }
         key = _idempotency_key(request)
@@ -789,9 +982,203 @@ def create_delivery_router(
             project, scope, request_hash, restored = _start_idempotent(
                 connection,
                 project_code,
-                f"acceptances/{resource_id}/complete",
+                f"acceptances/{resource_id}/reschedule",
                 key,
                 payload,
+            )
+            if restored is not None:
+                return restored
+            _require_active_project_row(project)
+            row = _owned_row(connection, "acceptances", project, resource_id)
+            _require_revision(row, expected)
+            if row["status"] != "scheduled":
+                raise _conflict(
+                    "Only scheduled acceptance can be rescheduled",
+                    "ACCEPTANCE_LOCKED",
+                )
+            connection.execute(
+                """
+                UPDATE acceptances
+                SET acceptance_type = ?, scheduled_on = ?, notes = ?,
+                    revision = revision + 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (acceptance_type, scheduled_on, notes, timestamp, resource_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO acceptance_reschedule_events
+                    (project_id, acceptance_id, previous_acceptance_type,
+                     acceptance_type, previous_scheduled_on, scheduled_on,
+                     previous_notes, notes, reason, expected_revision,
+                     resulting_revision, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project["id"],
+                    resource_id,
+                    row["acceptance_type"],
+                    acceptance_type,
+                    row["scheduled_on"],
+                    scheduled_on,
+                    row["notes"],
+                    notes,
+                    reason,
+                    expected,
+                    expected + 1,
+                    timestamp,
+                ),
+            )
+            row = _owned_row(connection, "acceptances", project, resource_id)
+            response = _acceptance_response(connection, row, project)
+            _save_idempotent(
+                connection,
+                scope=scope,
+                key=key,
+                request_hash=request_hash,
+                response=response,
+                response_status=200,
+                resource_type="acceptance_reschedule",
+                resource_id=resource_id,
+                timestamp=timestamp,
+            )
+            return response
+
+    @router.post("/api/projects/{project_code}/acceptances/{acceptance_id}/cancel")
+    async def cancel_acceptance(
+        project_code: str,
+        acceptance_id: str,
+        request: Request,
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        raw = await _json(
+            request,
+            ("cancelled_on", "reason", "expected_revision"),
+            "INVALID_ACCEPTANCE_CANCELLATION",
+        )
+        cancelled_on = _business_date(
+            raw["cancelled_on"], "cancelled_on", "INVALID_ACCEPTANCE_CANCELLATION"
+        )
+        reason = _required_text(
+            raw["reason"], "reason", "INVALID_ACCEPTANCE_CANCELLATION"
+        )
+        expected = _positive(
+            raw["expected_revision"],
+            "expected_revision",
+            "INVALID_ACCEPTANCE_CANCELLATION",
+        )
+        payload = {
+            "cancelled_on": cancelled_on,
+            "reason": reason,
+            "expected_revision": expected,
+        }
+        key = _idempotency_key(request)
+        resource_id = _identifier(acceptance_id)
+        timestamp = _timestamp(now)
+        with transaction_immediate(connection):
+            project, scope, request_hash, restored = _start_idempotent(
+                connection,
+                project_code,
+                f"acceptances/{resource_id}/cancel",
+                key,
+                payload,
+            )
+            if restored is not None:
+                return restored
+            _require_active_project_row(project)
+            row = _owned_row(connection, "acceptances", project, resource_id)
+            _require_revision(row, expected)
+            if row["status"] != "scheduled":
+                raise _conflict(
+                    "Only scheduled acceptance can be cancelled",
+                    "ACCEPTANCE_LOCKED",
+                )
+            from_status = str(row["status"])
+            connection.execute(
+                """
+                UPDATE acceptances
+                SET performed_on = ?, status = 'cancelled', cancel_reason = ?,
+                    cancelled_at = ?, revision = revision + 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (cancelled_on, reason, cancelled_on, timestamp, resource_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO acceptance_transition_events
+                    (project_id, acceptance_id, from_status, to_status,
+                     effective_on, reason, created_at)
+                VALUES (?, ?, ?, 'cancelled', ?, ?, ?)
+                """,
+                (
+                    project["id"],
+                    resource_id,
+                    from_status,
+                    cancelled_on,
+                    reason,
+                    timestamp,
+                ),
+            )
+            row = _owned_row(connection, "acceptances", project, resource_id)
+            response = _acceptance_response(connection, row, project)
+            _save_idempotent(
+                connection,
+                scope=scope,
+                key=key,
+                request_hash=request_hash,
+                response=response,
+                response_status=200,
+                resource_type="acceptance_cancellation",
+                resource_id=resource_id,
+                timestamp=timestamp,
+            )
+            return response
+
+    @router.post("/api/projects/{project_code}/acceptances/{acceptance_id}/complete")
+    async def complete_acceptance(
+        project_code: str,
+        acceptance_id: str,
+        request: Request,
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+        settings: Settings = settings_dependency,
+    ) -> dict[str, object]:
+        if business_attachments.is_multipart_request(request):
+            raw, attachment_batch = await business_attachments.read_multipart_batch(
+                request,
+                data_dir=settings.data_dir,
+                max_file_size_bytes=settings.max_document_upload_mb * 1024 * 1024,
+                invalid=_acceptance_attachment_error,
+                too_large=_attachment_too_large,
+                batch_too_large=_attachment_batch_too_large,
+            )
+        else:
+            raw = await _json(
+                request,
+                _ACCEPTANCE_COMPLETION_FIELDS,
+                "INVALID_ACCEPTANCE_COMPLETION",
+            )
+            attachment_batch = business_attachments.AttachmentBatch(
+                [], settings.data_dir
+            )
+        timestamp = _timestamp(now)
+        with attachment_batch, transaction_immediate(connection):
+            payload = _acceptance_completion_payload(raw)
+            performed_on = str(payload["performed_on"])
+            result = str(payload["result"])
+            notes = payload["notes"]
+            documents = payload["document_version_ids"]
+            expected = payload["expected_revision"]
+            warranty_payload = payload["warranty"]
+            key = _idempotency_key(request)
+            resource_id = _identifier(acceptance_id)
+            project, scope, request_hash, restored = _start_idempotent(
+                connection,
+                project_code,
+                f"acceptances/{resource_id}/complete",
+                key,
+                attachment_batch.hash_payload(payload),
             )
             if restored is not None:
                 return restored
@@ -820,9 +1207,6 @@ def create_delivery_router(
                     updated_at = ? WHERE id = ?
                 """,
                 (performed_on, result, notes, timestamp, resource_id),
-            )
-            _replace_links(
-                connection, project, "acceptance", resource_id, documents, timestamp
             )
             warranty_row = None
             if warranty_payload is not None:
@@ -860,6 +1244,42 @@ def create_delivery_router(
                 warranty_row = connection.execute(
                     "SELECT * FROM warranties WHERE id = ?", (_last_id(cursor),)
                 ).fetchone()
+            acceptance_identity = business_attachments.compact_iso_date(performed_on)
+            uploaded_version_ids = attachment_batch.publish_documents(
+                connection,
+                project_code=str(project["project_code"]),
+                category="acceptance",
+                documents=[
+                    business_attachments.ManagedDocument(
+                        title=(
+                            f"验收资料 {performed_on} 附件 {index:02d}"
+                            f"（验收记录 {resource_id}）"
+                        ),
+                        managed_filename=business_attachments.managed_filename(
+                            project["project_code"],
+                            "验收",
+                            acceptance_identity,
+                            f"{index:02d}",
+                            original_filename=attachment.original_filename,
+                            preserve_last_parts=2,
+                        ),
+                    )
+                    for index, attachment in enumerate(
+                        attachment_batch.attachments, start=1
+                    )
+                ],
+                notes=notes,
+                timestamp=timestamp,
+            )
+            document_version_ids = [*documents, *uploaded_version_ids]
+            _replace_links(
+                connection,
+                project,
+                "acceptance",
+                resource_id,
+                document_version_ids,
+                timestamp,
+            )
             row = _owned_row(connection, "acceptances", project, resource_id)
             response = {
                 "acceptance": _acceptance_response(connection, row, project),
@@ -878,7 +1298,7 @@ def create_delivery_router(
                 resource_id=resource_id,
                 timestamp=timestamp,
             )
-        return response
+            return response
 
     @router.get("/api/projects/{project_code}/warranty")
     def get_warranty(
@@ -1035,66 +1455,142 @@ def create_delivery_router(
         request: Request,
         _: None = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
+        settings: Settings = settings_dependency,
     ) -> dict[str, object]:
-        payload = _invoice_payload(
-            await _json(request, _INVOICE_FIELDS, "INVALID_INVOICE_PAYLOAD"),
-            updating=False,
-        )
-        key = _idempotency_key(request)
-        timestamp = _timestamp(now)
-        with transaction_immediate(connection):
-            project, scope, request_hash, restored = _start_idempotent(
-                connection, project_code, "invoices", key, payload
+        multipart = business_attachments.is_multipart_request(request)
+        if multipart:
+            raw, attachment_batch = await business_attachments.read_multipart_batch(
+                request,
+                data_dir=settings.data_dir,
+                max_file_size_bytes=settings.max_document_upload_mb * 1024 * 1024,
+                invalid=_invoice_attachment_error,
+                too_large=_attachment_too_large,
+                batch_too_large=_attachment_batch_too_large,
             )
-            if restored is not None:
-                return restored
-            _require_active_project_row(project)
-            _validate_documents(connection, project, payload["document_version_ids"])
-            cursor = connection.execute(
-                """
-                INSERT INTO project_invoices
-                    (project_id, invoice_type, status, requested_on, recorded_on,
-                     invoice_number, amount_cents, counterparty_name, notes,
-                     created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    project["id"],
-                    payload["invoice_type"],
-                    payload["status"],
-                    payload["requested_on"],
-                    payload["recorded_on"],
-                    payload["invoice_number"],
-                    payload["amount_cents"],
-                    payload["counterparty_name"],
-                    payload["notes"],
+        else:
+            raw = await _json(request, _INVOICE_FIELDS, "INVALID_INVOICE_PAYLOAD")
+            attachment_batch = business_attachments.AttachmentBatch(
+                [], settings.data_dir
+            )
+        with attachment_batch:
+            if set(raw) != set(_INVOICE_FIELDS):
+                raise _invalid(
+                    "INVALID_INVOICE_PAYLOAD", "body", "has invalid fields"
+                )
+            payload = _invoice_payload(raw, updating=False)
+            key = _idempotency_key(request)
+            timestamp = _timestamp(now)
+            idempotent_payload = (
+                attachment_batch.hash_payload(payload)
+            )
+            with transaction_immediate(connection):
+                project, scope, request_hash, restored = _start_idempotent(
+                    connection,
+                    project_code,
+                    "invoices",
+                    key,
+                    idempotent_payload,
+                )
+                if restored is not None:
+                    return restored
+                _require_active_project_row(project)
+                _require_available_invoice_number(
+                    connection, payload["invoice_number"]
+                )
+                _validate_documents(
+                    connection, project, payload["document_version_ids"]
+                )
+                cursor = connection.execute(
+                    """
+                    INSERT INTO project_invoices
+                        (project_id, invoice_type, status, requested_on, recorded_on,
+                         invoice_number, amount_cents, counterparty_name, notes,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        project["id"],
+                        payload["invoice_type"],
+                        payload["status"],
+                        payload["requested_on"],
+                        payload["recorded_on"],
+                        payload["invoice_number"],
+                        payload["amount_cents"],
+                        payload["counterparty_name"],
+                        payload["notes"],
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                resource_id = _last_id(cursor)
+                invoice_number = payload["invoice_number"]
+                if invoice_number:
+                    invoice_identity = str(invoice_number)
+                else:
+                    invoice_date = (
+                        payload["recorded_on"]
+                        or payload["requested_on"]
+                        or datetime.fromisoformat(timestamp)
+                        .astimezone(_BUSINESS_TIMEZONE)
+                        .date()
+                        .isoformat()
+                    )
+                    invoice_identity = business_attachments.compact_iso_date(
+                        str(invoice_date)
+                    )
+                uploaded_version_ids = attachment_batch.publish_documents(
+                    connection,
+                    project_code=str(project["project_code"]),
+                    category="invoice",
+                    documents=[
+                        business_attachments.ManagedDocument(
+                            title=(
+                                f"销项发票 {invoice_identity} 附件 {index:02d}"
+                                f"（发票记录 {resource_id}）"
+                            ),
+                            managed_filename=business_attachments.managed_filename(
+                                project["project_code"],
+                                "销项发票",
+                                invoice_identity,
+                                f"{index:02d}",
+                                original_filename=attachment.original_filename,
+                            ),
+                        )
+                        for index, attachment in enumerate(
+                            attachment_batch.attachments, start=1
+                        )
+                    ],
+                    notes=payload["notes"],
+                    timestamp=timestamp,
+                )
+                document_version_ids = [
+                    *payload["document_version_ids"],
+                    *uploaded_version_ids,
+                ]
+                _replace_links(
+                    connection,
+                    project,
+                    "invoice",
+                    resource_id,
+                    document_version_ids,
                     timestamp,
-                    timestamp,
-                ),
-            )
-            resource_id = _last_id(cursor)
-            _replace_links(
-                connection,
-                project,
-                "invoice",
-                resource_id,
-                payload["document_version_ids"],
-                timestamp,
-            )
-            row = _owned_row(connection, "project_invoices", project, resource_id)
-            response = _invoice_response(connection, row, project)
-            _save_idempotent(
-                connection,
-                scope=scope,
-                key=key,
-                request_hash=request_hash,
-                response=response,
-                response_status=201,
-                resource_type="invoice",
-                resource_id=resource_id,
-                timestamp=timestamp,
-            )
-        return response
+                )
+                row = _owned_row(
+                    connection, "project_invoices", project, resource_id
+                )
+                response = _invoice_response(connection, row, project)
+                _save_idempotent(
+                    connection,
+                    scope=scope,
+                    key=key,
+                    request_hash=request_hash,
+                    response=response,
+                    response_status=201,
+                    resource_type="invoice",
+                    resource_id=resource_id,
+                    timestamp=timestamp,
+                )
+            return response
 
     @router.put("/api/projects/{project_code}/invoices/{invoice_id}")
     async def update_invoice(
@@ -1104,22 +1600,62 @@ def create_delivery_router(
         _: None = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
-        payload = _invoice_payload(
-            await _json(
-                request,
-                (*_INVOICE_FIELDS, "expected_revision"),
+        raw = await _json(
+            request,
+            (*_INVOICE_FIELDS, "expected_revision"),
+            "INVALID_INVOICE_PAYLOAD",
+        )
+        deferred_recorded_validation = raw["status"] == "recorded" and any(
+            raw[field] is None
+            for field in ("recorded_on", "invoice_number", "amount_cents")
+        )
+        payload = (
+            None
+            if deferred_recorded_validation
+            else _invoice_payload(raw, updating=True)
+        )
+        expected_revision = (
+            _positive(
+                raw["expected_revision"],
+                "expected_revision",
                 "INVALID_INVOICE_PAYLOAD",
-            ),
-            updating=True,
+            )
+            if payload is None
+            else payload["expected_revision"]
         )
         resource_id = _identifier(invoice_id)
         timestamp = _timestamp(now)
         with transaction_immediate(connection):
             project = _active_project(connection, project_code)
             row = _owned_row(connection, "project_invoices", project, resource_id)
-            _require_revision(row, payload["expected_revision"])
+            _require_revision(row, expected_revision)
             if row["status"] == "void":
                 raise _conflict("Voided invoice cannot be edited", "INVOICE_VOID")
+            if row["status"] == "recorded" and deferred_recorded_validation:
+                raise _conflict(
+                    "Recorded invoice must be voided before formal fields can change",
+                    "INVOICE_RECORDED",
+                )
+            if payload is None:
+                payload = _invoice_payload(raw, updating=True)
+            if row["status"] == "recorded" and any(
+                row[field] != payload[field]
+                for field in (
+                    "status",
+                    "recorded_on",
+                    "invoice_number",
+                    "amount_cents",
+                )
+            ):
+                raise _conflict(
+                    "Recorded invoice must be voided before formal fields can change",
+                    "INVOICE_RECORDED",
+                )
+            _require_available_invoice_number(
+                connection,
+                payload["invoice_number"],
+                excluding_invoice_id=resource_id,
+            )
             _validate_documents(connection, project, payload["document_version_ids"])
             connection.execute(
                 """
@@ -1258,6 +1794,7 @@ def create_delivery_router(
             is_under_warranty = _is_under_warranty(
                 connection, int(project["id"]), str(payload["reported_on"])
             )
+            _require_warranty_coverage_match(payload["coverage_type"], is_under_warranty)
             cursor = connection.execute(
                 """
                 INSERT INTO after_sales_cases
@@ -1325,6 +1862,7 @@ def create_delivery_router(
             is_under_warranty = _is_under_warranty(
                 connection, int(project["id"]), str(payload["reported_on"])
             )
+            _require_warranty_coverage_match(payload["coverage_type"], is_under_warranty)
             connection.execute(
                 """
                 UPDATE after_sales_cases
@@ -1594,6 +2132,22 @@ def create_delivery_router(
     return router
 
 
+_SIGNOFF_FIELDS = (
+    "status",
+    "confirmed_on",
+    "not_required_reason",
+    "notes",
+    "document_version_ids",
+    "expected_revision",
+)
+_ACCEPTANCE_COMPLETION_FIELDS = (
+    "performed_on",
+    "result",
+    "notes",
+    "document_version_ids",
+    "warranty",
+    "expected_revision",
+)
 _COMMISSIONING_FIELDS = (
     "started_at",
     "ended_at",
@@ -1666,6 +2220,45 @@ def _signoff_payload(raw: dict[str, object]) -> dict[str, object]:
             raw["document_version_ids"], "INVALID_SIGNOFF_PAYLOAD"
         ),
         "expected_revision": expected,
+    }
+
+
+def _acceptance_completion_payload(raw: dict[str, object]) -> dict[str, Any]:
+    if set(raw) != set(_ACCEPTANCE_COMPLETION_FIELDS):
+        raise _invalid(
+            "INVALID_ACCEPTANCE_COMPLETION", "body", "has invalid fields"
+        )
+    performed_on = _business_date(
+        raw["performed_on"], "performed_on", "INVALID_ACCEPTANCE_COMPLETION"
+    )
+    result = _enum(
+        raw["result"],
+        "result",
+        _ACCEPTANCE_RESULTS,
+        "INVALID_ACCEPTANCE_COMPLETION",
+    )
+    warranty_payload = (
+        _warranty_payload(
+            raw["warranty"], "INVALID_ACCEPTANCE_COMPLETION", include_revision=False
+        )
+        if raw["warranty"] is not None
+        else None
+    )
+    return {
+        "performed_on": performed_on,
+        "result": result,
+        "notes": _optional_text(
+            raw["notes"], "notes", "INVALID_ACCEPTANCE_COMPLETION"
+        ),
+        "document_version_ids": _document_ids(
+            raw["document_version_ids"], "INVALID_ACCEPTANCE_COMPLETION"
+        ),
+        "warranty": warranty_payload,
+        "expected_revision": _positive(
+            raw["expected_revision"],
+            "expected_revision",
+            "INVALID_ACCEPTANCE_COMPLETION",
+        ),
     }
 
 
@@ -1984,6 +2577,8 @@ def _acceptance_response(
         "performed_on": row["performed_on"],
         "status": row["status"],
         "notes": row["notes"],
+        "cancel_reason": row["cancel_reason"],
+        "cancelled_at": row["cancelled_at"],
         "document_version_ids": _links(connection, "acceptance", int(row["id"])),
         "revision": row["revision"],
         "created_at": row["created_at"],
@@ -2191,6 +2786,48 @@ def _is_under_warranty(
         ).fetchone()
         is not None
     )
+
+
+def _require_available_invoice_number(
+    connection: sqlite3.Connection,
+    invoice_number: object,
+    *,
+    excluding_invoice_id: int | None = None,
+) -> None:
+    if invoice_number is None:
+        return
+    normalized = str(invoice_number).strip().casefold()
+    rows = connection.execute(
+        """
+        SELECT id, invoice_number FROM project_invoices
+        WHERE status <> 'void' AND invoice_number IS NOT NULL
+        """
+    ).fetchall()
+    if any(
+        int(row["id"]) != excluding_invoice_id
+        and str(row["invoice_number"]).strip().casefold() == normalized
+        for row in rows
+    ):
+        raise DeliveryError(
+            409,
+            "Invoice number is already used by another active record",
+            "INVOICE_NUMBER_CONFLICT",
+            field_errors={"invoice_number": "must be unique among non-voided invoices"},
+        )
+
+
+def _require_warranty_coverage_match(
+    coverage_type: object, is_under_warranty: bool
+) -> None:
+    if coverage_type == "warranty" and not is_under_warranty:
+        raise DeliveryError(
+            409,
+            "Warranty coverage does not match the reported date",
+            "WARRANTY_COVERAGE_MISMATCH",
+            field_errors={
+                "coverage_type": "cannot be warranty when the reported date is outside warranty"
+            },
+        )
 
 
 def _replace_links(
@@ -2476,6 +3113,51 @@ def _last_id(cursor: sqlite3.Cursor) -> int:
 def _invalid(error_code: str, field: str, message: str) -> DeliveryError:
     return DeliveryError(
         422, "Invalid delivery payload", error_code, field_errors={field: message}
+    )
+
+
+def _invoice_attachment_error(field: str, message: str) -> DeliveryError:
+    return _invalid("INVALID_INVOICE_PAYLOAD", field, message)
+
+
+def _signoff_attachment_error(field: str, message: str) -> DeliveryError:
+    return _invalid("INVALID_SIGNOFF_PAYLOAD", field, message)
+
+
+def _commissioning_attachment_error(field: str, message: str) -> DeliveryError:
+    return _invalid("INVALID_COMMISSIONING_PAYLOAD", field, message)
+
+
+def _change_attachment_error(field: str, message: str) -> DeliveryError:
+    return _invalid("INVALID_CHANGE_PAYLOAD", field, message)
+
+
+def _acceptance_attachment_error(field: str, message: str) -> DeliveryError:
+    return _invalid("INVALID_ACCEPTANCE_COMPLETION", field, message)
+
+
+def _attachment_too_large(max_size_bytes: int) -> DeliveryError:
+    return DeliveryError(
+        413,
+        "Document file is too large",
+        "DOCUMENT_FILE_TOO_LARGE",
+        field_errors={
+            "files": f"must not exceed {max_size_bytes // (1024 * 1024)} MB"
+        },
+    )
+
+
+def _attachment_batch_too_large(max_size_bytes: int) -> DeliveryError:
+    return DeliveryError(
+        413,
+        "Document attachment batch is too large",
+        "DOCUMENT_BATCH_TOO_LARGE",
+        field_errors={
+            "files": (
+                "must contain at most 20 files whose combined size does not "
+                f"exceed {max_size_bytes // (1024 * 1024)} MB"
+            )
+        },
     )
 
 

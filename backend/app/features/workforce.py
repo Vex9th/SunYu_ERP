@@ -339,6 +339,12 @@ def create_workforce_router(
             _require_open_project(project)
             worker = _require_worker(connection, int(payload["worker_id"]))
             _require_active_worker(worker)
+            _require_assignment_schedule_available(
+                connection,
+                int(payload["worker_id"]),
+                str(payload["scheduled_start_on"]),
+                payload["scheduled_end_on"],
+            )
             cursor = connection.execute(
                 """
                 INSERT INTO crew_assignments
@@ -389,9 +395,22 @@ def create_workforce_router(
             _require_open_project(project)
             current = _require_assignment(connection, int(project["id"]), identifier)
             _require_revision(current, expected_revision)
+            if current["status"] not in {"planned", "active"}:
+                raise WorkforceApiError(
+                    status.HTTP_409_CONFLICT,
+                    "Completed or cancelled crew assignment cannot be edited",
+                    "ASSIGNMENT_TERMINAL",
+                )
             worker = _require_worker(connection, int(payload["worker_id"]))
             if int(current["worker_id"]) != int(worker["id"]):
                 _require_active_worker(worker)
+            _require_assignment_schedule_available(
+                connection,
+                int(payload["worker_id"]),
+                str(payload["scheduled_start_on"]),
+                payload["scheduled_end_on"],
+                excluding_assignment_id=identifier,
+            )
             connection.execute(
                 """
                 UPDATE crew_assignments
@@ -568,15 +587,29 @@ def create_workforce_router(
                 int(assignment["worker_id"]),
                 work_date,
             )
+            replaced = _labor_by_worker_date(
+                connection,
+                project_id,
+                int(assignment["worker_id"]),
+                work_date,
+                status_filter="voided",
+            )
             values = _labor_values(
                 payload,
                 assignment,
-                None,
+                replaced,
                 error_code="INVALID_LABOR_PAYLOAD",
                 field="body",
             )
             entry_id = _insert_labor_entry(
-                connection, project_id, work_date, values, timestamp
+                connection,
+                project_id,
+                work_date,
+                values,
+                timestamp,
+                replaces_entry_id=(
+                    None if replaced is None else int(replaced["id"])
+                ),
             )
             return _require_labor_entry(connection, project_id, entry_id)
 
@@ -610,6 +643,11 @@ def create_workforce_router(
                 connection, project_id, int(payload["assignment_id"])
             )
             work_date = str(payload["work_date"])
+            _require_replacement_identity_unchanged(
+                current,
+                assignment,
+                work_date,
+            )
             _require_worker_available_for_date(assignment, work_date)
             _require_labor_slot_available(
                 connection,
@@ -822,7 +860,12 @@ def _save_labor_entries(
     if not isinstance(normalized_entries, list):
         raise TypeError("normalized entries must be a list")
     prepared_entries: list[
-        tuple[dict[str, object], dict[str, object], dict[str, object] | None]
+        tuple[
+            dict[str, object],
+            dict[str, object],
+            dict[str, object] | None,
+            dict[str, object] | None,
+        ]
     ] = []
     seen_workers: set[int] = set()
     for index, entry in enumerate(normalized_entries):
@@ -832,10 +875,15 @@ def _save_labor_entries(
             connection, project_id, int(entry["assignment_id"])
         )
         existing = _labor_by_assignment_date(
-            connection, int(assignment["id"]), work_date
+            connection, int(assignment["id"]), work_date, status_filter="active"
         )
-        worker_id = int(
-            existing["worker_id"] if existing is not None else assignment["worker_id"]
+        worker_id = int(assignment["worker_id"])
+        replaced = None if existing is not None else _labor_by_worker_date(
+            connection,
+            project_id,
+            worker_id,
+            work_date,
+            status_filter="voided",
         )
         if worker_id in seen_workers:
             raise _validation_error(
@@ -845,7 +893,7 @@ def _save_labor_entries(
             )
         seen_workers.add(worker_id)
         worker_entry = _labor_by_worker_date(
-            connection, project_id, worker_id, work_date
+            connection, project_id, worker_id, work_date, status_filter="active"
         )
         if worker_entry is not None and (
             existing is None or int(worker_entry["id"]) != int(existing["id"])
@@ -855,29 +903,40 @@ def _save_labor_entries(
                 "Worker already has a labor entry for this project and date",
                 "WORKER_LABOR_ENTRY_EXISTS",
             )
-        prepared_entries.append((entry, assignment, existing))
+        prepared_entries.append((entry, assignment, existing, replaced))
 
     saved_ids: list[int] = []
-    for entry, assignment, existing in prepared_entries:
+    for entry, assignment, existing, replaced in prepared_entries:
         if existing is None and project["status"] == "archived":
             raise WorkforceApiError(
                 status.HTTP_409_CONFLICT,
                 "Archived project cannot accept new labor entries",
                 "PROJECT_ARCHIVED",
             )
-        if existing is None:
+        if existing is None and replaced is None:
             _require_worker_available_for_date(assignment, work_date)
-        values = _labor_values(entry, assignment, existing)
+        values = _labor_values(entry, assignment, existing or replaced)
         if existing is None:
+            if replaced is not None:
+                _require_labor_revision(replaced, entry)
             saved_ids.append(
                 _insert_labor_entry(
-                    connection, project_id, work_date, values, timestamp
+                    connection,
+                    project_id,
+                    work_date,
+                    values,
+                    timestamp,
+                    replaces_entry_id=(
+                        None if replaced is None else int(replaced["id"])
+                    ),
                 )
             )
         else:
             _require_active_labor(existing)
-            _require_labor_revision(existing, entry)
-            _update_labor_entry(connection, int(existing["id"]), values, timestamp)
+            if _require_labor_revision(existing, entry):
+                _update_labor_entry(
+                    connection, int(existing["id"]), values, timestamp
+                )
             saved_ids.append(int(existing["id"]))
     return [
         _require_labor_entry(connection, project_id, entry_id) for entry_id in saved_ids
@@ -957,19 +1016,22 @@ def _insert_labor_entry(
     work_date: str,
     values: dict[str, object],
     timestamp: str,
+    *,
+    replaces_entry_id: int | None = None,
 ) -> int:
     cursor = connection.execute(
         """
         INSERT INTO labor_entries
-            (project_id, assignment_id, worker_id, work_date, attendance_status,
+            (project_id, assignment_id, worker_id, replaces_entry_id, work_date, attendance_status,
              day_fraction_milli, work_minutes, pay_basis, rate_cents, cost_cents,
              work_summary, notes, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             project_id,
             values["assignment_id"],
             values["worker_id"],
+            replaces_entry_id,
             work_date,
             values["attendance_status"],
             values["day_fraction_milli"],
@@ -1050,28 +1112,32 @@ def _replace_labor_entry(
 def _require_labor_revision(
     existing: dict[str, object],
     entry: dict[str, object],
-) -> None:
+) -> bool:
     expected = entry["expected_revision"]
     if expected is None:
         if _labor_entry_matches(existing, entry):
-            return
+            return False
         raise _revision_conflict(int(existing["revision"]))
     if int(expected) != int(existing["revision"]):
         raise _revision_conflict(int(existing["revision"]))
+    return True
 
 
 def _labor_entry_matches(
     existing: dict[str, object],
     entry: dict[str, object],
 ) -> bool:
-    return all(
-        existing[field] == entry[field]
-        for field in (
-            "attendance_status",
-            "day_fraction_milli",
-            "work_minutes",
-            "work_summary",
-            "notes",
+    return (
+        existing["status"] == "active"
+        and all(
+            existing[field] == entry[field]
+            for field in (
+                "attendance_status",
+                "day_fraction_milli",
+                "work_minutes",
+                "work_summary",
+                "notes",
+            )
         )
     )
 
@@ -1349,7 +1415,7 @@ def _idempotent_operation(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
     request_hash = hashlib.sha256(request_body.encode("utf-8")).hexdigest()
-    path = request.url.path
+    path = request.url.path.casefold()
     with transaction_immediate(connection):
         scope = f"POST:{path}"
         previous = connection.execute(
@@ -1413,6 +1479,42 @@ def _require_project(
             status.HTTP_404_NOT_FOUND, "Project not found", "PROJECT_NOT_FOUND"
         )
     return {field: row[field] for field in ("id", "project_code", "status")}
+
+
+def _require_assignment_schedule_available(
+    connection: sqlite3.Connection,
+    worker_id: int,
+    scheduled_start_on: str,
+    scheduled_end_on: object,
+    *,
+    excluding_assignment_id: int | None = None,
+) -> None:
+    end_on = "9999-12-31" if scheduled_end_on is None else str(scheduled_end_on)
+    exclusion = "" if excluding_assignment_id is None else " AND assignment.id <> ?"
+    parameters: tuple[object, ...] = (
+        (worker_id, end_on, scheduled_start_on)
+        if excluding_assignment_id is None
+        else (worker_id, end_on, scheduled_start_on, excluding_assignment_id)
+    )
+    overlap = connection.execute(
+        f"""
+        SELECT assignment.id FROM crew_assignments assignment
+        JOIN projects project ON project.id = assignment.project_id
+        WHERE assignment.worker_id = ?
+          AND project.status = 'active'
+          AND assignment.status IN ('planned', 'active')
+          AND assignment.scheduled_start_on <= ?
+          AND COALESCE(assignment.scheduled_end_on, '9999-12-31') >= ?{exclusion}
+        LIMIT 1
+        """,
+        parameters,
+    ).fetchone()
+    if overlap is not None:
+        raise WorkforceApiError(
+            status.HTTP_409_CONFLICT,
+            "Worker already has an overlapping crew assignment",
+            "CREW_ASSIGNMENT_OVERLAP",
+        )
 
 
 def _require_open_project(project: dict[str, object]) -> None:
@@ -1535,15 +1637,19 @@ def _labor_by_assignment_date(
     connection: sqlite3.Connection,
     assignment_id: int,
     work_date: str,
+    *,
+    status_filter: str,
 ) -> dict[str, object] | None:
     row = connection.execute(
         """
         SELECT id, worker_id, attendance_status, day_fraction_milli, work_minutes,
-               pay_basis, rate_cents, work_summary, notes, status, revision
+               pay_basis, rate_cents, work_summary, notes, status, revision,
+               replaces_entry_id
         FROM labor_entries
-        WHERE assignment_id = ? AND work_date = ?
+        WHERE assignment_id = ? AND work_date = ? AND status = ?
+        ORDER BY id DESC LIMIT 1
         """,
-        (assignment_id, work_date),
+        (assignment_id, work_date, status_filter),
     ).fetchone()
     if row is None:
         return None
@@ -1559,6 +1665,7 @@ def _labor_by_assignment_date(
         "notes",
         "status",
         "revision",
+        "replaces_entry_id",
     )
     return {field: row[field] for field in fields}
 
@@ -1568,18 +1675,38 @@ def _labor_by_worker_date(
     project_id: int,
     worker_id: int,
     work_date: str,
+    *,
+    status_filter: str,
 ) -> dict[str, object] | None:
     row = connection.execute(
         """
-        SELECT id, assignment_id
+        SELECT id, assignment_id, worker_id, attendance_status,
+               day_fraction_milli, work_minutes, pay_basis, rate_cents,
+               work_summary, notes, status, revision, replaces_entry_id
         FROM labor_entries
-        WHERE project_id = ? AND worker_id = ? AND work_date = ?
+        WHERE project_id = ? AND worker_id = ? AND work_date = ? AND status = ?
+        ORDER BY id DESC LIMIT 1
         """,
-        (project_id, worker_id, work_date),
+        (project_id, worker_id, work_date, status_filter),
     ).fetchone()
     if row is None:
         return None
-    return {field: row[field] for field in ("id", "assignment_id")}
+    fields = (
+        "id",
+        "assignment_id",
+        "worker_id",
+        "attendance_status",
+        "day_fraction_milli",
+        "work_minutes",
+        "pay_basis",
+        "rate_cents",
+        "work_summary",
+        "notes",
+        "status",
+        "revision",
+        "replaces_entry_id",
+    )
+    return {field: row[field] for field in fields}
 
 
 def _require_labor_slot_available(
@@ -1600,7 +1727,7 @@ def _require_labor_slot_available(
     assignment_entry = connection.execute(
         f"""
         SELECT id FROM labor_entries
-        WHERE assignment_id = ? AND work_date = ?{exclusion}
+        WHERE assignment_id = ? AND work_date = ? AND status = 'active'{exclusion}
         """,
         parameters,
     ).fetchone()
@@ -1618,7 +1745,8 @@ def _require_labor_slot_available(
     worker_entry = connection.execute(
         f"""
         SELECT id FROM labor_entries
-        WHERE project_id = ? AND worker_id = ? AND work_date = ?{exclusion}
+        WHERE project_id = ? AND worker_id = ? AND work_date = ?
+          AND status = 'active'{exclusion}
         """,
         worker_parameters,
     ).fetchone()
@@ -1657,6 +1785,25 @@ def _require_active_labor(entry: dict[str, object]) -> None:
             status.HTTP_409_CONFLICT,
             "Voided labor entry cannot be changed",
             "LABOR_ENTRY_VOIDED",
+        )
+
+
+def _require_replacement_identity_unchanged(
+    entry: dict[str, object],
+    assignment: dict[str, object],
+    work_date: str,
+) -> None:
+    if entry["replaces_entry_id"] is None:
+        return
+    if (
+        int(entry["assignment_id"]) != int(assignment["id"])
+        or int(entry["worker_id"]) != int(assignment["worker_id"])
+        or str(entry["work_date"]) != work_date
+    ):
+        raise WorkforceApiError(
+            status.HTTP_409_CONFLICT,
+            "Replacement labor identity cannot be changed; void and create a new record",
+            "LABOR_REPLACEMENT_IDENTITY_IMMUTABLE",
         )
 
 
@@ -1704,6 +1851,7 @@ def _labor_response(row: sqlite3.Row) -> dict[str, object]:
         "assignment_id",
         "worker_id",
         "worker_name",
+        "replaces_entry_id",
         "work_date",
         "attendance_status",
         "work_minutes",
@@ -1932,7 +2080,7 @@ JOIN workers w ON w.id = a.worker_id
 
 _LABOR_SELECT = """
 SELECT e.id, p.project_code, e.assignment_id, e.worker_id,
-       w.name AS worker_name, e.work_date, e.attendance_status,
+       w.name AS worker_name, e.replaces_entry_id, e.work_date, e.attendance_status,
        e.day_fraction_milli, e.work_minutes, e.pay_basis, e.rate_cents,
        e.cost_cents, e.work_summary, e.notes, e.status, e.void_reason,
        e.voided_at, e.revision,

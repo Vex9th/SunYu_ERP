@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import shutil
 import sqlite3
 import uuid
 from collections.abc import Iterator
@@ -31,8 +32,15 @@ class WorkforceHarness:
     database_path: Path
     settings: Settings
 
-    def client(self, *, authenticated: bool = True) -> TestClient:
-        client = TestClient(self.app)
+    def client(
+        self,
+        *,
+        authenticated: bool = True,
+        raise_server_exceptions: bool = True,
+    ) -> TestClient:
+        client = TestClient(
+            self.app, raise_server_exceptions=raise_server_exceptions
+        )
         if authenticated:
             client.cookies.set(
                 SESSION_COOKIE_NAME,
@@ -75,6 +83,15 @@ def _build_harness(tmp_path: Path) -> WorkforceHarness:
             VALUES (2, 'P-ARCHIVED', 'p-archived', 1, '归档项目', 'archived', ?, ?, ?)
             """,
             (NOW.isoformat(), NOW.isoformat(), NOW.isoformat()),
+        )
+        connection.execute(
+            """
+            INSERT INTO projects
+                (id, project_code, project_code_key, company_id, name,
+                 status, created_at, updated_at)
+            VALUES (3, 'P-002', 'p-002', 1, '另一在建项目', 'active', ?, ?)
+            """,
+            (NOW.isoformat(), NOW.isoformat()),
         )
     finally:
         connection.close()
@@ -153,6 +170,29 @@ def _create_assignment(
     return cast(dict[str, Any], response.json())
 
 
+def _insert_legacy_overlapping_assignment(
+    harness: WorkforceHarness,
+    worker_id: int,
+) -> dict[str, Any]:
+    """Represent data created before overlapping schedules were rejected."""
+    connection = connect_database(harness.database_path)
+    try:
+        cursor = connection.execute(
+            """
+            INSERT INTO crew_assignments
+                (project_id, worker_id, role, scheduled_start_on, scheduled_end_on,
+                 pay_basis, rate_cents, notes, status, created_at, updated_at)
+            VALUES (1, ?, '历史重叠排单', '2026-08-29', '2026-09-05',
+                    'daily', 60000, NULL, 'active', ?, ?)
+            """,
+            (worker_id, NOW.isoformat(), NOW.isoformat()),
+        )
+        connection.commit()
+        return {"id": cursor.lastrowid}
+    finally:
+        connection.close()
+
+
 def _single_labor_payload(
     assignment_id: int,
     *,
@@ -172,6 +212,57 @@ def _single_labor_payload(
         "work_summary": work_summary,
         "notes": notes,
     }
+
+
+def test_assignment_rejects_overlapping_schedule_for_same_worker(
+    harness: WorkforceHarness,
+) -> None:
+    with harness.client() as client:
+        worker = _create_worker(client)
+        first = _create_assignment(client, worker["id"])
+        overlapping = client.post(
+            "/api/projects/P-001/crew-assignments",
+            headers=_idempotency_headers(),
+            json={
+                "worker_id": worker["id"],
+                "role": "临时支援",
+                "scheduled_start_on": "2026-09-01",
+                "scheduled_end_on": "2026-09-10",
+                "pay_basis": "daily",
+                "rate_cents": 60_000,
+                "notes": None,
+            },
+        )
+        listed = client.get("/api/projects/P-001/crew-assignments?page_size=10")
+
+    assert first["status"] == "planned"
+    assert overlapping.status_code == 409
+    assert overlapping.json()["error_code"] == "CREW_ASSIGNMENT_OVERLAP"
+    assert listed.json()["total"] == 1
+
+
+def test_assignment_rejects_worker_schedule_overlap_across_active_projects(
+    harness: WorkforceHarness,
+) -> None:
+    with harness.client() as client:
+        worker = _create_worker(client)
+        _create_assignment(client, worker["id"], project_code="P-001")
+        overlapping = client.post(
+            "/api/projects/P-002/crew-assignments",
+            headers=_idempotency_headers(),
+            json={
+                "worker_id": worker["id"],
+                "role": "另一项目支援",
+                "scheduled_start_on": "2026-09-01",
+                "scheduled_end_on": "2026-09-10",
+                "pay_basis": "daily",
+                "rate_cents": 60_000,
+                "notes": None,
+            },
+        )
+
+    assert overlapping.status_code == 409
+    assert overlapping.json()["error_code"] == "CREW_ASSIGNMENT_OVERLAP"
 
 
 def test_migration_creates_workforce_and_later_delivery_tables(tmp_path: Path) -> None:
@@ -202,6 +293,7 @@ def test_migration_creates_workforce_and_later_delivery_tables(tmp_path: Path) -
 
     assert "009_workforce_delivery" in applied
     assert "013_workforce_events" in applied
+    assert "021_workforce_audit_history" in applied
     assert {
         "workers",
         "crew_assignments",
@@ -220,6 +312,126 @@ def test_migration_creates_workforce_and_later_delivery_tables(tmp_path: Path) -
         "after_sales_cases",
     } <= tables
     assert ("project_id", "worker_id", "work_date") in unique_labor_keys
+
+
+def test_workforce_audit_migration_preserves_existing_voided_labor(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "legacy.sqlite3"
+    legacy_migrations = tmp_path / "migrations-through-020"
+    legacy_migrations.mkdir()
+    source_migrations = PROJECT_ROOT / "backend" / "migrations"
+    for path in source_migrations.glob("*.sql"):
+        if path.name < "021_":
+            shutil.copy2(path, legacy_migrations / path.name)
+
+    connection = connect_database(database_path)
+    try:
+        apply_migrations(connection, legacy_migrations)
+        timestamp = NOW.isoformat()
+        connection.execute(
+            "INSERT INTO companies (id, name, created_at, updated_at) "
+            "VALUES (1, '客户', ?, ?)",
+            (timestamp, timestamp),
+        )
+        connection.execute(
+            """
+            INSERT INTO projects
+                (id, project_code, project_code_key, company_id, name, status,
+                 created_at, updated_at)
+            VALUES (1, 'P-001', 'p-001', 1, '项目', 'active', ?, ?)
+            """,
+            (timestamp, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO workers (id, name, status, created_at, updated_at) "
+            "VALUES (1, '张工', 'active', ?, ?)",
+            (timestamp, timestamp),
+        )
+        connection.execute(
+            """
+            INSERT INTO crew_assignments
+                (id, project_id, worker_id, role, scheduled_start_on,
+                 scheduled_end_on, pay_basis, rate_cents, status,
+                 created_at, updated_at)
+            VALUES (1, 1, 1, '施工员', '2026-08-01', '2026-09-30',
+                    'daily', 60000, 'active', ?, ?)
+            """,
+            (timestamp, timestamp),
+        )
+        connection.execute(
+            """
+            INSERT INTO labor_entries
+                (id, project_id, assignment_id, worker_id, work_date,
+                 attendance_status, day_fraction_milli, work_minutes,
+                 pay_basis, rate_cents, cost_cents, work_summary, notes,
+                 status, void_reason, voided_at, revision, created_at, updated_at)
+            VALUES (1, 1, 1, 1, '2026-08-29', 'present', 1000, NULL,
+                    'daily', 60000, 60000, '原始正文', NULL, 'voided',
+                    '工时录错', ?, 2, ?, ?)
+            """,
+            (timestamp, timestamp, timestamp),
+        )
+        connection.execute(
+            """
+            INSERT INTO site_daily_reports
+                (id, project_id, work_date, location, weather, work_summary,
+                 blockers, next_plan, notes, status, confirmed_at, revision,
+                 created_at, updated_at)
+            VALUES (1, 1, '2026-08-29', '一号车间', '晴', '已确认正文',
+                    NULL, '继续安装', NULL, 'confirmed', ?, 2, ?, ?)
+            """,
+            (timestamp, timestamp, timestamp),
+        )
+        connection.execute(
+            """
+            INSERT INTO site_daily_report_events
+                (id, project_id, report_id, from_status, to_status, reason,
+                 occurred_at, created_at)
+            VALUES (1, 1, 1, 'draft', 'confirmed', NULL, ?, ?)
+            """,
+            (timestamp, timestamp),
+        )
+
+        assert apply_migrations(connection, source_migrations) == [
+            "021_workforce_audit_history",
+            "022_supplier_invoice_active_number",
+        ]
+        preserved = connection.execute(
+            "SELECT * FROM labor_entries WHERE id = 1"
+        ).fetchone()
+        assert preserved is not None
+        assert preserved["status"] == "voided"
+        assert preserved["work_summary"] == "原始正文"
+        assert preserved["cost_cents"] == 60_000
+        assert preserved["replaces_entry_id"] is None
+        version = connection.execute(
+            "SELECT * FROM site_daily_report_versions WHERE report_id = 1"
+        ).fetchone()
+        assert version is not None
+        assert version["version_number"] == 1
+        assert version["work_summary"] == "已确认正文"
+        assert connection.execute(
+            "SELECT report_version_id FROM site_daily_report_events WHERE id = 1"
+        ).fetchone()[0] == version["id"]
+
+        connection.execute(
+            """
+            INSERT INTO labor_entries
+                (project_id, assignment_id, worker_id, replaces_entry_id,
+                 work_date, attendance_status, day_fraction_milli,
+                 work_minutes, pay_basis, rate_cents, cost_cents, work_summary,
+                 notes, status, created_at, updated_at)
+            VALUES (1, 1, 1, 1, '2026-08-29', 'present', 500, NULL,
+                    'daily', 60000, 30000, '更正正文', NULL, 'active', ?, ?)
+            """,
+            (timestamp, timestamp),
+        )
+        assert connection.execute(
+            "SELECT COUNT(*) FROM labor_entries WHERE work_date = '2026-08-29'"
+        ).fetchone()[0] == 2
+    finally:
+        connection.close()
 
 
 def test_workers_support_create_get_update_search_and_pagination(
@@ -385,6 +597,59 @@ def test_assignment_create_list_and_update_preserve_pay_rule(
     assert updated.status_code == 200
     assert updated.json()["rate_cents"] == 65_000
     assert updated.json()["revision"] == 2
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "cancelled"])
+def test_terminal_assignment_cannot_be_edited(
+    harness: WorkforceHarness,
+    terminal_status: str,
+) -> None:
+    with harness.client() as client:
+        worker = _create_worker(client)
+        assignment = _create_assignment(client, worker["id"])
+        current = assignment
+        if terminal_status == "completed":
+            current = client.post(
+                f"/api/projects/P-001/crew-assignments/{assignment['id']}/transition",
+                headers=_idempotency_headers(),
+                json={
+                    "to_status": "active",
+                    "effective_at": "2026-08-29T08:00:00+08:00",
+                    "reason": None,
+                    "expected_revision": current["revision"],
+                },
+            ).json()
+        terminal = client.post(
+            f"/api/projects/P-001/crew-assignments/{assignment['id']}/transition",
+            headers=_idempotency_headers(),
+            json={
+                "to_status": terminal_status,
+                "effective_at": "2026-08-29T10:00:00+08:00",
+                "reason": "状态已结束",
+                "expected_revision": current["revision"],
+            },
+        )
+        edited = client.put(
+            f"/api/projects/P-001/crew-assignments/{assignment['id']}",
+            json={
+                "worker_id": worker["id"],
+                "role": "不应被保存",
+                "scheduled_start_on": "2026-08-30",
+                "scheduled_end_on": "2026-09-06",
+                "pay_basis": "daily",
+                "rate_cents": 65_000,
+                "notes": None,
+                "expected_revision": terminal.json()["revision"],
+            },
+        )
+        detail = client.get(
+            f"/api/projects/P-001/crew-assignments?status={terminal_status}"
+        )
+
+    assert terminal.status_code == 200
+    assert edited.status_code == 409
+    assert edited.json()["error_code"] == "ASSIGNMENT_TERMINAL"
+    assert detail.json()["items"][0]["role"] == "施工员"
 
 
 def test_assignment_transition_enforces_state_machine_revision_and_idempotency(
@@ -704,13 +969,109 @@ def test_batch_updates_same_assignment_and_date_without_duplicate(
     assert listed.json()["total"] == 1
 
 
+def test_batch_without_revision_matching_active_entry_is_noop(
+    harness: WorkforceHarness,
+) -> None:
+    with harness.client(raise_server_exceptions=False) as client:
+        worker = _create_worker(client)
+        assignment = _create_assignment(client, worker["id"])
+        payload = {
+            "work_date": "2026-08-29",
+            "entries": [
+                {
+                    "assignment_id": assignment["id"],
+                    "attendance_status": "present",
+                    "day_fraction": "1.000",
+                    "work_minutes": None,
+                    "work_summary": "安装",
+                    "notes": None,
+                    "expected_revision": None,
+                }
+            ],
+        }
+        created = client.post(
+            "/api/projects/P-001/labor-entries/batch",
+            headers=_idempotency_headers(),
+            json=payload,
+        )
+        retried = client.post(
+            "/api/projects/P-001/labor-entries/batch",
+            headers=_idempotency_headers(),
+            json=payload,
+        )
+        listed = client.get("/api/projects/P-001/labor-entries")
+
+    assert created.status_code == 200
+    assert retried.status_code == 200
+    assert retried.json() == created.json()
+    assert listed.json()["total"] == 1
+    assert (
+        listed.json()["items"][0]["revision"]
+        == created.json()["items"][0]["revision"]
+    )
+
+
+def test_batch_without_revision_does_not_reactivate_matching_voided_entry(
+    harness: WorkforceHarness,
+) -> None:
+    with harness.client() as client:
+        worker = _create_worker(client)
+        assignment = _create_assignment(client, worker["id"])
+        batch_payload = {
+            "work_date": "2026-08-29",
+            "entries": [
+                {
+                    "assignment_id": assignment["id"],
+                    "attendance_status": "present",
+                    "day_fraction": "1.000",
+                    "work_minutes": None,
+                    "work_summary": "安装",
+                    "notes": None,
+                    "expected_revision": None,
+                }
+            ],
+        }
+        created = client.post(
+            "/api/projects/P-001/labor-entries/batch",
+            headers=_idempotency_headers(),
+            json=batch_payload,
+        )
+        entry = created.json()["items"][0]
+        voided = client.post(
+            f"/api/projects/P-001/labor-entries/{entry['id']}/void",
+            headers=_idempotency_headers(),
+            json={
+                "reason": "重复登记",
+                "expected_revision": entry["revision"],
+            },
+        )
+        conflict = client.post(
+            "/api/projects/P-001/labor-entries/batch",
+            headers=_idempotency_headers(),
+            json=batch_payload,
+        )
+        listed = client.get("/api/projects/P-001/labor-entries")
+
+    assert created.status_code == 200
+    assert voided.status_code == 200
+    assert conflict.status_code == 409
+    assert conflict.json()["error_code"] == "REVISION_CONFLICT"
+    assert conflict.json()["current_revision"] == voided.json()["revision"]
+    stored = listed.json()["items"][0]
+    assert stored["status"] == "voided"
+    assert stored["void_reason"] == "重复登记"
+    assert stored["revision"] == voided.json()["revision"]
+
+
 def test_batch_rejects_same_worker_twice_through_different_assignments(
     harness: WorkforceHarness,
 ) -> None:
     with harness.client() as client:
         worker = _create_worker(client)
         first_assignment = _create_assignment(client, worker["id"])
-        second_assignment = _create_assignment(client, worker["id"])
+        second_assignment = _insert_legacy_overlapping_assignment(
+            harness, worker["id"]
+        )
         response = client.post(
             "/api/projects/P-001/labor-entries/batch",
             headers=_idempotency_headers(),
@@ -751,7 +1112,9 @@ def test_batch_conflicts_with_existing_worker_date_under_another_assignment(
     with harness.client() as client:
         worker = _create_worker(client)
         first_assignment = _create_assignment(client, worker["id"])
-        second_assignment = _create_assignment(client, worker["id"])
+        second_assignment = _insert_legacy_overlapping_assignment(
+            harness, worker["id"]
+        )
         first = client.post(
             "/api/projects/P-001/labor-entries/batch",
             headers=_idempotency_headers(),
@@ -1193,6 +1556,7 @@ def test_single_labor_create_update_void_preserves_cost_and_void_state(
 ) -> None:
     create_key = str(uuid.uuid4())
     void_key = str(uuid.uuid4())
+    reenter_key = str(uuid.uuid4())
     with harness.client() as client:
         worker = _create_worker(client)
         assignment = _create_assignment(client, worker["id"], rate_cents=60_001)
@@ -1242,9 +1606,9 @@ def test_single_labor_create_update_void_preserves_cost_and_void_state(
                 "expected_revision": voided.json()["revision"],
             },
         )
-        batch_overwrite_voided = client.post(
+        batch_reenter_voided = client.post(
             "/api/projects/P-001/labor-entries/batch",
-            headers=_idempotency_headers(),
+            headers=_idempotency_headers(reenter_key),
             json={
                 "work_date": payload["work_date"],
                 "entries": [
@@ -1253,7 +1617,25 @@ def test_single_labor_create_update_void_preserves_cost_and_void_state(
                         "attendance_status": "present",
                         "day_fraction": "0.500",
                         "work_minutes": None,
-                        "work_summary": "不应覆盖作废事实",
+                        "work_summary": "作废后重新录入",
+                        "notes": None,
+                        "expected_revision": voided.json()["revision"],
+                    }
+                ],
+            },
+        )
+        reenter_replay = client.post(
+            "/api/projects/p-001/labor-entries/batch",
+            headers=_idempotency_headers(reenter_key),
+            json={
+                "work_date": payload["work_date"],
+                "entries": [
+                    {
+                        "assignment_id": assignment["id"],
+                        "attendance_status": "present",
+                        "day_fraction": "0.500",
+                        "work_minutes": None,
+                        "work_summary": "作废后重新录入",
                         "notes": None,
                         "expected_revision": voided.json()["revision"],
                     }
@@ -1279,10 +1661,280 @@ def test_single_labor_create_update_void_preserves_cost_and_void_state(
     assert void_replay.json() == voided.json()
     assert edit_voided.status_code == 409
     assert edit_voided.json()["error_code"] == "LABOR_ENTRY_VOIDED"
-    assert batch_overwrite_voided.status_code == 409
-    assert batch_overwrite_voided.json()["error_code"] == "LABOR_ENTRY_VOIDED"
-    assert listed.json()["items"][0]["void_reason"] == "重复登记"
-    assert listed.json()["items"][0]["revision"] == voided.json()["revision"]
+    assert batch_reenter_voided.status_code == 200
+    assert reenter_replay.status_code == 200
+    assert reenter_replay.json() == batch_reenter_voided.json()
+    replacement = batch_reenter_voided.json()["items"][0]
+    assert replacement["id"] != voided.json()["id"]
+    assert replacement["status"] == "active"
+    assert replacement["void_reason"] is None
+    assert replacement["work_summary"] == "作废后重新录入"
+    assert replacement["revision"] == 1
+    assert replacement["replaces_entry_id"] == voided.json()["id"]
+    entries = listed.json()["items"]
+    assert len(entries) == 2
+    assert entries[0]["id"] == replacement["id"]
+    assert entries[1]["id"] == voided.json()["id"]
+    assert entries[1]["status"] == "voided"
+    assert entries[1]["void_reason"] == "重复登记"
+
+    connection = connect_database(harness.database_path)
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="voided labor entry is immutable"):
+            connection.execute(
+                "UPDATE labor_entries SET status = 'active', void_reason = NULL, "
+                "voided_at = NULL WHERE id = ?",
+                (voided.json()["id"],),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="voided labor entry is immutable"):
+            connection.execute(
+                "DELETE FROM labor_entries WHERE id = ?", (voided.json()["id"],)
+            )
+    finally:
+        connection.close()
+
+
+def test_replacement_labor_identity_is_immutable_but_content_remains_editable(
+    harness: WorkforceHarness,
+) -> None:
+    with harness.client() as client:
+        worker = _create_worker(client)
+        assignment = _create_assignment(client, worker["id"])
+        other_worker = _create_worker(client, name="李师傅")
+        other_assignment = _create_assignment(client, other_worker["id"])
+        payload = _single_labor_payload(assignment["id"], work_summary="错误记录")
+        original = client.post(
+            "/api/projects/P-001/labor-entries",
+            headers=_idempotency_headers(),
+            json=payload,
+        ).json()
+        voided = client.post(
+            f"/api/projects/P-001/labor-entries/{original['id']}/void",
+            headers=_idempotency_headers(),
+            json={"reason": "身份录错", "expected_revision": original["revision"]},
+        ).json()
+        replacement = client.post(
+            "/api/projects/P-001/labor-entries",
+            headers=_idempotency_headers(),
+            json={**payload, "work_summary": "更正记录"},
+        ).json()
+
+        moved_date = client.put(
+            f"/api/projects/P-001/labor-entries/{replacement['id']}",
+            json={
+                **payload,
+                "work_date": "2026-08-30",
+                "expected_revision": replacement["revision"],
+            },
+        )
+        moved_worker = client.put(
+            f"/api/projects/P-001/labor-entries/{replacement['id']}",
+            json={
+                **_single_labor_payload(other_assignment["id"]),
+                "expected_revision": replacement["revision"],
+            },
+        )
+        edited = client.put(
+            f"/api/projects/P-001/labor-entries/{replacement['id']}",
+            json={
+                **payload,
+                "work_summary": "只修改工作内容",
+                "expected_revision": replacement["revision"],
+            },
+        )
+
+    assert replacement["replaces_entry_id"] == voided["id"]
+    for response in (moved_date, moved_worker):
+        assert response.status_code == 409
+        assert response.json()["error_code"] == (
+            "LABOR_REPLACEMENT_IDENTITY_IMMUTABLE"
+        )
+    assert edited.status_code == 200
+    assert edited.json()["work_summary"] == "只修改工作内容"
+
+    connection = connect_database(harness.database_path)
+    try:
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="replacement labor identity is immutable",
+        ):
+            connection.execute(
+                "UPDATE labor_entries SET work_date = '2026-08-30' WHERE id = ?",
+                (replacement["id"],),
+            )
+    finally:
+        connection.close()
+
+
+def test_workforce_audit_migration_preserves_legacy_report_cycles_without_fake_snapshots(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "legacy-report-history.sqlite3"
+    legacy_migrations = tmp_path / "migrations-through-020"
+    legacy_migrations.mkdir()
+    source_migrations = PROJECT_ROOT / "backend" / "migrations"
+    for path in source_migrations.glob("*.sql"):
+        if path.name < "021_":
+            shutil.copy2(path, legacy_migrations / path.name)
+
+    timestamp = NOW.isoformat()
+    connection = connect_database(database_path)
+    try:
+        apply_migrations(connection, legacy_migrations)
+        connection.execute(
+            "INSERT INTO companies (id, name, created_at, updated_at) "
+            "VALUES (1, '客户', ?, ?)",
+            (timestamp, timestamp),
+        )
+        connection.execute(
+            """
+            INSERT INTO projects
+                (id, project_code, project_code_key, company_id, name, status,
+                 created_at, updated_at)
+            VALUES (1, 'P-001', 'p-001', 1, '项目', 'active', ?, ?)
+            """,
+            (timestamp, timestamp),
+        )
+        connection.executemany(
+            """
+            INSERT INTO site_daily_reports
+                (id, project_id, work_date, location, weather, work_summary,
+                 blockers, next_plan, notes, status, confirmed_at, revision,
+                 created_at, updated_at)
+            VALUES (?, 1, ?, '一号车间', '晴', ?, NULL, '继续安装', NULL,
+                    ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    1,
+                    "2026-08-28",
+                    "第二轮确认后的正文",
+                    "confirmed",
+                    timestamp,
+                    5,
+                    timestamp,
+                    timestamp,
+                ),
+                (
+                    2,
+                    "2026-08-29",
+                    "第二次重开后的草稿",
+                    "draft",
+                    None,
+                    5,
+                    timestamp,
+                    timestamp,
+                ),
+            ],
+        )
+        connection.executemany(
+            """
+            INSERT INTO site_daily_report_events
+                (id, project_id, report_id, from_status, to_status, reason,
+                 occurred_at, created_at)
+            VALUES (?, 1, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, 1, "draft", "confirmed", None, timestamp, timestamp),
+                (2, 1, "confirmed", "draft", "第一轮补录", timestamp, timestamp),
+                (3, 1, "draft", "confirmed", None, timestamp, timestamp),
+                (4, 2, "draft", "confirmed", None, timestamp, timestamp),
+                (5, 2, "confirmed", "draft", "第一轮补录", timestamp, timestamp),
+                (6, 2, "draft", "confirmed", None, timestamp, timestamp),
+                (7, 2, "confirmed", "draft", "第二轮补录", timestamp, timestamp),
+            ],
+        )
+
+        assert apply_migrations(connection, source_migrations) == [
+            "021_workforce_audit_history",
+            "022_supplier_invoice_active_number",
+        ]
+        confirmed_versions = connection.execute(
+            "SELECT * FROM site_daily_report_versions WHERE report_id = 1"
+        ).fetchall()
+        draft_versions = connection.execute(
+            "SELECT * FROM site_daily_report_versions WHERE report_id = 2"
+        ).fetchall()
+        confirmed_event_links = connection.execute(
+            "SELECT report_version_id FROM site_daily_report_events "
+            "WHERE report_id = 1 ORDER BY id"
+        ).fetchall()
+        draft_event_links = connection.execute(
+            "SELECT report_version_id FROM site_daily_report_events "
+            "WHERE report_id = 2 ORDER BY id"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert len(confirmed_versions) == 1
+    assert confirmed_versions[0]["version_number"] == 2
+    assert confirmed_versions[0]["work_summary"] == "第二轮确认后的正文"
+    assert [row[0] for row in confirmed_event_links] == [
+        None,
+        None,
+        confirmed_versions[0]["id"],
+    ]
+    assert draft_versions == []
+    assert [row[0] for row in draft_event_links] == [None, None, None, None]
+
+    site_operations = importlib.import_module("backend.app.features.site_operations")
+    settings = Settings(
+        config_path=tmp_path / "config.json",
+        data_dir=tmp_path,
+        backup_dir=None,
+        backup_interval_hours=24,
+        backup_retention_days=30,
+        host="127.0.0.1",
+        port=8765,
+        session_secret="test-session-secret-with-at-least-32-bytes",
+    )
+
+    def get_connection() -> Iterator[sqlite3.Connection]:
+        current = connect_database(database_path)
+        try:
+            yield current
+        finally:
+            current.close()
+
+    app = FastAPI()
+    app.include_router(
+        site_operations.create_site_operations_router(
+            get_connection,
+            lambda: settings,
+            clock=lambda: NOW,
+        )
+    )
+    with TestClient(app) as client:
+        client.cookies.set(
+            SESSION_COOKIE_NAME,
+            create_session_token(settings.session_secret),
+        )
+        listed = client.get("/api/projects/P-001/site-daily-reports?page_size=20")
+        confirmed_again = client.post(
+            "/api/projects/P-001/site-daily-reports/2026-08-29/confirm",
+            headers=_idempotency_headers(),
+            json={"confirmed_at": timestamp, "expected_revision": 5},
+        )
+
+    assert listed.status_code == 200
+    reports = {item["id"]: item for item in listed.json()["items"]}
+    assert [event["report_version_id"] for event in reports[1]["events"]] == [
+        None,
+        None,
+        reports[1]["versions"][0]["id"],
+    ]
+    assert reports[2]["versions"] == []
+    assert [event["report_version_id"] for event in reports[2]["events"]] == [
+        None,
+        None,
+        None,
+        None,
+    ]
+    assert confirmed_again.status_code == 200
+    assert confirmed_again.json()["versions"][0]["version_number"] == 3
+    assert confirmed_again.json()["versions"][0]["work_summary"] == (
+        "第二次重开后的草稿"
+    )
 
 
 def test_single_hourly_labor_uses_assignment_snapshot_and_revision_conflicts(

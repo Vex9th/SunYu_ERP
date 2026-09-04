@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { LaborBatchInput } from '../domain/operations-api'
 import {
   createHttpWorkforceRepository,
+  createHttpWorkforceWorkspaceRepository,
   type WorkforceHttpRepository,
 } from '../repositories/workforce.live'
 
@@ -31,6 +32,36 @@ function successfulBatchResponse(input: LaborBatchInput): Response {
 function idempotencyKey(fetchMock: ReturnType<typeof vi.fn>, callIndex: number): string | undefined {
   const init = fetchMock.mock.calls[callIndex]?.[1] as RequestInit | undefined
   return (init?.headers as Record<string, string> | undefined)?.['Idempotency-Key']
+}
+
+function page<T>(items: T[]): Response {
+  return new Response(JSON.stringify({ items, total: items.length, page: 1, page_size: 200 }), { status: 200 })
+}
+
+function laborEntry(projectCode: string, id: number) {
+  return {
+    id,
+    project_code: projectCode,
+    assignment_id: id,
+    worker_id: id,
+    worker_name: `施工员${id}`,
+    work_date: '2026-08-31',
+    attendance_status: 'present',
+    day_fraction: '1.000',
+    work_minutes: null,
+    pay_basis: 'daily',
+    rate_cents: 50_000,
+    cost_cents: 50_000,
+    work_summary: `${projectCode} 已完成接线`,
+    notes: null,
+    status: 'active',
+    void_reason: null,
+    voided_at: null,
+    replaces_entry_id: null,
+    revision: 1,
+    created_at: '2026-08-31T08:00:00Z',
+    updated_at: '2026-08-31T08:00:00Z',
+  }
 }
 
 describe('HttpWorkforceRepository 幂等重试', () => {
@@ -186,5 +217,60 @@ describe('HttpWorkforceRepository 幂等重试', () => {
     expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/projects/SY%2F2026-001/labor-entries/9')
     expect((fetchMock.mock.calls[0]?.[1] as RequestInit | undefined)?.method).toBe('PUT')
     expect(JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit | undefined)?.body))).toEqual(input)
+  })
+})
+
+describe('HttpWorkforceWorkspaceRepository 局部加载容错', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('同一项目刷新时上工接口失败，保留上次成功数据并明确提示', async () => {
+    let laborRequestCount = 0
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const path = String(input)
+      if (path.includes('/labor-entries?')) {
+        laborRequestCount += 1
+        if (laborRequestCount === 2) throw new TypeError('network disconnected')
+        return page([laborEntry('SY-001', 9)])
+      }
+      return page([])
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const repository = createHttpWorkforceWorkspaceRepository()
+
+    const initial = await repository.getWorkforcePreview('SY-001')
+    const refreshed = await repository.getWorkforcePreview('SY-001')
+
+    expect(initial.data.labor_entries).toEqual([
+      expect.objectContaining({ entry_id: 9, work_summary: 'SY-001 已完成接线' }),
+    ])
+    expect(refreshed.data.labor_entries).toEqual(initial.data.labor_entries)
+    expect(refreshed.data.load_warnings).toContainEqual({
+      section: 'labor_entries',
+      message: expect.stringContaining('当前显示上次结果'),
+    })
+  })
+
+  it('切换项目后子接口失败，不继承上一项目的数据', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const path = String(input)
+      if (path.includes('/projects/A/labor-entries?')) return page([laborEntry('A', 9)])
+      if (path.includes('/projects/B/labor-entries?')) throw new TypeError('network disconnected')
+      return page([])
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const repository = createHttpWorkforceWorkspaceRepository()
+
+    await repository.getWorkforcePreview('A')
+    const projectB = await repository.getWorkforcePreview('B')
+
+    expect(projectB.data.project_code).toBe('B')
+    expect(projectB.data.labor_entries).toEqual([])
+    expect(projectB.data.load_warnings).toContainEqual({
+      section: 'labor_entries',
+      message: expect.not.stringContaining('当前显示上次结果'),
+    })
   })
 })

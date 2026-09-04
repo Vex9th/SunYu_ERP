@@ -311,6 +311,45 @@ def test_applied_versions_must_be_a_continuous_filename_prefix(
         connection.close()
 
 
+def test_known_concurrent_backfills_can_fill_legacy_016_017_gap(
+    tmp_path: Path,
+) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_migration(migrations_dir, "001_foundation.sql", _ledger_sql())
+    _write_migration(
+        migrations_dir,
+        "016_inventory_procurement_corrections.sql",
+        "CREATE TABLE inventory_correction_backfill (value TEXT);",
+    )
+    _write_migration(
+        migrations_dir,
+        "017_acceptance_corrections.sql",
+        "CREATE TABLE acceptance_correction_backfill (value TEXT);",
+    )
+    _write_migration(migrations_dir, "018_project_restore_events.sql", "SELECT 1;")
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    try:
+        connection.execute(_ledger_sql())
+        connection.executemany(
+            "INSERT INTO schema_migrations VALUES (?, ?)",
+            [
+                ("001_foundation", "2026-01-01T00:00:00+00:00"),
+                ("018_project_restore_events", "2026-01-02T00:00:00+00:00"),
+            ],
+        )
+
+        applied = _apply_migrations()(connection, migrations_dir)
+
+        assert applied == [
+            "016_inventory_procurement_corrections",
+            "017_acceptance_corrections",
+        ]
+        assert _table_exists(connection, "inventory_correction_backfill")
+        assert _table_exists(connection, "acceptance_correction_backfill")
+    finally:
+        connection.close()
+
+
 def test_migration_must_create_ledger_before_version_is_recorded(
     tmp_path: Path,
 ) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -21,7 +22,7 @@ from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
 from backend.app.core.security import SESSION_COOKIE_NAME, create_session_token
 from backend.app.core.storage_paths import project_code_identity
-from backend.app.features import procurement, procurement_extensions
+from backend.app.features import files, procurement, procurement_extensions
 from backend.app.features.api_common import ApiError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -40,8 +41,15 @@ class Harness:
     document_version_id: int
 
     @contextmanager
-    def client(self) -> Iterator[TestClient]:
-        with TestClient(self.app) as client:
+    def client(
+        self,
+        *,
+        raise_server_exceptions: bool = True,
+    ) -> Iterator[TestClient]:
+        with TestClient(
+            self.app,
+            raise_server_exceptions=raise_server_exceptions,
+        ) as client:
             client.cookies.set(
                 SESSION_COOKIE_NAME,
                 create_session_token(self.settings.session_secret),
@@ -126,11 +134,18 @@ def _insert_document_version(
     return int(version.lastrowid)
 
 
-def _build_harness(tmp_path: Path) -> Harness:
+def _build_harness(
+    tmp_path: Path,
+    *,
+    migrations_dir: Path | None = None,
+) -> Harness:
     database_path = tmp_path / "erp.sqlite3"
     connection = connect_database(database_path)
     try:
-        apply_migrations(connection, PROJECT_ROOT / "backend" / "migrations")
+        apply_migrations(
+            connection,
+            migrations_dir or PROJECT_ROOT / "backend" / "migrations",
+        )
         customer_id = _insert_company(connection, "客户公司")
         supplier_id = _insert_company(connection, "供应商公司")
         _insert_project(connection, customer_id, "P-2026-001")
@@ -717,6 +732,274 @@ def test_import_limits_asgi_receive_and_closes_every_multipart_upload(
     assert sorted(closed) == ["first.xlsx", "second.xlsx"]
 
 
+def test_purchase_order_multipart_creates_managed_contract_documents_and_replays(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        procurement_list = _create_confirmed_list(client, harness.project_code)
+        payload = {
+            "order_no": " PO-ATTACH-001 ",
+            "supplier_company_id": harness.supplier_company_id,
+            "ordered_on": "2026-08-31",
+            "expected_delivery_on": None,
+            "lines": [
+                {
+                    "procurement_line_id": procurement_list["lines"][0]["id"],
+                    "quantity": "2.000",
+                    "unit_cost_cents": 900,
+                    "overage_reason": None,
+                }
+            ],
+            "notes": "供应商合同随采购单归档",
+            "document_version_ids": [harness.document_version_id],
+        }
+        headers = {
+            "Idempotency-Key": "34000000-0000-4000-8000-000000000001"
+        }
+        uploads = [
+            ("files", ("原始合同.pdf", b"contract", "application/pdf")),
+            ("files", ("盖章页.jpg", b"signed", "image/jpeg")),
+        ]
+        endpoint = f"/api/projects/{harness.project_code}/purchase-orders"
+        created = client.post(
+            endpoint,
+            headers=headers,
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=uploads,
+        )
+        replay = client.post(
+            f"/api/projects/{harness.project_code.lower()}/purchase-orders",
+            headers=headers,
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=uploads,
+        )
+        reused = client.post(
+            endpoint,
+            headers=headers,
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=[
+                ("files", ("原始合同.pdf", b"changed", "application/pdf")),
+                ("files", ("盖章页.jpg", b"signed", "image/jpeg")),
+            ],
+        )
+
+    assert created.status_code == replay.status_code == 201, created.text
+    assert replay.json() == created.json()
+    assert reused.status_code == 409
+    assert reused.json()["error_code"] == "IDEMPOTENCY_KEY_REUSED"
+    assert created.json()["document_version_ids"][0] == harness.document_version_id
+    uploaded_version_ids = created.json()["document_version_ids"][1:]
+    assert len(uploaded_version_ids) == 2
+    with harness.connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT versions.original_filename, versions.managed_filename,
+                   versions.stored_relative_path, documents.category,
+                   documents.logical_name
+            FROM document_versions AS versions
+            JOIN documents ON documents.id = versions.document_id
+            WHERE versions.id IN (?, ?)
+            ORDER BY versions.id
+            """,
+            uploaded_version_ids,
+        ).fetchall()
+        assert connection.execute(
+            "SELECT COUNT(*) FROM purchase_orders"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM purchase_order_documents WHERE purchase_order_id = ?",
+            (created.json()["id"],),
+        ).fetchone()[0] == 3
+    assert [row["managed_filename"] for row in rows] == [
+        "P-2026-001_采购合同_PO-ATTACH-001_20260831_01.pdf",
+        "P-2026-001_采购合同_PO-ATTACH-001_20260831_02.jpg",
+    ]
+    assert [row["original_filename"] for row in rows] == ["原始合同.pdf", "盖章页.jpg"]
+    assert all(row["category"] == "procurement_contract" for row in rows)
+    assert all("PO-ATTACH-001" in row["logical_name"] for row in rows)
+    for row in rows:
+        stored = harness.settings.data_dir / row["stored_relative_path"]
+        assert stored.is_file()
+        assert stored.name == row["managed_filename"]
+
+
+def test_purchase_order_json_and_zero_file_multipart_share_idempotency(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        procurement_list = _create_confirmed_list(client, harness.project_code)
+        payload = {
+            "order_no": "PO-JSON-COMPAT",
+            "supplier_company_id": harness.supplier_company_id,
+            "ordered_on": "2026-08-31",
+            "expected_delivery_on": None,
+            "lines": [
+                {
+                    "procurement_line_id": procurement_list["lines"][0]["id"],
+                    "quantity": "1.000",
+                    "unit_cost_cents": 900,
+                    "overage_reason": None,
+                }
+            ],
+            "notes": None,
+            "document_version_ids": [],
+        }
+        endpoint = f"/api/projects/{harness.project_code}/purchase-orders"
+        headers = {
+            "Idempotency-Key": "34100000-0000-4000-8000-000000000001"
+        }
+        created = client.post(endpoint, headers=headers, json=payload)
+        replay = client.post(
+            endpoint,
+            headers=headers,
+            files={
+                "payload": (
+                    None,
+                    json.dumps(payload, ensure_ascii=False),
+                    "application/json",
+                )
+            },
+        )
+
+    assert created.status_code == replay.status_code == 201, replay.text
+    assert replay.json() == created.json()
+    with harness.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM purchase_orders"
+        ).fetchone()[0] == 1
+
+
+def test_purchase_order_attachment_database_failure_rolls_back_files_and_order(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        procurement_list = _create_confirmed_list(client, harness.project_code)
+    with harness.connection() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_purchase_order_attachment_version
+            BEFORE INSERT ON document_versions
+            BEGIN
+                SELECT RAISE(ABORT, 'injected purchase attachment database failure');
+            END
+            """
+        )
+    payload = {
+        "order_no": "PO-DB-FAIL",
+        "supplier_company_id": harness.supplier_company_id,
+        "ordered_on": "2026-08-31",
+        "expected_delivery_on": None,
+        "lines": [
+            {
+                "procurement_line_id": procurement_list["lines"][0]["id"],
+                "quantity": "1.000",
+                "unit_cost_cents": 900,
+                "overage_reason": None,
+            }
+        ],
+        "notes": None,
+        "document_version_ids": [],
+    }
+    with harness.client(raise_server_exceptions=False) as client:
+        response = client.post(
+            f"/api/projects/{harness.project_code}/purchase-orders",
+            headers={
+                "Idempotency-Key": "34200000-0000-4000-8000-000000000001"
+            },
+            data={"payload": json.dumps(payload)},
+            files={"files": ("contract.pdf", b"contract", "application/pdf")},
+        )
+
+    assert response.status_code == 500
+    with harness.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM purchase_orders"
+        ).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM document_versions"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM purchase_order_documents"
+        ).fetchone()[0] == 0
+    assert not [
+        path
+        for path in (harness.settings.data_dir / "Projects").rglob("*")
+        if path.is_file()
+    ]
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
+
+
+def test_purchase_order_second_attachment_publish_failure_rolls_back_everything(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        procurement_list = _create_confirmed_list(client, harness.project_code)
+    original_publish = files.publish_staged_version
+    calls = 0
+
+    def fail_second_publish(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected purchase attachment publish failure")
+        return original_publish(*args, **kwargs)
+
+    monkeypatch.setattr(files, "publish_staged_version", fail_second_publish)
+    payload = {
+        "order_no": "PO-FS-FAIL",
+        "supplier_company_id": harness.supplier_company_id,
+        "ordered_on": "2026-08-31",
+        "expected_delivery_on": None,
+        "lines": [
+            {
+                "procurement_line_id": procurement_list["lines"][0]["id"],
+                "quantity": "1.000",
+                "unit_cost_cents": 900,
+                "overage_reason": None,
+            }
+        ],
+        "notes": None,
+        "document_version_ids": [],
+    }
+    with harness.client(raise_server_exceptions=False) as client:
+        response = client.post(
+            f"/api/projects/{harness.project_code}/purchase-orders",
+            headers={
+                "Idempotency-Key": "34300000-0000-4000-8000-000000000001"
+            },
+            data={"payload": json.dumps(payload)},
+            files=[
+                ("files", ("first.pdf", b"first", "application/pdf")),
+                ("files", ("second.pdf", b"second", "application/pdf")),
+            ],
+        )
+
+    assert response.status_code == 500
+    with harness.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM purchase_orders"
+        ).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM document_versions"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM purchase_order_documents"
+        ).fetchone()[0] == 0
+    assert not [
+        path
+        for path in (harness.settings.data_dir / "Projects").rglob("*")
+        if path.is_file()
+    ]
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
+
+
 def test_draft_order_update_and_cancel_are_strict_revisioned_and_idempotent(
     tmp_path: Path,
 ) -> None:
@@ -968,6 +1251,422 @@ def test_supplier_payments_and_invoices_are_exact_capped_and_reversible(
         )
 
 
+def test_supplier_invoice_active_number_uniqueness_migrates_existing_history(
+    tmp_path: Path,
+) -> None:
+    legacy_migrations = tmp_path / "legacy-migrations"
+    legacy_migrations.mkdir()
+    for source in sorted((PROJECT_ROOT / "backend" / "migrations").glob("*.sql")):
+        if source.name >= "022_":
+            continue
+        (legacy_migrations / source.name).write_text(
+            source.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+    harness = _build_harness(tmp_path, migrations_dir=legacy_migrations)
+    invoice_payload: dict[str, object]
+    with harness.client() as client:
+        order = _create_confirmed_order(client, harness)
+        line_id = order["lines"][0]["id"]
+        invoice_payload = {
+            "invoice_no": "INV-REUSABLE-001",
+            "invoiced_on": "2026-08-31",
+            "amount_cents": 1000,
+            "allocations": [
+                {"purchase_order_line_id": line_id, "amount_cents": 1000}
+            ],
+            "document_version_ids": [harness.document_version_id],
+        }
+        original = client.post(
+            f"/api/projects/{harness.project_code}/purchase-orders/"
+            f"{order['id']}/supplier-invoices",
+            headers={
+                "Idempotency-Key": "73600000-0000-4000-8000-000000000001"
+            },
+            json=invoice_payload,
+        )
+        assert original.status_code == 201, original.text
+        reversed_invoice = client.post(
+            f"/api/projects/{harness.project_code}/supplier-invoices/"
+            f"{original.json()['id']}/reverse",
+            headers={
+                "Idempotency-Key": "73600000-0000-4000-8000-000000000002"
+            },
+            json={"reason": "原票作废", "expected_revision": 1},
+        )
+        assert reversed_invoice.status_code == 200, reversed_invoice.text
+
+    with harness.connection() as connection:
+        migration_022 = (
+            PROJECT_ROOT
+            / "backend"
+            / "migrations"
+            / "022_supplier_invoice_active_number.sql"
+        )
+        (legacy_migrations / migration_022.name).write_text(
+            migration_022.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        assert apply_migrations(
+            connection,
+            legacy_migrations,
+        ) == ["022_supplier_invoice_active_number"]
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+    with harness.client() as client:
+        replacement = client.post(
+            f"/api/projects/{harness.project_code}/purchase-orders/"
+            f"{order['id']}/supplier-invoices",
+            headers={
+                "Idempotency-Key": "73600000-0000-4000-8000-000000000003"
+            },
+            json={**invoice_payload, "document_version_ids": []},
+        )
+        active_duplicate = client.post(
+            f"/api/projects/{harness.project_code}/purchase-orders/"
+            f"{order['id']}/supplier-invoices",
+            headers={
+                "Idempotency-Key": "73600000-0000-4000-8000-000000000004"
+            },
+            json={**invoice_payload, "document_version_ids": []},
+        )
+
+    assert replacement.status_code == 201, replacement.text
+    assert replacement.json()["id"] != original.json()["id"]
+    assert active_duplicate.status_code == 409
+    assert active_duplicate.json()["error_code"] == "SUPPLIER_INVOICE_EXISTS"
+    with harness.connection() as connection:
+        invoice_rows = connection.execute(
+            """
+            SELECT id, status, reversal_reason, reversed_at
+            FROM supplier_invoices
+            WHERE purchase_order_id = ? AND invoice_no = ?
+            ORDER BY id
+            """,
+            (order["id"], invoice_payload["invoice_no"]),
+        ).fetchall()
+        assert [row["status"] for row in invoice_rows] == ["reversed", "active"]
+        assert invoice_rows[0]["reversal_reason"] == "原票作废"
+        assert invoice_rows[0]["reversed_at"] == NOW.isoformat()
+        assert connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM supplier_invoice_allocations
+            WHERE supplier_invoice_id = ?
+            """,
+            (original.json()["id"],),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            """
+            SELECT document_version_id
+            FROM supplier_invoice_documents
+            WHERE supplier_invoice_id = ?
+            """,
+            (original.json()["id"],),
+        ).fetchone()[0] == harness.document_version_id
+
+
+def test_supplier_invoice_multipart_creates_managed_documents_and_replays(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        order = _create_confirmed_order(client, harness)
+        line_id = order["lines"][0]["id"]
+        payload = {
+            "invoice_no": "PUR-INV-001",
+            "invoiced_on": "2026-08-31",
+            "amount_cents": 5000,
+            "allocations": [
+                {"purchase_order_line_id": line_id, "amount_cents": 5000}
+            ],
+            "document_version_ids": [],
+        }
+        key = "73000000-0000-4000-8000-000000000001"
+        uploads = [
+            ("files", ("供应商原票.pdf", b"supplier-invoice", "application/pdf")),
+            ("files", ("抵扣联.png", b"tax-copy", "image/png")),
+        ]
+        created = client.post(
+            f"/api/projects/{harness.project_code}/purchase-orders/"
+            f"{order['id']}/supplier-invoices",
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=uploads,
+        )
+        replay = client.post(
+            f"/api/projects/{harness.project_code.lower()}/purchase-orders/"
+            f"{order['id']}/supplier-invoices",
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=uploads,
+        )
+
+    assert created.status_code == replay.status_code == 201, created.text
+    assert replay.json() == created.json()
+    version_ids = created.json()["document_version_ids"]
+    assert len(version_ids) == 2
+    with harness.connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT versions.original_filename, versions.managed_filename,
+                   versions.stored_relative_path, documents.category,
+                   documents.logical_name
+            FROM document_versions AS versions
+            JOIN documents ON documents.id = versions.document_id
+            WHERE versions.id IN (?, ?)
+            ORDER BY versions.id
+            """,
+            version_ids,
+        ).fetchall()
+        assert connection.execute(
+            "SELECT COUNT(*) FROM supplier_invoices"
+        ).fetchone()[0] == 1
+    assert [row["managed_filename"] for row in rows] == [
+        "P-2026-001_进项发票_PUR-INV-001_01.pdf",
+        "P-2026-001_进项发票_PUR-INV-001_02.png",
+    ]
+    assert [row["original_filename"] for row in rows] == [
+        "供应商原票.pdf",
+        "抵扣联.png",
+    ]
+    assert all(row["category"] == "invoice" for row in rows)
+    assert len({row["logical_name"] for row in rows}) == 2
+    for row in rows:
+        stored = harness.settings.data_dir / row["stored_relative_path"]
+        assert stored.is_file()
+        assert stored.name == row["managed_filename"]
+
+
+def test_supplier_invoice_multipart_invalid_payload_cleans_staged_file(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        order = _create_confirmed_order(client, harness)
+        line_id = order["lines"][0]["id"]
+        response = client.post(
+            f"/api/projects/{harness.project_code}/purchase-orders/"
+            f"{order['id']}/supplier-invoices",
+            headers={
+                "Idempotency-Key": "73100000-0000-4000-8000-000000000001"
+            },
+            data={
+                "payload": json.dumps(
+                    {
+                        "invoice_no": "PUR-INV-INVALID",
+                        "invoiced_on": "2026-08-31",
+                        "amount_cents": -1,
+                        "allocations": [
+                            {
+                                "purchase_order_line_id": line_id,
+                                "amount_cents": 5000,
+                            }
+                        ],
+                        "document_version_ids": [],
+                    }
+                )
+            },
+            files={"files": ("valid.pdf", b"valid", "application/pdf")},
+        )
+
+    assert response.status_code == 422
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
+
+
+def test_supplier_invoice_rejects_repeated_idempotency_header(tmp_path: Path) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        order = _create_confirmed_order(client, harness)
+        line_id = order["lines"][0]["id"]
+        response = client.post(
+            f"/api/projects/{harness.project_code}/purchase-orders/"
+            f"{order['id']}/supplier-invoices",
+            headers=[
+                ("Idempotency-Key", "73200000-0000-4000-8000-000000000001"),
+                ("Idempotency-Key", "73200000-0000-4000-8000-000000000001"),
+            ],
+            json={
+                "invoice_no": "PUR-INV-HEADER",
+                "invoiced_on": "2026-08-31",
+                "amount_cents": 5000,
+                "allocations": [
+                    {"purchase_order_line_id": line_id, "amount_cents": 5000}
+                ],
+                "document_version_ids": [],
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "VALIDATION_ERROR"
+
+
+def test_supplier_invoice_json_and_zero_file_multipart_replay_same_response(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        order = _create_confirmed_order(client, harness)
+        line_id = order["lines"][0]["id"]
+        payload = {
+            "invoice_no": "PUR-INV-ZERO",
+            "invoiced_on": "2026-08-31",
+            "amount_cents": 5000,
+            "allocations": [
+                {"purchase_order_line_id": line_id, "amount_cents": 5000}
+            ],
+            "document_version_ids": [],
+        }
+        key = "73300000-0000-4000-8000-000000000001"
+        endpoint = (
+            f"/api/projects/{harness.project_code}/purchase-orders/"
+            f"{order['id']}/supplier-invoices"
+        )
+        created = client.post(endpoint, headers={"Idempotency-Key": key}, json=payload)
+        replay = client.post(
+            endpoint,
+            headers={"Idempotency-Key": key},
+            files={
+                "payload": (
+                    None,
+                    json.dumps(payload, ensure_ascii=False),
+                    "application/json",
+                )
+            },
+        )
+
+    assert created.status_code == replay.status_code == 201, replay.text
+    assert replay.json() == created.json()
+    with harness.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM supplier_invoices"
+        ).fetchone()[0] == 1
+
+
+def test_supplier_invoice_multipart_database_failure_rolls_back_everything(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        order = _create_confirmed_order(client, harness)
+    with harness.connection() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_supplier_attachment_version
+            BEFORE INSERT ON document_versions
+            BEGIN
+                SELECT RAISE(ABORT, 'injected attachment database failure');
+            END
+            """
+        )
+    payload = {
+        "invoice_no": "PUR-INV-DB-FAIL",
+        "invoiced_on": "2026-08-31",
+        "amount_cents": 5000,
+        "allocations": [
+            {
+                "purchase_order_line_id": order["lines"][0]["id"],
+                "amount_cents": 5000,
+            }
+        ],
+        "document_version_ids": [],
+    }
+    with harness.client(raise_server_exceptions=False) as client:
+        response = client.post(
+            f"/api/projects/{harness.project_code}/purchase-orders/"
+            f"{order['id']}/supplier-invoices",
+            headers={
+                "Idempotency-Key": "73400000-0000-4000-8000-000000000001"
+            },
+            data={"payload": json.dumps(payload)},
+            files={"files": ("invoice.pdf", b"invoice", "application/pdf")},
+        )
+
+    assert response.status_code == 500
+    with harness.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM supplier_invoices"
+        ).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM document_versions"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM supplier_invoice_documents"
+        ).fetchone()[0] == 0
+    assert not [
+        path
+        for path in (harness.settings.data_dir / "Projects").rglob("*")
+        if path.is_file()
+    ]
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
+
+
+def test_supplier_invoice_second_publish_failure_rolls_back_everything(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        order = _create_confirmed_order(client, harness)
+    original_publish = files.publish_staged_version
+    calls = 0
+
+    def fail_second_publish(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected publish failure")
+        return original_publish(*args, **kwargs)
+
+    monkeypatch.setattr(files, "publish_staged_version", fail_second_publish)
+    payload = {
+        "invoice_no": "PUR-INV-FS-FAIL",
+        "invoiced_on": "2026-08-31",
+        "amount_cents": 5000,
+        "allocations": [
+            {
+                "purchase_order_line_id": order["lines"][0]["id"],
+                "amount_cents": 5000,
+            }
+        ],
+        "document_version_ids": [],
+    }
+    with harness.client(raise_server_exceptions=False) as client:
+        response = client.post(
+            f"/api/projects/{harness.project_code}/purchase-orders/"
+            f"{order['id']}/supplier-invoices",
+            headers={
+                "Idempotency-Key": "73500000-0000-4000-8000-000000000001"
+            },
+            data={"payload": json.dumps(payload)},
+            files=[
+                ("files", ("first.pdf", b"first", "application/pdf")),
+                ("files", ("second.pdf", b"second", "application/pdf")),
+            ],
+        )
+
+    assert response.status_code == 500
+    with harness.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM supplier_invoices"
+        ).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM document_versions"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM supplier_invoice_documents"
+        ).fetchone()[0] == 0
+    assert not [
+        path
+        for path in (harness.settings.data_dir / "Projects").rglob("*")
+        if path.is_file()
+    ]
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
+
+
 def test_authentication_replay_archive_and_cross_project_ordering(
     tmp_path: Path,
 ) -> None:
@@ -1104,6 +1803,46 @@ def test_goods_receipt_reverse_atomically_restores_order_and_inventory(
         ).fetchall()
         assert [row["quantity_delta_milli"] for row in movements] == [2000, -2000]
         assert [row["value_delta_cents"] for row in movements] == [2000, -2000]
+
+
+def test_purchase_order_detail_includes_material_facts_for_each_receipt_line(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        order = _create_confirmed_order(client, harness)
+        receipt = client.post(
+            f"/api/projects/{harness.project_code}/purchase-orders/{order['id']}/goods-receipts",
+            headers={"Idempotency-Key": "61000000-0000-4000-8000-000000000001"},
+            json={
+                "received_on": "2026-08-31",
+                "warehouse_name": "主仓",
+                "lines": [
+                    {
+                        "purchase_order_line_id": order["lines"][0]["id"],
+                        "quantity": "2.000",
+                    }
+                ],
+                "notes": None,
+            },
+        )
+        assert receipt.status_code == 201, receipt.text
+        detail = client.get(
+            f"/api/projects/{harness.project_code}/purchase-orders/{order['id']}"
+        )
+
+    assert detail.status_code == 200
+    receipt_fact = detail.json()["goods_receipts"][0]
+    assert receipt_fact["warehouse_name"] == "主仓"
+    assert receipt_fact["status"] == "active"
+    assert receipt_fact["lines"] == [
+        {
+            **receipt.json()["lines"][0],
+            "material_name": "接触器",
+            "material_model": "LC1D09",
+            "unit": "PCS",
+        }
+    ]
 
 
 def test_goods_receipt_reverse_rolls_back_when_inventory_would_be_negative(
@@ -1347,3 +2086,78 @@ def test_quote_export_uses_customer_only_dto_without_cost_or_hidden_content(
     ]
     assert all(cell.data_type != "f" for row in worksheet.iter_rows() for cell in row)
     assert all(sheet.sheet_state == "visible" for sheet in workbook.worksheets)
+
+
+def test_quote_export_history_is_project_scoped_and_remains_downloadable(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        procurement_list = _create_confirmed_list(client, harness.project_code)
+        created_exports = []
+        for index in (1, 2):
+            response = client.post(
+                f"/api/projects/{harness.project_code}/procurement-lists/"
+                f"{procurement_list['id']}/quote-exports",
+                headers={
+                    "Idempotency-Key": (
+                        f"71000000-0000-4000-8000-{index:012d}"
+                    )
+                },
+                json={
+                    "title": f"项目报价单 V{index}",
+                    "customer_company_id": harness.customer_company_id,
+                    "notes": None,
+                },
+            )
+            assert response.status_code == 201
+            created_exports.append(response.json())
+
+        history = client.get(
+            f"/api/projects/{harness.project_code.lower()}/quote-exports",
+            params={"page": 1, "page_size": 1},
+        )
+        other_project = client.get(
+            f"/api/projects/{harness.other_project_code}/quote-exports"
+        )
+        old_download = client.get(created_exports[0]["download_url"])
+
+    assert history.status_code == 200
+    assert history.json()["total"] == 2
+    assert history.json()["page"] == 1
+    assert history.json()["page_size"] == 1
+    assert [item["title"] for item in history.json()["items"]] == [
+        "项目报价单 V2"
+    ]
+    assert other_project.status_code == 200
+    assert other_project.json()["items"] == []
+    assert old_download.status_code == 200
+    assert old_download.headers["content-type"].startswith(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+
+def test_quote_export_rejects_company_that_is_not_the_project_customer(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        procurement_list = _create_confirmed_list(client, harness.project_code)
+        response = client.post(
+            f"/api/projects/{harness.project_code}/procurement-lists/"
+            f"{procurement_list['id']}/quote-exports",
+            headers={"Idempotency-Key": "70000000-0000-4000-8000-000000000099"},
+            json={
+                "title": "项目报价单",
+                "customer_company_id": harness.supplier_company_id,
+                "notes": None,
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "PROJECT_CUSTOMER_MISMATCH"
+    assert response.json()["field_errors"] == {
+        "customer_company_id": ["必须使用项目绑定的客户公司"]
+    }
+    with harness.connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM quote_exports").fetchone()[0] == 0

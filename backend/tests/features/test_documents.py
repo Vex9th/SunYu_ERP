@@ -227,6 +227,7 @@ def test_create_list_detail_and_update_document_metadata(tmp_path: Path) -> None
                 "id": body["versions"][0]["id"],
                 "version_number": 1,
                 "original_filename": "机械总图.dwg",
+                "managed_filename": "P-001_机械设计_机械总图_20260831_V1.dwg",
                 "content_type": "application/acad",
                 "size_bytes": len(b"version-one"),
                 "sha256": body["versions"][0]["sha256"],
@@ -249,6 +250,179 @@ def test_create_list_detail_and_update_document_metadata(tmp_path: Path) -> None
     assert updated.json()["notes"] == "负责人已复核"
     assert updated.json()["revision"] == 2
     assert updated.json()["versions"] == body["versions"]
+
+
+def test_list_documents_paginates_searches_and_filters_archive_state(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+
+    with harness.client() as client:
+        first = _create_document(
+            client,
+            category="site_survey",
+            title="厂房尺寸复核",
+            notes="东侧立柱需要复测",
+        )
+        second = _create_document(
+            client,
+            category="contract",
+            title="设备采购合同",
+            notes="客户已经盖章",
+            filename="采购合同.pdf",
+            content=b"contract",
+            content_type="application/pdf",
+        )
+        third = _create_document(
+            client,
+            category="site_survey",
+            title="电柜位置测绘",
+            notes="西侧墙面",
+            filename="电柜位置.jpg",
+            content=b"image",
+            content_type="image/jpeg",
+        )
+        archived = client.post(
+            f"/api/projects/P-001/documents/{second.json()['id']}/archive",
+            headers={"Idempotency-Key": _idempotency_key()},
+            json={"reason": "合同已作废", "expected_revision": 1},
+        )
+        active_page = client.get(
+            "/api/projects/P-001/documents?page=1&page_size=1"
+        )
+        searched = client.get(
+            "/api/projects/P-001/documents?search=%E4%B8%9C%E4%BE%A7%E7%AB%8B%E6%9F%B1"
+        )
+        category = client.get(
+            "/api/projects/P-001/documents?category=site_survey&page_size=10"
+        )
+        archived_only = client.get(
+            "/api/projects/P-001/documents?archived=archived"
+        )
+        all_documents = client.get(
+            "/api/projects/P-001/documents?archived=all&page_size=10"
+        )
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert third.status_code == 201
+    assert archived.status_code == 200
+    assert active_page.status_code == 200
+    assert active_page.json()["total"] == 2
+    assert active_page.json()["page_size"] == 1
+    assert len(active_page.json()["items"]) == 1
+    assert searched.status_code == 200
+    assert [item["id"] for item in searched.json()["items"]] == [first.json()["id"]]
+    assert "东侧立柱" in searched.json()["items"][0]["search_excerpt"]
+    assert category.status_code == 200
+    assert {item["id"] for item in category.json()["items"]} == {
+        first.json()["id"],
+        third.json()["id"],
+    }
+    assert [item["id"] for item in archived_only.json()["items"]] == [
+        second.json()["id"]
+    ]
+    assert all_documents.json()["total"] == 3
+
+
+def test_list_documents_finds_and_excerpts_meeting_minutes_text(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    content = "项目启动会\n客户确认最终交付日期为十月十五日。\n机械图纸下周会签。"
+
+    with harness.client() as client:
+        minutes = _create_document(
+            client,
+            category="planning_minutes",
+            title="项目启动会",
+            notes="现场会议",
+            filename="planning-minutes.txt",
+            content=content.encode("utf-8"),
+            content_type="text/plain",
+        )
+        found = client.get(
+            "/api/projects/P-001/documents?search=%E5%8D%81%E6%9C%88%E5%8D%81%E4%BA%94%E6%97%A5"
+        )
+        missing = client.get(
+            "/api/projects/P-001/documents?search=%E4%B8%8D%E5%AD%98%E5%9C%A8%E7%9A%84%E5%86%85%E5%AE%B9"
+        )
+
+    assert minutes.status_code == 201
+    assert found.status_code == 200
+    assert found.json()["total"] == 1
+    assert found.json()["items"][0]["id"] == minutes.json()["id"]
+    assert "十月十五日" in found.json()["items"][0]["search_excerpt"]
+    assert missing.status_code == 200
+    assert missing.json()["items"] == []
+
+
+def test_document_version_options_use_one_compact_endpoint_and_skip_archived(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+
+    with harness.client() as client:
+        active = _create_document(client, title="机械总图")
+        second_version = _append_version(
+            client,
+            active.json()["id"],
+            expected_revision=1,
+        )
+        archived = _create_document(
+            client,
+            category="contract",
+            title="作废合同",
+            filename="作废合同.pdf",
+            content=b"contract",
+            content_type="application/pdf",
+        )
+        archived_response = client.post(
+            f"/api/projects/P-001/documents/{archived.json()['id']}/archive",
+            headers={"Idempotency-Key": _idempotency_key()},
+            json={"reason": "已经作废", "expected_revision": 1},
+        )
+        options = client.get("/api/projects/P-001/document-version-options")
+
+    assert second_version.status_code == 201
+    assert archived_response.status_code == 200
+    assert options.status_code == 200
+    assert [item["value"] for item in options.json()] == [
+        second_version.json()["id"],
+        active.json()["versions"][0]["id"],
+    ]
+    assert all("机械总图" in item["label"] for item in options.json())
+    assert all("作废合同" not in item["label"] for item in options.json())
+
+
+def test_document_list_rejects_invalid_search_and_archive_filters(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+
+    with harness.client() as client:
+        invalid_archive = client.get(
+            "/api/projects/P-001/documents?archived=deleted"
+        )
+        duplicate_search = client.get(
+            "/api/projects/P-001/documents?search=a&search=b"
+        )
+        too_long_search = client.get(
+            f"/api/projects/P-001/documents?search={'a' * 201}"
+        )
+
+    assert invalid_archive.status_code == 422
+    assert invalid_archive.json()["field_errors"] == {
+        "archived": ["must be active, archived, or all"]
+    }
+    assert duplicate_search.status_code == 422
+    assert duplicate_search.json()["field_errors"] == {
+        "search": ["must occur once"]
+    }
+    assert too_long_search.status_code == 422
+    assert too_long_search.json()["field_errors"] == {
+        "search": ["must not exceed 200 characters"]
+    }
 
 
 def test_two_documents_in_same_category_each_start_at_version_one(
@@ -682,20 +856,66 @@ def test_download_returns_original_content_and_safe_unicode_filename(
             f"/api/projects/P-001/documents/{document_id}"
             f"/versions/{version_id}/download"
         )
+        downloaded_by_version = client.get(
+            f"/api/projects/P-001/document-versions/{version_id}/download"
+        )
         cross_project = client.get(
             f"/api/projects/P-002/documents/{document_id}"
             f"/versions/{version_id}/download"
         )
+        cross_project_by_version = client.get(
+            f"/api/projects/P-002/document-versions/{version_id}/download"
+        )
 
     assert downloaded.status_code == 200
     assert downloaded.content == content
+    assert downloaded_by_version.status_code == 200
+    assert downloaded_by_version.content == content
     assert downloaded.headers["content-type"] == "application/pdf"
     disposition = downloaded.headers["content-disposition"]
     assert disposition.startswith("attachment;")
     assert "filename*=UTF-8''" in disposition
     assert "%E8%AE%BE%E5%A4%87" in disposition
+    assert "%E9%A1%B9%E7%9B%AE%E5%90%88%E5%90%8C" in disposition
     assert "\r" not in disposition and "\n" not in disposition
     assert cross_project.status_code == 404
+    assert cross_project_by_version.status_code == 404
+
+    version = created.json()["versions"][0]
+    assert version["original_filename"] == "设备采购合同（终版）.pdf"
+    assert version["managed_filename"] == (
+        "P-001_项目合同_设备采购合同_20260831_V1.pdf"
+    )
+    stored_files = [
+        path
+        for path in harness.settings.data_dir.rglob("*.pdf")
+        if path.is_file()
+    ]
+    assert len(stored_files) == 1
+    assert stored_files[0].name == version["managed_filename"]
+
+
+def test_managed_filename_keeps_date_and_version_for_long_multibyte_title(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    title = "超长机械设计标题" * 20
+
+    with harness.client() as client:
+        created = _create_document(client, title=title)
+        appended = _append_version(
+            client,
+            created.json()["id"],
+            expected_revision=created.json()["revision"],
+        )
+
+    assert created.status_code == 201, created.text
+    assert appended.status_code == 201, appended.text
+    first_name = created.json()["versions"][0]["managed_filename"]
+    second_name = appended.json()["managed_filename"]
+    assert first_name.endswith("_20260831_V1.dwg")
+    assert second_name.endswith("_20260831_V2.dwg")
+    assert first_name != second_name
 
 
 def test_download_rejects_database_path_traversal_without_reading_outside_data(
@@ -826,5 +1046,7 @@ def test_main_application_mounts_all_document_routes() -> None:
             "/api/projects/{project_code}/documents/{document_id}"
             "/versions/{version_id}/download"
         ),
+        "/api/projects/{project_code}/document-versions/{version_id}/download",
+        "/api/projects/{project_code}/document-version-options",
         "/api/projects/{project_code}/documents/{document_id}/archive",
     } <= paths.keys()

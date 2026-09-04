@@ -54,6 +54,7 @@ _ADJUSTMENT_FIELDS = {
     "reason",
     "occurred_on",
 }
+_ADJUSTMENT_REVERSAL_FIELDS = {"reason", "expected_revision"}
 _ISSUE_FIELDS = {"issued_on", "worker_id", "lines", "notes"}
 _ISSUE_LINE_FIELDS = {"inventory_item_id", "procurement_line_id", "quantity"}
 _ISSUE_REVERSAL_FIELDS = {"reason", "expected_revision"}
@@ -232,7 +233,9 @@ def create_inventory_router(
             """
             SELECT movements.*, projects.project_code,
                    issues.status AS issue_status,
-                   issues.revision AS issue_revision
+                   issues.revision AS issue_revision,
+                   adjustments.status AS adjustment_status,
+                   adjustments.revision AS adjustment_revision
             FROM inventory_movements AS movements
             LEFT JOIN projects ON projects.id = movements.project_id
             LEFT JOIN inventory_issues AS issues
@@ -240,6 +243,9 @@ def create_inventory_router(
              AND movements.source_type IN (
                  'inventory_issue', 'inventory_issue_reversal'
              )
+            LEFT JOIN inventory_adjustments AS adjustments
+              ON adjustments.id = movements.source_id
+             AND movements.source_type = 'inventory_adjustment'
             WHERE movements.inventory_item_id = ?
             ORDER BY movements.created_at DESC, movements.id DESC
             LIMIT 20
@@ -316,7 +322,9 @@ def create_inventory_router(
             """
             SELECT movements.*, projects.project_code,
                    issues.status AS issue_status,
-                   issues.revision AS issue_revision
+                   issues.revision AS issue_revision,
+                   adjustments.status AS adjustment_status,
+                   adjustments.revision AS adjustment_revision
             FROM inventory_movements AS movements
             LEFT JOIN projects ON projects.id = movements.project_id
             LEFT JOIN inventory_issues AS issues
@@ -324,6 +332,9 @@ def create_inventory_router(
              AND movements.source_type IN (
                  'inventory_issue', 'inventory_issue_reversal'
              )
+            LEFT JOIN inventory_adjustments AS adjustments
+              ON adjustments.id = movements.source_id
+             AND movements.source_type = 'inventory_adjustment'
             WHERE movements.inventory_item_id = ?
             ORDER BY movements.created_at DESC, movements.id DESC
             LIMIT ? OFFSET ?
@@ -350,8 +361,17 @@ def create_inventory_router(
         )
         normalized = _normalize_adjustment(payload)
         request_hash = _request_hash(normalized)
+        scope = idempotency_scope(request)
         timestamp = _timestamp(now)
         with transaction_immediate(connection):
+            restored = restore_idempotent_response(
+                connection,
+                scope=scope,
+                key=key,
+                request_hash=request_hash,
+            )
+            if restored is not None:
+                return restored
             replay = connection.execute(
                 "SELECT * FROM inventory_adjustments WHERE idempotency_key = ?",
                 (key,),
@@ -434,7 +454,136 @@ def create_inventory_router(
                 "SELECT * FROM inventory_adjustments WHERE id = ?",
                 (adjustment_id,),
             ).fetchone()
-            return _adjustment_response(connection, row)
+            response = _adjustment_response(connection, row)
+            save_idempotent_response(
+                connection,
+                scope=scope,
+                key=key,
+                request_hash=request_hash,
+                response=response,
+                response_status=status.HTTP_201_CREATED,
+                resource_type="inventory_adjustment",
+                resource_id=adjustment_id,
+                created_at=timestamp,
+            )
+            return response
+
+    @router.post("/api/inventory/adjustments/{adjustment_id}/reverse")
+    async def reverse_inventory_adjustment(
+        adjustment_id: str,
+        request: Request,
+        idempotency_key: str = Header(alias="Idempotency-Key"),
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        identifier = _parse_identifier(adjustment_id)
+        key = _validate_idempotency_key(idempotency_key)
+        payload = await _read_json(
+            request,
+            _ADJUSTMENT_REVERSAL_FIELDS,
+            "Invalid inventory adjustment reversal payload",
+        )
+        normalized = _normalize_adjustment_reversal(payload)
+        request_hash = _request_hash(normalized)
+        scope = idempotency_scope(request)
+        timestamp = _timestamp(now)
+        with transaction_immediate(connection):
+            restored = restore_idempotent_response(
+                connection,
+                scope=scope,
+                key=key,
+                request_hash=request_hash,
+            )
+            if restored is not None:
+                return restored
+            adjustment = _adjustment_row(connection, identifier)
+            if adjustment is None:
+                raise _not_found("Inventory adjustment not found")
+            if adjustment["status"] != "active":
+                raise _business_conflict(
+                    "Inventory adjustment is already reversed",
+                    "INVENTORY_ADJUSTMENT_ALREADY_REVERSED",
+                )
+            expected_revision = int(normalized["expected_revision"])
+            if int(adjustment["revision"]) != expected_revision:
+                raise _revision_conflict(int(adjustment["revision"]))
+            item = _item_row(connection, int(adjustment["inventory_item_id"]))
+            if item is None:
+                raise sqlite3.DatabaseError("inventory adjustment item is missing")
+            quantity_delta = -int(adjustment["quantity_delta_milli"])
+            value_delta = -int(adjustment["value_delta_cents"])
+            quantity_after = int(item["quantity_milli"]) + quantity_delta
+            value_after = int(item["inventory_value_cents"]) + value_delta
+            if quantity_after < 0 or value_after < 0:
+                raise _business_conflict(
+                    "Inventory is insufficient to reverse this adjustment",
+                    "INVENTORY_ADJUSTMENT_REVERSAL_INSUFFICIENT_INVENTORY",
+                )
+            if (
+                quantity_after > _SQLITE_MAX_INTEGER
+                or value_after > _SQLITE_MAX_INTEGER
+                or (quantity_after == 0 and value_after != 0)
+            ):
+                raise _business_conflict(
+                    "Inventory adjustment reversal exceeds storage capacity",
+                    "INVENTORY_ADJUSTMENT_REVERSAL_OVERFLOW",
+                )
+            reversal_movement_id = _insert_movement(
+                connection,
+                item_id=int(item["id"]),
+                project_id=None,
+                procurement_line_id=None,
+                movement_type="reversal",
+                quantity_delta_milli=quantity_delta,
+                value_delta_cents=value_delta,
+                quantity_after_milli=quantity_after,
+                value_after_cents=value_after,
+                source_type="inventory_adjustment_reversal",
+                source_id=identifier,
+                occurred_on=timestamp[:10],
+                reason=str(normalized["reason"]),
+                created_at=timestamp,
+            )
+            updated = connection.execute(
+                """
+                UPDATE inventory_adjustments
+                SET status = 'reversed', reversal_reason = ?, reversed_at = ?,
+                    reversal_movement_id = ?, revision = revision + 1
+                WHERE id = ? AND status = 'active' AND revision = ?
+                """,
+                (
+                    normalized["reason"],
+                    timestamp,
+                    reversal_movement_id,
+                    identifier,
+                    expected_revision,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise sqlite3.DatabaseError("inventory adjustment reversal update failed")
+            _update_balance(
+                connection,
+                int(item["id"]),
+                quantity_after,
+                value_after,
+                timestamp,
+            )
+            reversed_adjustment = _adjustment_row(connection, identifier)
+            if reversed_adjustment is None:
+                raise sqlite3.DatabaseError("reversed inventory adjustment is missing")
+            response = _adjustment_response(connection, reversed_adjustment)
+            save_idempotent_response(
+                connection,
+                scope=scope,
+                key=key,
+                request_hash=request_hash,
+                response=response,
+                response_status=status.HTTP_200_OK,
+                resource_type="inventory_adjustment",
+                resource_id=identifier,
+                created_at=timestamp,
+            )
+            return response
 
     @router.post(
         "/api/projects/{project_code}/inventory-issues",
@@ -629,12 +778,16 @@ def ensure_receipt_inventory_item(
     *,
     timestamp: str,
 ) -> sqlite3.Row:
+    procurement_line_id = int(procurement_line["procurement_line_id"])
     item_id = procurement_line["inventory_item_id"]
     if item_id is not None:
         item = _item_row(connection, int(item_id))
         if item is None:
             raise sqlite3.DatabaseError("procurement inventory item is missing")
-        return item
+        if _receipt_inventory_identity(item) == _receipt_inventory_identity(
+            procurement_line
+        ):
+            return item
     matches = connection.execute(
         """
         SELECT * FROM inventory_items
@@ -657,7 +810,7 @@ def ensure_receipt_inventory_item(
     if len(matches) == 1:
         item = matches[0]
     else:
-        stable_key = f"procurement-line-{procurement_line['id']}"
+        stable_key = f"procurement-line-{procurement_line_id}"
         cursor = connection.execute(
             """
             INSERT INTO inventory_items
@@ -685,9 +838,19 @@ def ensure_receipt_inventory_item(
         raise sqlite3.DatabaseError("receipt inventory item was not created")
     connection.execute(
         "UPDATE procurement_lines SET inventory_item_id = ? WHERE id = ?",
-        (item["id"], procurement_line["id"]),
+        (item["id"], procurement_line_id),
     )
     return item
+
+
+def _receipt_inventory_identity(row: sqlite3.Row) -> tuple[object, ...]:
+    return (
+        str(row["name"]).casefold(),
+        str(row["unit"]).casefold(),
+        row["brand"],
+        row["model"],
+        row["specification"],
+    )
 
 
 def post_receipt_movement(
@@ -814,6 +977,18 @@ def _normalize_adjustment(payload: dict[str, Any]) -> dict[str, object]:
         "reason": _required_text(payload["reason"], "Invalid inventory payload"),
         "occurred_on": _business_date(
             payload["occurred_on"], "Invalid inventory payload"
+        ),
+    }
+
+
+def _normalize_adjustment_reversal(payload: dict[str, Any]) -> dict[str, object]:
+    return {
+        "reason": _required_text(
+            payload["reason"], "Invalid inventory adjustment reversal payload"
+        ),
+        "expected_revision": _positive_integer(
+            payload["expected_revision"],
+            "Invalid inventory adjustment reversal payload",
         ),
     }
 
@@ -1137,6 +1312,14 @@ def _movement_response(row: sqlite3.Row) -> dict[str, object]:
         "issue_revision": (
             row["issue_revision"] if "issue_revision" in columns else None
         ),
+        "adjustment_status": (
+            row["adjustment_status"] if "adjustment_status" in columns else None
+        ),
+        "adjustment_revision": (
+            row["adjustment_revision"]
+            if "adjustment_revision" in columns
+            else None
+        ),
     }
 
 
@@ -1148,6 +1331,14 @@ def _adjustment_response(
         "SELECT * FROM inventory_movements WHERE id = ?",
         (row["movement_id"],),
     ).fetchone()
+    reversal_movement = (
+        None
+        if row["reversal_movement_id"] is None
+        else connection.execute(
+            "SELECT * FROM inventory_movements WHERE id = ?",
+            (row["reversal_movement_id"],),
+        ).fetchone()
+    )
     return {
         "id": row["id"],
         "inventory_item_id": row["inventory_item_id"],
@@ -1156,7 +1347,16 @@ def _adjustment_response(
         "value_delta_cents": row["value_delta_cents"],
         "occurred_on": row["occurred_on"],
         "reason": row["reason"],
+        "status": row["status"],
+        "revision": row["revision"],
+        "reversal_reason": row["reversal_reason"],
+        "reversed_at": row["reversed_at"],
         "movement": _movement_response(movement),
+        "reversal_movement": (
+            None
+            if reversal_movement is None
+            else _movement_response(reversal_movement)
+        ),
         "created_at": row["created_at"],
     }
 
@@ -1200,6 +1400,15 @@ def _item_row(connection: sqlite3.Connection, item_id: int) -> sqlite3.Row | Non
     return connection.execute(
         "SELECT * FROM inventory_items WHERE id = ?",
         (item_id,),
+    ).fetchone()
+
+
+def _adjustment_row(
+    connection: sqlite3.Connection, adjustment_id: int
+) -> sqlite3.Row | None:
+    return connection.execute(
+        "SELECT * FROM inventory_adjustments WHERE id = ?",
+        (adjustment_id,),
     ).fetchone()
 
 

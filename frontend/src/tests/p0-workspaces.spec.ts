@@ -15,6 +15,15 @@ async function settle(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
+async function clickDocumentAction(wrapper: VueWrapper, documentId: number, actionSelector: string): Promise<void> {
+  await wrapper.get(`[data-testid="document-actions-${documentId}"]`).trigger('click')
+  await settle()
+  const action = document.body.querySelector<HTMLElement>(actionSelector)
+  if (!action) throw new Error(`未找到资料操作 ${actionSelector}`)
+  action.click()
+  await settle()
+}
+
 function mountComponent(component: object, props: Record<string, unknown> = {}): VueWrapper {
   return mount(component, {
     attachTo: document.body,
@@ -55,7 +64,7 @@ describe('P0 preview workspaces', () => {
     vi.restoreAllMocks()
   })
 
-  it('全局经营面板只消费冻结 GlobalDashboard 字段并明确标记真实后端', async () => {
+  it('全局经营面板只消费冻结 GlobalDashboard 字段且不暴露开发标记', async () => {
     const repository = new MockProjectRepository()
     const result = await repository.getGlobalDashboard()
 
@@ -77,7 +86,7 @@ describe('P0 preview workspaces', () => {
     const wrapper = mountComponent(PortfolioOperatingOverview)
     await settle()
 
-    expect(wrapper.get('[data-testid="portfolio-operating-overview"]').text()).toContain('真实后端')
+    expect(wrapper.get('[data-testid="portfolio-operating-overview"]').text()).not.toContain('真实后端')
     expect(wrapper.text()).not.toContain('P0 ')
     expect(wrapper.text()).not.toContain('独立 Mock Repository')
     expect(wrapper.text()).toContain('合同分摊额')
@@ -132,20 +141,22 @@ describe('P0 preview workspaces', () => {
     expect(wrapper.findAll('[data-testid^="stage-row-"]')).toHaveLength(18)
     expect(wrapper.get('[data-testid="stage-row-mechanical_design"]').text()).toContain('机械设计')
     expect(wrapper.text()).toContain('等待客户确认现场接口尺寸')
-    await wrapper.get('[data-testid="stage-schedule-mechanical_design"]').trigger('click')
+    await wrapper.get('[data-testid="stage-schedule-procurement"]').trigger('click')
+    await wrapper.getComponent('[data-testid="stage-schedule-stage"]').setValue('mechanical_design')
     await wrapper.get('[data-testid="stage-schedule-save"]').trigger('click')
     await settle()
     expect(wrapper.text()).not.toContain('记录已更新')
     expect(wrapper.get('[data-testid="stage-row-mechanical_design"]').text()).toContain('2026-09-20')
 
-    await wrapper.get('[data-testid="stage-transition-staffing"]').trigger('click')
+    await wrapper.get('[data-testid="stage-transition-procurement"]').trigger('click')
+    await wrapper.getComponent('[data-testid="stage-transition-status"]').setValue('completed')
     await wrapper.get('[data-testid="stage-transition-save"]').trigger('click')
     await settle()
     const finalSnapshot = (await repository.getOperatingSnapshot('SY-2026-001')).data
-    expect(finalSnapshot.stages.find((stage) => stage.stage_code === 'staffing')?.status).toBe('in_progress')
+    expect(finalSnapshot.stages.find((stage) => stage.stage_code === 'procurement')?.status).toBe('completed')
     const changes = wrapper.emitted('changed') as Array<[typeof finalSnapshot.stages]>
-    expect(changes[changes.length - 1]?.[0].find((stage) => stage.stage_code === 'staffing')?.status).toBe('in_progress')
-    expect(wrapper.get('[data-testid="stage-row-staffing"]').text()).toContain('进行中')
+    expect(changes[changes.length - 1]?.[0].find((stage) => stage.stage_code === 'procurement')?.status).toBe('completed')
+    expect(wrapper.get('[data-testid="stage-row-procurement"]').text()).toContain('已完成')
     expect(wrapper.emitted('changed')).toBeTruthy()
     expect(fetchMock).not.toHaveBeenCalled()
   })
@@ -153,12 +164,12 @@ describe('P0 preview workspaces', () => {
   it('阶段状态原因在保存后以明确标签展示，不与排期备注互相覆盖', async () => {
     const repository = new MockProjectRepository()
     const initial = (await repository.getOperatingSnapshot('SY-2026-001')).data
-    const staffing = initial.stages.find((stage) => stage.stage_code === 'staffing')!
-    await repository.updateStageSchedule('SY-2026-001', 'staffing', {
+    const mechanicalDesign = initial.stages.find((stage) => stage.stage_code === 'mechanical_design')!
+    await repository.updateStageSchedule('SY-2026-001', 'mechanical_design', {
       planned_start_on: null,
       planned_end_on: null,
-      notes: '人员计划待项目日期确认',
-      expected_revision: staffing.revision,
+      notes: '机械设计计划待确认',
+      expected_revision: mechanicalDesign.revision,
     })
     const snapshot = (await repository.getOperatingSnapshot('SY-2026-001')).data
     const wrapper = mountComponent(ProjectStagesPanel, {
@@ -168,16 +179,16 @@ describe('P0 preview workspaces', () => {
     })
     await settle()
 
-    await wrapper.get('[data-testid="stage-transition-staffing"]').trigger('click')
+    await wrapper.get('[data-testid="stage-transition-mechanical_design"]').trigger('click')
     await wrapper.getComponent('[data-testid="stage-transition-status"]').setValue('skipped')
-    await wrapper.get('[data-testid="stage-transition-reason"]').setValue('客户暂不安排施工人员')
+    await wrapper.get('[data-testid="stage-transition-reason"]').setValue('客户已有现成物料')
     await wrapper.get('[data-testid="stage-transition-save"]').trigger('click')
     await settle()
 
-    const row = wrapper.get('[data-testid="stage-row-staffing"]')
-    expect(row.get('[data-testid="stage-status-reason-staffing"]').text())
-      .toBe('状态原因：客户暂不安排施工人员')
-    expect(row.text()).toContain('排期备注：人员计划待项目日期确认')
+    const row = wrapper.get('[data-testid="stage-row-mechanical_design"]')
+    expect(row.get('[data-testid="stage-status-reason-mechanical_design"]').text())
+      .toBe('状态原因：客户已有现成物料')
+    expect(row.text()).toContain('排期备注：机械设计计划待确认')
   })
 
   it('文档版本台账通过真实契约新建、追加版本、归档和下载', async () => {
@@ -250,7 +261,7 @@ describe('P0 preview workspaces', () => {
     const wrapper = mountComponent(ProjectDocumentsPanel, { projectCode: 'SY-2026-001' })
     await settle()
 
-    expect(wrapper.get('[data-testid="project-documents-panel"]').text()).toContain('真实后端')
+    expect(wrapper.get('[data-testid="project-documents-panel"]').text()).not.toContain('真实后端')
     expect(wrapper.findAll('.el-alert').length).toBeLessThanOrEqual(1)
     expect(wrapper.text()).toContain('现场测绘记录')
     expect(wrapper.text()).toContain('现场勘查')
@@ -260,7 +271,7 @@ describe('P0 preview workspaces', () => {
     expect(wrapper.get('[data-testid="document-ledger-summary"]').text())
       .toContain('资料数量不代表审批完成或项目进度')
 
-    await wrapper.get('[data-testid="document-edit-open-101"]').trigger('click')
+    await clickDocumentAction(wrapper, 101, '[data-testid="document-edit-open-101"]')
     await wrapper.get('[data-testid="document-edit-title"]').setValue('现场测绘与接口复核')
     await wrapper.get('[data-testid="document-edit-notes"]').setValue('已完成客户复核')
     await wrapper.get('[data-testid="document-edit-save"]').trigger('click')
@@ -279,7 +290,7 @@ describe('P0 preview workspaces', () => {
     await settle()
     expect(wrapper.text()).toContain('施工交底记录')
 
-    await wrapper.get('[data-testid="document-version-open-101"]').trigger('click')
+    await clickDocumentAction(wrapper, 101, '[data-testid="document-version-open-101"]')
     const versionFile = wrapper.get('[data-testid="document-version-file"]')
     Object.defineProperty(versionFile.element, 'files', {
       configurable: true,
@@ -288,21 +299,21 @@ describe('P0 preview workspaces', () => {
     await versionFile.trigger('change')
     await wrapper.get('[data-testid="document-version-save"]').trigger('click')
     await settle()
-    expect(wrapper.get('[data-testid="document-row-101"]').text()).toContain('V2')
+    expect(wrapper.text()).toContain('V2')
     expect(wrapper.get('[data-testid="document-ledger-summary"]').text())
       .toContain('2 份资料 · 3 个历史版本')
 
-    await wrapper.get('[data-testid="document-download-101"]').trigger('click')
+    await clickDocumentAction(wrapper, 101, '[data-testid="document-download-101"]')
     await settle()
     expect(createObjectUrl).toHaveBeenCalledTimes(1)
     expect(anchorClick).toHaveBeenCalledTimes(1)
     expect(wrapper.get('[data-testid="document-live-notice"]').text()).toContain('已下载 survey-v2.pdf')
 
-    await wrapper.get('[data-testid="document-archive-open-101"]').trigger('click')
+    await clickDocumentAction(wrapper, 101, '[data-testid="document-archive-open-101"]')
     await wrapper.get('[data-testid="document-archive-reason"]').setValue('资料已由新版本替代')
     await wrapper.get('[data-testid="document-archive-save"]').trigger('click')
     await settle()
-    expect(wrapper.get('[data-testid="document-row-101"]').text()).toContain('已归档')
+    expect(wrapper.get('[data-testid="document-status-101"]').text()).toContain('已归档')
     expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'POST' && init.body instanceof FormData)).toBe(true)
   })
 
@@ -313,6 +324,7 @@ describe('P0 preview workspaces', () => {
       ...contract,
       allocations: contract.allocations.map((allocation) => ({ ...allocation })),
     }))
+    let createdContractBody: Record<string, unknown> | null = null
     const payments = JSON.parse(JSON.stringify(snapshot.receivables)) as typeof snapshot.receivables
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input)
@@ -339,6 +351,7 @@ describe('P0 preview workspaces', () => {
       }
       if (path.endsWith('/contracts') && method === 'POST') {
         const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+        createdContractBody = body
         const created = {
           ...contracts[0], ...body, id: 22, status: 'draft', revision: 1,
           customer_company_name: '演示客户单位',
@@ -353,8 +366,8 @@ describe('P0 preview workspaces', () => {
         return jsonResponse(contracts.find((contract) => contract.id === 22))
       }
       if (path.endsWith('/payments')) return jsonResponse(payments)
-      if (path.includes('/documents?page=')) {
-        return jsonResponse({ items: [], total: 0, page: 1, page_size: 100 })
+      if (path.endsWith('/document-version-options')) {
+        return jsonResponse([])
       }
       if (path.endsWith('/receipts') && method === 'POST') {
         const body = JSON.parse(String(init?.body)) as Record<string, unknown>
@@ -396,7 +409,7 @@ describe('P0 preview workspaces', () => {
 
     expect(wrapper.text()).toContain('报价不是项目收入')
     expect(wrapper.text()).toContain('发票不是收款')
-    expect(wrapper.text()).toContain('真实后端')
+    expect(wrapper.text()).not.toContain('真实后端')
     expect(wrapper.findAll('.el-alert')).toHaveLength(0)
     expect(wrapper.text()).not.toContain('状态操作')
 
@@ -415,7 +428,8 @@ describe('P0 preview workspaces', () => {
     await settle()
     expect(wrapper.get('[data-testid="commercial-quotes"]').text()).toContain('¥3,100,000.00')
     expect(wrapper.get('[data-testid="quote-status-12"]').text()).toContain('草稿')
-    expect(wrapper.get('[data-testid="quote-status-12"]').attributes()).toMatchObject({ role: 'button', tabindex: '0' })
+    expect(wrapper.get('[data-testid="quote-status-12"]').attributes('role')).toBeUndefined()
+    expect(wrapper.get('[data-testid="quote-transition-open-12"]').text()).toContain('推进状态')
 
     await wrapper.get('[data-testid="commercial-nav-contracts"]').trigger('click')
     await wrapper.get('[data-testid="contract-create-open"]').trigger('click')
@@ -424,16 +438,20 @@ describe('P0 preview workspaces', () => {
     expect((wrapper.get('[data-testid="contract-company"]').element as HTMLInputElement).value)
       .toBe('演示客户单位')
     await wrapper.get('[data-testid="contract-total"]').setValue('800000.00')
-    await wrapper.get('[data-testid="contract-allocation"]').setValue('800000.00')
     await wrapper.get('[data-testid="contract-create-save"]').trigger('click')
     await settle()
+    expect(createdContractBody).toMatchObject({
+      total_amount_cents: 80000000,
+      allocations: [{ project_code: 'SY-2026-001', amount_cents: 80000000 }],
+    })
     expect(wrapper.get('[data-testid="commercial-contracts"]').text()).toContain('SYHT-2026-019')
     await wrapper.get('[data-testid="contract-edit-open-22"]').trigger('click')
     await wrapper.get('[data-testid="contract-title"]').setValue('装配线二期补充合同')
     await wrapper.get('[data-testid="contract-create-save"]').trigger('click')
     await settle()
     expect(wrapper.get('[data-testid="commercial-contracts"]').text()).toContain('装配线二期补充合同')
-    expect(wrapper.get('[data-testid="contract-status-22"]').attributes()).toMatchObject({ role: 'button', tabindex: '0' })
+    expect(wrapper.get('[data-testid="contract-status-22"]').attributes('role')).toBeUndefined()
+    expect(wrapper.get('[data-testid="contract-transition-open-22"]').text()).toContain('推进状态')
 
     await wrapper.get('[data-testid="commercial-nav-receivables"]').trigger('click')
     expect(wrapper.get('[data-testid="commercial-receivables"]').text()).toContain('已收清')

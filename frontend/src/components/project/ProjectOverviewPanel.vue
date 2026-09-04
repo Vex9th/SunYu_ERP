@@ -2,12 +2,14 @@
 import { computed, ref } from 'vue'
 
 import type { ProjectOperatingSnapshot } from '../../domain/contracts'
+import { formatChineseDate } from '../../domain/dates'
 import { formatBasisPoints, formatMoney } from '../../domain/formatters'
 import ProjectStagesPanel from './ProjectStagesPanel.vue'
 
 const props = defineProps<{
   operating: ProjectOperatingSnapshot
   projectCode?: string
+  readonly?: boolean
 }>()
 
 const emit = defineEmits<{ stagesChanged: [stages: ProjectOperatingSnapshot['stages']] }>()
@@ -63,8 +65,8 @@ const currentStageText = computed(() => {
 const nextStageText = computed(() => {
   if (props.operating.stages.length === 0) return '暂无阶段数据'
   if (currentStageIndex.value < 0) return '已完成全部流程'
-  if (nextStage.value) return stageLabel(nextStage.value.stage_code)
   if (currentStage.value?.status === 'blocked') return '等待解除阻塞'
+  if (nextStage.value) return stageLabel(nextStage.value.stage_code)
   return '暂无下一阶段'
 })
 </script>
@@ -154,7 +156,7 @@ const nextStageText = computed(() => {
           <div v-else class="todo-list">
             <div v-for="todo in operating.todos" :key="todo.code" class="todo-item">
               <el-tag :type="severityTypes[todo.severity]" effect="dark" size="small">
-                {{ severityLabels[todo.severity] }} · {{ todo.due_on ?? '无截止日期' }}
+                {{ severityLabels[todo.severity] }} · {{ todo.due_on ? formatChineseDate(todo.due_on) : '无截止日期' }}
               </el-tag>
               <strong>{{ todo.title }}</strong>
               <p>{{ todo.description ?? '暂无说明' }}</p>
@@ -169,6 +171,7 @@ const nextStageText = computed(() => {
         v-if="stageFlowVisible"
         :project-code="projectCode ?? 'SY-2026-001'"
         :stages="operating.stages"
+        :readonly="readonly"
         @changed="emit('stagesChanged', $event)"
       />
     </el-drawer>

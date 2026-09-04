@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 
 import type { DocumentDetail, DocumentSummary, DocumentVersion } from '../../domain/contracts'
+import { formatChineseDateTime } from '../../domain/dates'
+import { managedDocumentFilename, traceableDocumentFilename } from '../../domain/document-filenames'
 import type { ProjectOperatingRepository } from '../../repositories/project-operating.live'
 
 type PreviewKind = 'text' | 'image' | 'pdf' | 'unsupported'
@@ -43,14 +45,19 @@ const previewObjectUrl = ref<string | null>(null)
 const previewBlob = ref<Blob | null>(null)
 const previewBlobVersionId = ref<number | null>(null)
 const previewTooLarge = ref(false)
+const downloadBusy = ref(false)
 const copyNotice = ref<string | null>(null)
 const copyNoticeType = ref<'success' | 'error'>('success')
 const searchText = ref('')
+const activeSearchMatch = ref(0)
 const imageScale = ref(1)
 const imageRotation = ref(0)
 let documentGeneration = 0
 let previewGeneration = 0
 let previewAbortController: AbortController | null = null
+let manualDownloadGeneration = 0
+let manualDownloadAbortController: AbortController | null = null
+let mounted = true
 
 const currentVersion = computed(() => detail.value?.versions.find(
   (version) => version.id === selectedVersionId.value,
@@ -73,6 +80,27 @@ const searchMatchCount = computed(() => {
   }
   return count
 })
+const highlightedText = computed(() => {
+  const needle = searchText.value.trim()
+  if (!needle) return [{ text: previewText.value, match: false, index: -1 }]
+  const loweredNeedle = needle.toLocaleLowerCase()
+  const loweredText = previewText.value.toLocaleLowerCase()
+  const segments: Array<{ text: string; match: boolean; index: number }> = []
+  let cursor = 0
+  let matchIndex = 0
+  while (cursor < previewText.value.length) {
+    const found = loweredText.indexOf(loweredNeedle, cursor)
+    if (found < 0) {
+      segments.push({ text: previewText.value.slice(cursor), match: false, index: -1 })
+      break
+    }
+    if (found > cursor) segments.push({ text: previewText.value.slice(cursor, found), match: false, index: -1 })
+    segments.push({ text: previewText.value.slice(found, found + needle.length), match: true, index: matchIndex })
+    matchIndex += 1
+    cursor = found + needle.length
+  }
+  return segments
+})
 const imageTransform = computed(() => ({
   transform: `scale(${imageScale.value}) rotate(${imageRotation.value}deg)`,
 }))
@@ -87,7 +115,7 @@ function extension(filename: string): string {
 }
 
 function classifyVersion(version: DocumentVersion, category: string): PreviewKind {
-  const suffix = extension(version.original_filename)
+  const suffix = extension(managedDocumentFilename(version))
   if (['txt', 'md', 'log', 'csv'].includes(suffix)) return 'text'
   if (suffix in imageMimeByExtension) return 'image'
   if (suffix === 'pdf') return 'pdf'
@@ -116,20 +144,42 @@ function cancelPreviewDownload(): void {
   previewAbortController = null
 }
 
+function cancelManualDownload(): void {
+  manualDownloadAbortController?.abort()
+  manualDownloadAbortController = null
+}
+
 function resetPreviewState(): void {
   previewGeneration += 1
+  manualDownloadGeneration += 1
   cancelPreviewDownload()
+  cancelManualDownload()
   cleanupPreviewUrl()
   previewLoading.value = false
+  downloadBusy.value = false
   previewError.value = null
   previewText.value = ''
   previewTooLarge.value = false
   copyNotice.value = null
   copyNoticeType.value = 'success'
   searchText.value = ''
+  activeSearchMatch.value = 0
   imageScale.value = 1
   imageRotation.value = 0
 }
+
+function focusSearchMatch(index: number): void {
+  if (searchMatchCount.value === 0) return
+  activeSearchMatch.value = (index + searchMatchCount.value) % searchMatchCount.value
+  void nextTick(() => {
+    document.querySelector<HTMLElement>(`[data-search-match="${activeSearchMatch.value}"]`)?.scrollIntoView?.({ block: 'center' })
+  })
+}
+
+watch(searchText, () => {
+  activeSearchMatch.value = 0
+  if (searchMatchCount.value > 0) focusSearchMatch(0)
+})
 
 function preferredVersion(document: DocumentDetail): DocumentVersion | null {
   const requested = props.versionId === null || props.versionId === undefined
@@ -185,7 +235,7 @@ function startsWith(bytes: Uint8Array, signature: number[]): boolean {
 }
 
 async function validatedMime(blob: Blob, version: DocumentVersion): Promise<string | null> {
-  const suffix = extension(version.original_filename)
+  const suffix = extension(managedDocumentFilename(version))
   const prefix = new Uint8Array(await readBlob(blob.slice(0, 16), 'buffer') as ArrayBuffer)
   if (suffix === 'pdf') {
     return startsWith(prefix, [0x25, 0x50, 0x44, 0x46, 0x2d]) ? 'application/pdf' : null
@@ -206,9 +256,12 @@ async function loadPreview(): Promise<void> {
   const version = currentVersion.value
   const document = detail.value
   const generation = ++previewGeneration
+  manualDownloadGeneration += 1
   cancelPreviewDownload()
+  cancelManualDownload()
   cleanupPreviewUrl()
   previewLoading.value = false
+  downloadBusy.value = false
   previewError.value = null
   previewText.value = ''
   previewTooLarge.value = false
@@ -278,19 +331,47 @@ function selectVersion(value: string | number): void {
 async function downloadCurrent(): Promise<void> {
   const version = currentVersion.value
   const document = detail.value
-  if (!version || !document) return
+  if (!version || !document || downloadBusy.value) return
+  const generation = ++manualDownloadGeneration
+  const projectCode = props.projectCode
+  const documentId = document.id
+  const versionId = version.id
+  const repository = props.repository
+  const controller = new AbortController()
+  cancelManualDownload()
+  manualDownloadAbortController = controller
+  downloadBusy.value = true
+  const isCurrent = () => mounted
+    && generation === manualDownloadGeneration
+    && projectCode === props.projectCode
+    && documentId === props.documentId
+    && versionId === selectedVersionId.value
+    && repository === props.repository
   try {
     const blob = previewBlobVersionId.value === version.id && previewBlob.value
       ? previewBlob.value
-      : await props.repository.downloadDocumentVersion(props.projectCode, document.id, version.id)
+      : await repository.downloadDocumentVersion(
+        projectCode,
+        documentId,
+        versionId,
+        controller.signal,
+      )
+    if (!isCurrent()) return
     const url = URL.createObjectURL(blob)
     const anchor = window.document.createElement('a')
     anchor.href = url
-    anchor.download = version.original_filename
+    anchor.download = managedDocumentFilename(version)
     anchor.click()
     URL.revokeObjectURL(url)
   } catch (error) {
-    previewError.value = errorMessage(error)
+    if (isCurrent() && !(error instanceof DOMException && error.name === 'AbortError')) {
+      previewError.value = errorMessage(error)
+    }
+  } finally {
+    if (manualDownloadAbortController === controller) {
+      manualDownloadAbortController = null
+    }
+    if (isCurrent()) downloadBusy.value = false
   }
 }
 
@@ -339,9 +420,12 @@ watch(() => props.versionId, (versionId) => {
 })
 
 onBeforeUnmount(() => {
+  mounted = false
   documentGeneration += 1
   previewGeneration += 1
+  manualDownloadGeneration += 1
   cancelPreviewDownload()
+  cancelManualDownload()
   cleanupPreviewUrl()
 })
 </script>
@@ -378,13 +462,24 @@ onBeforeUnmount(() => {
               v-for="version in sortedVersions"
               :key="version.id"
               :value="version.id"
-              :label="`V${version.version_number} · ${version.original_filename}`"
+              :label="`V${version.version_number} · ${traceableDocumentFilename(version)}`"
             />
+          </el-select>
+          <el-select
+            data-testid="document-preview-document-select"
+            :model-value="documentId"
+            aria-label="选择项目资料"
+            placeholder="选择资料"
+            filterable
+            @change="selectDocument"
+          >
+            <el-option v-for="document in documents" :key="document.id" :value="document.id" :label="document.title" />
           </el-select>
           <el-button
             data-testid="document-preview-download"
             type="primary"
-            :disabled="!currentVersion"
+            :loading="downloadBusy"
+            :disabled="!currentVersion || downloadBusy"
             @click="downloadCurrent"
           >下载原文件</el-button>
         </el-space>
@@ -411,16 +506,16 @@ onBeforeUnmount(() => {
         </el-result>
         <el-skeleton v-else-if="previewLoading" :rows="10" animated />
         <el-result v-else-if="previewError" icon="error" title="无法预览" :sub-title="previewError">
-          <template #extra><el-button type="primary" @click="downloadCurrent">下载原文件</el-button></template>
+          <template #extra><el-button type="primary" :loading="downloadBusy" :disabled="downloadBusy" @click="downloadCurrent">下载原文件</el-button></template>
         </el-result>
         <el-result
           v-else-if="previewTooLarge"
           data-testid="document-preview-too-large"
           icon="warning"
           title="文件过大，不在网页中自动加载"
-          :sub-title="currentVersion ? `${currentVersion.original_filename} · ${formatBytes(currentVersion.size_bytes)}` : ''"
+          :sub-title="currentVersion ? `${traceableDocumentFilename(currentVersion)} · ${formatBytes(currentVersion.size_bytes)}` : ''"
         >
-          <template #extra><el-button type="primary" @click="downloadCurrent">下载后查看</el-button></template>
+          <template #extra><el-button type="primary" :loading="downloadBusy" :disabled="downloadBusy" @click="downloadCurrent">下载后查看</el-button></template>
         </el-result>
 
         <template v-else-if="previewKind === 'text'">
@@ -432,14 +527,16 @@ onBeforeUnmount(() => {
               placeholder="搜索纪要内容"
             />
             <el-text data-testid="document-preview-search-summary" type="info">
-              {{ searchText.trim() ? `${searchMatchCount} 处` : '输入关键词搜索' }}
+              {{ searchText.trim() ? (searchMatchCount ? `${searchMatchCount} 处 · 当前第 ${activeSearchMatch + 1} 处` : '0 处') : '输入关键词搜索' }}
             </el-text>
+            <el-button :disabled="searchMatchCount === 0" aria-label="上一个搜索结果" @click="focusSearchMatch(activeSearchMatch - 1)">上一个</el-button>
+            <el-button :disabled="searchMatchCount === 0" aria-label="下一个搜索结果" @click="focusSearchMatch(activeSearchMatch + 1)">下一个</el-button>
             <el-button data-testid="document-preview-copy" @click="copyText">复制全文</el-button>
             <el-button data-testid="document-preview-print" @click="printText">打印</el-button>
           </div>
           <el-alert v-if="copyNotice" :title="copyNotice" :type="copyNoticeType" :closable="false" />
           <article data-testid="document-preview-text" class="document-preview__paper">
-            <pre>{{ previewText }}</pre>
+            <pre><template v-for="(segment, index) in highlightedText" :key="`${index}-${segment.index}`"><mark v-if="segment.match" :data-search-match="segment.index" :class="{ 'is-active': segment.index === activeSearchMatch }">{{ segment.text }}</mark><template v-else>{{ segment.text }}</template></template></pre>
           </article>
         </template>
 
@@ -454,7 +551,7 @@ onBeforeUnmount(() => {
             <img
               data-testid="document-preview-image"
               :src="previewObjectUrl"
-              :alt="detail?.title ?? currentVersion?.original_filename"
+              :alt="detail?.title ?? (currentVersion ? managedDocumentFilename(currentVersion) : '')"
               :style="imageTransform"
             >
           </div>
@@ -473,9 +570,9 @@ onBeforeUnmount(() => {
           data-testid="document-preview-unsupported"
           icon="info"
           title="当前格式不支持网页预览"
-          :sub-title="currentVersion ? `${currentVersion.original_filename} · ${formatBytes(currentVersion.size_bytes)}` : '当前文档没有可用版本'"
+          :sub-title="currentVersion ? `${traceableDocumentFilename(currentVersion)} · ${formatBytes(currentVersion.size_bytes)}` : '当前文档没有可用版本'"
         >
-          <template #extra><el-button v-if="currentVersion" type="primary" @click="downloadCurrent">下载原文件</el-button></template>
+          <template #extra><el-button v-if="currentVersion" type="primary" :loading="downloadBusy" :disabled="downloadBusy" @click="downloadCurrent">下载原文件</el-button></template>
         </el-result>
       </main>
 
@@ -485,14 +582,14 @@ onBeforeUnmount(() => {
           <el-timeline-item
             v-for="version in sortedVersions"
             :key="version.id"
-            :timestamp="version.created_at"
+            :timestamp="formatChineseDateTime(version.created_at)"
             :type="version.id === selectedVersionId ? 'primary' : undefined"
           >
             <el-button
               :type="version.id === selectedVersionId ? 'primary' : 'default'"
               :plain="version.id !== selectedVersionId"
               @click="selectVersion(version.id)"
-            >V{{ version.version_number }} · {{ version.original_filename }}</el-button>
+            >V{{ version.version_number }} · {{ traceableDocumentFilename(version) }}</el-button>
             <p>{{ version.notes ?? '无版本说明' }}</p>
           </el-timeline-item>
         </el-timeline>
@@ -526,7 +623,7 @@ onBeforeUnmount(() => {
 }
 .document-preview__identity { min-width: 0; display: grid; gap: 2px; }
 .document-preview__identity strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.document-preview__header-actions :deep(.el-select) { width: min(280px, 32vw); }
+.document-preview__header-actions :deep(.el-select) { width: min(250px, 29vw); }
 .document-preview__body { height: 100%; min-height: 0; display: grid; grid-template-columns: 240px minmax(0, 1fr) 300px; }
 .document-preview__documents,
 .document-preview__versions { min-height: 0; overflow: auto; padding: 16px 12px; background: #fff; }
@@ -543,6 +640,8 @@ onBeforeUnmount(() => {
 .document-preview__toolbar :deep(.el-input) { width: min(420px, 45vw); }
 .document-preview__paper { width: min(920px, calc(100% - 48px)); min-height: calc(100vh - 160px); margin: 24px auto; padding: 48px 56px; background: #fff; box-shadow: 0 10px 30px rgba(20, 32, 51, .1); }
 .document-preview__paper pre { margin: 0; color: var(--sunyu-ink); font: inherit; line-height: 1.85; white-space: pre-wrap; overflow-wrap: anywhere; }
+.document-preview__paper mark { padding: 0 2px; background: var(--el-color-warning-light-5); color: inherit; }
+.document-preview__paper mark.is-active { background: var(--el-color-warning); outline: 2px solid var(--el-color-primary); }
 .document-preview__canvas { min-height: calc(100vh - 130px); display: grid; place-items: center; overflow: auto; padding: 24px; }
 .document-preview__canvas img { display: block; max-width: 100%; max-height: calc(100vh - 180px); transform-origin: center; transition: transform .16s ease; }
 .document-preview__pdf { width: 100%; height: 100%; min-height: calc(100vh - 74px); border: 0; background: #fff; }

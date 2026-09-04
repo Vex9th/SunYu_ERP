@@ -69,13 +69,14 @@ _SQLITE_MAX_INTEGER = 2**63 - 1
 _PROJECT_STATUSES = frozenset({"active", "archived", "all"})
 _PROJECT_UPDATE_FIELDS = {"company_id", "name", "description", "expected_revision"}
 _PROJECT_CLOSE_FIELDS = {"closure_type", "reason", "expected_revision"}
+_PROJECT_RESTORE_FIELDS = {"reason", "expected_revision"}
 _CLOSURE_TYPES = frozenset({"cancelled", "completed"})
 
 Clock = Callable[[], datetime]
 ProjectPayload = dict[str, str | int | None]
-ArchivePayload = dict[str, str | None]
 ProjectUpdatePayload = dict[str, str | int | None]
 ProjectClosePayload = dict[str, str | int]
+ProjectRestorePayload = dict[str, str | int]
 
 
 def create_projects_router(
@@ -92,9 +93,7 @@ def create_projects_router(
     connection_dependency = Depends(get_connection)
     settings_dependency = Depends(get_settings)
     project_payload_dependency = Depends(_read_project_payload)
-    archive_payload_dependency = Depends(_read_archive_payload)
     project_status_dependency = Depends(_read_project_status)
-    project_code_dependency = Depends(_read_path_project_code)
     structured_project_code_dependency = Depends(_read_structured_path_project_code)
     now = clock or _utc_now
 
@@ -205,32 +204,16 @@ def create_projects_router(
 
     @router.post("/{project_code}/archive")
     def archive_project(
+        project_code: str,
         _: None = authentication_dependency,
-        project_code: str = project_code_dependency,
-        payload: ArchivePayload = archive_payload_dependency,
-        connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
-        timestamp = _timestamp(now)
-        try:
-            with transaction(connection):
-                connection.execute(
-                    """
-                    UPDATE projects
-                    SET status = 'archived', archive_reason = ?,
-                        archived_at = ?, revision = revision + 1, updated_at = ?
-                    WHERE project_code_key = ?
-                      AND status = 'active'
-                    """,
-                    (payload["reason"], timestamp, timestamp, project_code),
-                )
-                response = _project_by_key(connection, project_code)
-                if response is None:
-                    raise _project_not_found()
-        except sqlite3.IntegrityError as exc:
-            raise _unexpected_database_failure(exc) from None
-        except sqlite3.Error as exc:
-            raise _unexpected_database_failure(exc) from None
-        return response
+        del project_code
+        raise ApiError(
+            status.HTTP_410_GONE,
+            "Project archive endpoint is retired; use project close",
+            "PROJECT_ARCHIVE_RETIRED",
+            headers={"X-Error-Code": "PROJECT_ARCHIVE_RETIRED"},
+        )
 
     @router.get("/{project_code}/dashboard")
     def get_project_dashboard(
@@ -260,6 +243,11 @@ def create_projects_router(
                     project,
                     today=_business_date(now),
                 )
+                completion_check = _project_completion_check(
+                    connection,
+                    project,
+                    operating,
+                )
         except sqlite3.Error as exc:
             raise _unexpected_structured_database_failure(exc) from None
         return {
@@ -268,6 +256,7 @@ def create_projects_router(
             "contacts": contacts,
             "documents": documents,
             **operating,
+            "completion_check": completion_check,
         }
 
     @router.get("/{project_code}")
@@ -361,6 +350,19 @@ def create_projects_router(
                         "PROJECT_ALREADY_CLOSED",
                     )
                 _require_revision(current, int(payload["expected_revision"]))
+                if payload["closure_type"] == "completed":
+                    operating = build_project_operating_snapshot(
+                        connection,
+                        current,
+                        today=_business_date(now),
+                    )
+                    completion_check = _project_completion_check(
+                        connection,
+                        current,
+                        operating,
+                    )
+                    if completion_check["ready"] is not True:
+                        raise _project_completion_blocked(completion_check)
                 connection.execute(
                     """
                     UPDATE projects
@@ -388,6 +390,93 @@ def create_projects_router(
                     response=response,
                     response_status=status.HTTP_200_OK,
                     resource_type="project",
+                    resource_id=int(current["id"]),
+                    created_at=timestamp,
+                )
+                return response
+        except sqlite3.Error as exc:
+            raise _unexpected_structured_database_failure(exc) from None
+
+    @router.post("/{project_code}/restore")
+    async def restore_project(
+        request: Request,
+        _: None = authentication_dependency,
+        project_code: str = structured_project_code_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        key = _read_idempotency_key(request)
+        payload = await _read_project_restore_payload(request)
+        request_hash = _request_hash(payload)
+        scope = f"POST:/api/projects/{project_code}/restore"
+        timestamp = _timestamp(now)
+        try:
+            with transaction_immediate(connection):
+                restored = restore_idempotent_response(
+                    connection,
+                    scope=scope,
+                    key=key,
+                    request_hash=request_hash,
+                )
+                if restored is not None:
+                    return restored
+                current = _project_detail_row_by_key(connection, project_code)
+                if current is None:
+                    raise _resource_not_found("Project not found")
+                if current["status"] != "archived":
+                    raise _business_conflict(
+                        "Project is already active",
+                        "PROJECT_ALREADY_ACTIVE",
+                    )
+                expected_revision = int(payload["expected_revision"])
+                _require_revision(current, expected_revision)
+                resulting_revision = expected_revision + 1
+                cursor = connection.execute(
+                    """
+                    UPDATE projects
+                    SET status = 'active', closure_type = NULL,
+                        archive_reason = NULL, archived_at = NULL,
+                        revision = ?, updated_at = ?
+                    WHERE project_code_key = ? AND revision = ?
+                    """,
+                    (
+                        resulting_revision,
+                        timestamp,
+                        project_code,
+                        expected_revision,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise sqlite3.DatabaseError("restored project update was lost")
+                connection.execute(
+                    """
+                    INSERT INTO project_restore_events
+                        (project_id, from_closure_type, from_archive_reason,
+                         from_archived_at, restore_reason, expected_revision,
+                         resulting_revision, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        current["id"],
+                        current["closure_type"],
+                        current["archive_reason"],
+                        current["archived_at"],
+                        payload["reason"],
+                        expected_revision,
+                        resulting_revision,
+                        timestamp,
+                    ),
+                )
+                response = _project_detail_by_key(connection, project_code)
+                if response is None:
+                    raise sqlite3.DatabaseError("restored project is missing")
+                save_idempotent_response(
+                    connection,
+                    scope=scope,
+                    key=key,
+                    request_hash=request_hash,
+                    response=response,
+                    response_status=status.HTTP_200_OK,
+                    resource_type="project_restore",
                     resource_id=int(current["id"]),
                     created_at=timestamp,
                 )
@@ -438,25 +527,6 @@ async def _read_project_payload(request: Request) -> ProjectPayload:
         "company_id": company_id,
         "name": name,
         "description": description,
-    }
-
-
-async def _read_archive_payload(request: Request) -> ArchivePayload:
-    try:
-        payload: Any = await request.json()
-    except (RecursionError, UnicodeError, ValueError):
-        raise _invalid_archive_payload() from None
-    if not isinstance(payload, dict) or set(payload) != {"reason"}:
-        raise _invalid_archive_payload()
-    reason = payload["reason"]
-    if reason is None:
-        return {"reason": None}
-    return {
-        "reason": _normalize_text(
-            reason,
-            required=False,
-            detail="Invalid archive payload",
-        )
     }
 
 
@@ -512,6 +582,23 @@ async def _read_project_close_payload(request: Request) -> ProjectClosePayload:
         "expected_revision": _positive_integer(
             payload["expected_revision"],
             "Invalid project close payload",
+        ),
+    }
+
+
+async def _read_project_restore_payload(request: Request) -> ProjectRestorePayload:
+    payload = await _read_json_object(request, "Invalid project restore payload")
+    if set(payload) != _PROJECT_RESTORE_FIELDS:
+        raise _invalid_structured_payload("Invalid project restore payload")
+    return {
+        "reason": _normalize_structured_text(
+            payload["reason"],
+            required=True,
+            detail="Invalid project restore payload",
+        ),
+        "expected_revision": _positive_integer(
+            payload["expected_revision"],
+            "Invalid project restore payload",
         ),
     }
 
@@ -647,6 +734,120 @@ def _require_revision(row: sqlite3.Row, expected_revision: int) -> None:
         )
 
 
+def _project_completion_check(
+    connection: sqlite3.Connection,
+    project: sqlite3.Row | dict[str, object],
+    operating: dict[str, object],
+) -> dict[str, object]:
+    stages = operating.get("stages")
+    receivables = operating.get("receivables")
+    if not isinstance(stages, list) or not isinstance(receivables, dict):
+        raise sqlite3.DatabaseError("project completion inputs are invalid")
+    outstanding_receivable = receivables.get("outstanding_receivable_cents")
+    if isinstance(outstanding_receivable, bool) or not isinstance(
+        outstanding_receivable,
+        int,
+    ):
+        raise sqlite3.DatabaseError("project receivables are invalid")
+    contract_outstanding = _project_contract_outstanding(
+        connection,
+        int(project["id"]),
+    )
+
+    stages_ready = bool(stages) and all(
+        isinstance(stage, dict)
+        and stage.get("status") in {"completed", "skipped"}
+        for stage in stages
+    )
+    latest_final_acceptance = connection.execute(
+        """
+        SELECT status FROM acceptances
+        WHERE project_id = ?
+          AND acceptance_type = 'final'
+        ORDER BY COALESCE(performed_on, scheduled_on, '') DESC, id DESC
+        LIMIT 1
+        """,
+        (project["id"],),
+    ).fetchone()
+    final_acceptance_ready = (
+        latest_final_acceptance is not None
+        and latest_final_acceptance["status"] in {"passed", "passed_with_punch"}
+    )
+    receivables_ready = outstanding_receivable == 0 and contract_outstanding == 0
+    blockers: list[str] = []
+    if not stages_ready:
+        blockers.append("PROJECT_STAGES_INCOMPLETE")
+    if not final_acceptance_ready:
+        blockers.append("FINAL_ACCEPTANCE_NOT_PASSED")
+    if not receivables_ready:
+        blockers.append("RECEIVABLES_OUTSTANDING")
+    return {
+        "stages_ready": stages_ready,
+        "final_acceptance_ready": final_acceptance_ready,
+        "receivables_ready": receivables_ready,
+        "ready": not blockers,
+        "blockers": blockers,
+    }
+
+
+def _project_contract_outstanding(
+    connection: sqlite3.Connection,
+    project_id: int,
+) -> int:
+    row = connection.execute(
+        """
+        SELECT COALESCE(
+            SUM(
+                CASE
+                    WHEN received_amount >= contract_amount THEN 0
+                    ELSE contract_amount - received_amount
+                END
+            ),
+            0
+        ) AS outstanding_amount
+        FROM (
+            SELECT
+                allocations.id,
+                allocations.amount_cents AS contract_amount,
+                COALESCE(SUM(receipts.amount_cents), 0) AS received_amount
+            FROM contract_project_allocations AS allocations
+            JOIN contracts ON contracts.id = allocations.contract_id
+            LEFT JOIN receipts
+                ON receipts.contract_allocation_id = allocations.id
+               AND receipts.status = 'active'
+            WHERE allocations.project_id = ?
+              AND contracts.status IN ('signed', 'completed')
+            GROUP BY allocations.id, allocations.amount_cents
+        ) AS contract_collection
+        """,
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        raise sqlite3.DatabaseError("project contract collection is missing")
+    return int(row["outstanding_amount"])
+
+
+def _project_completion_blocked(
+    completion_check: dict[str, object],
+) -> ApiError:
+    field_errors: dict[str, object] = {}
+    if completion_check["stages_ready"] is not True:
+        field_errors["stages"] = "所有项目阶段必须为已完成或已跳过"
+    if completion_check["final_acceptance_ready"] is not True:
+        field_errors["final_acceptance"] = (
+            "必须存在结果为通过或带整改通过的最终验收"
+        )
+    if completion_check["receivables_ready"] is not True:
+        field_errors["receivables"] = "项目未收款必须为 0"
+    return ApiError(
+        status.HTTP_409_CONFLICT,
+        "Project completion requirements are not met",
+        "PROJECT_COMPLETION_BLOCKED",
+        field_errors=field_errors,
+        headers={"X-Error-Code": "PROJECT_COMPLETION_BLOCKED"},
+    )
+
+
 def _project_by_id(
     connection: sqlite3.Connection,
     project_id: int,
@@ -660,25 +861,6 @@ def _project_by_id(
         WHERE id = ?
         """,
         (project_id,),
-    ).fetchone()
-    if row is None:
-        return None
-    return _row_response(row, _PROJECT_RESPONSE_FIELDS)
-
-
-def _project_by_key(
-    connection: sqlite3.Connection,
-    project_code_key: str,
-) -> dict[str, object] | None:
-    row = connection.execute(
-        """
-        SELECT
-            id, project_code, company_id, name, description, status,
-            archive_reason, archived_at, created_at, updated_at
-        FROM projects
-        WHERE project_code_key = ?
-        """,
-        (project_code_key,),
     ).fetchone()
     if row is None:
         return None
@@ -872,10 +1054,6 @@ def _invalid_project_payload() -> HTTPException:
     return _invalid_payload("Invalid project payload")
 
 
-def _invalid_archive_payload() -> HTTPException:
-    return _invalid_payload("Invalid archive payload")
-
-
 def _invalid_payload(detail: str) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -912,13 +1090,6 @@ def _company_not_found() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail="Company not found",
-    )
-
-
-def _project_not_found() -> HTTPException:
-    return HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail="Project not found",
     )
 
 

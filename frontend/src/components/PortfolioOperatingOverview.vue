@@ -2,6 +2,7 @@
 import { onMounted, ref } from 'vue'
 
 import type { GlobalDashboard } from '../domain/contracts'
+import { formatChineseDateTime } from '../domain/dates'
 import { formatMoney } from '../domain/formatters'
 import { createHttpProjectOperatingRepository } from '../repositories/project-operating.live'
 
@@ -62,7 +63,6 @@ function stageLabel(stageCode: string | undefined): string {
         <h2>经营总览</h2>
         <p>在建项目、应收和当前阶段集中查看。</p>
       </div>
-      <el-tag data-testid="portfolio-operating-live" type="success" effect="plain">真实后端</el-tag>
     </header>
 
     <el-card v-if="loading" shadow="never"><el-skeleton :rows="6" animated /></el-card>
@@ -82,7 +82,9 @@ function stageLabel(stageCode: string | undefined): string {
         <el-tag :type="dashboard.backup.healthy ? 'success' : 'warning'">
           {{ dashboard.backup.healthy ? '备份正常' : '备份待检查' }}
         </el-tag>
-        <el-text type="info">{{ dashboard.backup.message ?? `最近成功：${dashboard.backup.last_success_at ?? '暂无记录'}` }}</el-text>
+        <el-text type="info">
+          {{ dashboard.backup.message ?? `最近成功：${dashboard.backup.last_success_at ? formatChineseDateTime(dashboard.backup.last_success_at) : '暂无记录'}` }}
+        </el-text>
       </div>
 
       <el-row :gutter="16" class="metric-grid">
@@ -131,7 +133,7 @@ function stageLabel(stageCode: string | undefined): string {
               <el-text tag="strong" size="large">项目经营台账</el-text>
               <p class="section-note">报价不作为收入，利润只使用合同分摊额和实际成本。</p>
             </div>
-            <el-tag type="info">生成于 {{ dashboard.generated_at }}</el-tag>
+            <el-tag type="info">生成于 {{ formatChineseDateTime(dashboard.generated_at) }}</el-tag>
           </el-row>
         </template>
         <div class="overview-table-scroll">
@@ -186,7 +188,15 @@ function stageLabel(stageCode: string | undefined): string {
                 :type="severityType(todo.severity)"
                 :closable="false"
                 show-icon
-              />
+              >
+                <el-button
+                  v-if="todo.project_code"
+                  :data-testid="`todo-open-project-${todo.project_code}-${todo.code}`"
+                  link
+                  type="primary"
+                  @click="emit('open-project', todo.project_code)"
+                >进入项目</el-button>
+              </el-alert>
             </el-space>
           </el-card>
         </el-col>

@@ -391,6 +391,37 @@ def test_stage_event_schema_enforces_reason_and_one_event_per_revision(
                 """,
                 (stage_id, NOW.isoformat(), NOW.isoformat()),
             )
+        for missing_reason in (None, "   "):
+            with pytest.raises(
+                sqlite3.IntegrityError,
+                match="blocked stage reopen reason is required",
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO project_stage_events
+                        (project_stage_id, from_status, to_status, reason,
+                         occurred_at, resulting_revision, created_at)
+                    VALUES (?, 'blocked', 'in_progress', ?, ?, 3, ?)
+                    """,
+                    (stage_id, missing_reason, NOW.isoformat(), NOW.isoformat()),
+                )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                """
+                UPDATE project_stage_events
+                SET reason = '篡改原因'
+                WHERE project_stage_id = ? AND resulting_revision = 2
+                """,
+                (stage_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                """
+                DELETE FROM project_stage_events
+                WHERE project_stage_id = ? AND resulting_revision = 2
+                """,
+                (stage_id,),
+            )
     finally:
         connection.close()
 
@@ -566,7 +597,11 @@ def test_transition_flow_persists_timestamps_reason_and_events(tmp_path: Path) -
         resumed = client.post(
             "/api/projects/SY-2026-001/stages/planning/transition",
             headers=_idempotency_headers(),
-            json=_transition_payload("in_progress", revision=3),
+            json=_transition_payload(
+                "in_progress",
+                revision=3,
+                reason="客户资料已经补齐",
+            ),
         )
         completed = client.post(
             "/api/projects/SY-2026-001/stages/planning/transition",
@@ -610,7 +645,7 @@ def test_transition_flow_persists_timestamps_reason_and_events(tmp_path: Path) -
         assert [tuple(event) for event in events] == [
             ("pending", "in_progress", None, 2),
             ("in_progress", "blocked", "等待客户资料", 3),
-            ("blocked", "in_progress", None, 4),
+            ("blocked", "in_progress", "客户资料已经补齐", 4),
             ("in_progress", "completed", None, 5),
             ("completed", "in_progress", "补录遗漏纪要", 6),
         ]
@@ -647,13 +682,30 @@ def test_block_skip_and_terminal_correction_require_reason(tmp_path: Path) -> No
             headers=_idempotency_headers(),
             json=_transition_payload("blocked", revision=2),
         )
+        blocked = client.post(
+            "/api/projects/SY-2026-001/stages/quotation/transition",
+            headers=_idempotency_headers(),
+            json=_transition_payload("blocked", revision=2, reason="等待客户确认"),
+        )
+        no_resolve_reason = client.post(
+            "/api/projects/SY-2026-001/stages/quotation/transition",
+            headers=_idempotency_headers(),
+            json=_transition_payload("in_progress", revision=3),
+        )
 
-    for response in (no_skip_reason, no_reopen_reason, no_block_reason):
+    for response in (
+        no_skip_reason,
+        no_reopen_reason,
+        no_block_reason,
+        no_resolve_reason,
+    ):
         assert response.status_code == 422
         assert response.json()["detail"] == "Invalid stage transition"
     assert skipped.status_code == 200
     assert skipped.json()["status"] == "skipped"
     assert skipped.json()["completed_at"] == "2026-08-29T02:00:00+00:00"
+    assert blocked.status_code == 200
+    assert blocked.json()["status"] == "blocked"
 
 
 def test_invalid_transition_is_409_and_does_not_add_event(tmp_path: Path) -> None:

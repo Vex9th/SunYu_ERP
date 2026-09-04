@@ -134,11 +134,42 @@ describe('project document preview workbench', () => {
     expect(screen('document-preview-text').text()).toContain('客户确认交付日期')
     await screen('document-preview-search').setValue('交付日期')
     expect(screen('document-preview-search-summary').text()).toContain('2 处')
+    expect(document.body.querySelectorAll('[data-search-match]').length).toBe(2)
+    expect(screenSelector('[data-search-match="0"]').classes()).toContain('is-active')
+    await screenSelector('[aria-label="下一个搜索结果"]').trigger('click')
+    expect(screenSelector('[data-search-match="1"]').classes()).toContain('is-active')
     await screen('document-preview-copy').trigger('click')
     await screen('document-preview-print').trigger('click')
 
     expect(writeText).toHaveBeenCalledWith(expect.stringContaining('客户确认交付日期'))
     expect(print).toHaveBeenCalledOnce()
+  })
+
+  it('预览和版本标题优先使用 managed filename，并显示原文件名追溯', async () => {
+    const managedVersion = {
+      ...version(31, 1, '客户扫描原稿.bin', 'application/octet-stream', 8),
+      managed_filename: 'SY-2026-001-发票-20260903.pdf',
+    }
+    const invoice = detail(12, '销项发票', [managedVersion], 'invoice')
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => 'blob:managed-pdf'),
+    })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
+
+    mountPreview({
+      documentId: invoice.id,
+      documents: [summary(invoice)],
+      repository: repository(
+        vi.fn().mockResolvedValue(invoice),
+        vi.fn().mockResolvedValue(new Blob(['%PDF-1.7'], { type: 'application/pdf' })),
+      ),
+    })
+    await settle()
+
+    expect(document.body.textContent).toContain('SY-2026-001-发票-20260903.pdf')
+    expect(document.body.textContent).toContain('原文件名：客户扫描原稿.bin')
+    expect(screen('document-preview-pdf').exists()).toBe(true)
   })
 
   it('复制失败时显示错误提示而不是成功提示', async () => {
@@ -194,6 +225,26 @@ describe('project document preview workbench', () => {
 
     expect(wrapper.emitted('navigate')).toContainEqual([12, 31])
     expect(screen('document-preview-text').text()).toBe('V31 内容')
+  })
+
+  it('页头提供资料选择器，窄屏隐藏侧栏后仍可切换其他资料', async () => {
+    const first = detail(12, '启动会纪要', [version(31, 1, 'minutes.txt', 'text/plain')], 'planning_minutes')
+    const second = detail(13, '现场照片', [version(32, 1, 'site.png', 'image/png')])
+    const wrapper = mountPreview({
+      documentId: first.id,
+      documents: [summary(first), summary(second)],
+      repository: repository(
+        vi.fn().mockResolvedValue(first),
+        vi.fn().mockResolvedValue(new Blob(['纪要内容'], { type: 'text/plain' })),
+      ),
+    })
+    await settle()
+
+    const selector = wrapper.getComponent('[data-testid="document-preview-document-select"]')
+    expect(screen('document-preview-document-select').find('input').attributes('aria-label')).toBe('选择项目资料')
+    ;(selector as VueWrapper).vm.$emit('change', 13)
+
+    expect(wrapper.emitted('navigate')).toContainEqual([13, null])
   })
 
   it('使用 Element Plus 全屏对话框承载预览并 teleport 到应用根节点之外', async () => {
@@ -417,7 +468,7 @@ describe('project document preview workbench', () => {
 
     await screen('document-preview-download').trigger('click')
     await settle()
-    expect(download).toHaveBeenCalledWith('SY-2026-001', 13, 32)
+    expect(download).toHaveBeenCalledWith('SY-2026-001', 13, 32, expect.any(AbortSignal))
   })
 
   it('项目或文档切换后忽略旧请求的迟到结果', async () => {
@@ -444,6 +495,45 @@ describe('project document preview workbench', () => {
     expect(screen('document-preview-text').text()).toBe('B 项目内容')
     expect(download).toHaveBeenCalledWith('SY-2026-001', 22, 41, expect.any(AbortSignal))
     expect(download).not.toHaveBeenCalledWith('SY-2026-001', 12, 31)
+  })
+
+  it('手动下载在切换文档后迟到时不会下载旧文件或污染当前错误', async () => {
+    let resolveOldDownload!: (value: Blob) => void
+    const oldDownload = new Promise<Blob>((resolve) => { resolveOldDownload = resolve })
+    const old = detail(12, 'A 机械图', [version(31, 1, 'a-layout.dwg', 'application/acad')])
+    const current = detail(22, 'B 机械图', [version(41, 1, 'b-layout.dwg', 'application/acad')])
+    const getDocument = vi.fn().mockImplementation(async (_projectCode: string, documentId: number) => (
+      documentId === old.id ? old : current
+    ))
+    const download = vi.fn().mockImplementation(async (
+      _projectCode: string,
+      documentId: number,
+    ) => {
+      if (documentId === old.id) return oldDownload
+      return new Blob(['B'])
+    })
+    const createObjectUrl = vi.fn(() => 'blob:late-old-download')
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectUrl })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const wrapper = mountPreview({
+      documentId: old.id,
+      documents: [summary(old), summary(current)],
+      repository: repository(getDocument, download),
+    })
+    await settle()
+
+    await screen('document-preview-download').trigger('click')
+    await vi.waitFor(() => expect(download).toHaveBeenCalledTimes(1))
+    await wrapper.setProps({ documentId: current.id })
+    await settle()
+    resolveOldDownload(new Blob(['A']))
+    await settle()
+
+    expect(screenSelector('.document-preview__identity').text()).toContain('B 机械图')
+    expect(createObjectUrl).not.toHaveBeenCalled()
+    expect(click).not.toHaveBeenCalled()
+    expect(document.body.textContent).not.toContain('A 下载失败')
   })
 
   it('Esc 可以退出独立预览', async () => {
@@ -537,6 +627,11 @@ describe('project document preview workbench', () => {
     await wrapper.get('[data-testid="document-preview-open-12"]').trigger('click')
     await settle()
     await screen('document-preview-close').trigger('click')
+    await settle()
+    expect(router.currentRoute.value.fullPath).toBe('/projects/SY-2026-001/documents')
+    expect(document.body.querySelector('[data-testid="document-preview-workbench"]')).toBeNull()
+
+    router.back()
     await settle()
     expect(router.currentRoute.value.fullPath).toBe('/projects/SY-2026-001/documents')
     expect(document.body.querySelector('[data-testid="document-preview-workbench"]')).toBeNull()

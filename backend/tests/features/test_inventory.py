@@ -242,3 +242,184 @@ def test_opening_balance_rejects_value_outside_sqlite_integer_range(
             "current_revision": None,
         }
         assert client.get("/api/inventory/items").json()["total"] == 0
+
+
+def test_manual_adjustment_reversal_is_exact_audited_idempotent_and_concurrent(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        created = client.post(
+            "/api/inventory/items",
+            headers={"Idempotency-Key": "51000000-0000-4000-8000-000000000001"},
+            json=_item_payload(),
+        )
+        adjustment_headers = {
+            "Idempotency-Key": "51000000-0000-4000-8000-000000000002"
+        }
+        adjustment_payload = {
+            "item_id": created.json()["id"],
+            "quantity_delta": "1.000",
+            "unit_cost_cents": 200,
+            "reason": "盘盈",
+            "occurred_on": "2026-08-29",
+        }
+        adjustment = client.post(
+            "/api/inventory/adjustments",
+            headers=adjustment_headers,
+            json=adjustment_payload,
+        )
+        assert adjustment.status_code == 201, adjustment.text
+        assert adjustment.json()["status"] == "active"
+        assert adjustment.json()["revision"] == 1
+
+        stale = client.post(
+            f"/api/inventory/adjustments/{adjustment.json()['id']}/reverse",
+            headers={"Idempotency-Key": "51000000-0000-4000-8000-000000000003"},
+            json={"reason": "录入错误", "expected_revision": 99},
+        )
+        assert stale.status_code == 409
+        assert stale.json()["error_code"] == "REVISION_CONFLICT"
+
+        reverse_headers = {
+            "Idempotency-Key": "51000000-0000-4000-8000-000000000004"
+        }
+        reverse_payload = {"reason": "录入错误", "expected_revision": 1}
+        reversed_adjustment = client.post(
+            f"/api/inventory/adjustments/{adjustment.json()['id']}/reverse",
+            headers=reverse_headers,
+            json=reverse_payload,
+        )
+        replay = client.post(
+            f"/api/inventory/adjustments/{adjustment.json()['id']}/reverse",
+            headers=reverse_headers,
+            json=reverse_payload,
+        )
+        assert reversed_adjustment.status_code == replay.status_code == 200
+        assert replay.json() == reversed_adjustment.json()
+        assert reversed_adjustment.json()["status"] == "reversed"
+        assert reversed_adjustment.json()["revision"] == 2
+        assert reversed_adjustment.json()["reversal_reason"] == "录入错误"
+        assert reversed_adjustment.json()["reversed_at"] == NOW.isoformat()
+        assert reversed_adjustment.json()["reversal_movement"]["source_type"] == (
+            "inventory_adjustment_reversal"
+        )
+        assert reversed_adjustment.json()["reversal_movement"]["source_id"] == (
+            adjustment.json()["id"]
+        )
+        assert reversed_adjustment.json()["reversal_movement"]["quantity_delta"] == (
+            "-1.000"
+        )
+        assert reversed_adjustment.json()["reversal_movement"]["value_delta_cents"] == (
+            -200
+        )
+
+        create_replay_after_reversal = client.post(
+            "/api/inventory/adjustments",
+            headers=adjustment_headers,
+            json=adjustment_payload,
+        )
+        assert create_replay_after_reversal.status_code == 201
+        assert create_replay_after_reversal.json() == adjustment.json()
+
+        duplicate = client.post(
+            f"/api/inventory/adjustments/{adjustment.json()['id']}/reverse",
+            headers={"Idempotency-Key": "51000000-0000-4000-8000-000000000005"},
+            json={"reason": "再次冲销", "expected_revision": 2},
+        )
+        assert duplicate.status_code == 409
+        assert duplicate.json()["error_code"] == "INVENTORY_ADJUSTMENT_ALREADY_REVERSED"
+
+        detail = client.get(f"/api/inventory/items/{created.json()['id']}")
+        assert detail.json()["quantity"] == "2.000"
+        movements = detail.json()["movements"]
+        assert [entry["movement_type"] for entry in movements] == [
+            "reversal",
+            "adjustment",
+            "opening",
+        ]
+        original = next(
+            entry for entry in movements if entry["source_type"] == "inventory_adjustment"
+        )
+        assert original["adjustment_status"] == "reversed"
+        assert original["adjustment_revision"] == 2
+
+    connection = connect_database(harness.database_path)
+    try:
+        row = connection.execute(
+            "SELECT * FROM inventory_adjustments WHERE id = ?",
+            (adjustment.json()["id"],),
+        ).fetchone()
+        assert row is not None
+        assert row["quantity_delta_milli"] == 1000
+        assert row["value_delta_cents"] == 200
+        assert row["reason"] == "盘盈"
+        assert row["movement_id"] == adjustment.json()["movement"]["id"]
+        assert row["reversal_movement_id"] == reversed_adjustment.json()[
+            "reversal_movement"
+        ]["id"]
+    finally:
+        connection.close()
+
+
+def test_manual_adjustment_reversal_rolls_back_when_inventory_would_be_negative(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        created = client.post(
+            "/api/inventory/items",
+            headers={"Idempotency-Key": "52000000-0000-4000-8000-000000000001"},
+            json=_item_payload(),
+        )
+        positive = client.post(
+            "/api/inventory/adjustments",
+            headers={"Idempotency-Key": "52000000-0000-4000-8000-000000000002"},
+            json={
+                "item_id": created.json()["id"],
+                "quantity_delta": "1.000",
+                "unit_cost_cents": 200,
+                "reason": "盘盈",
+                "occurred_on": "2026-08-29",
+            },
+        )
+        consumed = client.post(
+            "/api/inventory/adjustments",
+            headers={"Idempotency-Key": "52000000-0000-4000-8000-000000000003"},
+            json={
+                "item_id": created.json()["id"],
+                "quantity_delta": "-3.000",
+                "unit_cost_cents": None,
+                "reason": "盘亏",
+                "occurred_on": "2026-08-29",
+            },
+        )
+        assert consumed.status_code == 201
+
+        failed = client.post(
+            f"/api/inventory/adjustments/{positive.json()['id']}/reverse",
+            headers={"Idempotency-Key": "52000000-0000-4000-8000-000000000004"},
+            json={"reason": "原盘盈录错", "expected_revision": 1},
+        )
+        assert failed.status_code == 409
+        assert failed.json()["error_code"] == (
+            "INVENTORY_ADJUSTMENT_REVERSAL_INSUFFICIENT_INVENTORY"
+        )
+        detail = client.get(f"/api/inventory/items/{created.json()['id']}")
+        assert detail.json()["quantity"] == "0.000"
+        assert len(detail.json()["movements"]) == 3
+
+    connection = connect_database(harness.database_path)
+    try:
+        row = connection.execute(
+            "SELECT status, revision, reversal_movement_id "
+            "FROM inventory_adjustments WHERE id = ?",
+            (positive.json()["id"],),
+        ).fetchone()
+        assert dict(row) == {
+            "status": "active",
+            "revision": 1,
+            "reversal_movement_id": None,
+        }
+    finally:
+        connection.close()

@@ -592,7 +592,8 @@ def _stage_response(row: sqlite3.Row) -> dict[str, object]:
 
 def _transition_requires_reason(from_status: str, to_status: str) -> bool:
     return to_status in {"blocked", "skipped"} or (
-        from_status in {"completed", "skipped"} and to_status == "in_progress"
+        from_status in {"blocked", "completed", "skipped"}
+        and to_status == "in_progress"
     )
 
 

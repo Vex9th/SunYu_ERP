@@ -20,7 +20,7 @@ from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
 from backend.app.core.security import SESSION_COOKIE_NAME, create_session_token
 from backend.app.core.storage_paths import project_code_identity
-from backend.app.features import files
+from backend.app.features import business_attachments, files
 from backend.app.features.projects import create_projects_router
 
 
@@ -56,6 +56,15 @@ def test_documents_migration_creates_tables_and_enforces_constraints(
             "011_procurement_audit",
             "012_delivery_events",
             "013_workforce_events",
+            "014_managed_document_filenames",
+            "015_write_safety",
+            "016_inventory_procurement_corrections",
+            "017_acceptance_corrections",
+            "018_project_restore_events",
+            "019_project_stage_event_safety",
+            "020_acceptance_reschedule_events",
+            "021_workforce_audit_history",
+            "022_supplier_invoice_active_number",
         ]
         assert {
             row["name"]
@@ -65,6 +74,12 @@ def test_documents_migration_creates_tables_and_enforces_constraints(
         } >= {"documents", "document_versions"}
 
         assert connection.execute("PRAGMA foreign_key_list(documents)").fetchall() == []
+
+        version_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(document_versions)")
+        }
+        assert "managed_filename" in version_columns
 
         # Documents may be uploaded before the corresponding project is registered.
         connection.execute(
@@ -93,6 +108,9 @@ def test_documents_migration_creates_tables_and_enforces_constraints(
             """,
             valid_version,
         )
+        assert connection.execute(
+            "SELECT managed_filename FROM document_versions WHERE id = 1"
+        ).fetchone()[0] == "drawing.dwg"
 
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
@@ -177,6 +195,120 @@ def test_documents_migration_creates_tables_and_enforces_constraints(
             == ["document_id", "version_number"]
             for row in indexes
         )
+    finally:
+        connection.close()
+
+
+def test_managed_filename_migration_upgrades_blank_legacy_names_safely(
+    tmp_path: Path,
+) -> None:
+    staged_migrations = tmp_path / "migrations"
+    staged_migrations.mkdir()
+    for source in sorted(_migrations_dir().glob("*.sql")):
+        if source.name >= "014_managed_document_filenames.sql":
+            continue
+        (staged_migrations / source.name).write_text(
+            source.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+    connection = connect_database(tmp_path / "erp.sqlite3")
+    try:
+        applied = apply_migrations(connection, staged_migrations)
+        assert applied[-1] == "013_workforce_events"
+        connection.execute(
+            """
+            INSERT INTO documents
+                (id, project_code, category, logical_name, revision,
+                 created_at, updated_at)
+            VALUES (7, 'P-LEGACY', 'other', '历史附件', 1,
+                    '2026-08-01T00:00:00+00:00',
+                    '2026-08-01T00:00:00+00:00')
+            """
+        )
+        legacy_rows = [
+            (
+                41,
+                7,
+                1,
+                "",
+                "application/octet-stream",
+                "Projects/P-LEGACY/other/7/legacy-empty",
+                1,
+                "a" * 64,
+                None,
+                "2026-08-01T00:00:00+00:00",
+            ),
+            (
+                42,
+                7,
+                2,
+                "   ",
+                "application/pdf",
+                "Projects/P-LEGACY/other/7/legacy-spaces",
+                2,
+                "b" * 64,
+                "保留备注",
+                "2026-08-02T00:00:00+00:00",
+            ),
+        ]
+        connection.executemany(
+            """
+            INSERT INTO document_versions
+                (id, document_id, version_number, original_filename,
+                 content_type, stored_relative_path, size_bytes, sha256,
+                 notes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            legacy_rows,
+        )
+        (staged_migrations / "014_managed_document_filenames.sql").write_text(
+            (_migrations_dir() / "014_managed_document_filenames.sql").read_text(
+                encoding="utf-8"
+            ),
+            encoding="utf-8",
+        )
+
+        assert apply_migrations(connection, staged_migrations) == [
+            "014_managed_document_filenames"
+        ]
+        upgraded = connection.execute(
+            """
+            SELECT id, document_id, version_number, original_filename,
+                   content_type, stored_relative_path, size_bytes, sha256,
+                   notes, created_at, managed_filename
+            FROM document_versions
+            WHERE id IN (41, 42)
+            ORDER BY id
+            """
+        ).fetchall()
+        assert [tuple(row[:-1]) for row in upgraded] == legacy_rows
+        assert [row["managed_filename"] for row in upgraded] == [
+            "legacy_document_41",
+            "legacy_document_42",
+        ]
+
+        connection.execute(
+            """
+            INSERT INTO document_versions
+                (id, document_id, version_number, original_filename,
+                 content_type, stored_relative_path, size_bytes, sha256,
+                 created_at)
+            VALUES (43, 7, 3, '   ', 'application/octet-stream',
+                    'Projects/P-LEGACY/other/7/future-spaces', 3, ?,
+                    '2026-08-03T00:00:00+00:00')
+            """,
+            ("c" * 64,),
+        )
+        assert tuple(
+            connection.execute(
+                "SELECT original_filename, managed_filename "
+                "FROM document_versions WHERE id = 43"
+            ).fetchone()
+        ) == ("   ", "legacy_document_43")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE document_versions SET managed_filename = ' ' WHERE id = 43"
+            )
     finally:
         connection.close()
 
@@ -400,6 +532,40 @@ def test_sanitizes_windows_names_and_preserves_chinese(
     assert sanitized == expected
     assert not re.search(r'[<>:"|?*\\\x00-\x1f]', sanitized)
     assert not sanitized.endswith((".", " "))
+
+
+@pytest.mark.parametrize(
+    ("left_identity", "right_identity"),
+    [
+        ("超长业务编号" * 30 + "甲", "超长业务编号" * 30 + "乙"),
+        ("INVOICE-" + "A" * 180 + "X", "INVOICE-" + "A" * 180 + "Y"),
+    ],
+)
+def test_truncated_managed_filenames_keep_hash_date_version_and_index(
+    left_identity: str,
+    right_identity: str,
+) -> None:
+    names = [
+        business_attachments.managed_filename(
+            "P-001",
+            "报价",
+            identity,
+            "20260831",
+            "V1",
+            "01",
+            original_filename="原始文件.pdf",
+            preserve_last_parts=3,
+        )
+        for identity in (left_identity, right_identity)
+    ]
+
+    assert names[0] != names[1]
+    assert all(len(name.encode("utf-8")) <= 120 for name in names)
+    assert all(name.endswith("_20260831_V1_01.pdf") for name in names)
+    assert all(
+        re.search(r"_[0-9a-f]{10}_20260831_V1_01\.pdf$", name)
+        for name in names
+    )
 
 
 @pytest.mark.parametrize(

@@ -7,6 +7,17 @@ export type AttendanceStatus = 'present' | 'absent' | 'leave'
 export type LaborEntryStatus = 'active' | 'voided'
 export type SiteDailyReportStatus = 'draft' | 'confirmed'
 export type MaterialAdvanceStatus = 'unreimbursed' | 'partial' | 'reimbursed' | 'voided'
+export type WorkforcePreviewSection =
+  | 'workers'
+  | 'crew_assignments'
+  | 'labor_entries'
+  | 'site_daily_reports'
+  | 'material_advances'
+
+export interface WorkforceLoadWarning {
+  section: WorkforcePreviewSection
+  message: string
+}
 
 export interface DemoWorkerViewModel {
   worker_id: number
@@ -31,6 +42,7 @@ export interface DemoCrewAssignmentViewModel {
 export interface DemoLaborEntryViewModel {
   entry_id: number
   assignment_id: number
+  replaces_entry_id: number | null
   work_date: ISODate
   attendance_status: AttendanceStatus
   day_fraction: DecimalString | null
@@ -65,6 +77,32 @@ export interface DemoSiteDailyReportViewModel {
   next_plan: string | null
   notes: string | null
   status: SiteDailyReportStatus
+  versions: DemoSiteDailyReportVersionViewModel[]
+  events: DemoSiteDailyReportEventViewModel[]
+}
+
+export interface DemoSiteDailyReportVersionViewModel {
+  id: number
+  version_number: number
+  work_date: ISODate
+  location: string | null
+  weather: string | null
+  work_summary: string | null
+  blockers: string | null
+  next_plan: string | null
+  notes: string | null
+  confirmed_at: ISODateTime
+  created_at: ISODateTime
+}
+
+export interface DemoSiteDailyReportEventViewModel {
+  id: number
+  from_status: SiteDailyReportStatus
+  to_status: SiteDailyReportStatus
+  reason: string | null
+  occurred_at: ISODateTime
+  created_at: ISODateTime
+  report_version_id: number | null
 }
 
 export interface DemoMaterialAdvanceItemViewModel {
@@ -78,10 +116,14 @@ export interface DemoMaterialAdvanceItemViewModel {
 }
 
 export interface DemoReimbursementViewModel {
+  reimbursement_id: number
   amount_cents: MoneyCents
   reimbursed_on: ISODate
   payment_method: 'bank_transfer' | 'cash' | 'other'
   notes: string | null
+  status: 'active' | 'voided'
+  void_reason: string | null
+  voided_at: ISODateTime | null
 }
 
 export interface DemoMaterialAdvanceViewModel {
@@ -93,11 +135,14 @@ export interface DemoMaterialAdvanceViewModel {
   notes: string | null
   document_version_ids: number[]
   status: MaterialAdvanceStatus
+  void_reason: string | null
+  voided_at: ISODateTime | null
   reimbursements: DemoReimbursementViewModel[]
 }
 
 export interface WorkforceDemoViewModel {
   project_code: string
+  load_warnings?: WorkforceLoadWarning[]
   workers: DemoWorkerViewModel[]
   crew_assignments: DemoCrewAssignmentViewModel[]
   labor_entries: DemoLaborEntryViewModel[]
@@ -122,7 +167,10 @@ export interface CrewAssignmentInput {
 }
 
 export type LaborEntryUpdateInput = LaborEntryBatchItemInput & { work_date: ISODate }
-export type SiteDailyReportInput = Omit<DemoSiteDailyReportViewModel, 'status'>
+export type SiteDailyReportInput = Omit<
+  DemoSiteDailyReportViewModel,
+  'status' | 'versions' | 'events'
+>
 
 export interface MaterialAdvanceItemInput {
   name: string
@@ -141,6 +189,11 @@ export interface MaterialAdvanceInput {
   notes: string | null
   document_version_ids: number[]
 }
+
+export type MaterialAdvanceReimbursementInput = Pick<
+  DemoReimbursementViewModel,
+  'amount_cents' | 'reimbursed_on' | 'payment_method' | 'notes'
+>
 
 export type DrawingDiscipline = 'mechanical' | 'electrical'
 export type DrawingSignoffStatus = 'pending' | 'confirmed' | 'not_required'
@@ -204,6 +257,8 @@ export interface DemoAcceptanceViewModel {
   performed_on: ISODate | null
   notes: string | null
   document_version_ids: number[]
+  cancel_reason: string | null
+  cancelled_at: ISODate | null
 }
 
 export interface DemoWarrantyViewModel {
@@ -223,8 +278,8 @@ export interface DemoInvoiceViewModel {
   requested_on: ISODate | null
   recorded_on: ISODate | null
   invoice_number: string | null
-  amount_cents: MoneyCents
-  counterparty_name: string
+  amount_cents: MoneyCents | null
+  counterparty_name: string | null
   notes: string | null
   document_version_ids: number[]
   void_reason: string | null
@@ -238,13 +293,16 @@ export interface DemoAfterSalesCaseViewModel {
   contact_name: string
   contact_phone: string
   coverage_type: AfterSalesCoverageType
+  is_under_warranty: boolean
   notes: string | null
   status: AfterSalesStatus
   resolution: string | null
+  completed_at: ISODateTime | null
 }
 
 export interface DeliveryDemoViewModel {
   project_code: string
+  load_warnings?: string[]
   drawing_signoffs: DemoDrawingSignoffViewModel[]
   commissioning_sessions: DemoCommissioningSessionViewModel[]
   engineering_changes: DemoEngineeringChangeViewModel[]
@@ -252,6 +310,16 @@ export interface DeliveryDemoViewModel {
   warranty: DemoWarrantyViewModel | null
   invoices: DemoInvoiceViewModel[]
   after_sales: DemoAfterSalesCaseViewModel[]
+}
+
+export interface DeliverySummaryViewModel {
+  project_code: string
+  final_payment: {
+    due_on: ISODate | null
+    planned_amount_cents: MoneyCents
+    received_amount_cents: MoneyCents
+    outstanding_amount_cents: MoneyCents
+  }
 }
 
 export type DrawingSignoffInput = Omit<DemoDrawingSignoffViewModel, 'discipline'>
@@ -267,7 +335,7 @@ export type WarrantyInput = Pick<DemoWarrantyViewModel, 'starts_on' | 'duration_
   renewal_price_cents: MoneyCents
 }
 export type InvoiceInput = Omit<DemoInvoiceViewModel, 'invoice_id' | 'void_reason'>
-export type AfterSalesInput = Omit<DemoAfterSalesCaseViewModel, 'case_id' | 'status' | 'resolution'>
+export type AfterSalesInput = Omit<DemoAfterSalesCaseViewModel, 'case_id' | 'status' | 'resolution' | 'completed_at' | 'is_under_warranty'>
 
 export function optionalYuanToCents(value: string): MoneyCents | null {
   const normalized = value.trim()

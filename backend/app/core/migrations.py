@@ -13,6 +13,12 @@ _TRANSACTION_KEYWORDS = frozenset(
 _UTF8_BOM = "\ufeff"
 _PROJECT_CODE_IDENTITY_MIGRATION = "004_project_code_identity"
 _PROJECT_CODE_IDENTITY_FUNCTION = "project_code_identity"
+_SAFE_OUT_OF_ORDER_BACKFILLS = frozenset(
+    {
+        "016_inventory_procurement_corrections",
+        "017_acceptance_corrections",
+    }
+)
 
 
 class MigrationError(RuntimeError):
@@ -34,8 +40,14 @@ def apply_migrations(
         missing = ", ".join(missing_versions)
         raise MigrationError(f"migration drift: applied versions are missing: {missing}")
     ordered_versions = [path.stem for path in migrations]
-    expected_prefix = set(ordered_versions[: len(applied_versions)])
-    if applied_versions != expected_prefix:
+    last_applied_index = max(
+        (ordered_versions.index(version) for version in applied_versions),
+        default=-1,
+    )
+    prefix_gaps = (
+        set(ordered_versions[: last_applied_index + 1]) - applied_versions
+    )
+    if prefix_gaps - _SAFE_OUT_OF_ORDER_BACKFILLS:
         raise MigrationError(
             "migration drift: applied versions are not a continuous filename prefix"
         )

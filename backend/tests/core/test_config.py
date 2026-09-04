@@ -35,6 +35,7 @@ def test_settings_has_only_the_declared_frozen_fields(tmp_path: Path) -> None:
         "port",
         "session_secret",
         "max_document_upload_mb",
+        "backup_enabled",
     ]
     with pytest.raises(FrozenInstanceError):
         settings.port = 9000  # type: ignore[misc]
@@ -78,6 +79,22 @@ def test_relative_paths_resolve_from_config_directory(tmp_path: Path) -> None:
     assert settings.backup_dir == (
         config_path.parent / "runtime/backups"
     ).resolve()
+    assert settings.automatic_backup_enabled is True
+
+
+def test_legacy_config_without_backup_enabled_uses_directory_as_default(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.json"
+    write_config(
+        config_path,
+        backup_dir="Synology/ERP",
+        session_secret="test-secret",
+    )
+
+    settings = load_settings(config_path)
+
+    assert settings.automatic_backup_enabled is True
 
 
 def test_absolute_backup_path_is_preserved(tmp_path: Path) -> None:
@@ -336,6 +353,32 @@ def test_backup_settings_update_is_atomic_and_preserves_runtime_keys(
     }
     assert settings.backup_dir == (tmp_path / "Synology/ERP").resolve()
     assert settings.session_secret == "secret-that-must-be-preserved"
+
+
+def test_disabling_automatic_backup_keeps_configured_directory(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.json"
+    write_config(
+        config_path,
+        backup_dir="Synology/ERP",
+        backup_enabled=True,
+        session_secret="test-secret",
+    )
+
+    settings = config_module.update_backup_settings(
+        config_path,
+        enabled=False,
+        directory=None,
+        interval_hours=12,
+        retention_days=90,
+    )
+
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))
+    assert persisted["backup_dir"] == "Synology/ERP"
+    assert persisted["backup_enabled"] is False
+    assert settings.backup_dir == (tmp_path / "Synology/ERP").resolve()
+    assert settings.automatic_backup_enabled is False
 
 
 def test_backup_settings_update_can_disable_directory(tmp_path: Path) -> None:

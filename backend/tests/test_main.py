@@ -105,6 +105,7 @@ def test_create_app_registers_first_business_vertical_slice_routes() -> None:
         "/api/projects/{project_code}/stages",
         "/api/projects/{project_code}/stages/{stage_code}",
         "/api/projects/{project_code}/stages/{stage_code}/transition",
+        "/api/projects/{project_code}/restore",
         "/api/procurement/import-template.xlsx",
         "/api/projects/{project_code}/procurement-lists",
         "/api/projects/{project_code}/purchase-orders",
@@ -149,6 +150,8 @@ def test_create_app_registers_first_business_vertical_slice_routes() -> None:
         "/api/projects/{project_code}/commissioning-sessions",
         "/api/projects/{project_code}/engineering-changes",
         "/api/projects/{project_code}/acceptances",
+        "/api/projects/{project_code}/acceptances/{acceptance_id}/reschedule",
+        "/api/projects/{project_code}/acceptances/{acceptance_id}/cancel",
         "/api/projects/{project_code}/warranty",
         "/api/projects/{project_code}/invoices",
         "/api/projects/{project_code}/after-sales",
@@ -326,6 +329,15 @@ def test_lifespan_applies_migrations_and_closes_every_owned_connection(
         "011_procurement_audit",
         "012_delivery_events",
         "013_workforce_events",
+        "014_managed_document_filenames",
+        "015_write_safety",
+        "016_inventory_procurement_corrections",
+        "017_acceptance_corrections",
+        "018_project_restore_events",
+        "019_project_stage_event_safety",
+        "020_acceptance_reschedule_events",
+        "021_workforce_audit_history",
+        "022_supplier_invoice_active_number",
     }
 
 

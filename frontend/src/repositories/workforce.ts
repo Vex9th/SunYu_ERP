@@ -12,6 +12,7 @@ import type {
   DemoSiteDailyReportViewModel,
   DemoWorkerViewModel,
   DeliveryDemoViewModel,
+  DeliverySummaryViewModel,
   DrawingDiscipline,
   DrawingSignoffInput,
   EngineeringChangeInput,
@@ -21,6 +22,7 @@ import type {
   LaborEntryBatchItemInput,
   LaborEntryUpdateInput,
   MaterialAdvanceInput,
+  MaterialAdvanceReimbursementInput,
   SiteDailyReportInput,
   WarrantyInput,
   WorkerInput,
@@ -40,29 +42,50 @@ export interface WorkforceRepository {
   updateWorker(workerId: number, input: WorkerInput): Promise<void>
   setWorkerStatus(workerId: number, status: WorkerStatus): Promise<void>
   assignWorker(projectCode: string, input: CrewAssignmentInput): Promise<RepositoryResult<DemoCrewAssignmentViewModel>>
+  updateCrewAssignment(projectCode: string, assignmentId: number, input: CrewAssignmentInput): Promise<void>
   setCrewAssignmentStatus(projectCode: string, assignmentId: number, status: CrewAssignmentStatus): Promise<void>
   updateLaborEntry(projectCode: string, entryId: number, input: LaborEntryUpdateInput): Promise<void>
   voidLaborEntry(projectCode: string, entryId: number, reason: string): Promise<void>
   saveSiteDailyReport(projectCode: string, input: SiteDailyReportInput): Promise<RepositoryResult<DemoSiteDailyReportViewModel>>
   confirmSiteDailyReport(projectCode: string, workDate: string): Promise<void>
+  reopenSiteDailyReport(projectCode: string, workDate: string, reason: string): Promise<void>
   saveMaterialAdvance(projectCode: string, input: MaterialAdvanceInput): Promise<RepositoryResult<DemoMaterialAdvanceViewModel>>
+  updateMaterialAdvance(projectCode: string, advanceId: number, input: MaterialAdvanceInput): Promise<void>
+  voidMaterialAdvance(projectCode: string, advanceId: number, reason: string): Promise<void>
   recordMaterialAdvanceReimbursement(
     projectCode: string,
     advanceId: number,
-    input: DemoMaterialAdvanceViewModel['reimbursements'][number],
+    input: MaterialAdvanceReimbursementInput,
+  ): Promise<void>
+  voidMaterialAdvanceReimbursement(
+    projectCode: string,
+    advanceId: number,
+    reimbursementId: number,
+    reason: string,
   ): Promise<void>
   getDeliveryPreview(projectCode: string): Promise<RepositoryResult<DeliveryDemoViewModel>>
+  getDeliverySummary(projectCode: string): Promise<RepositoryResult<DeliverySummaryViewModel>>
   saveDrawingSignoff(projectCode: string, discipline: DrawingDiscipline, input: DrawingSignoffInput): Promise<void>
   saveCommissioningSession(projectCode: string, input: CommissioningSessionInput): Promise<void>
+  discardSaveCommissioningSession(projectCode: string, input: CommissioningSessionInput, files?: readonly File[]): boolean
   updateCommissioningSession(projectCode: string, sessionId: number, input: CommissioningSessionInput): Promise<void>
   saveEngineeringChange(projectCode: string, input: EngineeringChangeInput): Promise<void>
+  discardSaveEngineeringChange(projectCode: string, input: EngineeringChangeInput, files?: readonly File[]): boolean
+  updateEngineeringChange(projectCode: string, changeId: number, input: EngineeringChangeInput): Promise<void>
   setEngineeringChangeStatus(projectCode: string, changeId: number, status: EngineeringChangeStatus): Promise<void>
   saveAcceptance(projectCode: string, input: AcceptanceInput): Promise<void>
+  discardSaveAcceptance(projectCode: string, input: AcceptanceInput): boolean
+  rescheduleAcceptance(projectCode: string, acceptanceId: number, input: AcceptanceInput, reason: string): Promise<void>
+  cancelAcceptance(projectCode: string, acceptanceId: number, reason: string): Promise<void>
   completeAcceptance(projectCode: string, acceptanceId: number, input: AcceptanceCompletionInput): Promise<void>
   updateWarranty(projectCode: string, input: WarrantyInput): Promise<void>
-  saveInvoice(projectCode: string, input: InvoiceInput): Promise<void>
+  saveInvoice(projectCode: string, input: InvoiceInput, files?: readonly File[]): Promise<void>
+  updateInvoice(projectCode: string, invoiceId: number, input: InvoiceInput): Promise<void>
+  discardSaveInvoice(projectCode: string, input: InvoiceInput, files?: readonly File[]): boolean
   voidInvoice(projectCode: string, invoiceId: number, reason: string): Promise<void>
   saveAfterSalesCase(projectCode: string, input: AfterSalesInput): Promise<void>
+  discardSaveAfterSalesCase(projectCode: string, input: AfterSalesInput): boolean
+  updateAfterSalesCase(projectCode: string, caseId: number, input: AfterSalesInput): Promise<void>
   setAfterSalesStatus(projectCode: string, caseId: number, status: AfterSalesStatus, resolution: string | null): Promise<void>
 }
 
@@ -72,13 +95,31 @@ export class MockWorkforceRepository implements WorkforceRepository {
   private readonly deliveries = new Map<string, DeliveryDemoViewModel>()
   private readonly createdWorkers: DemoWorkerViewModel[] = []
   private nextLaborEntryId = 1000
+  private nextReportVersionId = 1000
+  private nextReportEventId = 1000
   private nextWorkerId = 1000
   private nextAssignmentId = 2000
   private nextAdvanceId = 3000
+  private nextReimbursementId = 3000
   private nextDeliveryId = 4000
 
   async getWorkforcePreview(projectCode: string): Promise<RepositoryResult<WorkforceDemoViewModel>> {
     return { source: this.source, data: clone(this.workspace(projectCode)) }
+  }
+
+  async getDeliverySummary(projectCode: string): Promise<RepositoryResult<DeliverySummaryViewModel>> {
+    return {
+      source: this.source,
+      data: {
+        project_code: projectCode,
+        final_payment: {
+          due_on: '2026-10-20',
+          planned_amount_cents: 20000000,
+          received_amount_cents: 0,
+          outstanding_amount_cents: 20000000,
+        },
+      },
+    }
   }
 
   async saveLaborEntriesBatch(
@@ -113,9 +154,17 @@ export class MockWorkforceRepository implements WorkforceRepository {
               && candidateAssignment.worker_id === assignment.worker_id,
           ),
       )
+      const replaced = existing ? undefined : workspace.labor_entries.find(
+        (candidate) => candidate.status === 'voided' && candidate.work_date === input.work_date
+          && workspace.crew_assignments.some(
+            (candidateAssignment) => candidateAssignment.assignment_id === candidate.assignment_id
+              && candidateAssignment.worker_id === assignment.worker_id,
+          ),
+      )
       const value: DemoLaborEntryViewModel = {
         entry_id: existing?.entry_id ?? this.nextLaborEntryId++,
         assignment_id: entry.assignment_id,
+        replaces_entry_id: existing?.replaces_entry_id ?? replaced?.entry_id ?? null,
         work_date: input.work_date,
         attendance_status: entry.attendance_status,
         day_fraction: entry.day_fraction,
@@ -199,6 +248,31 @@ export class MockWorkforceRepository implements WorkforceRepository {
     return { source: this.source, data: clone(assignment) }
   }
 
+  async updateCrewAssignment(
+    projectCode: string,
+    assignmentId: number,
+    input: CrewAssignmentInput,
+  ): Promise<void> {
+    const workspace = this.workspace(projectCode)
+    const assignment = workspace.crew_assignments.find((item) => item.assignment_id === assignmentId)
+    if (!assignment) throw new Error('项目排单不存在')
+    if (assignment.status !== 'planned' && assignment.status !== 'active') {
+      throw new Error('已结束的项目排单不能编辑')
+    }
+    if (!workspace.workers.some((worker) => worker.worker_id === input.worker_id && worker.status === 'active')) {
+      throw new Error('请选择有效施工员')
+    }
+    if (!input.role.trim() || !input.scheduled_start_on || !input.scheduled_end_on) {
+      throw new Error('请填写岗位和排单日期')
+    }
+    if (input.scheduled_end_on < input.scheduled_start_on) throw new Error('结束日期不能早于开始日期')
+    if (!Number.isSafeInteger(input.rate_cents) || input.rate_cents < 0) throw new Error('计薪金额不正确')
+    Object.assign(assignment, clone(input), {
+      role: input.role.trim(),
+      notes: normalizedOptionalText(input.notes),
+    })
+  }
+
   async setCrewAssignmentStatus(
     projectCode: string,
     assignmentId: number,
@@ -217,6 +291,10 @@ export class MockWorkforceRepository implements WorkforceRepository {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(input.work_date)) throw new Error('上工日期格式不正确')
     const assignment = workspace.crew_assignments.find((item) => item.assignment_id === input.assignment_id)
     if (!assignment) throw new Error('项目排单不存在')
+    if (entry.replaces_entry_id !== null
+      && (entry.assignment_id !== input.assignment_id || entry.work_date !== input.work_date)) {
+      throw new Error('补录记录不能修改施工员或上工日期；身份错误请先作废，再重新登记')
+    }
     const duplicate = workspace.labor_entries.find((candidate) => candidate.entry_id !== entryId
       && candidate.status === 'active'
       && candidate.work_date === input.work_date
@@ -236,10 +314,10 @@ export class MockWorkforceRepository implements WorkforceRepository {
   async voidLaborEntry(projectCode: string, entryId: number, reason: string): Promise<void> {
     const entry = this.workspace(projectCode).labor_entries.find((item) => item.entry_id === entryId)
     if (!entry) throw new Error('上工记录不存在')
+    if (entry.status === 'voided') throw new Error('上工记录已作废')
     if (!reason.trim()) throw new Error('请填写作废原因')
     entry.status = 'voided'
     entry.void_reason = reason.trim()
-    entry.cost_cents = 0
   }
 
   async saveSiteDailyReport(
@@ -249,7 +327,8 @@ export class MockWorkforceRepository implements WorkforceRepository {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(input.work_date)) throw new Error('施工日报日期不正确')
     if (!input.work_summary?.trim()) throw new Error('请填写施工内容')
     const workspace = this.workspace(projectCode)
-    const report = {
+    const existing = workspace.site_daily_reports.find((item) => item.work_date === input.work_date)
+    const report: DemoSiteDailyReportViewModel = {
       ...input,
       location: normalizedOptionalText(input.location),
       weather: normalizedOptionalText(input.weather),
@@ -258,8 +337,13 @@ export class MockWorkforceRepository implements WorkforceRepository {
       next_plan: normalizedOptionalText(input.next_plan),
       notes: normalizedOptionalText(input.notes),
       status: 'draft' as const,
+      versions: existing?.versions ?? [],
+      events: existing?.events ?? [],
     }
     const index = workspace.site_daily_reports.findIndex((item) => item.work_date === input.work_date)
+    if (index >= 0 && workspace.site_daily_reports[index]?.status === 'confirmed') {
+      throw new Error('已确认日报需要重新打开后才能编辑')
+    }
     if (index >= 0) workspace.site_daily_reports[index] = report
     else workspace.site_daily_reports.unshift(report)
     return { source: this.source, data: clone(report) }
@@ -268,7 +352,52 @@ export class MockWorkforceRepository implements WorkforceRepository {
   async confirmSiteDailyReport(projectCode: string, workDate: string): Promise<void> {
     const report = this.workspace(projectCode).site_daily_reports.find((item) => item.work_date === workDate)
     if (!report) throw new Error('施工日报不存在')
+    if (report.status !== 'draft') throw new Error('施工日报已确认')
+    const timestamp = new Date().toISOString()
+    const version = {
+      id: this.nextReportVersionId++,
+      version_number: Math.max(0, ...report.versions.map((item) => item.version_number)) + 1,
+      work_date: report.work_date,
+      location: report.location,
+      weather: report.weather,
+      work_summary: report.work_summary,
+      blockers: report.blockers,
+      next_plan: report.next_plan,
+      notes: report.notes,
+      confirmed_at: timestamp,
+      created_at: timestamp,
+    }
+    report.versions.unshift(version)
+    report.events.push({
+      id: this.nextReportEventId++,
+      from_status: 'draft',
+      to_status: 'confirmed',
+      reason: null,
+      occurred_at: timestamp,
+      created_at: timestamp,
+      report_version_id: version.id,
+    })
     report.status = 'confirmed'
+  }
+
+  async reopenSiteDailyReport(projectCode: string, workDate: string, reason: string): Promise<void> {
+    const report = this.workspace(projectCode).site_daily_reports.find((item) => item.work_date === workDate)
+    if (!report) throw new Error('施工日报不存在')
+    if (report.status !== 'confirmed') throw new Error('只有已确认日报可以重新打开')
+    if (!reason.trim()) throw new Error('请填写重新打开原因')
+    const version = report.versions[0]
+    if (!version) throw new Error('已确认日报缺少确认版本')
+    const timestamp = new Date().toISOString()
+    report.events.push({
+      id: this.nextReportEventId++,
+      from_status: 'confirmed',
+      to_status: 'draft',
+      reason: reason.trim(),
+      occurred_at: timestamp,
+      created_at: timestamp,
+      report_version_id: version.id,
+    })
+    report.status = 'draft'
   }
 
   async saveMaterialAdvance(
@@ -276,36 +405,48 @@ export class MockWorkforceRepository implements WorkforceRepository {
     input: MaterialAdvanceInput,
   ): Promise<RepositoryResult<DemoMaterialAdvanceViewModel>> {
     const workspace = this.workspace(projectCode)
-    if (!workspace.workers.some((worker) => worker.worker_id === input.worker_id)) throw new Error('施工员不存在')
-    if (!input.spent_on || !input.vendor_name.trim() || input.items.length === 0) throw new Error('请完整填写垫资信息')
-    const items = input.items.map((item) => {
-      const quantityMilli = decimalToMilli(item.quantity)
-      if (quantityMilli <= 0n || !Number.isSafeInteger(item.unit_price_cents) || item.unit_price_cents < 0) {
-        throw new Error('垫资物料数量或单价不正确')
-      }
-      const lineAmount = Number((quantityMilli * BigInt(item.unit_price_cents) + 500n) / 1000n)
-      if (!Number.isSafeInteger(lineAmount)) throw new Error('垫资金额超出可保存范围')
-      return { ...item, name: item.name.trim(), unit: item.unit.trim(), line_amount_cents: lineAmount }
-    })
+    const normalized = normalizeAdvanceInput(workspace, input)
     const advance: DemoMaterialAdvanceViewModel = {
       advance_id: this.nextAdvanceId++,
-      worker_id: input.worker_id,
-      spent_on: input.spent_on,
-      vendor_name: input.vendor_name.trim(),
-      items,
-      notes: normalizedOptionalText(input.notes),
-      document_version_ids: [...input.document_version_ids],
+      ...normalized,
       status: 'unreimbursed',
+      void_reason: null,
+      voided_at: null,
       reimbursements: [],
     }
     workspace.material_advances.unshift(advance)
     return { source: this.source, data: clone(advance) }
   }
 
+  async updateMaterialAdvance(
+    projectCode: string,
+    advanceId: number,
+    input: MaterialAdvanceInput,
+  ): Promise<void> {
+    const workspace = this.workspace(projectCode)
+    const advance = workspace.material_advances.find((item) => item.advance_id === advanceId)
+    if (!advance) throw new Error('垫资记录不存在')
+    if (advance.status === 'voided') throw new Error('已作废垫资不能编辑')
+    if (activeReimbursedCents(advance) !== 0) throw new Error('已有有效报销的垫资不能编辑')
+    const normalized = normalizeAdvanceInput(workspace, input)
+    Object.assign(advance, normalized, { status: 'unreimbursed' as const })
+  }
+
+  async voidMaterialAdvance(projectCode: string, advanceId: number, reason: string): Promise<void> {
+    const advance = this.workspace(projectCode).material_advances.find((item) => item.advance_id === advanceId)
+    if (!advance) throw new Error('垫资记录不存在')
+    if (!reason.trim()) throw new Error('请填写作废原因')
+    if (advance.status === 'voided') throw new Error('垫资记录已作废')
+    if (activeReimbursedCents(advance) !== 0) throw new Error('已有有效报销的垫资不能作废')
+    advance.status = 'voided'
+    advance.void_reason = reason.trim()
+    advance.voided_at = new Date().toISOString()
+  }
+
   async recordMaterialAdvanceReimbursement(
     projectCode: string,
     advanceId: number,
-    input: DemoMaterialAdvanceViewModel['reimbursements'][number],
+    input: MaterialAdvanceReimbursementInput,
   ): Promise<void> {
     const advance = this.workspace(projectCode).material_advances.find((item) => item.advance_id === advanceId)
     if (!advance) throw new Error('垫资记录不存在')
@@ -314,12 +455,37 @@ export class MockWorkforceRepository implements WorkforceRepository {
       throw new Error('请填写正确的报销金额和日期')
     }
     const totalAmount = advance.items.reduce((sum, item) => sum + item.line_amount_cents, 0)
-    const reimbursed = advance.reimbursements.reduce((sum, item) => sum + item.amount_cents, 0)
+    const reimbursed = activeReimbursedCents(advance)
     if (!Number.isSafeInteger(reimbursed + input.amount_cents) || reimbursed + input.amount_cents > totalAmount) {
       throw new Error('报销金额不能超过垫资总额')
     }
-    advance.reimbursements.push({ ...clone(input), notes: normalizedOptionalText(input.notes) })
+    advance.reimbursements.push({
+      reimbursement_id: this.nextReimbursementId++,
+      ...clone(input),
+      notes: normalizedOptionalText(input.notes),
+      status: 'active',
+      void_reason: null,
+      voided_at: null,
+    })
     advance.status = reimbursed + input.amount_cents === totalAmount ? 'reimbursed' : 'partial'
+  }
+
+  async voidMaterialAdvanceReimbursement(
+    projectCode: string,
+    advanceId: number,
+    reimbursementId: number,
+    reason: string,
+  ): Promise<void> {
+    const advance = this.workspace(projectCode).material_advances.find((item) => item.advance_id === advanceId)
+    if (!advance) throw new Error('垫资记录不存在')
+    const reimbursement = advance.reimbursements.find((item) => item.reimbursement_id === reimbursementId)
+    if (!reimbursement) throw new Error('报销记录不存在')
+    if (reimbursement.status === 'voided') throw new Error('报销记录已冲销')
+    if (!reason.trim()) throw new Error('请填写冲销原因')
+    reimbursement.status = 'voided'
+    reimbursement.void_reason = reason.trim()
+    reimbursement.voided_at = new Date().toISOString()
+    advance.status = materialAdvanceStatus(advance)
   }
 
   async saveDrawingSignoff(projectCode: string, discipline: DrawingDiscipline, input: DrawingSignoffInput): Promise<void> {
@@ -331,6 +497,14 @@ export class MockWorkforceRepository implements WorkforceRepository {
   async saveCommissioningSession(projectCode: string, input: CommissioningSessionInput): Promise<void> {
     if (!input.started_at) throw new Error('请填写调试开始时间')
     this.deliveryWorkspace(projectCode).commissioning_sessions.unshift({ session_id: this.nextDeliveryId++, ...clone(input) })
+  }
+
+  discardSaveCommissioningSession(
+    _projectCode: string,
+    _input: CommissioningSessionInput,
+    _files: readonly File[] = [],
+  ): boolean {
+    return false
   }
 
   async updateCommissioningSession(
@@ -352,6 +526,28 @@ export class MockWorkforceRepository implements WorkforceRepository {
     this.deliveryWorkspace(projectCode).engineering_changes.unshift({ change_id: this.nextDeliveryId++, status: 'proposed', ...clone(input) })
   }
 
+  discardSaveEngineeringChange(
+    _projectCode: string,
+    _input: EngineeringChangeInput,
+    _files: readonly File[] = [],
+  ): boolean {
+    return false
+  }
+
+  async updateEngineeringChange(
+    projectCode: string,
+    changeId: number,
+    input: EngineeringChangeInput,
+  ): Promise<void> {
+    const change = this.deliveryWorkspace(projectCode).engineering_changes.find((item) => item.change_id === changeId)
+    if (!change) throw new Error('工程变更不存在')
+    if (change.status !== 'proposed') throw new Error('只有待审批的工程变更可以编辑')
+    if (!input.title.trim() || !input.description.trim() || !input.reason.trim() || !input.proposed_on) {
+      throw new Error('请完整填写工程变更')
+    }
+    Object.assign(change, clone(input))
+  }
+
   async setEngineeringChangeStatus(
     projectCode: string,
     changeId: number,
@@ -367,6 +563,43 @@ export class MockWorkforceRepository implements WorkforceRepository {
     this.deliveryWorkspace(projectCode).acceptances.unshift({
       acceptance_id: this.nextDeliveryId++, acceptance_type: input.acceptance_type, status: 'scheduled',
       scheduled_on: input.scheduled_on, performed_on: null, notes: normalizedOptionalText(input.notes), document_version_ids: [],
+      cancel_reason: null, cancelled_at: null,
+    })
+  }
+
+  discardSaveAcceptance(_projectCode: string, _input: AcceptanceInput): boolean {
+    return false
+  }
+
+  async rescheduleAcceptance(
+    projectCode: string,
+    acceptanceId: number,
+    input: AcceptanceInput,
+    reason: string,
+  ): Promise<void> {
+    if (!input.scheduled_on) throw new Error('请填写验收计划日期')
+    if (!reason.trim()) throw new Error('请填写改期原因')
+    const acceptance = this.deliveryWorkspace(projectCode).acceptances.find((item) => item.acceptance_id === acceptanceId)
+    if (!acceptance) throw new Error('验收记录不存在')
+    if (acceptance.status !== 'scheduled') throw new Error('只有已安排的验收可以改期')
+    Object.assign(acceptance, {
+      acceptance_type: input.acceptance_type,
+      scheduled_on: input.scheduled_on,
+      notes: normalizedOptionalText(input.notes),
+    })
+  }
+
+  async cancelAcceptance(projectCode: string, acceptanceId: number, reason: string): Promise<void> {
+    if (!reason.trim()) throw new Error('请填写取消原因')
+    const acceptance = this.deliveryWorkspace(projectCode).acceptances.find((item) => item.acceptance_id === acceptanceId)
+    if (!acceptance) throw new Error('验收记录不存在')
+    if (acceptance.status !== 'scheduled') throw new Error('只有已安排的验收可以取消')
+    const cancelledOn = localBusinessDate()
+    Object.assign(acceptance, {
+      status: 'cancelled',
+      performed_on: cancelledOn,
+      cancel_reason: reason.trim(),
+      cancelled_at: cancelledOn,
     })
   }
 
@@ -397,10 +630,28 @@ export class MockWorkforceRepository implements WorkforceRepository {
   }
 
   async saveInvoice(projectCode: string, input: InvoiceInput): Promise<void> {
-    if (!input.counterparty_name.trim() || !Number.isSafeInteger(input.amount_cents) || input.amount_cents < 0) {
-      throw new Error('请填写发票对方单位和正确金额')
-    }
+    validateInvoiceInput(input)
     this.deliveryWorkspace(projectCode).invoices.unshift({ invoice_id: this.nextDeliveryId++, ...clone(input), void_reason: null })
+  }
+
+  async updateInvoice(projectCode: string, invoiceId: number, input: InvoiceInput): Promise<void> {
+    validateInvoiceInput(input)
+    const invoice = this.deliveryWorkspace(projectCode).invoices.find((item) => item.invoice_id === invoiceId)
+    if (!invoice) throw new Error('发票记录不存在')
+    if (invoice.status === 'void') throw new Error('已作废发票不能编辑')
+    if (invoice.status === 'recorded' && (
+      input.status !== invoice.status
+      || input.recorded_on !== invoice.recorded_on
+      || input.invoice_number !== invoice.invoice_number
+      || input.amount_cents !== invoice.amount_cents
+    )) {
+      throw new Error('已登记发票的正式信息需先作废再变更')
+    }
+    Object.assign(invoice, clone(input))
+  }
+
+  discardSaveInvoice(_projectCode: string, _input: InvoiceInput, _files: readonly File[] = []): boolean {
+    return false
   }
 
   async voidInvoice(projectCode: string, invoiceId: number, reason: string): Promise<void> {
@@ -415,9 +666,36 @@ export class MockWorkforceRepository implements WorkforceRepository {
     if (!input.reported_on || !input.reason.trim() || !input.contact_name.trim() || !input.contact_phone.trim()) {
       throw new Error('请完整填写售后报修信息')
     }
-    this.deliveryWorkspace(projectCode).after_sales.unshift({
-      case_id: this.nextDeliveryId++, ...clone(input), status: 'open', resolution: null,
+    const delivery = this.deliveryWorkspace(projectCode)
+    const isUnderWarranty = Boolean(
+      delivery.warranty
+      && input.reported_on >= delivery.warranty.starts_on
+      && input.reported_on <= delivery.warranty.ends_on,
+    )
+    delivery.after_sales.unshift({
+      case_id: this.nextDeliveryId++, ...clone(input), is_under_warranty: isUnderWarranty,
+      status: 'open', resolution: null, completed_at: null,
     })
+  }
+
+  discardSaveAfterSalesCase(_projectCode: string, _input: AfterSalesInput): boolean {
+    return false
+  }
+
+  async updateAfterSalesCase(projectCode: string, caseId: number, input: AfterSalesInput): Promise<void> {
+    if (!input.reported_on || !input.reason.trim() || !input.contact_name.trim() || !input.contact_phone.trim()) {
+      throw new Error('请完整填写售后报修信息')
+    }
+    const delivery = this.deliveryWorkspace(projectCode)
+    const item = delivery.after_sales.find((candidate) => candidate.case_id === caseId)
+    if (!item) throw new Error('售后案件不存在')
+    if (item.status === 'completed' || item.status === 'cancelled') throw new Error('已结案售后不能编辑')
+    const isUnderWarranty = Boolean(
+      delivery.warranty
+      && input.reported_on >= delivery.warranty.starts_on
+      && input.reported_on <= delivery.warranty.ends_on,
+    )
+    Object.assign(item, clone(input), { is_under_warranty: isUnderWarranty })
   }
 
   async setAfterSalesStatus(
@@ -426,11 +704,20 @@ export class MockWorkforceRepository implements WorkforceRepository {
     status: AfterSalesStatus,
     resolution: string | null,
   ): Promise<void> {
-    if (status === 'completed' && !resolution?.trim()) throw new Error('完成售后时请填写处理结果')
     const item = this.deliveryWorkspace(projectCode).after_sales.find((candidate) => candidate.case_id === caseId)
     if (!item) throw new Error('售后案件不存在')
+    const transitions: Record<AfterSalesStatus, AfterSalesStatus[]> = {
+      open: ['in_progress', 'completed', 'cancelled'],
+      in_progress: ['completed', 'cancelled'],
+      completed: [],
+      cancelled: [],
+    }
+    if (!transitions[item.status].includes(status)) throw new Error('售后状态不能这样变更')
+    if (status === 'completed' && !resolution?.trim()) throw new Error('完成售后时请填写处理结果')
+    if (status === 'cancelled' && !resolution?.trim()) throw new Error('取消售后时请填写原因')
     item.status = status
     item.resolution = normalizedOptionalText(resolution)
+    item.completed_at = status === 'completed' ? new Date().toISOString() : null
   }
 
   private allWorkers(workerId: number): DemoWorkerViewModel[] {
@@ -469,6 +756,56 @@ function decimalToMilli(value: string): bigint {
   return BigInt(whole) * 1000n + BigInt(fraction.padEnd(3, '0'))
 }
 
+function normalizeAdvanceInput(
+  workspace: WorkforceDemoViewModel,
+  input: MaterialAdvanceInput,
+): Omit<
+  DemoMaterialAdvanceViewModel,
+  'advance_id' | 'status' | 'void_reason' | 'voided_at' | 'reimbursements'
+> {
+  if (!workspace.workers.some((worker) => worker.worker_id === input.worker_id)) throw new Error('施工员不存在')
+  if (!input.spent_on || !input.vendor_name.trim() || input.items.length === 0) throw new Error('请完整填写垫资信息')
+  const items = input.items.map((item) => {
+    const quantityMilli = decimalToMilli(item.quantity)
+    if (!item.name.trim() || !item.unit.trim() || quantityMilli <= 0n
+      || !Number.isSafeInteger(item.unit_price_cents) || item.unit_price_cents < 0) {
+      throw new Error('垫资物料名称、单位、数量或单价不正确')
+    }
+    const lineAmount = Number((quantityMilli * BigInt(item.unit_price_cents) + 500n) / 1000n)
+    if (!Number.isSafeInteger(lineAmount)) throw new Error('垫资金额超出可保存范围')
+    return {
+      ...clone(item),
+      name: item.name.trim(),
+      specification: normalizedOptionalText(item.specification),
+      brand: normalizedOptionalText(item.brand),
+      unit: item.unit.trim(),
+      line_amount_cents: lineAmount,
+    }
+  })
+  return {
+    worker_id: input.worker_id,
+    spent_on: input.spent_on,
+    vendor_name: input.vendor_name.trim(),
+    items,
+    notes: normalizedOptionalText(input.notes),
+    document_version_ids: [...input.document_version_ids],
+  }
+}
+
+function activeReimbursedCents(advance: DemoMaterialAdvanceViewModel): number {
+  return advance.reimbursements
+    .filter((item) => item.status === 'active')
+    .reduce((sum, item) => sum + item.amount_cents, 0)
+}
+
+function materialAdvanceStatus(advance: DemoMaterialAdvanceViewModel): DemoMaterialAdvanceViewModel['status'] {
+  if (advance.status === 'voided') return 'voided'
+  const reimbursed = activeReimbursedCents(advance)
+  const total = advance.items.reduce((sum, item) => sum + item.line_amount_cents, 0)
+  if (reimbursed === 0) return 'unreimbursed'
+  return reimbursed === total ? 'reimbursed' : 'partial'
+}
+
 function laborCost(
   assignment: DemoCrewAssignmentViewModel,
   entry: LaborEntryBatchItemInput,
@@ -494,6 +831,24 @@ function laborCost(
     throw new Error('时薪上工分钟必须在 1 到 1440 之间')
   }
   return Math.round(assignment.rate_cents * entry.work_minutes / 60)
+}
+
+function validateInvoiceInput(input: InvoiceInput): void {
+  if (input.status === 'void') throw new Error('新建或补录发票不能直接设为已作废')
+  if (input.amount_cents !== null
+    && (!Number.isSafeInteger(input.amount_cents) || input.amount_cents < 0)) {
+    throw new Error('发票金额不正确')
+  }
+  if ((input.status === 'requested' || input.status === 'recorded') && !input.requested_on) {
+    throw new Error('请填写发票申请日期')
+  }
+  if (input.status === 'recorded'
+    && (!input.recorded_on || !input.invoice_number?.trim() || input.amount_cents === null)) {
+    throw new Error('已登记发票必须填写登记日期、发票号码和金额')
+  }
+  if (input.requested_on && input.recorded_on && input.recorded_on < input.requested_on) {
+    throw new Error('登记日期不能早于申请日期')
+  }
 }
 
 function deriveWarranty(input: WarrantyInput): DeliveryDemoViewModel['warranty'] {
@@ -574,6 +929,7 @@ function createWorkforcePreview(projectCode: string): WorkforceDemoViewModel {
       {
         entry_id: 301,
         assignment_id: 201,
+        replaces_entry_id: null,
         work_date: '2026-09-03',
         attendance_status: 'present',
         day_fraction: '0.500',
@@ -587,6 +943,7 @@ function createWorkforcePreview(projectCode: string): WorkforceDemoViewModel {
       {
         entry_id: 302,
         assignment_id: 202,
+        replaces_entry_id: null,
         work_date: '2026-09-09',
         attendance_status: 'present',
         day_fraction: null,
@@ -607,6 +964,8 @@ function createWorkforcePreview(projectCode: string): WorkforceDemoViewModel {
       next_plan: '进入设备吊装与回路测试',
       notes: null,
       status: 'draft',
+      versions: [],
+      events: [],
     }],
     material_advances: [{
       advance_id: 401,
@@ -636,11 +995,17 @@ function createWorkforcePreview(projectCode: string): WorkforceDemoViewModel {
       notes: '现场缺料临时补买',
       document_version_ids: [],
       status: 'partial',
+      void_reason: null,
+      voided_at: null,
       reimbursements: [{
+        reimbursement_id: 1,
         amount_cents: 100000,
         reimbursed_on: '2026-09-08',
         payment_method: 'bank_transfer',
         notes: '首笔报销',
+        status: 'active',
+        void_reason: null,
+        voided_at: null,
       }],
     }],
   }
@@ -700,6 +1065,8 @@ function createDeliveryPreview(projectCode: string): DeliveryDemoViewModel {
       performed_on: '2026-10-08',
       notes: '遗留铭牌补装项',
       document_version_ids: [502],
+      cancel_reason: null,
+      cancelled_at: null,
     }],
     warranty: {
       starts_on: '2026-10-08',
@@ -731,9 +1098,16 @@ function createDeliveryPreview(projectCode: string): DeliveryDemoViewModel {
       contact_name: '张经理',
       contact_phone: '13900139000',
       coverage_type: 'warranty',
+      is_under_warranty: true,
       notes: '客户提供了现场视频',
       status: 'in_progress',
       resolution: '已预约到场复检',
+      completed_at: null,
     }],
   }
+}
+
+function localBusinessDate(): string {
+  const now = new Date()
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
 }

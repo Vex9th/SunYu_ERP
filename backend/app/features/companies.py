@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from backend.app.core.config import Settings
-from backend.app.core.database import transaction
+from backend.app.core.database import transaction_immediate
+from backend.app.features.api_common import (
+    ApiError,
+    ApiErrorRoute,
+    idempotency_scope,
+    restore_idempotent_response,
+    save_idempotent_response,
+)
 from backend.app.features.auth import require_authenticated_session
 
 logger = logging.getLogger(__name__)
@@ -26,6 +36,7 @@ _COMPANY_FIELDS = (
 _COMPANY_RESPONSE_FIELDS = (
     "id",
     *_COMPANY_FIELDS,
+    "revision",
     "created_at",
     "updated_at",
 )
@@ -34,6 +45,7 @@ _CONTACT_RESPONSE_FIELDS = (
     "id",
     "company_id",
     *_CONTACT_FIELDS,
+    "revision",
     "created_at",
     "updated_at",
 )
@@ -41,6 +53,7 @@ _SQLITE_MAX_INTEGER = 2**63 - 1
 
 Clock = Callable[[], datetime]
 NormalizedPayload = dict[str, str | None]
+NormalizedUpdatePayload = dict[str, str | int | None]
 
 
 def create_companies_router(
@@ -49,11 +62,18 @@ def create_companies_router(
     *,
     clock: Clock | None = None,
 ) -> APIRouter:
-    router = APIRouter(prefix="/api/companies", tags=["companies"])
+    router = APIRouter(
+        prefix="/api/companies",
+        tags=["companies"],
+        route_class=ApiErrorRoute,
+    )
     connection_dependency = Depends(get_connection)
     settings_dependency = Depends(get_settings)
     company_payload_dependency = Depends(_read_company_payload)
     contact_payload_dependency = Depends(_read_contact_payload)
+    company_update_payload_dependency = Depends(_read_company_update_payload)
+    contact_update_payload_dependency = Depends(_read_contact_update_payload)
+    revision_payload_dependency = Depends(_read_revision_payload)
     company_id_dependency = Depends(_read_company_id)
     contact_id_dependency = Depends(_read_contact_id)
     now = clock or _utc_now
@@ -83,6 +103,7 @@ def create_companies_router(
                     companies.bank_name,
                     companies.bank_account,
                     companies.notes,
+                    companies.revision,
                     companies.created_at,
                     companies.updated_at,
                     COUNT(contacts.id) AS contact_count
@@ -101,13 +122,26 @@ def create_companies_router(
 
     @router.post("", status_code=status.HTTP_201_CREATED)
     def create_company(
+        request: Request,
         _: None = authentication_dependency,
         payload: NormalizedPayload = company_payload_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
+        key = _read_optional_idempotency_key(request)
+        request_hash = _request_hash(payload)
+        scope = idempotency_scope(request)
         timestamp = _timestamp(now)
         try:
-            with transaction(connection):
+            with transaction_immediate(connection):
+                if key is not None:
+                    restored = restore_idempotent_response(
+                        connection,
+                        scope=scope,
+                        key=key,
+                        request_hash=request_hash,
+                    )
+                    if restored is not None:
+                        return restored
                 cursor = connection.execute(
                     """
                     INSERT INTO companies
@@ -120,6 +154,20 @@ def create_companies_router(
                 )
                 company_id = _last_insert_id(cursor)
                 response = _company_detail(connection, company_id)
+                if response is None:
+                    raise sqlite3.DatabaseError("created company is missing")
+                if key is not None:
+                    save_idempotent_response(
+                        connection,
+                        scope=scope,
+                        key=key,
+                        request_hash=request_hash,
+                        response=response,
+                        response_status=status.HTTP_201_CREATED,
+                        resource_type="company",
+                        resource_id=company_id,
+                        created_at=timestamp,
+                    )
         except sqlite3.IntegrityError as exc:
             if _is_unique_constraint(exc):
                 raise HTTPException(
@@ -149,28 +197,34 @@ def create_companies_router(
     def replace_company(
         _: None = authentication_dependency,
         company_id: int = company_id_dependency,
-        payload: NormalizedPayload = company_payload_dependency,
+        payload: NormalizedUpdatePayload = company_update_payload_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         timestamp = _timestamp(now)
         try:
-            with transaction(connection):
+            with transaction_immediate(connection):
+                current = _company_revision_row(connection, company_id)
+                if current is None:
+                    raise _company_not_found()
+                expected_revision = int(payload["expected_revision"])
+                _require_revision(current, expected_revision)
                 cursor = connection.execute(
                     """
                     UPDATE companies
                     SET name = ?, taxpayer_id = ?, registered_address = ?,
                         registered_phone = ?, bank_name = ?, bank_account = ?,
-                        notes = ?, updated_at = ?
-                    WHERE id = ?
+                        notes = ?, revision = revision + 1, updated_at = ?
+                    WHERE id = ? AND revision = ?
                     """,
                     (
                         *_payload_values(payload, _COMPANY_FIELDS),
                         timestamp,
                         company_id,
+                        expected_revision,
                     ),
                 )
                 if cursor.rowcount != 1:
-                    raise _company_not_found()
+                    _raise_company_write_miss(connection, company_id)
                 response = _company_detail(connection, company_id)
         except sqlite3.IntegrityError as exc:
             if _is_unique_constraint(exc):
@@ -187,16 +241,21 @@ def create_companies_router(
     def delete_company(
         _: None = authentication_dependency,
         company_id: int = company_id_dependency,
+        expected_revision: int = revision_payload_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> Response:
         try:
-            with transaction(connection):
+            with transaction_immediate(connection):
+                current = _company_revision_row(connection, company_id)
+                if current is None:
+                    raise _company_not_found()
+                _require_revision(current, expected_revision)
                 cursor = connection.execute(
-                    "DELETE FROM companies WHERE id = ?",
-                    (company_id,),
+                    "DELETE FROM companies WHERE id = ? AND revision = ?",
+                    (company_id, expected_revision),
                 )
                 if cursor.rowcount != 1:
-                    raise _company_not_found()
+                    _raise_company_write_miss(connection, company_id)
         except sqlite3.IntegrityError as exc:
             try:
                 is_project_reference = _is_project_reference_failure(
@@ -221,14 +280,27 @@ def create_companies_router(
         status_code=status.HTTP_201_CREATED,
     )
     def create_contact(
+        request: Request,
         _: None = authentication_dependency,
         company_id: int = company_id_dependency,
         payload: NormalizedPayload = contact_payload_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
+        key = _read_optional_idempotency_key(request)
+        request_hash = _request_hash(payload)
+        scope = idempotency_scope(request)
         timestamp = _timestamp(now)
         try:
-            with transaction(connection):
+            with transaction_immediate(connection):
+                if key is not None:
+                    restored = restore_idempotent_response(
+                        connection,
+                        scope=scope,
+                        key=key,
+                        request_hash=request_hash,
+                    )
+                    if restored is not None:
+                        return restored
                 cursor = connection.execute(
                     """
                     INSERT INTO contacts
@@ -245,14 +317,26 @@ def create_companies_router(
                 )
                 contact_id = _last_insert_id(cursor)
                 response = _contact_response(connection, company_id, contact_id)
+                if response is None:
+                    raise sqlite3.DatabaseError("created contact is missing")
+                if key is not None:
+                    save_idempotent_response(
+                        connection,
+                        scope=scope,
+                        key=key,
+                        request_hash=request_hash,
+                        response=response,
+                        response_status=status.HTTP_201_CREATED,
+                        resource_type="contact",
+                        resource_id=contact_id,
+                        created_at=timestamp,
+                    )
         except sqlite3.IntegrityError as exc:
             if _is_foreign_key_constraint(exc):
                 raise _company_not_found() from None
             raise _unexpected_database_failure("Contact", exc) from None
         except sqlite3.Error as exc:
             raise _unexpected_database_failure("Contact", exc) from None
-        if response is None:
-            raise _operation_failed("Contact")
         return response
 
     @router.put("/{company_id}/contacts/{contact_id}")
@@ -260,28 +344,34 @@ def create_companies_router(
         _: None = authentication_dependency,
         company_id: int = company_id_dependency,
         contact_id: int = contact_id_dependency,
-        payload: NormalizedPayload = contact_payload_dependency,
+        payload: NormalizedUpdatePayload = contact_update_payload_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         timestamp = _timestamp(now)
         try:
-            with transaction(connection):
+            with transaction_immediate(connection):
+                current = _contact_revision_row(connection, company_id, contact_id)
+                if current is None:
+                    raise _contact_not_found()
+                expected_revision = int(payload["expected_revision"])
+                _require_revision(current, expected_revision)
                 cursor = connection.execute(
                     """
                     UPDATE contacts
                     SET name = ?, phone = ?, email = ?, position = ?, notes = ?,
-                        updated_at = ?
-                    WHERE id = ? AND company_id = ?
+                        revision = revision + 1, updated_at = ?
+                    WHERE id = ? AND company_id = ? AND revision = ?
                     """,
                     (
                         *_payload_values(payload, _CONTACT_FIELDS),
                         timestamp,
                         contact_id,
                         company_id,
+                        expected_revision,
                     ),
                 )
                 if cursor.rowcount != 1:
-                    raise _contact_not_found()
+                    _raise_contact_write_miss(connection, company_id, contact_id)
                 response = _contact_response(connection, company_id, contact_id)
         except sqlite3.IntegrityError as exc:
             raise _unexpected_database_failure("Contact", exc) from None
@@ -299,16 +389,24 @@ def create_companies_router(
         _: None = authentication_dependency,
         company_id: int = company_id_dependency,
         contact_id: int = contact_id_dependency,
+        expected_revision: int = revision_payload_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> Response:
         try:
-            with transaction(connection):
+            with transaction_immediate(connection):
+                current = _contact_revision_row(connection, company_id, contact_id)
+                if current is None:
+                    raise _contact_not_found()
+                _require_revision(current, expected_revision)
                 cursor = connection.execute(
-                    "DELETE FROM contacts WHERE id = ? AND company_id = ?",
-                    (contact_id, company_id),
+                    """
+                    DELETE FROM contacts
+                    WHERE id = ? AND company_id = ? AND revision = ?
+                    """,
+                    (contact_id, company_id, expected_revision),
                 )
                 if cursor.rowcount != 1:
-                    raise _contact_not_found()
+                    _raise_contact_write_miss(connection, company_id, contact_id)
         except sqlite3.IntegrityError as exc:
             raise _unexpected_database_failure("Contact", exc) from None
         except sqlite3.Error as exc:
@@ -332,6 +430,55 @@ async def _read_contact_payload(request: Request) -> NormalizedPayload:
         fields=_CONTACT_FIELDS,
         detail="Invalid contact payload",
     )
+
+
+async def _read_company_update_payload(request: Request) -> NormalizedUpdatePayload:
+    return await _read_update_payload(
+        request,
+        fields=_COMPANY_FIELDS,
+        detail="Invalid company payload",
+    )
+
+
+async def _read_contact_update_payload(request: Request) -> NormalizedUpdatePayload:
+    return await _read_update_payload(
+        request,
+        fields=_CONTACT_FIELDS,
+        detail="Invalid contact payload",
+    )
+
+
+async def _read_update_payload(
+    request: Request,
+    *,
+    fields: tuple[str, ...],
+    detail: str,
+) -> NormalizedUpdatePayload:
+    try:
+        payload: Any = await request.json()
+    except (RecursionError, UnicodeError, ValueError):
+        raise _invalid_payload(detail) from None
+    if not isinstance(payload, dict):
+        raise _invalid_payload(detail)
+    if set(payload) == set(fields):
+        raise _invalid_structured_payload(detail)
+    if set(payload) != {*fields, "expected_revision"}:
+        raise _invalid_payload(detail)
+    normalized = _normalize_payload(payload, fields=fields, detail=detail)
+    return {
+        **normalized,
+        "expected_revision": _positive_integer(payload["expected_revision"], detail),
+    }
+
+
+async def _read_revision_payload(request: Request) -> int:
+    try:
+        payload: Any = await request.json()
+    except (RecursionError, UnicodeError, ValueError):
+        raise _invalid_structured_payload("Invalid revision payload") from None
+    if not isinstance(payload, dict) or set(payload) != {"expected_revision"}:
+        raise _invalid_structured_payload("Invalid revision payload")
+    return _positive_integer(payload["expected_revision"], "Invalid revision payload")
 
 
 def _read_company_id(company_id: str) -> int:
@@ -374,6 +521,15 @@ async def _read_payload(
     if not isinstance(payload, dict) or set(payload) != set(fields):
         raise _invalid_payload(detail)
 
+    return _normalize_payload(payload, fields=fields, detail=detail)
+
+
+def _normalize_payload(
+    payload: dict[str, object],
+    *,
+    fields: tuple[str, ...],
+    detail: str,
+) -> NormalizedPayload:
     normalized_name = _normalize_text(payload["name"], required=True, detail=detail)
     normalized: NormalizedPayload = {"name": normalized_name}
     for field in fields[1:]:
@@ -383,6 +539,16 @@ async def _read_payload(
         else:
             normalized[field] = _normalize_text(value, required=False, detail=detail)
     return normalized
+
+
+def _positive_integer(value: object, detail: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= _SQLITE_MAX_INTEGER
+    ):
+        raise _invalid_structured_payload(detail)
+    return value
 
 
 def _normalize_text(
@@ -415,7 +581,7 @@ def _company_detail(
         """
         SELECT
             id, name, taxpayer_id, registered_address, registered_phone,
-            bank_name, bank_account, notes, created_at, updated_at
+            bank_name, bank_account, notes, revision, created_at, updated_at
         FROM companies
         WHERE id = ?
         """,
@@ -427,7 +593,7 @@ def _company_detail(
         """
         SELECT
             id, company_id, name, phone, email, position, notes,
-            created_at, updated_at
+            revision, created_at, updated_at
         FROM contacts
         WHERE company_id = ?
         ORDER BY id
@@ -451,7 +617,7 @@ def _contact_response(
         """
         SELECT
             id, company_id, name, phone, email, position, notes,
-            created_at, updated_at
+            revision, created_at, updated_at
         FROM contacts
         WHERE id = ? AND company_id = ?
         """,
@@ -460,6 +626,51 @@ def _contact_response(
     if row is None:
         return None
     return _row_response(row, _CONTACT_RESPONSE_FIELDS)
+
+
+def _company_revision_row(
+    connection: sqlite3.Connection,
+    company_id: int,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        "SELECT revision FROM companies WHERE id = ?",
+        (company_id,),
+    ).fetchone()
+
+
+def _contact_revision_row(
+    connection: sqlite3.Connection,
+    company_id: int,
+    contact_id: int,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT revision FROM contacts
+        WHERE id = ? AND company_id = ?
+        """,
+        (contact_id, company_id),
+    ).fetchone()
+
+
+def _raise_company_write_miss(
+    connection: sqlite3.Connection,
+    company_id: int,
+) -> None:
+    current = _company_revision_row(connection, company_id)
+    if current is None:
+        raise _company_not_found()
+    _raise_revision_conflict(int(current["revision"]))
+
+
+def _raise_contact_write_miss(
+    connection: sqlite3.Connection,
+    company_id: int,
+    contact_id: int,
+) -> None:
+    current = _contact_revision_row(connection, company_id, contact_id)
+    if current is None:
+        raise _contact_not_found()
+    _raise_revision_conflict(int(current["revision"]))
 
 
 def _row_response(
@@ -481,6 +692,52 @@ def _last_insert_id(cursor: sqlite3.Cursor) -> int:
     if identifier is None:
         raise sqlite3.DatabaseError("insert did not produce an identifier")
     return identifier
+
+
+def _read_optional_idempotency_key(request: Request) -> str | None:
+    values = request.headers.getlist("Idempotency-Key")
+    if not values:
+        return None
+    if len(values) != 1:
+        raise _invalid_structured_payload("Invalid Idempotency-Key")
+    try:
+        parsed = UUID(values[0])
+    except (AttributeError, ValueError):
+        raise _invalid_structured_payload("Invalid Idempotency-Key") from None
+    canonical = str(parsed)
+    if values[0].lower() != canonical:
+        raise _invalid_structured_payload("Invalid Idempotency-Key")
+    return canonical
+
+
+def _request_hash(payload: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
+def _require_revision(row: sqlite3.Row, expected_revision: int) -> None:
+    current_revision = int(row["revision"])
+    if current_revision != expected_revision:
+        _raise_revision_conflict(current_revision)
+
+
+def _raise_revision_conflict(current_revision: int) -> None:
+    raise ApiError(
+        status.HTTP_409_CONFLICT,
+        "Resource was modified",
+        "REVISION_CONFLICT",
+        current_revision=current_revision,
+        headers={
+            "X-Error-Code": "REVISION_CONFLICT",
+            "X-Current-Revision": str(current_revision),
+        },
+    )
 
 
 def _timestamp(clock: Clock) -> str:
@@ -529,6 +786,15 @@ def _invalid_payload(detail: str) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         detail=detail,
+    )
+
+
+def _invalid_structured_payload(detail: str) -> ApiError:
+    return ApiError(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail,
+        "VALIDATION_ERROR",
+        headers={"X-Error-Code": "VALIDATION_ERROR"},
     )
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from collections.abc import Iterator
@@ -12,13 +13,14 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx import Response
+from starlette import formparsers
 
 from backend.app.core.config import Settings
 from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
 from backend.app.core.security import SESSION_COOKIE_NAME, create_session_token
 from backend.app.core.storage_paths import project_code_identity
-from backend.app.features import commercial
+from backend.app.features import business_attachments, commercial, files
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 NOW = datetime(2026, 8, 31, 9, 30, tzinfo=timezone.utc)
@@ -37,8 +39,15 @@ class CommercialHarness:
     second_document_version_id: int
 
     @contextmanager
-    def client(self, *, authenticated: bool = True) -> Iterator[TestClient]:
-        with TestClient(self.app) as client:
+    def client(
+        self,
+        *,
+        authenticated: bool = True,
+        raise_server_exceptions: bool = True,
+    ) -> Iterator[TestClient]:
+        with TestClient(
+            self.app, raise_server_exceptions=raise_server_exceptions
+        ) as client:
             if authenticated:
                 client.cookies.set(
                     SESSION_COOKIE_NAME,
@@ -47,7 +56,11 @@ class CommercialHarness:
             yield client
 
 
-def _build_harness(tmp_path: Path) -> CommercialHarness:
+def _build_harness(
+    tmp_path: Path,
+    *,
+    max_document_upload_mb: int = 4096,
+) -> CommercialHarness:
     database_path = tmp_path / "erp.sqlite3"
     connection = connect_database(database_path)
     try:
@@ -74,6 +87,7 @@ def _build_harness(tmp_path: Path) -> CommercialHarness:
         host="127.0.0.1",
         port=8765,
         session_secret="commercial-test-session-secret-32-bytes",
+        max_document_upload_mb=max_document_upload_mb,
     )
 
     def get_connection() -> Iterator[sqlite3.Connection]:
@@ -280,6 +294,435 @@ def test_quotes_create_continuous_versions_list_and_detail(
     assert listing.json()["total"] == 2
     assert listing.json()["items"][0]["version_number"] == 2
     assert detail.json() == first.json()
+
+
+def test_quote_multipart_creates_independent_managed_documents_and_is_idempotent(
+    harness: CommercialHarness,
+) -> None:
+    key = "71000000-0000-4000-8000-000000000001"
+    payload = _quote_payload(harness)
+    files = [
+        ("files", ("客户原始报价.pdf", b"quote-pdf", "application/pdf")),
+        ("files", ("附件无扩展名", b"quote-image", "image/png")),
+    ]
+    with harness.client() as client:
+        first = client.post(
+            f"/api/projects/{PROJECT_CODE}/quotes",
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=files,
+        )
+        replay = client.post(
+            f"/api/projects/{PROJECT_CODE.lower()}/quotes",
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=files,
+        )
+        conflict = client.post(
+            f"/api/projects/{PROJECT_CODE}/quotes",
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=[
+                ("files", ("客户原始报价.pdf", b"changed", "application/pdf")),
+                ("files", ("附件无扩展名", b"quote-image", "image/png")),
+            ],
+        )
+
+    assert first.status_code == replay.status_code == 201, first.text
+    assert replay.json() == first.json()
+    assert conflict.status_code == 409
+    assert conflict.json()["error_code"] == "IDEMPOTENCY_KEY_REUSED"
+    assert first.json()["document_version_ids"][:1] == [
+        harness.document_version_id
+    ]
+    new_version_ids = first.json()["document_version_ids"][1:]
+    assert len(new_version_ids) == 2
+    connection = connect_database(harness.database_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT versions.id, versions.original_filename,
+                   versions.managed_filename, versions.stored_relative_path,
+                   documents.category, documents.logical_name
+            FROM document_versions AS versions
+            JOIN documents ON documents.id = versions.document_id
+            WHERE versions.id IN (?, ?)
+            ORDER BY versions.id
+            """,
+            new_version_ids,
+        ).fetchall()
+        assert connection.execute("SELECT COUNT(*) FROM quotes").fetchone()[0] == 1
+    finally:
+        connection.close()
+    assert [row["original_filename"] for row in rows] == [
+        "客户原始报价.pdf",
+        "附件无扩展名",
+    ]
+    assert [row["managed_filename"] for row in rows] == [
+        f"{PROJECT_CODE}_报价_20260831_V1_01.pdf",
+        f"{PROJECT_CODE}_报价_20260831_V1_02",
+    ]
+    assert [row["category"] for row in rows] == ["quotation", "quotation"]
+    assert len({row["logical_name"] for row in rows}) == 2
+    for row in rows:
+        stored = harness.settings.data_dir / row["stored_relative_path"]
+        assert stored.is_file()
+        assert stored.name == row["managed_filename"]
+
+
+def test_quote_multipart_rejects_bad_shape_empty_invalid_and_oversized_files(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path, max_document_upload_mb=1)
+    payload = _quote_payload(harness, document_version_ids=[])
+    with harness.client() as client:
+        missing_payload = client.post(
+            f"/api/projects/{PROJECT_CODE}/quotes",
+            headers={
+                "Idempotency-Key": "71100000-0000-4000-8000-000000000001"
+            },
+            files={"files": ("quote.pdf", b"quote", "application/pdf")},
+        )
+        empty_file = client.post(
+            f"/api/projects/{PROJECT_CODE}/quotes",
+            headers={
+                "Idempotency-Key": "71100000-0000-4000-8000-000000000002"
+            },
+            data={"payload": json.dumps(payload)},
+            files={"files": ("empty.pdf", b"", "application/pdf")},
+        )
+        invalid_filename = client.post(
+            f"/api/projects/{PROJECT_CODE}/quotes",
+            headers={
+                "Idempotency-Key": "71100000-0000-4000-8000-000000000003"
+            },
+            data={"payload": json.dumps(payload)},
+            files={"files": ("", b"quote", "application/pdf")},
+        )
+        too_large = client.post(
+            f"/api/projects/{PROJECT_CODE}/quotes",
+            headers={
+                "Idempotency-Key": "71100000-0000-4000-8000-000000000004"
+            },
+            data={"payload": json.dumps(payload)},
+            files={
+                "files": (
+                    "large.pdf",
+                    b"x" * (1024 * 1024 + 1),
+                    "application/pdf",
+                )
+            },
+        )
+        invalid_payload = client.post(
+            f"/api/projects/{PROJECT_CODE}/quotes",
+            headers={
+                "Idempotency-Key": "71100000-0000-4000-8000-000000000005"
+            },
+            data={"payload": json.dumps(payload | {"amount_cents": -1})},
+            files={"files": ("valid.pdf", b"valid", "application/pdf")},
+        )
+
+    assert missing_payload.status_code == 422
+    assert empty_file.status_code == 422
+    assert invalid_filename.status_code == 422
+    assert too_large.status_code == 413
+    assert invalid_payload.status_code == 422
+    assert too_large.json()["error_code"] == "DOCUMENT_FILE_TOO_LARGE"
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
+
+
+def test_quote_multipart_rejects_more_than_twenty_files_and_closes_spools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _build_harness(tmp_path, max_document_upload_mb=1)
+    payload = _quote_payload(harness, document_version_ids=[])
+    created_spools: list[object] = []
+    original_spooled_file = formparsers.SpooledTemporaryFile
+
+    def tracked_spooled_file(*args: object, **kwargs: object):
+        spool = original_spooled_file(*args, **kwargs)
+        created_spools.append(spool)
+        return spool
+
+    monkeypatch.setattr(formparsers, "SpooledTemporaryFile", tracked_spooled_file)
+    with harness.client() as client:
+        response = client.post(
+            f"/api/projects/{PROJECT_CODE}/quotes",
+            headers={
+                "Idempotency-Key": "71100000-0000-4000-8000-000000000006"
+            },
+            data={"payload": json.dumps(payload)},
+            files=[
+                ("files", (f"file-{index}.txt", b"x", "text/plain"))
+                for index in range(21)
+            ],
+        )
+
+    assert response.status_code == 413
+    assert response.json()["error_code"] == "DOCUMENT_BATCH_TOO_LARGE"
+    assert created_spools
+    assert all(spool.closed for spool in created_spools)  # type: ignore[attr-defined]
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
+
+
+def test_quote_multipart_rejects_files_whose_combined_size_exceeds_limit(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path, max_document_upload_mb=1)
+    payload = _quote_payload(harness, document_version_ids=[])
+    with harness.client() as client:
+        response = client.post(
+            f"/api/projects/{PROJECT_CODE}/quotes",
+            headers={
+                "Idempotency-Key": "71100000-0000-4000-8000-000000000007"
+            },
+            data={"payload": json.dumps(payload)},
+            files=[
+                ("files", ("first.bin", b"a" * 600_000, "application/octet-stream")),
+                ("files", ("second.bin", b"b" * 600_000, "application/octet-stream")),
+            ],
+        )
+
+    assert response.status_code == 413
+    assert response.json()["error_code"] == "DOCUMENT_BATCH_TOO_LARGE"
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
+
+
+@pytest.mark.parametrize("content_length", ["1", None], ids=["forged", "missing"])
+def test_quote_multipart_actual_stream_limit_is_authoritative(
+    tmp_path: Path,
+    content_length: str | None,
+) -> None:
+    harness = _build_harness(tmp_path, max_document_upload_mb=1)
+    boundary = "actual-stream-limit"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="payload"\r\n\r\n'
+    ).encode() + b"x" * (2 * 1024 * 1024 + 256 * 1024) + (
+        f"\r\n--{boundary}--\r\n"
+    ).encode()
+    headers: list[tuple[str, str]] = [
+        ("Idempotency-Key", "71100000-0000-4000-8000-000000000008"),
+        ("Content-Type", f"multipart/form-data; boundary={boundary}"),
+    ]
+    if content_length is not None:
+        headers.append(("Content-Length", content_length))
+        content: object = body
+    else:
+        content = iter([body])
+
+    with harness.client() as client:
+        response = client.post(
+            f"/api/projects/{PROJECT_CODE}/quotes",
+            headers=headers,
+            content=content,
+        )
+
+    assert response.status_code == 413
+    assert response.json()["error_code"] == "DOCUMENT_BATCH_TOO_LARGE"
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
+
+
+def test_quote_stages_each_file_through_threadpool(
+    harness: CommercialHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+
+    async def tracked_threadpool(function: object, *args: object, **kwargs: object):
+        calls.append(function)
+        return function(*args, **kwargs)  # type: ignore[operator]
+
+    monkeypatch.setattr(
+        business_attachments,
+        "run_in_threadpool",
+        tracked_threadpool,
+        raising=False,
+    )
+    with harness.client() as client:
+        response = client.post(
+            f"/api/projects/{PROJECT_CODE}/quotes",
+            headers={
+                "Idempotency-Key": "71100000-0000-4000-8000-000000000009"
+            },
+            data={
+                "payload": json.dumps(
+                    _quote_payload(harness, document_version_ids=[])
+                )
+            },
+            files={"files": ("quote.pdf", b"quote", "application/pdf")},
+        )
+
+    assert response.status_code == 201, response.text
+    assert files.stage_stream in calls
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, OSError])
+def test_quote_storage_integrity_failure_stays_500_and_cleans_staged_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[Exception],
+) -> None:
+    harness = _build_harness(tmp_path)
+    original_stage = files.stage_stream
+    calls = 0
+
+    def fail_second_stage(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise failure_type("injected storage integrity failure")
+        return original_stage(*args, **kwargs)
+
+    monkeypatch.setattr(files, "stage_stream", fail_second_stage)
+    with harness.client(raise_server_exceptions=False) as client:
+        response = client.post(
+            f"/api/projects/{PROJECT_CODE}/quotes",
+            headers={
+                "Idempotency-Key": "71100000-0000-4000-8000-000000000010"
+            },
+            data={
+                "payload": json.dumps(
+                    _quote_payload(harness, document_version_ids=[])
+                )
+            },
+            files=[
+                ("files", ("first.pdf", b"first", "application/pdf")),
+                ("files", ("second.pdf", b"second", "application/pdf")),
+            ],
+        )
+
+    assert response.status_code == 500
+    connection = connect_database(harness.database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM quotes").fetchone()[0] == 0
+    finally:
+        connection.close()
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
+
+
+def test_quote_json_and_zero_file_multipart_share_idempotency_hash(
+    harness: CommercialHarness,
+) -> None:
+    key = "71400000-0000-4000-8000-000000000001"
+    payload = _quote_payload(harness, document_version_ids=[])
+    with harness.client() as client:
+        created = client.post(
+            f"/api/projects/{PROJECT_CODE}/quotes",
+            headers={"Idempotency-Key": key},
+            json=payload,
+        )
+        replay = client.post(
+            f"/api/projects/{PROJECT_CODE.lower()}/quotes",
+            headers={"Idempotency-Key": key},
+            files={
+                "payload": (
+                    None,
+                    json.dumps(payload, ensure_ascii=False),
+                    "application/json",
+                )
+            },
+        )
+
+    assert created.status_code == replay.status_code == 201, replay.text
+    assert replay.json() == created.json()
+    connection = connect_database(harness.database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM quotes").fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_quote_multipart_database_failure_rolls_back_records_and_files(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    connection = connect_database(harness.database_path)
+    try:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_business_attachment_version
+            BEFORE INSERT ON document_versions
+            BEGIN
+                SELECT RAISE(ABORT, 'injected attachment database failure');
+            END
+            """
+        )
+    finally:
+        connection.close()
+    payload = _quote_payload(harness, document_version_ids=[])
+    with harness.client(raise_server_exceptions=False) as client:
+        response = client.post(
+            f"/api/projects/{PROJECT_CODE}/quotes",
+            headers={
+                "Idempotency-Key": "71200000-0000-4000-8000-000000000001"
+            },
+            data={"payload": json.dumps(payload)},
+            files={"files": ("quote.pdf", b"quote", "application/pdf")},
+        )
+
+    assert response.status_code == 500
+    connection = connect_database(harness.database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM quotes").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM document_versions"
+        ).fetchone()[0] == 2
+    finally:
+        connection.close()
+    assert not [
+        path
+        for path in (harness.settings.data_dir / "Projects").rglob("*")
+        if path.is_file()
+    ]
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
+
+
+def test_quote_multipart_publish_failure_cleans_previously_published_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _build_harness(tmp_path)
+    original_publish = files.publish_staged_version
+    calls = 0
+
+    def fail_second_publish(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected publish failure")
+        return original_publish(*args, **kwargs)
+
+    monkeypatch.setattr(files, "publish_staged_version", fail_second_publish)
+    payload = _quote_payload(harness, document_version_ids=[])
+    with harness.client(raise_server_exceptions=False) as client:
+        response = client.post(
+            f"/api/projects/{PROJECT_CODE}/quotes",
+            headers={
+                "Idempotency-Key": "71300000-0000-4000-8000-000000000001"
+            },
+            data={"payload": json.dumps(payload)},
+            files=[
+                ("files", ("first.pdf", b"first", "application/pdf")),
+                ("files", ("second.pdf", b"second", "application/pdf")),
+            ],
+        )
+
+    assert response.status_code == 500
+    connection = connect_database(harness.database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM quotes").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 2
+    finally:
+        connection.close()
+    assert not [
+        path
+        for path in (harness.settings.data_dir / "Projects").rglob("*")
+        if path.is_file()
+    ]
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
 
 
 @pytest.mark.parametrize(
@@ -504,6 +947,100 @@ def test_contract_create_lists_multi_project_allocations_and_detail(
     ]
     assert listing.json()["total"] == 1
     assert detail.json() == created.json()
+
+
+def test_contract_multipart_creates_managed_documents_and_is_idempotent(
+    harness: CommercialHarness,
+) -> None:
+    key = "72000000-0000-4000-8000-000000000001"
+    payload = _contract_payload(harness)
+    files_payload = [
+        ("files", ("客户合同.pdf", b"contract-pdf", "application/pdf")),
+        ("files", ("技术附件.docx", b"contract-docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
+    ]
+    with harness.client() as client:
+        first = client.post(
+            f"/api/projects/{PROJECT_CODE}/contracts",
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=files_payload,
+        )
+        replay = client.post(
+            f"/api/projects/{PROJECT_CODE.lower()}/contracts",
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=files_payload,
+        )
+        conflict = client.post(
+            f"/api/projects/{PROJECT_CODE}/contracts",
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=[
+                ("files", ("客户合同.pdf", b"changed-contract", "application/pdf")),
+                ("files", ("技术附件.docx", b"contract-docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
+            ],
+        )
+
+    assert first.status_code == replay.status_code == 201, first.text
+    assert replay.json() == first.json()
+    assert conflict.status_code == 409
+    assert conflict.json()["error_code"] == "IDEMPOTENCY_KEY_REUSED"
+    assert first.json()["document_version_ids"][:1] == [
+        harness.document_version_id
+    ]
+    new_version_ids = first.json()["document_version_ids"][1:]
+    assert len(new_version_ids) == 2
+    connection = connect_database(harness.database_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT versions.original_filename, versions.managed_filename,
+                   versions.stored_relative_path, documents.category
+            FROM document_versions AS versions
+            JOIN documents ON documents.id = versions.document_id
+            WHERE versions.id IN (?, ?)
+            ORDER BY versions.id
+            """,
+            new_version_ids,
+        ).fetchall()
+        assert connection.execute("SELECT COUNT(*) FROM contracts").fetchone()[0] == 1
+    finally:
+        connection.close()
+    assert [row["managed_filename"] for row in rows] == [
+        f"{PROJECT_CODE}_合同_HT-2026-001_01.pdf",
+        f"{PROJECT_CODE}_合同_HT-2026-001_02.docx",
+    ]
+    assert [row["category"] for row in rows] == ["contract", "contract"]
+    for row in rows:
+        stored = harness.settings.data_dir / row["stored_relative_path"]
+        assert stored.is_file()
+        assert stored.name == row["managed_filename"]
+
+
+def test_contract_json_retries_restore_the_created_contract(
+    harness: CommercialHarness,
+) -> None:
+    key = "72100000-0000-4000-8000-000000000001"
+    payload = _contract_payload(harness, document_version_ids=[])
+    with harness.client() as client:
+        created = client.post(
+            f"/api/projects/{PROJECT_CODE}/contracts",
+            headers={"Idempotency-Key": key},
+            json=payload,
+        )
+        replay = client.post(
+            f"/api/projects/{PROJECT_CODE.lower()}/contracts",
+            headers={"Idempotency-Key": key},
+            json=payload,
+        )
+
+    assert created.status_code == replay.status_code == 201, replay.text
+    assert replay.json() == created.json()
+    connection = connect_database(harness.database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM contracts").fetchone()[0] == 1
+    finally:
+        connection.close()
 
 
 def test_contract_rejects_duplicate_number_bad_allocations_and_cross_project_document(
@@ -757,6 +1294,128 @@ def test_signed_contract_allocation_reordering_does_not_change_locked_amounts(
     } == {PROJECT_CODE: 800_000, SECOND_PROJECT_CODE: 480_000}
 
 
+@pytest.mark.parametrize("locked_status", ["signed", "completed", "terminated"])
+def test_locked_contract_rejects_formal_and_attachment_overwrites_but_allows_notes(
+    harness: CommercialHarness,
+    locked_status: str,
+) -> None:
+    with harness.client() as client:
+        locked = _create_signed_contract(
+            client,
+            harness,
+            contract_no=f"HT-{locked_status.upper()}-FORMAL-LOCK",
+            multi_project=True,
+        )
+        if locked_status != "signed":
+            transitioned = client.post(
+                f"/api/projects/{PROJECT_CODE}/contracts/{locked['id']}/transition",
+                json={
+                    "to_status": locked_status,
+                    "occurred_at": "2026-09-01T09:00:00+08:00",
+                    "reason": None if locked_status == "completed" else "客户终止",
+                    "expected_revision": locked["revision"],
+                },
+            )
+            assert transitioned.status_code == 200, transitioned.text
+            locked = transitioned.json()
+
+        allocations = [
+            {
+                "project_code": item["project_code"],
+                "amount_cents": item["amount_cents"],
+            }
+            for item in locked["allocations"]
+        ]
+        baseline = {
+            "contract_no": locked["contract_no"],
+            "title": locked["title"],
+            "customer_company_id": locked["customer_company_id"],
+            "signed_on": locked["signed_on"],
+            "total_amount_cents": locked["total_amount_cents"],
+            "final_delivery_on": locked["final_delivery_on"],
+            "allocations": allocations,
+            "notes": locked["notes"],
+            "document_version_ids": locked["document_version_ids"],
+        }
+        shifted_allocations = [
+            {**allocations[0], "amount_cents": allocations[0]["amount_cents"] - 1},
+            {**allocations[1], "amount_cents": allocations[1]["amount_cents"] + 1},
+        ]
+        mutations = [
+            ("contract_no", {"contract_no": f"{locked['contract_no']}-EDIT"}),
+            ("title", {"title": "改写后的合同标题"}),
+            (
+                "customer_company_id",
+                {"customer_company_id": harness.second_company_id},
+            ),
+            ("signed_on", {"signed_on": "2026-08-21"}),
+            (
+                "total_amount_cents",
+                {
+                    "total_amount_cents": locked["total_amount_cents"] + 1,
+                    "allocations": [
+                        {
+                            **allocations[0],
+                            "amount_cents": allocations[0]["amount_cents"] + 1,
+                        },
+                        allocations[1],
+                    ],
+                },
+            ),
+            ("final_delivery_on", {"final_delivery_on": "2027-01-01"}),
+            ("allocations", {"allocations": shifted_allocations}),
+            ("document_version_ids", {"document_version_ids": []}),
+        ]
+        for field, mutation in mutations:
+            rejected = client.put(
+                f"/api/projects/{PROJECT_CODE}/contracts/{locked['id']}",
+                json={
+                    **baseline,
+                    **mutation,
+                    "expected_revision": locked["revision"],
+                },
+            )
+            assert rejected.status_code == 409, (
+                locked_status,
+                field,
+                rejected.text,
+            )
+            expected_error = (
+                "CONTRACT_AMOUNT_LOCKED"
+                if field in {"total_amount_cents", "allocations"}
+                else "CONTRACT_FORMAL_FIELDS_LOCKED"
+            )
+            assert rejected.json()["error_code"] == expected_error
+
+        unchanged = client.get(
+            f"/api/projects/{PROJECT_CODE}/contracts/{locked['id']}"
+        )
+        notes_only = client.put(
+            f"/api/projects/{PROJECT_CODE}/contracts/{locked['id']}",
+            json={
+                **baseline,
+                "notes": f"{locked_status} 状态补充备注",
+                "expected_revision": locked["revision"],
+            },
+        )
+
+    assert unchanged.status_code == 200
+    assert unchanged.json() == locked
+    assert notes_only.status_code == 200, notes_only.text
+    assert notes_only.json()["notes"] == f"{locked_status} 状态补充备注"
+    for field in (
+        "contract_no",
+        "title",
+        "customer_company_id",
+        "signed_on",
+        "total_amount_cents",
+        "final_delivery_on",
+        "allocations",
+        "document_version_ids",
+    ):
+        assert notes_only.json()[field] == locked[field]
+
+
 def test_terminated_contract_keeps_signed_amount_and_allocation_history(
     harness: CommercialHarness,
 ) -> None:
@@ -958,6 +1617,103 @@ def test_payment_overview_has_three_empty_nodes_and_null_denominators(
     }
 
 
+def test_receipt_without_effective_contract_fails_without_consuming_idempotency_key(
+    harness: CommercialHarness,
+) -> None:
+    key = "40000000-0000-4000-8000-000000000099"
+    path = f"/api/projects/{PROJECT_CODE}/receipts"
+    payload = _receipt_payload(allocation_id=None)
+    with harness.client() as client:
+        rejected = client.post(path, headers=_idempotency_headers(key), json=payload)
+        _create_signed_contract(client, harness, contract_no="HT-AFTER-REJECT")
+        retried = client.post(path, headers=_idempotency_headers(key), json=payload)
+
+    assert rejected.status_code == 409
+    assert rejected.json()["error_code"] == "RECEIPT_CONTRACT_REQUIRED"
+    assert rejected.json()["field_errors"] == {
+        "contract_allocation_id": ["项目暂无已生效合同，不能登记到账"]
+    }
+    assert retried.status_code == 201
+    assert retried.json()["contract_allocation_id"] is not None
+
+
+def test_receipt_without_allocation_auto_uses_the_only_effective_contract(
+    harness: CommercialHarness,
+) -> None:
+    with harness.client() as client:
+        signed = _create_signed_contract(client, harness, contract_no="HT-ONLY")
+        created = client.post(
+            f"/api/projects/{PROJECT_CODE}/receipts",
+            headers=_idempotency_headers(),
+            json=_receipt_payload(allocation_id=None),
+        )
+
+    assert created.status_code == 201
+    assert created.json()["contract_allocation_id"] == signed["allocations"][0]["id"]
+
+
+def test_receipt_cannot_overpay_its_contract_allocation(
+    harness: CommercialHarness,
+) -> None:
+    key = "40000000-0000-4000-8000-000000000100"
+    with harness.client() as client:
+        signed = _create_signed_contract(
+            client,
+            harness,
+            amount_cents=100,
+            contract_no="HT-RECEIPT-LIMIT",
+        )
+        allocation_id = signed["allocations"][0]["id"]
+        first = client.post(
+            f"/api/projects/{PROJECT_CODE}/receipts",
+            headers=_idempotency_headers(),
+            json=_receipt_payload(allocation_id=allocation_id, amount_cents=80),
+        )
+        rejected = client.post(
+            f"/api/projects/{PROJECT_CODE}/receipts",
+            headers=_idempotency_headers(key),
+            json=_receipt_payload(allocation_id=allocation_id, amount_cents=21),
+        )
+        corrected = client.post(
+            f"/api/projects/{PROJECT_CODE}/receipts",
+            headers=_idempotency_headers(key),
+            json=_receipt_payload(allocation_id=allocation_id, amount_cents=20),
+        )
+
+    assert first.status_code == 201
+    assert rejected.status_code == 409
+    assert rejected.headers["x-error-code"] == "RECEIPT_ALLOCATION_EXCEEDED"
+    assert rejected.json()["field_errors"] == {
+        "amount_cents": ["本次到账超过该合同在本项目的剩余应收 0.20 元"]
+    }
+    assert corrected.status_code == 201
+
+
+def test_receipt_with_multiple_effective_contracts_requires_explicit_allocation(
+    harness: CommercialHarness,
+) -> None:
+    with harness.client() as client:
+        first = _create_signed_contract(client, harness, contract_no="HT-FIRST")
+        _create_signed_contract(client, harness, contract_no="HT-SECOND")
+        rejected = client.post(
+            f"/api/projects/{PROJECT_CODE}/receipts",
+            headers=_idempotency_headers(),
+            json=_receipt_payload(allocation_id=None),
+        )
+        accepted = client.post(
+            f"/api/projects/{PROJECT_CODE}/receipts",
+            headers=_idempotency_headers(),
+            json=_receipt_payload(allocation_id=first["allocations"][0]["id"]),
+        )
+
+    assert rejected.status_code == 409
+    assert rejected.json()["error_code"] == "RECEIPT_CONTRACT_AMBIGUOUS"
+    assert rejected.json()["field_errors"] == {
+        "contract_allocation_id": ["项目存在多份已生效合同，必须明确选择本次到账归属"]
+    }
+    assert accepted.status_code == 201
+
+
 def test_payment_term_initialization_and_update_have_explicit_revision_semantics(
     harness: CommercialHarness,
 ) -> None:
@@ -1033,10 +1789,10 @@ def test_payments_use_signed_contracts_integer_rounding_overdue_and_split_receip
     assert body["contracted_amount_cents"] == 3
     assert body["receivable_amount_cents"] == 3
     assert body["received_amount_cents"] == 2
-    assert body["allocated_received_amount_cents"] == 1
-    assert body["unallocated_received_amount_cents"] == 1
+    assert body["allocated_received_amount_cents"] == 2
+    assert body["unallocated_received_amount_cents"] == 0
     assert body["outstanding_receivable_cents"] == 1
-    assert body["contract_collection_basis_points"] == 3333
+    assert body["contract_collection_basis_points"] == 6667
     advance = body["terms"][0]
     assert advance["received_amount_cents"] == 2
     assert advance["outstanding_amount_cents"] == 1
@@ -1123,6 +1879,7 @@ def test_receipt_replay_returns_original_snapshot_and_key_reuse_conflicts(
     path = f"/api/projects/{PROJECT_CODE}/receipts"
     original_payload = _receipt_payload(notes="初次到账")
     with harness.client() as client:
+        _create_signed_contract(client, harness, contract_no="HT-REPLAY")
         created = client.post(path, headers=_idempotency_headers(key), json=original_payload)
         receipt = created.json()
         updated = client.put(
@@ -1160,6 +1917,7 @@ def test_archived_project_blocks_new_writes_but_allows_successful_receipt_replay
     path = f"/api/projects/{PROJECT_CODE}/receipts"
     payload = _receipt_payload()
     with harness.client() as client:
+        _create_signed_contract(client, harness, contract_no="HT-ARCHIVE-REPLAY")
         created = client.post(path, headers=_idempotency_headers(key), json=payload)
         assert created.status_code == 201
         connection = connect_database(harness.database_path)
@@ -1199,6 +1957,7 @@ def test_receipt_update_changes_only_description_fields_and_checks_revision(
 ) -> None:
     path = f"/api/projects/{PROJECT_CODE}/receipts"
     with harness.client() as client:
+        _create_signed_contract(client, harness, contract_no="HT-RECEIPT-UPDATE")
         created = client.post(
             path,
             headers=_idempotency_headers(),
@@ -1314,6 +2073,8 @@ def test_receipt_and_idempotency_record_roll_back_together(
     def fail_save(*_args: object, **_kwargs: object) -> None:
         raise sqlite3.OperationalError("injected idempotency failure")
 
+    with harness.client() as client:
+        _create_signed_contract(client, harness, contract_no="HT-ROLLBACK")
     monkeypatch.setattr(commercial, "save_idempotent_response", fail_save)
     with TestClient(harness.app, raise_server_exceptions=False) as client:
         client.cookies.set(
