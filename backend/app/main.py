@@ -60,14 +60,19 @@ class FrontendStaticFiles(StaticFiles):
         return await super().get_response("index.html", scope)
 
 
-def _is_frontend_navigation(path: str, scope: Scope) -> bool:
+def _is_frontend_navigation(_path: str, scope: Scope) -> bool:
     if scope.get("method") not in {"GET", "HEAD"}:
         return False
     headers = {
         key.decode("latin-1").lower(): value.decode("latin-1")
         for key, value in scope.get("headers", [])
     }
-    return "text/html" in headers.get("accept", "") and path.startswith("projects/")
+    url_path = scope.get("path")
+    return (
+        "text/html" in headers.get("accept", "")
+        and isinstance(url_path, str)
+        and url_path.startswith("/projects/")
+    )
 
 
 def create_app(

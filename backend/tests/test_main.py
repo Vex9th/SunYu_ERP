@@ -218,6 +218,19 @@ def test_release_frontend_routes_fall_back_to_index_without_hiding_missing_api_o
     assert missing_asset.status_code == 404
 
 
+def test_frontend_navigation_uses_url_path_instead_of_os_normalized_path() -> None:
+    scope = {
+        "method": "GET",
+        "path": "/projects/SY-2026-001/documents/12",
+        "headers": [(b"accept", b"text/html")],
+    }
+
+    assert main_module._is_frontend_navigation(
+        r"projects\SY-2026-001\documents\12",
+        scope,
+    )
+
+
 def test_release_app_restart_preserves_config_database_and_login(
     tmp_path: Path,
 ) -> None:
