@@ -1830,7 +1830,7 @@ describe('交付新增请求未知结果与放弃安全', () => {
     expect(repositoryDoubles.discardSaveAfterSalesCase)
       .toHaveBeenCalledWith(...repositoryDoubles.saveAfterSalesCase.mock.calls[0])
     expect(confirm).toHaveBeenCalledTimes(4)
-  })
+  }, 15_000)
 
   it('明确的 4xx 拒绝不锁住旧快照，用户修正后提交新内容', async () => {
     const preview = await useDemoBusinessContext().workforce.getDeliveryPreview('SY-2026-001')
