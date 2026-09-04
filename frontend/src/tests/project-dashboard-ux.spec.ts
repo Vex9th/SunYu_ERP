@@ -139,9 +139,12 @@ describe('项目工作页关键交互', () => {
 
     await wrapper.get('[data-testid="project-edit-open"]').trigger('click')
     await vi.waitFor(() => expect(requests.some(([path]) => path === '/api/companies')).toBe(true))
+    await vi.waitFor(() => {
+      expect(wrapper.get('[data-testid="project-edit-save"]').attributes('disabled')).toBeUndefined()
+    })
     await wrapper.get('[data-testid="project-edit-name"]').setValue('   ')
     await wrapper.get('[data-testid="project-edit-save"]').trigger('click')
-    expect(wrapper.text()).toContain('请输入项目名称并选择客户')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('请输入项目名称并选择客户'))
     expect(requests.some(([, init]) => init?.method === 'PUT')).toBe(false)
 
     await wrapper.get('[data-testid="project-edit-name"]').setValue(' 新名称 ')

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../api'
 import DeliveryWorkspace from '../components/delivery/DeliveryWorkspace.vue'
 import WorkforceCenter from '../components/workforce/WorkforceCenter.vue'
-import { localISODate } from '../domain/dates'
+import { localISODate, localISODateTimeInput } from '../domain/dates'
 import { resetDemoBusinessContext, useDemoBusinessContext } from '../repositories/demo-context'
 import type { DeliveryWorkspaceRepository } from '../repositories/delivery.live'
 import { MockWorkforceRepository } from '../repositories/workforce'
@@ -1861,7 +1861,7 @@ describe('交付新增请求未知结果与放弃安全', () => {
 
     expect(repositoryDoubles.saveCommissioningSession).toHaveBeenCalledTimes(2)
     expect(repositoryDoubles.saveCommissioningSession.mock.calls[0]?.[1].started_at)
-      .toBe('2026-09-10T09:00')
+      .toBe(localISODateTimeInput())
     expect(repositoryDoubles.saveCommissioningSession.mock.calls[1]?.[1].started_at)
       .toBe('2026-09-11T10:00')
   })

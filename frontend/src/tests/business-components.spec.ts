@@ -648,6 +648,10 @@ describe('ProjectCenter', () => {
     await wrapper.get('[data-testid="archive-reason"]').setValue('客户取消')
     const confirm = wrapper.get('[data-testid="archive-confirm"]')
     await confirm.trigger('click')
+    await vi.waitFor(() => {
+      expect(fetchMock.mock.calls.filter(([url]) =>
+        url === '/api/projects/SY-2026-001/close')).toHaveLength(1)
+    })
     await confirm.trigger('click')
     const closeCalls = fetchMock.mock.calls.filter(([url]) =>
       url === '/api/projects/SY-2026-001/close')
