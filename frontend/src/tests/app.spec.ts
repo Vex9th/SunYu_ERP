@@ -204,7 +204,7 @@ describe('App', () => {
       }),
     ])
     expect(fetchMock.mock.calls[3]?.[0]).toBe('/api/system/overview')
-    expect(wrapper.get('[data-testid="dashboard"]').text()).toContain('项目中心')
+    expect(wrapper.find('[data-testid="nav-projects"]').exists()).toBe(true)
   })
 
   it('首次设置后的登录失败时保留已设置状态并允许重新登录', async () => {
@@ -285,13 +285,13 @@ describe('App', () => {
     const dashboard = wrapper.get('[data-testid="dashboard"]')
     expect(dashboard.get('[data-testid="nav-overview"]').text()).toBe('总览')
     expect(dashboard.get('[data-testid="workbench-overview"]').text()).toContain('今天先处理什么')
-    expect(dashboard.get('[data-testid="portfolio-operating-overview"]').text()).toContain('真实后端')
+    expect(dashboard.get('[data-testid="portfolio-operating-overview"]').text()).not.toContain('真实后端')
     expect(dashboard.get('[data-testid="portfolio-operating-overview"]').isVisible()).toBe(true)
     expect(dashboard.find('[data-testid="portfolio-preview-toggle"]').exists()).toBe(false)
     expect(dashboard.find('.preview-collapse').exists()).toBe(false)
     expect(dashboard.get('[data-testid="workbench-summary"]').findAll('.workbench-summary__item')).toHaveLength(4)
     expect(dashboard.find('.system-brief').exists()).toBe(false)
-    expect(dashboard.get('[data-testid="workbench-recent-projects"]').classes()).toContain('el-col-xl-24')
+    expect(dashboard.find('[data-testid="workbench-recent-projects"]').exists()).toBe(false)
     expect(dashboard.get('[data-testid="workbench-active-projects"]').text()).toContain('0')
     expect(dashboard.get('[data-testid="workbench-companies"]').text()).toContain('0')
     expect(dashboard.findAll('.workspace-menu [data-testid^="nav-"]').map((item) => item.text())).toEqual([
@@ -345,7 +345,7 @@ describe('App', () => {
     await vi.waitFor(() => {
       expect(wrapper.find('[data-testid="portfolio-operating-overview"]').exists()).toBe(true)
     })
-    expect(wrapper.get('[data-testid="portfolio-operating-overview"]').text()).toContain('真实后端')
+    expect(wrapper.get('[data-testid="portfolio-operating-overview"]').text()).not.toContain('真实后端')
   })
 
   it('总工作台只用现有项目和公司接口生成真实摘要', async () => {
@@ -394,9 +394,46 @@ describe('App', () => {
 
     expect(wrapper.get('[data-testid="workbench-active-projects"]').text()).toContain('1')
     expect(wrapper.get('[data-testid="workbench-companies"]').text()).toContain('1')
-    expect(wrapper.get('[data-testid="workbench-overview"]').text()).toContain('装配线改造')
     expect(wrapper.get('[data-testid="workbench-overview"]').text()).toContain('联系人2')
     expect(wrapper.get('[data-testid="workbench-overview"]').text()).toContain('资料待完善0')
+  })
+
+  it('首页项目先返回时立即显示项目结果，不等待公司请求', async () => {
+    let resolveCompanies!: (response: Response) => void
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ authenticated: true, password_configured: true }))
+      .mockResolvedValueOnce(jsonResponse(overview))
+    businessFetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/projects?status=active') {
+        return jsonResponse([{
+          id: 21,
+          project_code: 'SY-2026-001',
+          company_id: 1,
+          name: '装配线改造',
+          description: null,
+          status: 'active',
+          archive_reason: null,
+          archived_at: null,
+          created_at: '2026-08-28T02:00:00+00:00',
+          updated_at: '2026-08-28T02:00:00+00:00',
+          company_name: '苏州出发科技',
+        }])
+      }
+      if (path === '/api/companies') {
+        return new Promise<Response>((resolve) => { resolveCompanies = resolve })
+      }
+      throw new Error(`unexpected ${path}`)
+    })
+
+    const wrapper = mountApp()
+    await settle()
+
+    expect(wrapper.get('[data-testid="workbench-active-projects"]').text()).toContain('1')
+    expect(wrapper.get('[data-testid="workbench-companies"]').text()).toContain('正在读取')
+
+    resolveCompanies(jsonResponse([]))
+    await settle()
   })
 
   it('总工作台任一并发接口返回 401 都立即退出失效会话', async () => {
@@ -484,7 +521,6 @@ describe('App', () => {
     expect(wrapper.get('[data-testid="workbench-active-projects"]').text()).toContain('--')
     expect(wrapper.get('[data-testid="workbench-companies"]').text()).toContain('1')
     expect(wrapper.get('[data-testid="workbench-overview"]').text()).not.toContain('暂无在建项目')
-    expect(wrapper.get('[data-testid="workbench-project-error"]').text()).toContain('项目数据读取失败')
   })
 
   it('展示已停止调度器及最近错误信息', async () => {
@@ -507,7 +543,7 @@ describe('App', () => {
 
     const scheduler = wrapper.get('[data-testid="scheduler-status"]')
     expect(scheduler.text()).toContain('已停止')
-    expect(scheduler.text()).toContain('2026-08-28T06:30:00+08:00')
+    expect(scheduler.text()).toContain('2026年8月28日 06:30')
     expect(scheduler.text()).toContain('cleanup:OSError')
   })
 
@@ -530,6 +566,8 @@ describe('App', () => {
     expect(wrapper.get('[data-testid="overview-error"]').text()).toContain(
       '系统概况暂时不可用',
     )
+    expect(wrapper.get('[data-testid="scheduler-summary"]').text()).toContain('状态未知')
+    expect(wrapper.get('[data-testid="scheduler-summary"]').text()).not.toContain('已停止')
     expect(wrapper.text()).not.toContain('正在读取系统状态')
 
     const retryButton = wrapper.get('[data-testid="overview-retry"]')
@@ -568,7 +606,7 @@ describe('App', () => {
     expect(wrapper.find('[data-testid="dashboard"]').exists()).toBe(false)
   })
 
-  it('可关闭自动备份并用 null 保存目录', async () => {
+  it('关闭自动备份时保留 NAS 目录', async () => {
     fetchMock
       .mockResolvedValueOnce(
         jsonResponse({ authenticated: true, password_configured: true }),
@@ -577,7 +615,7 @@ describe('App', () => {
       .mockResolvedValueOnce(
         jsonResponse({
           enabled: false,
-          directory: null,
+          directory: overview.backup.directory,
           interval_hours: 12,
           retention_days: 14,
         }),
@@ -597,7 +635,8 @@ describe('App', () => {
       expect.objectContaining({
         method: 'PUT',
         body: JSON.stringify({
-          directory: null,
+          enabled: false,
+          directory: overview.backup.directory,
           interval_hours: 12,
           retention_days: 14,
         }),
@@ -645,11 +684,30 @@ describe('App', () => {
 
     expect(fetchMock.mock.calls[2]?.[1]?.body).toBe(
       JSON.stringify({
+        enabled: true,
         directory: 'D:\\NAS\\ERP',
         interval_hours: 8760,
         retention_days: 0,
       }),
     )
+  })
+
+  it('设置有未保存修改时不允许误用旧目录立即备份', async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ authenticated: true, password_configured: true }))
+      .mockResolvedValueOnce(jsonResponse(overview))
+
+    const wrapper = mountApp()
+    await settle()
+    await wrapper.get('[data-testid="nav-system"]').trigger('click')
+    const backupButton = wrapper.get('[data-testid="backup-now"]')
+    expect(backupButton.text()).toContain('按已保存设置立即备份')
+
+    await wrapper.get('[data-testid="backup-directory"]').setValue('D:\\NAS\\New')
+
+    expect(backupButton.attributes('disabled')).toBeDefined()
+    expect(wrapper.text()).toContain('请先保存当前修改，再执行手动备份')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
   it('保存备份设置后保留已有的最近执行状态', async () => {
@@ -687,7 +745,7 @@ describe('App', () => {
     await wrapper.get('[data-testid="backup-save"]').trigger('click')
     await settle()
 
-    expect(wrapper.text()).toContain('2026-08-27T10:01:00+08:00')
+    expect(wrapper.text()).toContain('2026年8月27日 10:01')
     expect(wrapper.text()).toContain('D:\\NAS\\ERP\\2026-08-27_100000')
   })
 
@@ -761,6 +819,10 @@ describe('App', () => {
     await backupButton.trigger('click')
     expect(fetchMock).toHaveBeenCalledTimes(3)
     expect(backupButton.attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="backup-enabled"] input').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="backup-directory"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="backup-interval"] input').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="backup-retention"] input').attributes('disabled')).toBeDefined()
 
     resolveBackup(
       jsonResponse({
@@ -773,7 +835,7 @@ describe('App', () => {
 
     expect(fetchMock.mock.calls[2]?.[0]).toBe('/api/system/backups')
     expect(fetchMock.mock.calls[3]?.[0]).toBe('/api/system/overview')
-    expect(wrapper.text()).toContain('2026-08-28T10:20:30+08:00')
+    expect(wrapper.text()).toContain('2026年8月28日 10:20')
     expect(wrapper.get('[data-testid="last-run-status"]').text()).toContain('成功')
     expect(document.body.textContent).toContain('备份已完成')
     expect(document.body.textContent).not.toContain(
@@ -1057,6 +1119,23 @@ describe('App', () => {
 
     expect(wrapper.get('[data-testid="auth-title"]').text()).toContain('密码登录')
     expect(wrapper.get('[data-testid="request-error"]').text()).toContain('业务会话已失效')
+    expect(wrapper.find('[data-testid="dashboard"]').exists()).toBe(false)
+  })
+
+  it('没有逐页会话处理的库存接口返回 401 时也统一回到登录页', async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ authenticated: true, password_configured: true }))
+      .mockResolvedValueOnce(jsonResponse(overview))
+      .mockResolvedValueOnce(jsonResponse({ detail: 'Authentication required' }, 401))
+
+    const wrapper = mountApp()
+    await settle()
+    await wrapper.get('[data-testid="nav-inventory"]').trigger('click')
+
+    await vi.waitFor(() => {
+      expect(wrapper.get('[data-testid="auth-title"]').text()).toContain('密码登录')
+    })
+    expect(wrapper.get('[data-testid="request-error"]').text()).toContain('登录状态已失效')
     expect(wrapper.find('[data-testid="dashboard"]').exists()).toBe(false)
   })
 

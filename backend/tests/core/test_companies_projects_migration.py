@@ -37,6 +37,15 @@ def business_schema(tmp_path: Path) -> Iterator[sqlite3.Connection]:
             "011_procurement_audit",
             "012_delivery_events",
             "013_workforce_events",
+            "014_managed_document_filenames",
+            "015_write_safety",
+            "016_inventory_procurement_corrections",
+            "017_acceptance_corrections",
+            "018_project_restore_events",
+            "019_project_stage_event_safety",
+            "020_acceptance_reschedule_events",
+            "021_workforce_audit_history",
+            "022_supplier_invoice_active_number",
         ]
         yield connection
     finally:
@@ -121,6 +130,7 @@ def test_business_migration_creates_exact_columns(
             ("notes", "TEXT", 0, None, 0),
             ("created_at", "TEXT", 1, None, 0),
             ("updated_at", "TEXT", 1, None, 0),
+            ("revision", "INTEGER", 1, "1", 0),
         ],
         "contacts": [
             ("id", "INTEGER", 0, None, 1),
@@ -132,6 +142,7 @@ def test_business_migration_creates_exact_columns(
             ("notes", "TEXT", 0, None, 0),
             ("created_at", "TEXT", 1, None, 0),
             ("updated_at", "TEXT", 1, None, 0),
+            ("revision", "INTEGER", 1, "1", 0),
         ],
         "projects": [
             ("id", "INTEGER", 0, None, 1),

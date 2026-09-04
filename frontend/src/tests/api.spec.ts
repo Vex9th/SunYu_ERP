@@ -1,18 +1,64 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   ApiError,
   requestBlob,
   createPlannedPostRequest,
+  createRetriableMultipartPostSender,
   createRetriablePostSender,
   requestJson,
   requestVoid,
+  subscribeProtectedSessionExpired,
   withQuery,
 } from '../api'
 
 describe('API client', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('本地接口超过请求时限后中止并返回可重试提示', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.fn<typeof fetch>((_input, init) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('aborted', 'AbortError'))
+        })
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const request = requestJson('/api/slow', { timeoutMs: 25 })
+    const rejection = expect(request).rejects.toEqual(
+      new ApiError('请求超时，请重试', 0, 'REQUEST_TIMEOUT'),
+    )
+    await vi.advanceTimersByTimeAsync(25)
+
+    expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(true)
+    await rejection
+  })
+
+  it('任意受保护接口 401 广播统一会话失效，但登录失败不广播', async () => {
+    const expired = vi.fn()
+    const unsubscribe = subscribeProtectedSessionExpired(expired)
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ detail: 'Authentication required' }), { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ detail: 'Invalid password' }), { status: 401 })))
+
+    await expect(requestJson('/api/inventory/items')).rejects.toMatchObject({ status: 401 })
+    expect(expired).toHaveBeenCalledTimes(1)
+    expect(expired.mock.calls[0]?.[0]).toMatchObject({
+      message: '登录状态已失效，请重新登录',
+      path: '/api/inventory/items',
+    })
+
+    await expect(requestVoid('/api/auth/login', { method: 'POST' })).rejects.toMatchObject({ status: 401 })
+    expect(expired).toHaveBeenCalledTimes(1)
+    unsubscribe()
   })
 
   it('统一使用同源凭证和 JSON 请求头', async () => {
@@ -31,6 +77,7 @@ describe('API client', () => {
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ value: 1 }),
+      signal: expect.any(AbortSignal),
     })
   })
 
@@ -54,6 +101,7 @@ describe('API client', () => {
         'Idempotency-Key': '018f3e40-1234-7000-8000-123456789abc',
       },
       body: JSON.stringify({ amount_cents: 1280000 }),
+      signal: expect.any(AbortSignal),
     })
   })
 
@@ -244,7 +292,7 @@ describe('API client', () => {
     })
   })
 
-  it('重试待定期间同一路径改变 payload 会使用新键', async () => {
+  it('重试待定期间同一路径改变 payload 必须先明确放弃原请求', async () => {
     const randomUUID = vi.spyOn(crypto, 'randomUUID')
       .mockReturnValueOnce('018f3e40-1234-7000-8000-123456789abc')
       .mockReturnValueOnce('018f3e40-1234-7000-8000-abcdefabcdef')
@@ -258,6 +306,12 @@ describe('API client', () => {
     await expect(sender.send('/api/projects/SY-1/receipts', { amount_cents: 1280000 }))
       .rejects.toMatchObject({ status: 0 })
     await expect(sender.send('/api/projects/SY-1/receipts', { amount_cents: 2560000 }))
+      .rejects.toThrow('上一笔请求结果未知，只能原样重试或先明确放弃')
+
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(randomUUID).toHaveBeenCalledOnce()
+    expect(sender.discard('/api/projects/SY-1/receipts', { amount_cents: 1280000 })).toBe(true)
+    await expect(sender.send('/api/projects/SY-1/receipts', { amount_cents: 2560000 }))
       .resolves.toEqual({ id: 2 })
 
     expect(randomUUID).toHaveBeenCalledTimes(2)
@@ -266,7 +320,7 @@ describe('API client', () => {
     })
   })
 
-  it('数组顺序改变视为新提交意图并使用新键', async () => {
+  it('数组顺序改变也不能绕过结果未知的原请求', async () => {
     const randomUUID = vi.spyOn(crypto, 'randomUUID')
       .mockReturnValueOnce('018f3e40-1234-7000-8000-123456789abc')
       .mockReturnValueOnce('018f3e40-1234-7000-8000-abcdefabcdef')
@@ -279,6 +333,12 @@ describe('API client', () => {
 
     await expect(sender.send('/api/projects/SY-1/receipts', { amounts: [1280000, 2560000] }))
       .rejects.toMatchObject({ status: 0 })
+    await expect(sender.send('/api/projects/SY-1/receipts', { amounts: [2560000, 1280000] }))
+      .rejects.toThrow('上一笔请求结果未知，只能原样重试或先明确放弃')
+
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(sender.discard('/api/projects/SY-1/receipts', { amounts: [1280000, 2560000] }))
+      .toBe(true)
     await expect(sender.send('/api/projects/SY-1/receipts', { amounts: [2560000, 1280000] }))
       .resolves.toEqual({ id: 2 })
 
@@ -480,7 +540,163 @@ describe('API client', () => {
       credentials: 'same-origin',
       headers: { 'Idempotency-Key': '018f3e40-1234-7000-8000-123456789abc' },
       body,
+      signal: expect.any(AbortSignal),
     })
+  })
+
+  it('业务附件 multipart 精确发送 JSON payload 和重复 files', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ id: 1 }), { status: 201 }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('018f3e40-1234-7000-8000-123456789abc')
+    const sender = createRetriableMultipartPostSender()
+    const payload = { amount_cents: null, notes: '图片登记' }
+    const files = [
+      new File(['pdf'], '发票.pdf', { type: 'application/pdf', lastModified: 10 }),
+      new File(['image'], '发票.jpg', { type: 'image/jpeg', lastModified: 20 }),
+    ]
+
+    await sender.send('/api/projects/SY-1/invoices', payload, files)
+
+    const request = fetchMock.mock.calls[0]?.[1]
+    expect(request?.headers).toEqual({
+      'Idempotency-Key': '018f3e40-1234-7000-8000-123456789abc',
+    })
+    expect(request?.body).toBeInstanceOf(FormData)
+    const form = request?.body as FormData
+    expect(form.get('payload')).toBe(JSON.stringify(payload))
+    expect(form.getAll('files')).toEqual(files)
+  })
+
+  it('业务附件网络失败重试复用键且同内容并发合并', async () => {
+    const randomUUID = vi.spyOn(crypto, 'randomUUID').mockReturnValue(
+      '018f3e40-1234-7000-8000-123456789abc',
+    )
+    let resolveFetch!: (response: Response) => void
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError('network disconnected'))
+      .mockReturnValueOnce(new Promise<Response>((resolve) => { resolveFetch = resolve }))
+    vi.stubGlobal('fetch', fetchMock)
+    const sender = createRetriableMultipartPostSender()
+    const payload = { invoice_number: null }
+    const firstFile = new File(['pdf'], '发票.pdf', {
+      type: 'application/pdf',
+      lastModified: 10,
+    })
+
+    await expect(sender.send('/api/projects/SY-1/invoices', payload, [firstFile]))
+      .rejects.toMatchObject({ status: 0 })
+    const retry = sender.send('/api/projects/SY-1/invoices', { invoice_number: null }, [firstFile])
+    const concurrent = sender.send('/api/projects/SY-1/invoices', payload, [firstFile])
+
+    expect(concurrent).toBe(retry)
+    expect(randomUUID).toHaveBeenCalledOnce()
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).toEqual(fetchMock.mock.calls[1]?.[1]?.headers)
+    resolveFetch(new Response(JSON.stringify({ id: 1 }), { status: 201 }))
+    await expect(retry).resolves.toEqual({ id: 1 })
+  })
+
+  it('不同 File 即使元数据相同也不会合并 inflight', async () => {
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('018f3e40-1234-7000-8000-123456789abc')
+    let resolveFetch!: (response: Response) => void
+    const fetchMock = vi.fn<typeof fetch>().mockReturnValue(
+      new Promise<Response>((resolve) => { resolveFetch = resolve }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const sender = createRetriableMultipartPostSender()
+    const path = '/api/projects/SY-1/invoices'
+    const first = sender.send(path, { notes: null }, [
+      new File(['aaa'], '发票.pdf', { type: 'application/pdf', lastModified: 10 }),
+    ])
+
+    const second = sender.send(path, { notes: null }, [
+      new File(['bbb'], '发票.pdf', { type: 'application/pdf', lastModified: 10 }),
+    ])
+    expect(fetchMock).toHaveBeenCalledOnce()
+
+    resolveFetch(new Response(JSON.stringify({ id: 1 }), { status: 201 }))
+    expect(second).not.toBe(first)
+    await expect(second).rejects.toThrow('该路径已有其他文件正在上传')
+    await expect(first).resolves.toEqual({ id: 1 })
+  })
+
+  it('网络失败后不同 File 必须先明确放弃原上传', async () => {
+    const randomUUID = vi.spyOn(crypto, 'randomUUID')
+      .mockReturnValueOnce('018f3e40-1234-7000-8000-123456789abc')
+      .mockReturnValueOnce('018f3e40-1234-7000-8000-abcdefabcdef')
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError('network disconnected'))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 2 }), { status: 201 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const sender = createRetriableMultipartPostSender()
+    const path = '/api/projects/SY-1/invoices'
+
+    const originalFile = new File(['aaa'], '发票.pdf', {
+      type: 'application/pdf',
+      lastModified: 10,
+    })
+    const changedFile = new File(['bbb'], '发票.pdf', {
+      type: 'application/pdf',
+      lastModified: 10,
+    })
+    await expect(sender.send(path, { notes: null }, [originalFile]))
+      .rejects.toMatchObject({ status: 0 })
+    await expect(sender.send(path, { notes: null }, [changedFile]))
+      .rejects.toThrow('上一笔上传结果未知，只能原样重试或先明确放弃')
+
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(sender.discard(path, { notes: null }, [originalFile])).toBe(true)
+    await expect(sender.send(path, { notes: null }, [changedFile]))
+      .resolves.toEqual({ id: 2 })
+
+    expect(randomUUID).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).not.toEqual(fetchMock.mock.calls[1]?.[1]?.headers)
+  })
+
+  it('业务附件确定性 4xx 后相同内容重试生成新键', async () => {
+    const randomUUID = vi.spyOn(crypto, 'randomUUID')
+      .mockReturnValueOnce('018f3e40-1234-7000-8000-123456789abc')
+      .mockReturnValueOnce('018f3e40-1234-7000-8000-abcdefabcdef')
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ detail: 'Rejected' }), { status: 422 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 2 }), { status: 201 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const sender = createRetriableMultipartPostSender()
+    const file = new File(['pdf'], '发票.pdf', { type: 'application/pdf', lastModified: 10 })
+
+    await expect(sender.send('/api/projects/SY-1/invoices', { notes: null }, [file]))
+      .rejects.toMatchObject({ status: 422 })
+    await expect(sender.send('/api/projects/SY-1/invoices', { notes: null }, [file]))
+      .resolves.toEqual({ id: 2 })
+
+    expect(randomUUID).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1]?.[1]?.headers).toEqual({
+      'Idempotency-Key': '018f3e40-1234-7000-8000-abcdefabcdef',
+    })
+  })
+
+  it('业务附件 5xx 后相同内容重试复用原键', async () => {
+    const randomUUID = vi.spyOn(crypto, 'randomUUID').mockReturnValue(
+      '018f3e40-1234-7000-8000-123456789abc',
+    )
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 2 }), { status: 201 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const sender = createRetriableMultipartPostSender()
+    const path = '/api/projects/SY-1/invoices'
+    const payload = { notes: null }
+    const file = new File(['pdf'], '发票.pdf', {
+      type: 'application/pdf',
+      lastModified: 10,
+    })
+
+    await expect(sender.send(path, payload, [file])).rejects.toMatchObject({ status: 503 })
+    await expect(sender.send(path, payload, [file])).resolves.toEqual({ id: 2 })
+
+    expect(randomUUID).toHaveBeenCalledOnce()
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).toEqual(fetchMock.mock.calls[1]?.[1]?.headers)
   })
 
   it('读取 Blob 下载内容，不假设契约未冻结的文件名传输方式', async () => {
@@ -521,6 +737,7 @@ describe('API client', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/companies/7', {
       method: 'DELETE',
       credentials: 'same-origin',
+      signal: expect.any(AbortSignal),
     })
   })
 

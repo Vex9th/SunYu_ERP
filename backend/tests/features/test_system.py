@@ -202,6 +202,42 @@ def test_backup_settings_endpoint_updates_file_and_runtime_atomically(
     assert persisted["backup_dir"] == "Synology/ERP"
 
 
+def test_disabling_automatic_backup_preserves_directory_and_manual_backup(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.json"
+    _write_config(
+        config_path,
+        backup_dir="Synology/Backups",
+        backup_enabled=True,
+    )
+    application = create_app(
+        config_path=config_path,
+        scheduler_factory=_noop_scheduler_factory,
+    )
+
+    with TestClient(application) as client:
+        _login(client)
+        response = client.put(
+            "/api/system/backup-settings",
+            json={
+                "enabled": False,
+                "directory": "Synology/Backups",
+                "interval_hours": 24,
+                "retention_days": 30,
+            },
+        )
+        manual = client.post("/api/system/backups")
+
+    expected_directory = str((tmp_path / "Synology/Backups").resolve())
+    assert response.json()["enabled"] is False
+    assert response.json()["directory"] == expected_directory
+    assert manual.status_code == 201
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))
+    assert persisted["backup_enabled"] is False
+    assert persisted["backup_dir"] == "Synology/Backups"
+
+
 def test_backup_settings_rejects_projects_child_without_file_or_state_change(
     tmp_path: Path,
 ) -> None:
@@ -337,6 +373,12 @@ def test_every_system_endpoint_requires_authentication_before_body_validation(
         {"directory": "", "interval_hours": 24, "retention_days": 30},
         {"directory": "   ", "interval_hours": 24, "retention_days": 30},
         {"directory": 42, "interval_hours": 24, "retention_days": 30},
+        {
+            "enabled": True,
+            "directory": None,
+            "interval_hours": 24,
+            "retention_days": 30,
+        },
         {"directory": None, "interval_hours": True, "retention_days": 30},
         {"directory": None, "interval_hours": 0, "retention_days": 30},
         {"directory": None, "interval_hours": 8761, "retention_days": 30},

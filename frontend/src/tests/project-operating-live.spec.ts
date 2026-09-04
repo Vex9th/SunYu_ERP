@@ -126,6 +126,37 @@ describe('项目经营真实 Repository 契约', () => {
     expect(expectUuidKey(lastRequest(fetchMock)[1])).toBe(firstKey)
   })
 
+  it('文档创建和追加版本结果未知后只能用精确 input 与同一 File 放弃', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockRejectedValue(new TypeError('Failed to fetch')))
+    const repository = createHttpProjectOperatingRepository()
+    const createInput = {
+      category: 'planning_minutes',
+      title: '项目启动会纪要',
+      notes: null,
+      file: new File(['原纪要'], 'planning-minutes.txt', { type: 'text/plain' }),
+    }
+
+    await expect(repository.createDocument('SY-001', createInput)).rejects.toThrow('无法连接本地服务')
+    expect(repository.discardCreateDocument('SY-001', {
+      ...createInput,
+      file: new File(['原纪要'], 'planning-minutes.txt', { type: 'text/plain' }),
+    })).toBe(false)
+    expect(repository.discardCreateDocument('SY-001', createInput)).toBe(true)
+
+    const versionInput = {
+      notes: null,
+      expected_revision: 3,
+      file: new File(['追加纪要'], 'planning-minutes.txt', { type: 'text/plain' }),
+    }
+    await expect(repository.addDocumentVersion('SY-001', 12, versionInput)).rejects.toThrow('无法连接本地服务')
+    expect(repository.discardAddDocumentVersion('SY-001', 13, versionInput)).toBe(false)
+    expect(repository.discardAddDocumentVersion('SY-001', 12, {
+      ...versionInput,
+      expected_revision: 4,
+    })).toBe(false)
+    expect(repository.discardAddDocumentVersion('SY-001', 12, versionInput)).toBe(true)
+  })
+
   it('写入成功后清除 JSON 和 multipart 的 pending 幂等请求', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () => jsonResponse({}))
     vi.stubGlobal('fetch', fetchMock)
@@ -169,7 +200,7 @@ describe('项目经营真实 Repository 契约', () => {
     const repository = createHttpProjectOperatingRepository()
 
     await repository.listDocuments('SY/001')
-    expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY%2F001/documents?page=1&page_size=100')
+    expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY%2F001/documents?page=1&page_size=20&archived=active')
     await repository.getDocument('SY/001', 12)
     expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY%2F001/documents/12')
     await repository.updateDocument('SY/001', 12, {
@@ -179,15 +210,18 @@ describe('项目经营真实 Repository 契约', () => {
     await repository.archiveDocument('SY/001', 12, { reason: '已替代', expected_revision: 3 })
     expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY%2F001/documents/12/archive')
     expectUuidKey(lastRequest(fetchMock)[1])
-    const downloaded = await repository.downloadDocumentVersion('SY/001', 12, 31)
+    const controller = new AbortController()
+    const downloaded = await repository.downloadDocumentVersion('SY/001', 12, 31, controller.signal)
     expect({ size: downloaded.size, type: downloaded.type }).toEqual({
       size: 8,
       type: 'application/pdf',
     })
     expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY%2F001/documents/12/versions/31/download')
+    expect(lastRequest(fetchMock)[1].signal).toBeInstanceOf(AbortSignal)
+    expect(lastRequest(fetchMock)[1].signal?.aborted).toBe(false)
   })
 
-  it('文档、报价和合同会读取全部分页而不是只取前100条', async () => {
+  it('文档只读取指定页，报价和合同仍读取全部分页', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
       const page = path.includes('page=2') ? 2 : 1
@@ -206,8 +240,14 @@ describe('项目经营真实 Repository 契约', () => {
     vi.stubGlobal('fetch', fetchMock)
     const repository = createHttpProjectOperatingRepository()
 
-    await expect(repository.listDocuments('SY-001')).resolves.toMatchObject({
-      items: [{ id: 1 }, { id: 2 }], total: 101, page: 1, page_size: 100,
+    await expect(repository.listDocuments('SY-001', {
+      page: 2,
+      page_size: 20,
+      search: '验收 记录',
+      category: 'acceptance',
+      archived: 'all',
+    })).resolves.toMatchObject({
+      items: [{ id: 2 }], total: 101, page: 2, page_size: 100,
     })
     await expect(repository.listQuotes('SY-001')).resolves.toMatchObject({
       items: [{ id: 1 }, { id: 2 }], total: 101, page: 1, page_size: 100,
@@ -217,8 +257,7 @@ describe('项目经营真实 Repository 契约', () => {
     })
 
     expect(fetchMock.mock.calls.map(([path]) => String(path))).toEqual([
-      '/api/projects/SY-001/documents?page=1&page_size=100',
-      '/api/projects/SY-001/documents?page=2&page_size=100',
+      '/api/projects/SY-001/documents?page=2&page_size=20&search=%E9%AA%8C%E6%94%B6+%E8%AE%B0%E5%BD%95&category=acceptance&archived=all',
       '/api/projects/SY-001/quotes?page=1&page_size=100',
       '/api/projects/SY-001/quotes?page=2&page_size=100',
       '/api/projects/SY-001/contracts?page=1&page_size=100',
@@ -259,6 +298,13 @@ describe('项目经营真实 Repository 契约', () => {
     }
     await repository.createContract('SY/001', contract)
     expectUuidKey(lastRequest(fetchMock)[1])
+    const contractFile = new File(['signed-contract'], '销售合同.pdf', { type: 'application/pdf' })
+    await repository.createContract('SY/001', contract, [contractFile])
+    const [, contractUploadInit] = lastRequest(fetchMock)
+    expectUuidKey(contractUploadInit)
+    expect(contractUploadInit.body).toBeInstanceOf(FormData)
+    expect(JSON.parse(String((contractUploadInit.body as FormData).get('payload')))).toEqual(contract)
+    expect((contractUploadInit.body as FormData).getAll('files')).toEqual([contractFile])
     await repository.updateContract('SY/001', 8, { ...contract, expected_revision: 4 })
     expect(lastRequest(fetchMock)[1].method).toBe('PUT')
     await repository.transitionContract('SY/001', 8, {
@@ -291,5 +337,71 @@ describe('项目经营真实 Repository 契约', () => {
       voided_on: '2026-09-02', reason: '录入错误', expected_revision: 2,
     })
     expectUuidKey(lastRequest(fetchMock)[1])
+  })
+
+  it('报价带文件时发送 JSON payload 与重复 files，无文件仍保留 JSON', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () => jsonResponse({ id: 7 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const repository = createHttpProjectOperatingRepository()
+    const quote = {
+      quote_date: '2026-09-03', amount_cents: 1280000, valid_until: null,
+      notes: null, document_version_ids: [31],
+    }
+    const files = [
+      new File(['pdf'], '报价.pdf', { type: 'application/pdf' }),
+      new File(['sheet'], '报价.xlsx', { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+    ]
+
+    await repository.createQuote('SY/001', quote, files)
+    const [multipartPath, multipartInit] = lastRequest(fetchMock)
+    expect(multipartPath).toBe('/api/projects/SY%2F001/quotes')
+    expect((multipartInit.headers as Record<string, string>)['Content-Type']).toBeUndefined()
+    const form = multipartInit.body as FormData
+    expect(form.get('payload')).toBe(JSON.stringify(quote))
+    expect(form.getAll('files')).toEqual(files)
+
+    await repository.createQuote('SY/001', quote)
+    const [, jsonInit] = lastRequest(fetchMock)
+    expect(jsonInit.headers).toMatchObject({ 'Content-Type': 'application/json' })
+    expect(JSON.parse(String(jsonInit.body))).toEqual(quote)
+  })
+
+  it('报价和合同失败后可按 JSON 或同一批 File 显式放弃待重试语义', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockRejectedValue(new TypeError('network disconnected')))
+    const repository = createHttpProjectOperatingRepository()
+    const quote = {
+      quote_date: '2026-09-03', amount_cents: 1280000, valid_until: null,
+      notes: null, document_version_ids: [],
+    }
+    const file = new File(['pdf'], '报价.pdf', { type: 'application/pdf' })
+
+    await expect(repository.createQuote('SY-001', quote, [file])).rejects.toThrow('无法连接本地服务')
+    expect(repository.discardCreateQuote('SY-001', quote, [file])).toBe(true)
+    await expect(repository.createQuote('SY-001', quote)).rejects.toThrow('无法连接本地服务')
+    expect(repository.discardCreateQuote('SY-001', quote)).toBe(true)
+
+    const contract = {
+      contract_no: 'HT-001', title: '项目合同', customer_company_id: 3,
+      signed_on: null, total_amount_cents: 1280000, final_delivery_on: null,
+      allocations: [{ project_code: 'SY-001', amount_cents: 1280000 }],
+      notes: null, document_version_ids: [],
+    }
+    await expect(repository.createContract('SY-001', contract, [file])).rejects.toThrow('无法连接本地服务')
+    expect(repository.discardCreateContract('SY-001', contract, [file])).toBe(true)
+  })
+
+  it('已有资料选项优先显示 managed filename，并保留原文件名追溯与旧数据 fallback', async () => {
+    const expected = [
+      { value: 31, label: '报价资料 V1 · SY-001-报价-20260903.pdf（原文件名：客户原稿.pdf）' },
+      { value: 32, label: '旧资料 V1 · 旧文件.pdf' },
+    ]
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse(expected))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const options = await createHttpProjectOperatingRepository().listDocumentVersionOptions('SY-001')
+
+    expect(options).toEqual(expected)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY-001/document-version-options')
   })
 })

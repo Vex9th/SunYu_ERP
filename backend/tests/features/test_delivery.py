@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sqlite3
 import uuid
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Barrier
 from typing import Any
 
 import pytest
@@ -17,6 +20,7 @@ from backend.app.core.config import Settings
 from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
 from backend.app.core.security import SESSION_COOKIE_NAME, create_session_token
+from backend.app.features import files
 
 ROOT = Path(__file__).resolve().parents[3]
 NOW = datetime(2026, 2, 1, 4, 0, tzinfo=timezone.utc)
@@ -191,7 +195,7 @@ def _after_sales_payload() -> dict[str, object]:
         "reason": "传感器误报",
         "contact_name": "王工",
         "contact_phone": "13800000000",
-        "coverage_type": "warranty",
+        "coverage_type": "paid",
         "notes": None,
     }
 
@@ -614,6 +618,227 @@ def test_drawing_signoffs_return_fixed_pair_and_support_strict_upsert(
     assert cross_project.status_code == 422
 
 
+def test_drawing_signoff_multipart_creates_managed_documents_and_replays(
+    harness: Harness,
+) -> None:
+    key = "71000000-0000-4000-8000-000000000001"
+    payload = {
+        "status": "confirmed",
+        "confirmed_on": "2026-01-31",
+        "not_required_reason": None,
+        "notes": "最终版会签图",
+        "document_version_ids": [1],
+        "expected_revision": None,
+    }
+    uploads = [
+        ("files", ("机械最终版.dwg", b"cad-one", "application/acad")),
+        ("files", ("会签扫描.pdf", b"signed-pdf", "application/pdf")),
+    ]
+    with harness.client() as client:
+        created = client.put(
+            "/api/projects/P-001/drawing-signoffs/mechanical",
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=uploads,
+        )
+        replay = client.put(
+            "/api/projects/p-001/drawing-signoffs/mechanical",
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=uploads,
+        )
+        conflict = client.put(
+            "/api/projects/P-001/drawing-signoffs/mechanical",
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files={"files": ("机械最终版.dwg", b"different", "application/acad")},
+        )
+
+    assert created.status_code == replay.status_code == 200, created.text
+    assert replay.json() == created.json()
+    assert conflict.status_code == 409
+    assert conflict.json()["error_code"] == "IDEMPOTENCY_KEY_REUSED"
+    uploaded_ids = created.json()["document_version_ids"][1:]
+    assert len(uploaded_ids) == 2
+    connection = connect_database(harness.database_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT versions.original_filename, versions.managed_filename,
+                   versions.stored_relative_path, documents.category
+            FROM document_versions AS versions
+            JOIN documents ON documents.id = versions.document_id
+            WHERE versions.id IN (?, ?)
+            ORDER BY versions.id
+            """,
+            uploaded_ids,
+        ).fetchall()
+        assert connection.execute(
+            "SELECT COUNT(*) FROM drawing_signoffs WHERE project_id = 1"
+        ).fetchone()[0] == 1
+    finally:
+        connection.close()
+    assert [row["managed_filename"] for row in rows] == [
+        "P-001_机械会签_20260131_01.dwg",
+        "P-001_机械会签_20260131_02.pdf",
+    ]
+    assert [row["original_filename"] for row in rows] == [
+        "机械最终版.dwg",
+        "会签扫描.pdf",
+    ]
+    assert all(row["category"] == "mechanical_signoff" for row in rows)
+    for row in rows:
+        stored = harness.settings.data_dir / row["stored_relative_path"]
+        assert stored.is_file()
+        assert stored.name == row["managed_filename"]
+
+
+def test_drawing_signoff_multipart_database_failure_rolls_back_and_cleans_files(
+    harness: Harness,
+) -> None:
+    connection = connect_database(harness.database_path)
+    try:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_signoff_attachment_version
+            BEFORE INSERT ON document_versions
+            BEGIN
+                SELECT RAISE(ABORT, 'injected signoff attachment failure');
+            END
+            """
+        )
+    finally:
+        connection.close()
+    payload = {
+        "status": "confirmed",
+        "confirmed_on": "2026-01-31",
+        "not_required_reason": None,
+        "notes": None,
+        "document_version_ids": [],
+        "expected_revision": None,
+    }
+    with harness.client(raise_server_exceptions=False) as client:
+        response = client.put(
+            "/api/projects/P-001/drawing-signoffs/mechanical",
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+            data={"payload": json.dumps(payload)},
+            files={"files": ("final.dwg", b"drawing", "application/acad")},
+        )
+
+    assert response.status_code == 500
+    connection = connect_database(harness.database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM drawing_signoffs").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM document_versions").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM workforce_document_links").fetchone()[0] == 0
+    finally:
+        connection.close()
+    assert not [
+        path
+        for path in (harness.settings.data_dir / "Projects").rglob("*")
+        if path.is_file()
+    ]
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
+
+
+@pytest.mark.parametrize(
+    ("path", "payload", "filename", "expected_category", "expected_managed_name"),
+    [
+        (
+            "/api/projects/P-001/commissioning-sessions",
+            _commissioning_payload() | {"document_version_ids": []},
+            "现场调试记录.pdf",
+            "commissioning",
+            "P-001_调试_20260130_01.pdf",
+        ),
+        (
+            "/api/projects/P-001/engineering-changes",
+            _change_payload() | {"document_version_ids": []},
+            "增补确认单.docx",
+            "technical_agreement",
+            "P-001_工程变更_20260130_01.docx",
+        ),
+    ],
+)
+def test_commissioning_and_change_create_accept_direct_attachments(
+    harness: Harness,
+    path: str,
+    payload: dict[str, object],
+    filename: str,
+    expected_category: str,
+    expected_managed_name: str,
+) -> None:
+    key = str(uuid.uuid4())
+    uploads = {"files": (filename, b"business-proof", "application/octet-stream")}
+    with harness.client() as client:
+        created = client.post(
+            path,
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=uploads,
+        )
+        replay = client.post(
+            path.replace("P-001", "p-001"),
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=uploads,
+        )
+
+    assert created.status_code == replay.status_code == 201, created.text
+    assert replay.json() == created.json()
+    version_ids = created.json()["document_version_ids"]
+    assert len(version_ids) == 1
+    connection = connect_database(harness.database_path)
+    try:
+        row = connection.execute(
+            """
+            SELECT versions.original_filename, versions.managed_filename,
+                   versions.stored_relative_path, documents.category
+            FROM document_versions AS versions
+            JOIN documents ON documents.id = versions.document_id
+            WHERE versions.id = ?
+            """,
+            (version_ids[0],),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    assert row["original_filename"] == filename
+    assert row["managed_filename"] == expected_managed_name
+    assert row["category"] == expected_category
+    stored = harness.settings.data_dir / row["stored_relative_path"]
+    assert stored.is_file()
+    assert stored.name == expected_managed_name
+
+
+def test_legacy_acceptance_put_cannot_bypass_reason_and_idempotency(
+    harness: Harness,
+) -> None:
+    with harness.client() as client:
+        acceptance = client.post(
+            "/api/projects/P-001/acceptances",
+            json={
+                "acceptance_type": "final",
+                "scheduled_on": "2026-02-10",
+                "notes": None,
+            },
+        ).json()
+        response = client.put(
+            f"/api/projects/P-001/acceptances/{acceptance['id']}",
+            json={
+                "acceptance_type": "final",
+                "scheduled_on": "2026-02-12",
+                "notes": "绕过原因",
+                "expected_revision": acceptance["revision"],
+            },
+        )
+        listed = client.get("/api/projects/P-001/acceptances").json()
+
+    assert response.status_code == 404
+    assert listed["items"][0]["scheduled_on"] == "2026-02-10"
+
+
 def test_commissioning_create_update_list_filter_revision_and_isolation(
     harness: Harness,
 ) -> None:
@@ -731,6 +956,356 @@ def test_final_acceptance_and_warranty_are_atomic_and_use_calendar_months(
     assert completed.json()["warranty"]["ends_on"] == "2026-02-28"
     assert warranty.json()["status"] == "expiring"
     assert warranty.json()["days_remaining"] == 27
+
+
+def test_scheduled_acceptance_reschedule_is_idempotent_and_audited(
+    harness: Harness,
+) -> None:
+    key = "71100000-0000-4000-8000-000000000098"
+    with harness.client() as client:
+        created = client.post(
+            "/api/projects/P-001/acceptances",
+            json={
+                "acceptance_type": "pre_acceptance",
+                "scheduled_on": "2026-02-10",
+                "notes": "原计划",
+            },
+        ).json()
+        payload = {
+            "acceptance_type": "final",
+            "scheduled_on": "2026-02-15",
+            "notes": "客户改期",
+            "reason": "客户要求延后验收",
+            "expected_revision": created["revision"],
+        }
+        updated = client.post(
+            f"/api/projects/P-001/acceptances/{created['id']}/reschedule",
+            headers={"Idempotency-Key": key},
+            json=payload,
+        )
+        replay = client.post(
+            f"/api/projects/P-001/acceptances/{created['id']}/reschedule",
+            headers={"Idempotency-Key": key},
+            json=payload,
+        )
+        stale = client.post(
+            f"/api/projects/P-001/acceptances/{created['id']}/reschedule",
+            json={
+                **payload,
+                "scheduled_on": "2026-02-20",
+                "expected_revision": created["revision"],
+            },
+        )
+
+    assert updated.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json() == updated.json()
+    assert updated.json()["acceptance_type"] == "final"
+    assert updated.json()["scheduled_on"] == "2026-02-15"
+    assert updated.json()["notes"] == "客户改期"
+    assert updated.json()["revision"] == created["revision"] + 1
+    assert stale.status_code == 409
+    assert stale.json()["error_code"] == "REVISION_CONFLICT"
+    connection = connect_database(harness.database_path)
+    try:
+        event = connection.execute(
+            "SELECT * FROM acceptance_reschedule_events WHERE acceptance_id = ?",
+            (created["id"],),
+        ).fetchone()
+        assert event["previous_scheduled_on"] == "2026-02-10"
+        assert event["scheduled_on"] == "2026-02-15"
+        assert event["previous_acceptance_type"] == "pre_acceptance"
+        assert event["acceptance_type"] == "final"
+        assert event["reason"] == "客户要求延后验收"
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE acceptance_reschedule_events SET reason = 'tampered' WHERE id = ?",
+                (event["id"],),
+            )
+    finally:
+        connection.close()
+
+
+def test_acceptance_cancel_is_idempotent_audited_and_cannot_be_completed(
+    harness: Harness,
+) -> None:
+    key = "71100000-0000-4000-8000-000000000099"
+    with harness.client() as client:
+        created = client.post(
+            "/api/projects/P-001/acceptances",
+            json={
+                "acceptance_type": "pre_acceptance",
+                "scheduled_on": "2026-02-10",
+                "notes": None,
+            },
+        ).json()
+        payload = {
+            "cancelled_on": "2026-02-08",
+            "reason": "客户延期，原验收计划作废",
+            "expected_revision": created["revision"],
+        }
+        cancelled = client.post(
+            f"/api/projects/P-001/acceptances/{created['id']}/cancel",
+            headers={"Idempotency-Key": key},
+            json=payload,
+        )
+        replay = client.post(
+            f"/api/projects/P-001/acceptances/{created['id']}/cancel",
+            headers={"Idempotency-Key": key},
+            json=payload,
+        )
+        reschedule_cancelled = client.post(
+            f"/api/projects/P-001/acceptances/{created['id']}/reschedule",
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+            json={
+                "acceptance_type": "pre_acceptance",
+                "scheduled_on": "2026-02-20",
+                "notes": None,
+                "reason": "取消后误操作改期",
+                "expected_revision": cancelled.json()["revision"],
+            },
+        )
+        complete = client.post(
+            f"/api/projects/P-001/acceptances/{created['id']}/complete",
+            json={
+                "performed_on": "2026-02-10",
+                "result": "failed",
+                "notes": None,
+                "document_version_ids": [],
+                "warranty": None,
+                "expected_revision": cancelled.json()["revision"],
+            },
+        )
+
+    connection = connect_database(harness.database_path)
+    try:
+        event = connection.execute(
+            "SELECT * FROM acceptance_transition_events WHERE acceptance_id = ?",
+            (created["id"],),
+        ).fetchone()
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE acceptance_transition_events SET reason = 'tampered' WHERE id = ?",
+                (event["id"],),
+            )
+    finally:
+        connection.close()
+
+    assert cancelled.status_code == replay.status_code == 200
+    assert cancelled.json() == replay.json()
+    assert cancelled.json()["status"] == "cancelled"
+    assert cancelled.json()["cancelled_at"] == "2026-02-08"
+    assert cancelled.json()["cancel_reason"] == "客户延期，原验收计划作废"
+    assert event["from_status"] == "scheduled"
+    assert event["to_status"] == "cancelled"
+    assert event["reason"] == "客户延期，原验收计划作废"
+    assert reschedule_cancelled.status_code == 409
+    assert reschedule_cancelled.json()["error_code"] == "ACCEPTANCE_LOCKED"
+    assert complete.status_code == 409
+
+
+def test_acceptance_completion_multipart_creates_managed_documents_and_replays(
+    harness: Harness,
+) -> None:
+    key = "71100000-0000-4000-8000-000000000001"
+    with harness.client() as client:
+        acceptance = client.post(
+            "/api/projects/P-001/acceptances",
+            json={
+                "acceptance_type": "final",
+                "scheduled_on": "2026-01-31",
+                "notes": None,
+            },
+        ).json()
+        payload = {
+            "performed_on": "2026-01-31",
+            "result": "passed",
+            "notes": "验收通过",
+            "document_version_ids": [1],
+            "warranty": {
+                "starts_on": "2026-01-31",
+                "duration_months": 12,
+                "renewal_price_cents": 50_000,
+                "notes": None,
+            },
+            "expected_revision": acceptance["revision"],
+        }
+        uploads = [
+            ("files", ("验收单.pdf", b"acceptance-pdf", "application/pdf")),
+            ("files", ("现场照片.jpg", b"acceptance-photo", "image/jpeg")),
+        ]
+        path = f"/api/projects/P-001/acceptances/{acceptance['id']}/complete"
+        created = client.post(
+            path,
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=uploads,
+        )
+        replay = client.post(
+            path.replace("P-001", "p-001"),
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=uploads,
+        )
+        conflict = client.post(
+            path,
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files={"files": ("验收单.pdf", b"different", "application/pdf")},
+        )
+
+    assert created.status_code == replay.status_code == 200, created.text
+    assert replay.json() == created.json()
+    assert conflict.status_code == 409
+    assert conflict.json()["error_code"] == "IDEMPOTENCY_KEY_REUSED"
+    uploaded_ids = created.json()["acceptance"]["document_version_ids"][1:]
+    assert len(uploaded_ids) == 2
+    connection = connect_database(harness.database_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT versions.managed_filename, versions.stored_relative_path,
+                   documents.category
+            FROM document_versions AS versions
+            JOIN documents ON documents.id = versions.document_id
+            WHERE versions.id IN (?, ?)
+            ORDER BY versions.id
+            """,
+            uploaded_ids,
+        ).fetchall()
+    finally:
+        connection.close()
+    assert [row["managed_filename"] for row in rows] == [
+        "P-001_验收_20260131_01.pdf",
+        "P-001_验收_20260131_02.jpg",
+    ]
+    assert all(row["category"] == "acceptance" for row in rows)
+    for row in rows:
+        stored = harness.settings.data_dir / row["stored_relative_path"]
+        assert stored.is_file()
+        assert stored.name == row["managed_filename"]
+
+
+def test_acceptance_completion_multipart_failure_is_atomic_and_cleans_files(
+    harness: Harness,
+) -> None:
+    with harness.client() as client:
+        acceptance = client.post(
+            "/api/projects/P-001/acceptances",
+            json={
+                "acceptance_type": "final",
+                "scheduled_on": "2026-01-31",
+                "notes": None,
+            },
+        ).json()
+    connection = connect_database(harness.database_path)
+    try:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_acceptance_attachment_version
+            BEFORE INSERT ON document_versions
+            BEGIN
+                SELECT RAISE(ABORT, 'injected acceptance attachment failure');
+            END
+            """
+        )
+    finally:
+        connection.close()
+    payload = {
+        "performed_on": "2026-01-31",
+        "result": "passed",
+        "notes": None,
+        "document_version_ids": [],
+        "warranty": {
+            "starts_on": "2026-01-31",
+            "duration_months": 12,
+            "renewal_price_cents": None,
+            "notes": None,
+        },
+        "expected_revision": acceptance["revision"],
+    }
+    with harness.client(raise_server_exceptions=False) as client:
+        response = client.post(
+            f"/api/projects/P-001/acceptances/{acceptance['id']}/complete",
+            data={"payload": json.dumps(payload)},
+            files={"files": ("验收单.pdf", b"proof", "application/pdf")},
+        )
+
+    assert response.status_code == 500
+    connection = connect_database(harness.database_path)
+    try:
+        row = connection.execute(
+            "SELECT status, performed_on, revision FROM acceptances WHERE id = ?",
+            (acceptance["id"],),
+        ).fetchone()
+        assert tuple(row) == ("scheduled", None, 1)
+        assert connection.execute("SELECT COUNT(*) FROM warranties").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM document_versions").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM workforce_document_links").fetchone()[0] == 0
+    finally:
+        connection.close()
+    assert not [
+        path
+        for path in (harness.settings.data_dir / "Projects").rglob("*")
+        if path.is_file()
+    ]
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
+
+
+def test_delivery_direct_upload_validation_failure_discards_staged_files(
+    harness: Harness,
+) -> None:
+    with harness.client() as client:
+        signoff = client.put(
+            "/api/projects/P-001/drawing-signoffs/mechanical",
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+            data={
+                "payload": json.dumps(
+                    {
+                        "status": "confirmed",
+                        "confirmed_on": "not-a-date",
+                        "not_required_reason": None,
+                        "notes": None,
+                        "document_version_ids": [],
+                        "expected_revision": None,
+                    }
+                )
+            },
+            files={"files": ("final.dwg", b"drawing", "application/acad")},
+        )
+        acceptance = client.post(
+            "/api/projects/P-001/acceptances",
+            json={
+                "acceptance_type": "pre_acceptance",
+                "scheduled_on": "2026-01-31",
+                "notes": None,
+            },
+        ).json()
+        completion = client.post(
+            f"/api/projects/P-001/acceptances/{acceptance['id']}/complete",
+            data={
+                "payload": json.dumps(
+                    {
+                        "performed_on": "not-a-date",
+                        "result": "passed",
+                        "notes": None,
+                        "document_version_ids": [],
+                        "warranty": None,
+                        "expected_revision": acceptance["revision"],
+                    }
+                )
+            },
+            files={"files": ("验收单.pdf", b"proof", "application/pdf")},
+        )
+
+    assert signoff.status_code == completion.status_code == 422
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
+    assert not [
+        path
+        for path in (harness.settings.data_dir / "Projects").rglob("*")
+        if path.is_file()
+    ]
 
 
 def test_acceptance_document_failure_rolls_back_completion_and_warranty(
@@ -890,25 +1465,44 @@ def test_after_sales_warranty_fact_is_derived_and_recomputed_on_edit(
         connection.close()
 
     with harness.client() as client:
-        created = client.post(
+        mismatch_on_create = client.post(
             "/api/projects/P-001/after-sales",
             json=_after_sales_payload()
             | {"reported_on": "2026-02-02", "coverage_type": "warranty"},
+        )
+        created = client.post(
+            "/api/projects/P-001/after-sales",
+            json=_after_sales_payload() | {"reported_on": "2026-02-02"},
+        )
+        mismatch_on_update = client.put(
+            f"/api/projects/P-001/after-sales/{created.json()['id']}",
+            json=_after_sales_payload()
+            | {
+                "reported_on": "2026-02-02",
+                "coverage_type": "warranty",
+                "expected_revision": created.json()["revision"],
+            },
         )
         updated = client.put(
             f"/api/projects/P-001/after-sales/{created.json()['id']}",
             json=_after_sales_payload()
             | {
                 "reported_on": "2026-02-01",
-                "coverage_type": "paid",
+                "coverage_type": "warranty",
                 "expected_revision": created.json()["revision"],
             },
         )
 
+    assert mismatch_on_create.status_code == 409
+    assert mismatch_on_create.json()["error_code"] == "WARRANTY_COVERAGE_MISMATCH"
+    assert "coverage_type" in mismatch_on_create.json()["field_errors"]
     assert created.status_code == 201
     assert created.json()["is_under_warranty"] is False
+    assert mismatch_on_update.status_code == 409
+    assert mismatch_on_update.json()["error_code"] == "WARRANTY_COVERAGE_MISMATCH"
+    assert "coverage_type" in mismatch_on_update.json()["field_errors"]
     assert updated.status_code == 200
-    assert updated.json()["coverage_type"] == "paid"
+    assert updated.json()["coverage_type"] == "warranty"
     assert updated.json()["is_under_warranty"] is True
 
 
@@ -951,6 +1545,485 @@ def test_invoice_crud_filter_void_and_document_validation(harness: Harness) -> N
     assert voided.json()["void_reason"] == "发票作废"
     assert invalid.status_code == 422
     assert invalid_date_order.status_code == 422
+
+
+def test_requested_invoice_can_be_recorded_through_update(harness: Harness) -> None:
+    requested_payload = _invoice_payload() | {
+        "status": "requested",
+        "recorded_on": None,
+        "invoice_number": None,
+        "amount_cents": None,
+    }
+    with harness.client() as client:
+        created = client.post("/api/projects/P-001/invoices", json=requested_payload)
+        recorded = client.put(
+            f"/api/projects/P-001/invoices/{created.json()['id']}",
+            json=_invoice_payload() | {"expected_revision": created.json()["revision"]},
+        )
+
+    assert created.status_code == 201
+    assert created.json()["status"] == "requested"
+    assert recorded.status_code == 200
+    assert recorded.json()["status"] == "recorded"
+    assert recorded.json()["recorded_on"] == "2026-01-25"
+    assert recorded.json()["invoice_number"] == "INV-001"
+    assert recorded.json()["amount_cents"] == 300_000
+
+
+def test_duplicate_invoice_number_is_normalized_and_does_not_double_count(
+    harness: Harness,
+) -> None:
+    with harness.client() as client:
+        first = client.post("/api/projects/P-001/invoices", json=_invoice_payload())
+        duplicate = client.post(
+            "/api/projects/P-002/invoices",
+            json=_invoice_payload()
+            | {
+                "invoice_number": "  inv-001  ",
+                "amount_cents": 900_000,
+                "document_version_ids": [2],
+            },
+        )
+        summary = client.get("/api/projects/P-001/delivery-summary")
+
+    assert first.status_code == 201
+    assert duplicate.status_code == 409
+    assert duplicate.json()["error_code"] == "INVOICE_NUMBER_CONFLICT"
+    assert "invoice_number" in duplicate.json()["field_errors"]
+    assert summary.json()["invoices"]["recorded_amount_cents"] == 300_000
+
+
+@pytest.mark.parametrize("target_status", ["planned", "recorded"])
+def test_invoice_update_rejects_duplicate_number_for_draft_and_registration(
+    harness: Harness,
+    target_status: str,
+) -> None:
+    draft = _invoice_payload() | {
+        "status": "planned",
+        "requested_on": None,
+        "recorded_on": None,
+        "invoice_number": None,
+        "amount_cents": None,
+        "document_version_ids": [],
+    }
+    with harness.client() as client:
+        existing = client.post("/api/projects/P-001/invoices", json=_invoice_payload())
+        created = client.post("/api/projects/P-002/invoices", json=draft)
+        update_payload = draft | {
+            "status": target_status,
+            "invoice_number": "Inv-001",
+            "expected_revision": created.json()["revision"],
+        }
+        if target_status == "recorded":
+            update_payload |= {
+                "requested_on": "2026-01-20",
+                "recorded_on": "2026-01-25",
+                "amount_cents": 600_000,
+            }
+        duplicate = client.put(
+            f"/api/projects/P-002/invoices/{created.json()['id']}",
+            json=update_payload,
+        )
+        listing = client.get("/api/projects/P-002/invoices")
+
+    assert existing.status_code == 201
+    assert duplicate.status_code == 409
+    assert duplicate.json()["error_code"] == "INVOICE_NUMBER_CONFLICT"
+    assert "invoice_number" in duplicate.json()["field_errors"]
+    assert listing.json()["items"][0]["status"] == "planned"
+    assert listing.json()["items"][0]["invoice_number"] is None
+
+
+def test_voided_invoice_number_can_be_reused_without_double_counting(
+    harness: Harness,
+) -> None:
+    with harness.client() as client:
+        original = client.post("/api/projects/P-001/invoices", json=_invoice_payload()).json()
+        voided = client.post(
+            f"/api/projects/P-001/invoices/{original['id']}/void",
+            json={"reason": "原票作废", "expected_revision": original["revision"]},
+        )
+        replacement = client.post(
+            "/api/projects/P-001/invoices",
+            json=_invoice_payload()
+            | {"invoice_number": " inv-001 ", "amount_cents": 450_000},
+        )
+        summary = client.get("/api/projects/P-001/delivery-summary")
+
+    assert voided.status_code == 200
+    assert replacement.status_code == 201
+    assert replacement.json()["invoice_number"] == "inv-001"
+    assert summary.json()["invoices"] == {
+        "count": 1,
+        "recorded_amount_cents": 450_000,
+    }
+
+
+def test_concurrent_duplicate_invoice_creation_has_one_winner(
+    harness: Harness,
+) -> None:
+    barrier = Barrier(2)
+
+    def create(project_code: str) -> tuple[int, dict[str, object]]:
+        payload = _invoice_payload() | {
+            "invoice_number": "Concurrent-001" if project_code == "P-001" else " concurrent-001 ",
+            "document_version_ids": [],
+        }
+        with harness.client() as client:
+            barrier.wait(timeout=5)
+            response = client.post(f"/api/projects/{project_code}/invoices", json=payload)
+            return response.status_code, response.json()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(create, ("P-001", "P-002")))
+
+    assert sorted(status for status, _ in results) == [201, 409]
+    conflict = next(body for status, body in results if status == 409)
+    assert conflict["error_code"] == "INVOICE_NUMBER_CONFLICT"
+    assert "invoice_number" in conflict["field_errors"]
+    connection = connect_database(harness.database_path)
+    try:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM project_invoices WHERE status <> 'void'"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert count == 1
+
+
+def test_recorded_invoice_update_rejects_downgrade_and_formal_field_rewrite(
+    harness: Harness,
+) -> None:
+    with harness.client() as client:
+        created = client.post("/api/projects/P-001/invoices", json=_invoice_payload())
+        invoice = created.json()
+        downgraded = client.put(
+            f"/api/projects/P-001/invoices/{invoice['id']}",
+            json=_invoice_payload()
+            | {
+                "status": "requested",
+                "recorded_on": None,
+                "invoice_number": None,
+                "amount_cents": None,
+                "expected_revision": invoice["revision"],
+            },
+        )
+        rewritten = client.put(
+            f"/api/projects/P-001/invoices/{invoice['id']}",
+            json=_invoice_payload()
+            | {
+                "recorded_on": "2026-01-26",
+                "invoice_number": "INV-REWRITTEN",
+                "amount_cents": 1,
+                "expected_revision": invoice["revision"],
+            },
+        )
+        listed = client.get("/api/projects/P-001/invoices")
+
+    assert created.status_code == 201
+    assert downgraded.status_code == 409
+    assert downgraded.json()["error_code"] == "INVOICE_RECORDED"
+    assert rewritten.status_code == 409
+    assert rewritten.json()["error_code"] == "INVOICE_RECORDED"
+    stored = listed.json()["items"][0]
+    assert stored["status"] == "recorded"
+    assert stored["recorded_on"] == "2026-01-25"
+    assert stored["invoice_number"] == "INV-001"
+    assert stored["amount_cents"] == 300_000
+    assert stored["revision"] == invoice["revision"]
+
+
+@pytest.mark.parametrize(
+    "cleared_field", ("recorded_on", "invoice_number", "amount_cents")
+)
+def test_recorded_invoice_update_rejects_each_cleared_formal_field_as_conflict(
+    harness: Harness,
+    cleared_field: str,
+) -> None:
+    requested_payload = _invoice_payload() | {
+        "status": "requested",
+        "recorded_on": None,
+        "invoice_number": None,
+        "amount_cents": None,
+    }
+    with harness.client() as client:
+        recorded = client.post(
+            "/api/projects/P-001/invoices", json=_invoice_payload()
+        ).json()
+        requested = client.post(
+            "/api/projects/P-001/invoices", json=requested_payload
+        ).json()
+        conflict = client.put(
+            f"/api/projects/P-001/invoices/{recorded['id']}",
+            json=_invoice_payload()
+            | {
+                cleared_field: None,
+                "expected_revision": recorded["revision"],
+            },
+        )
+        invalid_registration = client.put(
+            f"/api/projects/P-001/invoices/{requested['id']}",
+            json=_invoice_payload()
+            | {
+                cleared_field: None,
+                "expected_revision": requested["revision"],
+            },
+        )
+
+    assert conflict.status_code == 409
+    assert conflict.json()["error_code"] == "INVOICE_RECORDED"
+    assert invalid_registration.status_code == 422
+    assert invalid_registration.json()["error_code"] == "INVALID_INVOICE_PAYLOAD"
+
+
+def test_project_invoice_multipart_creates_managed_documents_and_replays(
+    harness: Harness,
+) -> None:
+    key = "72000000-0000-4000-8000-000000000001"
+    payload = _invoice_payload() | {
+        "status": "requested",
+        "recorded_on": None,
+        "invoice_number": None,
+    }
+    uploads = [
+        ("files", ("客户发票扫描.pdf", b"invoice-pdf", "application/pdf")),
+        ("files", ("发票现场图.jpg", b"invoice-photo", "image/jpeg")),
+    ]
+    with harness.client() as client:
+        created = client.post(
+            "/api/projects/P-001/invoices",
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=uploads,
+        )
+        replay = client.post(
+            "/api/projects/p-001/invoices",
+            headers={"Idempotency-Key": key},
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files=uploads,
+        )
+
+    assert created.status_code == replay.status_code == 201, created.text
+    assert replay.json() == created.json()
+    new_version_ids = created.json()["document_version_ids"][1:]
+    assert len(new_version_ids) == 2
+    connection = connect_database(harness.database_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT versions.original_filename, versions.managed_filename,
+                   versions.stored_relative_path, documents.category,
+                   documents.logical_name
+            FROM document_versions AS versions
+            JOIN documents ON documents.id = versions.document_id
+            WHERE versions.id IN (?, ?)
+            ORDER BY versions.id
+            """,
+            new_version_ids,
+        ).fetchall()
+        counts = (
+            connection.execute("SELECT COUNT(*) FROM project_invoices").fetchone()[0],
+            connection.execute(
+                "SELECT COUNT(*) FROM documents WHERE category = 'invoice'"
+            ).fetchone()[0],
+        )
+    finally:
+        connection.close()
+    assert counts == (1, 2)
+    assert [row["managed_filename"] for row in rows] == [
+        "P-001_销项发票_20260120_01.pdf",
+        "P-001_销项发票_20260120_02.jpg",
+    ]
+    assert [row["original_filename"] for row in rows] == [
+        "客户发票扫描.pdf",
+        "发票现场图.jpg",
+    ]
+    assert all(row["category"] == "invoice" for row in rows)
+    assert len({row["logical_name"] for row in rows}) == 2
+    for row in rows:
+        stored = harness.settings.data_dir / row["stored_relative_path"]
+        assert stored.is_file()
+        assert stored.name == row["managed_filename"]
+
+
+def test_project_invoice_image_only_creates_planned_record_for_later_completion(
+    harness: Harness,
+) -> None:
+    payload = _invoice_payload() | {
+        "status": "planned",
+        "requested_on": None,
+        "recorded_on": None,
+        "invoice_number": None,
+        "amount_cents": None,
+        "counterparty_name": None,
+        "document_version_ids": [],
+    }
+    with harness.client() as client:
+        created = client.post(
+            "/api/projects/P-001/invoices",
+            data={"payload": json.dumps(payload, ensure_ascii=False)},
+            files={"files": ("销项发票.jpg", b"invoice-photo", "image/jpeg")},
+        )
+
+    assert created.status_code == 201, created.text
+    assert created.json()["status"] == "planned"
+    assert created.json()["requested_on"] is None
+    assert created.json()["recorded_on"] is None
+    assert created.json()["invoice_number"] is None
+    assert created.json()["amount_cents"] is None
+    assert len(created.json()["document_version_ids"]) == 1
+
+
+def test_project_invoice_multipart_invalid_payload_cleans_staged_file(
+    harness: Harness,
+) -> None:
+    with harness.client() as client:
+        response = client.post(
+            "/api/projects/P-001/invoices",
+            data={
+                "payload": json.dumps(_invoice_payload() | {"amount_cents": -1})
+            },
+            files={"files": ("valid.pdf", b"valid", "application/pdf")},
+        )
+
+    assert response.status_code == 422
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
+
+
+def test_project_invoice_json_and_zero_file_multipart_replay_same_response(
+    harness: Harness,
+) -> None:
+    key = "72100000-0000-4000-8000-000000000001"
+    payload = _invoice_payload() | {"document_version_ids": []}
+    with harness.client() as client:
+        created = client.post(
+            "/api/projects/P-001/invoices",
+            headers={"Idempotency-Key": key},
+            json=payload,
+        )
+        replay = client.post(
+            "/api/projects/p-001/invoices",
+            headers={"Idempotency-Key": key},
+            files={
+                "payload": (
+                    None,
+                    json.dumps(payload, ensure_ascii=False),
+                    "application/json",
+                )
+            },
+        )
+
+    assert created.status_code == replay.status_code == 201, replay.text
+    assert replay.json() == created.json()
+    connection = connect_database(harness.database_path)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM project_invoices"
+        ).fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_project_invoice_multipart_database_failure_rolls_back_everything(
+    harness: Harness,
+) -> None:
+    connection = connect_database(harness.database_path)
+    try:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_delivery_attachment_version
+            BEFORE INSERT ON document_versions
+            BEGIN
+                SELECT RAISE(ABORT, 'injected attachment database failure');
+            END
+            """
+        )
+    finally:
+        connection.close()
+    with harness.client(raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/projects/P-001/invoices",
+            data={
+                "payload": json.dumps(
+                    _invoice_payload() | {"document_version_ids": []}
+                )
+            },
+            files={"files": ("invoice.pdf", b"invoice", "application/pdf")},
+        )
+
+    assert response.status_code == 500
+    connection = connect_database(harness.database_path)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM project_invoices"
+        ).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM document_versions"
+        ).fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM workforce_document_links"
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
+    assert not [
+        path
+        for path in (harness.settings.data_dir / "Projects").rglob("*")
+        if path.is_file()
+    ]
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
+
+
+def test_project_invoice_second_publish_failure_rolls_back_everything(
+    harness: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_publish = files.publish_staged_version
+    calls = 0
+
+    def fail_second_publish(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected publish failure")
+        return original_publish(*args, **kwargs)
+
+    monkeypatch.setattr(files, "publish_staged_version", fail_second_publish)
+    with harness.client(raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/projects/P-001/invoices",
+            data={
+                "payload": json.dumps(
+                    _invoice_payload() | {"document_version_ids": []}
+                )
+            },
+            files=[
+                ("files", ("first.pdf", b"first", "application/pdf")),
+                ("files", ("second.pdf", b"second", "application/pdf")),
+            ],
+        )
+
+    assert response.status_code == 500
+    connection = connect_database(harness.database_path)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM project_invoices"
+        ).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM document_versions"
+        ).fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM workforce_document_links"
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
+    assert not [
+        path
+        for path in (harness.settings.data_dir / "Projects").rglob("*")
+        if path.is_file()
+    ]
+    assert not list((harness.settings.data_dir / "Temp").glob(".upload-*.tmp"))
 
 
 def test_after_sales_crud_transition_rules_and_filters(harness: Harness) -> None:

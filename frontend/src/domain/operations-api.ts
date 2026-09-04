@@ -152,18 +152,28 @@ export interface GoodsReceiptDto {
   received_on: ISODate
   warehouse_name: string
   notes: string | null
-  status: 'active'
+  status: 'active' | 'reversed'
+  reversal_reason: string | null
+  reversed_at: ISODateTime | null
   revision: Revision
   lines: Array<{
     id: number
     purchase_order_line_id: number
     inventory_item_id: number
+    material_name: string
+    material_model: string | null
+    unit: string
     quantity: DecimalString
     value_cents: MoneyCents
     movement_id: number
   }>
   created_at: ISODateTime
   updated_at: ISODateTime
+}
+
+export interface GoodsReceiptReversalInput {
+  reason: string
+  expected_revision: Revision
 }
 
 export interface ProcurementOverviewDto {
@@ -233,6 +243,8 @@ export interface InventoryMovementDto {
   project_code?: string | null
   issue_status?: 'active' | 'reversed' | null
   issue_revision?: Revision | null
+  adjustment_status?: 'active' | 'reversed' | null
+  adjustment_revision?: Revision | null
 }
 
 export interface InventoryItemDetailDto extends InventoryItemDto {
@@ -251,8 +263,18 @@ export interface InventoryAdjustmentDto extends Omit<InventoryAdjustmentInput, '
   id: number
   inventory_item_id: number
   value_delta_cents: MoneyCents
+  status: 'active' | 'reversed'
+  revision: Revision
+  reversal_reason: string | null
+  reversed_at: ISODateTime | null
   movement: InventoryMovementDto
+  reversal_movement: InventoryMovementDto | null
   created_at: ISODateTime
+}
+
+export interface InventoryAdjustmentReversalInput {
+  reason: string
+  expected_revision: Revision
 }
 
 export interface InventoryIssueInput {
@@ -348,6 +370,7 @@ export interface LaborEntryDto {
   project_code: string
   assignment_id: number
   worker_id: number
+  replaces_entry_id: number | null
   worker_name: string
   work_date: ISODate
   attendance_status: AttendanceStatus

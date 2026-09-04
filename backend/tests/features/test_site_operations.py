@@ -85,6 +85,17 @@ def harness(tmp_path: Path) -> Harness:
             """,
             (timestamp, timestamp),
         )
+        connection.executemany(
+            """
+            INSERT INTO crew_assignments
+                (id, project_id, worker_id, role, scheduled_start_on,
+                 scheduled_end_on, pay_basis, rate_cents, status,
+                 created_at, updated_at)
+            VALUES (?, ?, 1, '施工员', '2026-08-01', '2026-09-30',
+                    'daily', 60000, 'active', ?, ?)
+            """,
+            [(1, 1, timestamp, timestamp), (2, 2, timestamp, timestamp)],
+        )
         for identifier, project_code in ((1, "P-001"), (2, "P-002")):
             connection.execute(
                 """
@@ -245,6 +256,8 @@ def test_daily_report_upsert_list_filter_confirm_reopen_and_revision(
         "revision": 1,
         "created_at": NOW.isoformat(),
         "updated_at": NOW.isoformat(),
+        "versions": [],
+        "events": [],
     }
     assert stale_create.status_code == 409
     assert stale_create.json()["error_code"] == "REVISION_CONFLICT"
@@ -374,6 +387,49 @@ def test_advance_rejects_invalid_items_documents_and_worker(
     with harness.client() as client:
         response = client.post("/api/projects/P-001/material-advances", json=payload)
     assert response.status_code == 422
+
+
+def test_advance_worker_requires_current_project_assignment_covering_spent_date(
+    harness: Harness,
+) -> None:
+    connection = connect_database(harness.database_path)
+    try:
+        timestamp = NOW.isoformat()
+        connection.execute(
+            """
+            INSERT INTO workers (id, name, status, created_at, updated_at)
+            VALUES (2, '无排班人员', 'active', ?, ?)
+            """,
+            (timestamp, timestamp),
+        )
+    finally:
+        connection.close()
+
+    without_assignment = _advance_payload()
+    without_assignment["worker_id"] = 2
+    outside_schedule = _advance_payload()
+    outside_schedule["spent_on"] = "2026-10-01"
+    with harness.client() as client:
+        missing = client.post(
+            "/api/projects/P-001/material-advances",
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+            json=without_assignment,
+        )
+        outside = client.post(
+            "/api/projects/P-001/material-advances",
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+            json=outside_schedule,
+        )
+
+    assert missing.status_code == 422
+    assert missing.json()["error_code"] == "INVALID_ADVANCE_PAYLOAD"
+    assert missing.json()["field_errors"] == {
+        "worker_id": "must have an active assignment for spent_on"
+    }
+    assert outside.status_code == 422
+    assert outside.json()["field_errors"] == {
+        "worker_id": "must have an active assignment for spent_on"
+    }
 
 
 def test_advance_total_overflow_is_a_structured_validation_error(
@@ -513,6 +569,147 @@ def test_reimbursement_cannot_exceed_total_or_reuse_key_with_new_body(
     assert ok.status_code == 201
     assert conflict.status_code == 409
     assert conflict.json()["error_code"] == "IDEMPOTENCY_CONFLICT"
+
+
+def test_void_reimbursement_preserves_audit_and_restores_advance_balance(
+    harness: Harness,
+) -> None:
+    void_key = str(uuid.uuid4())
+    reimbursement_payload = {
+        "amount_cents": 1_000,
+        "reimbursed_on": "2026-08-31",
+        "payment_method": "cash",
+        "notes": "现金报销",
+    }
+    with harness.client() as client:
+        advance = _create_advance(client)
+        reimbursement = client.post(
+            f"/api/projects/P-001/material-advances/{advance['id']}/reimbursements",
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+            json=reimbursement_payload,
+        ).json()
+        path = (
+            f"/api/projects/P-001/material-advances/{advance['id']}"
+            f"/reimbursements/{reimbursement['id']}/void"
+        )
+        void_payload = {
+            "reason": "付款方式登记错误",
+            "expected_revision": reimbursement["revision"],
+        }
+        voided = client.post(
+            path,
+            headers={"Idempotency-Key": void_key},
+            json=void_payload,
+        )
+        detail = client.get(f"/api/projects/P-001/material-advances/{advance['id']}")
+        edit_payload = _advance_payload()
+        edit_payload["vendor_name"] = "冲销后更正的商户"
+        edit_payload["expected_revision"] = voided.json()["advance_revision"]
+        edited = client.put(
+            f"/api/projects/P-001/material-advances/{advance['id']}",
+            json=edit_payload,
+        )
+        connection = connect_database(harness.database_path)
+        try:
+            connection.execute(
+                "UPDATE projects SET status = 'archived', archived_at = ? WHERE id = 1",
+                (NOW.isoformat(),),
+            )
+        finally:
+            connection.close()
+        replay = client.post(
+            path.replace("P-001", "p-001"),
+            headers={"Idempotency-Key": void_key},
+            json=void_payload,
+        )
+
+    assert voided.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json() == voided.json()
+    assert voided.json() == {
+        **reimbursement_payload,
+        "id": reimbursement["id"],
+        "advance_id": advance["id"],
+        "status": "voided",
+        "void_reason": "付款方式登记错误",
+        "voided_at": NOW.isoformat(),
+        "revision": 2,
+        "advance_status": "unreimbursed",
+        "advance_reimbursed_amount_cents": 0,
+        "advance_outstanding_amount_cents": 3_000,
+        "advance_revision": reimbursement["advance_revision"] + 1,
+        "created_at": reimbursement["created_at"],
+        "updated_at": NOW.isoformat(),
+    }
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "unreimbursed"
+    assert detail.json()["reimbursed_amount_cents"] == 0
+    assert detail.json()["outstanding_amount_cents"] == 3_000
+    assert detail.json()["reimbursements"] == [{
+        "id": reimbursement["id"],
+        "advance_id": advance["id"],
+        **reimbursement_payload,
+        "status": "voided",
+        "void_reason": "付款方式登记错误",
+        "voided_at": NOW.isoformat(),
+        "revision": 2,
+        "created_at": reimbursement["created_at"],
+        "updated_at": NOW.isoformat(),
+    }]
+    assert edited.status_code == 200
+    assert edited.json()["vendor_name"] == "冲销后更正的商户"
+
+
+def test_void_reimbursement_checks_ownership_revision_and_idempotency_body(
+    harness: Harness,
+) -> None:
+    with harness.client() as client:
+        first_advance = _create_advance(client)
+        second_advance = _create_advance(client)
+        reimbursement = client.post(
+            f"/api/projects/P-001/material-advances/{first_advance['id']}/reimbursements",
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+            json={
+                "amount_cents": 1_000,
+                "reimbursed_on": "2026-08-31",
+                "payment_method": "bank_transfer",
+                "notes": None,
+            },
+        ).json()
+        wrong_parent = client.post(
+            f"/api/projects/P-001/material-advances/{second_advance['id']}"
+            f"/reimbursements/{reimbursement['id']}/void",
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+            json={"reason": "录错", "expected_revision": reimbursement["revision"]},
+        )
+        stale = client.post(
+            f"/api/projects/P-001/material-advances/{first_advance['id']}"
+            f"/reimbursements/{reimbursement['id']}/void",
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+            json={"reason": "录错", "expected_revision": reimbursement["revision"] + 1},
+        )
+        key = str(uuid.uuid4())
+        path = (
+            f"/api/projects/P-001/material-advances/{first_advance['id']}"
+            f"/reimbursements/{reimbursement['id']}/void"
+        )
+        ok = client.post(
+            path,
+            headers={"Idempotency-Key": key},
+            json={"reason": "录错", "expected_revision": reimbursement["revision"]},
+        )
+        mismatch = client.post(
+            path,
+            headers={"Idempotency-Key": key},
+            json={"reason": "另一个原因", "expected_revision": reimbursement["revision"]},
+        )
+
+    assert wrong_parent.status_code == 404
+    assert stale.status_code == 409
+    assert stale.json()["error_code"] == "REVISION_CONFLICT"
+    assert ok.status_code == 200
+    assert mismatch.status_code == 409
+    assert mismatch.json()["error_code"] == "IDEMPOTENCY_CONFLICT"
 
 
 def test_advance_cannot_edit_or_void_after_reimbursement(harness: Harness) -> None:
@@ -683,6 +880,86 @@ def test_report_transitions_are_idempotent_and_reopen_reason_is_audited(
     ]
 
 
+def test_report_confirmation_keeps_immutable_snapshot_across_reopen_and_edit(
+    harness: Harness,
+) -> None:
+    with harness.client() as client:
+        report = client.put(
+            "/api/projects/P-001/site-daily-reports/2026-08-30",
+            json=_report_payload(),
+        ).json()
+        confirmed = client.post(
+            "/api/projects/P-001/site-daily-reports/2026-08-30/confirm",
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+            json={
+                "confirmed_at": "2026-08-31T09:00:00+08:00",
+                "expected_revision": report["revision"],
+            },
+        ).json()
+        reopened = client.post(
+            "/api/projects/P-001/site-daily-reports/2026-08-30/reopen",
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+            json={
+                "reason": "补录次日信息",
+                "expected_revision": confirmed["revision"],
+            },
+        ).json()
+        edited_payload = _report_payload(reopened["revision"])
+        edited_payload["work_summary"] = "B：次日补录后的施工内容"
+        edited = client.put(
+            "/api/projects/P-001/site-daily-reports/2026-08-30",
+            json=edited_payload,
+        )
+
+    assert edited.status_code == 200
+    body = edited.json()
+    assert body["work_summary"] == "B：次日补录后的施工内容"
+    assert body["versions"] == [
+        {
+            "id": body["versions"][0]["id"],
+            "version_number": 1,
+            "work_date": "2026-08-30",
+            "location": "一号车间",
+            "weather": "晴",
+            "work_summary": "安装机架",
+            "blockers": None,
+            "next_plan": "铺设线缆",
+            "notes": None,
+            "confirmed_at": "2026-08-31T01:00:00+00:00",
+            "created_at": NOW.isoformat(),
+        }
+    ]
+    assert [event["report_version_id"] for event in body["events"]] == [
+        body["versions"][0]["id"],
+        body["versions"][0]["id"],
+    ]
+
+    connection = connect_database(harness.database_path)
+    try:
+        version_id = body["versions"][0]["id"]
+        event_id = body["events"][0]["id"]
+        with pytest.raises(sqlite3.IntegrityError, match="report version is immutable"):
+            connection.execute(
+                "UPDATE site_daily_report_versions SET work_summary = '篡改' WHERE id = ?",
+                (version_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="report version is immutable"):
+            connection.execute(
+                "DELETE FROM site_daily_report_versions WHERE id = ?", (version_id,)
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="report event is immutable"):
+            connection.execute(
+                "UPDATE site_daily_report_events SET reason = '篡改' WHERE id = ?",
+                (event_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="report event is immutable"):
+            connection.execute(
+                "DELETE FROM site_daily_report_events WHERE id = ?", (event_id,)
+            )
+    finally:
+        connection.close()
+
+
 def test_report_and_advance_responses_are_built_inside_one_database_snapshot(
     harness: Harness,
     monkeypatch: pytest.MonkeyPatch,
@@ -710,9 +987,11 @@ def test_report_and_advance_responses_are_built_inside_one_database_snapshot(
         summary_transaction_states.append(connection.in_transaction)
         return original_summary(connection, *args)
 
-    def tracked_report(row: sqlite3.Row, project_code: str):
+    def tracked_report(
+        connection: sqlite3.Connection, row: sqlite3.Row, project_code: str
+    ):
         report_transaction_states.append(read_transaction_active)
-        return original_report(row, project_code)
+        return original_report(connection, row, project_code)
 
     original_transaction = site_operations.transaction
 

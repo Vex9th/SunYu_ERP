@@ -2,6 +2,7 @@ import type { ISODate, ISODateTime, MoneyCents, Revision } from './contracts'
 import type {
   ProcurementLineInput,
   ProcurementListDetailDto,
+  GoodsReceiptDto,
   PurchaseOrderDto,
   PurchaseOrderInput,
 } from './operations-api'
@@ -91,6 +92,11 @@ export interface SupplierInvoiceDto extends SupplierInvoiceInput {
   updated_at: ISODateTime
 }
 
+export interface SupplierRecordReversalInput {
+  reason: string
+  expected_revision: Revision
+}
+
 export interface PurchaseOrderFacts {
   cancelled_at: ISODateTime | null
   cancel_reason: string | null
@@ -99,15 +105,7 @@ export interface PurchaseOrderFacts {
   received_amount_cents: MoneyCents
   supplier_payments: SupplierPaymentDto[]
   supplier_invoices: SupplierInvoiceDto[]
-  goods_receipts: Array<{
-    id: number
-    status: 'active' | 'reversed'
-    revision: Revision
-    received_on: ISODate
-    warehouse_name: string
-    reversal_reason: string | null
-    reversed_at: ISODateTime | null
-  }>
+  goods_receipts: GoodsReceiptDto[]
 }
 
 export type PurchaseOrderRecordDto = PurchaseOrderDto & Partial<PurchaseOrderFacts>

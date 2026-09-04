@@ -1,5 +1,6 @@
 import {
   ApiError,
+  createRetriableMultipartPostSender,
   createRetriablePostSender,
   requestBlob,
   requestJson,
@@ -11,6 +12,7 @@ import type {
   ConfirmRevisionInput,
   GoodsReceiptDto,
   GoodsReceiptInput,
+  GoodsReceiptReversalInput,
   PaginationQuery,
   ProcurementLineDto,
   ProcurementLineInput,
@@ -36,8 +38,13 @@ import type {
   SupplierInvoiceInput,
   SupplierPaymentDto,
   SupplierPaymentInput,
+  SupplierRecordReversalInput,
 } from '../domain/procurement-extensions'
 import type { RepositoryResult } from './common'
+import {
+  createHttpProjectOperatingRepository,
+  type DocumentVersionOption,
+} from './project-operating.live'
 
 export interface PurchaseOrderListQuery extends PaginationQuery {
   status?: PurchaseOrderStatus
@@ -56,33 +63,45 @@ export interface ProcurementHttpRepository {
   updateProcurementLine(projectCode: string, listId: number, lineId: number, input: ProcurementLineUpdateInput): Promise<RepositoryResult<ProcurementLineDto>>
   deleteProcurementLine(projectCode: string, listId: number, lineId: number): Promise<void>
   confirmProcurementList(projectCode: string, listId: number, input: ConfirmRevisionInput): Promise<RepositoryResult<ProcurementListDetailDto>>
+  copyProcurementListAsDraft(projectCode: string, listId: number, input: ConfirmRevisionInput): Promise<RepositoryResult<ProcurementListDetailDto>>
   listPurchaseOrders(projectCode: string, query?: PurchaseOrderListQuery): Promise<RepositoryResult<PagedResult<PurchaseOrderDto>>>
-  createPurchaseOrder(projectCode: string, input: PurchaseOrderInput): Promise<RepositoryResult<PurchaseOrderDto>>
+  listDocumentVersionOptions?(projectCode: string): Promise<DocumentVersionOption[]>
+  createPurchaseOrder(projectCode: string, input: PurchaseOrderInput, files?: readonly File[]): Promise<RepositoryResult<PurchaseOrderDto>>
   getPurchaseOrder(projectCode: string, orderId: number): Promise<RepositoryResult<PurchaseOrderDto>>
   confirmPurchaseOrder(projectCode: string, orderId: number, input: ConfirmRevisionInput): Promise<RepositoryResult<PurchaseOrderDto>>
   updatePurchaseOrder(projectCode: string, orderId: number, input: PurchaseOrderUpdateInput): Promise<RepositoryResult<PurchaseOrderDto>>
   cancelPurchaseOrder(projectCode: string, orderId: number, input: PurchaseOrderCancelInput): Promise<RepositoryResult<PurchaseOrderDto>>
   receiveGoods(projectCode: string, orderId: number, input: GoodsReceiptInput): Promise<RepositoryResult<GoodsReceiptDto>>
+  reverseGoodsReceipt(projectCode: string, receiptId: number, input: GoodsReceiptReversalInput): Promise<RepositoryResult<GoodsReceiptDto>>
   createSupplierPayment(projectCode: string, orderId: number, input: SupplierPaymentInput): Promise<RepositoryResult<SupplierPaymentDto>>
-  createSupplierInvoice(projectCode: string, orderId: number, input: SupplierInvoiceInput): Promise<RepositoryResult<SupplierInvoiceDto>>
+  createSupplierInvoice(projectCode: string, orderId: number, input: SupplierInvoiceInput, files?: readonly File[]): Promise<RepositoryResult<SupplierInvoiceDto>>
+  reverseSupplierPayment(projectCode: string, paymentId: number, input: SupplierRecordReversalInput): Promise<RepositoryResult<SupplierPaymentDto>>
+  reverseSupplierInvoice(projectCode: string, invoiceId: number, input: SupplierRecordReversalInput): Promise<RepositoryResult<SupplierInvoiceDto>>
   createQuoteExport(projectCode: string, listId: number, input: QuoteExportInput): Promise<RepositoryResult<QuoteExportDto>>
+  listQuoteExports?(projectCode: string, query?: PaginationQuery): Promise<RepositoryResult<PagedResult<QuoteExportDto>>>
   downloadQuoteExport(projectCode: string, exportId: number): Promise<Blob>
   getProcurementOverview(projectCode: string): Promise<RepositoryResult<ProcurementOverviewDto>>
   discardCreateProcurementList(projectCode: string, input: ProcurementListInput): boolean
   discardCreateProcurementLine(projectCode: string, listId: number, input: ProcurementLineInput): boolean
-  discardCreatePurchaseOrder(projectCode: string, input: PurchaseOrderInput): boolean
+  discardCreatePurchaseOrder(projectCode: string, input: PurchaseOrderInput, files?: readonly File[]): boolean
   discardReceiveGoods(projectCode: string, orderId: number, input: GoodsReceiptInput): boolean
+  discardReverseGoodsReceipt(projectCode: string, receiptId: number, input: GoodsReceiptReversalInput): boolean
   discardPreviewProcurementImport(projectCode: string, file: File): boolean
   discardConfirmProcurementImport(projectCode: string, importId: number, input: ProcurementImportConfirmInput): boolean
+  discardCopyProcurementListAsDraft(projectCode: string, listId: number, input: ConfirmRevisionInput): boolean
   discardCancelPurchaseOrder(projectCode: string, orderId: number, input: PurchaseOrderCancelInput): boolean
   discardCreateSupplierPayment(projectCode: string, orderId: number, input: SupplierPaymentInput): boolean
-  discardCreateSupplierInvoice(projectCode: string, orderId: number, input: SupplierInvoiceInput): boolean
+  discardCreateSupplierInvoice(projectCode: string, orderId: number, input: SupplierInvoiceInput, files?: readonly File[]): boolean
+  discardReverseSupplierPayment(projectCode: string, paymentId: number, input: SupplierRecordReversalInput): boolean
+  discardReverseSupplierInvoice(projectCode: string, invoiceId: number, input: SupplierRecordReversalInput): boolean
   discardCreateQuoteExport(projectCode: string, listId: number, input: QuoteExportInput): boolean
 }
 
 class HttpProcurementRepository implements ProcurementHttpRepository {
   private readonly postSender = createRetriablePostSender()
+  private readonly multipartPostSender = createRetriableMultipartPostSender()
   private readonly uploadSender = new RetriableFileUploadSender()
+  private readonly projectRepository = createHttpProjectOperatingRepository()
 
   async listSupplierCompanies(): Promise<RepositoryResult<CompanyRecord[]>> {
     return live(await requestJson('/api/companies'))
@@ -132,12 +151,23 @@ class HttpProcurementRepository implements ProcurementHttpRepository {
     return live(await this.postSender.send(`${procurementListPath(projectCode, listId)}/confirm`, input))
   }
 
+  async copyProcurementListAsDraft(projectCode: string, listId: number, input: ConfirmRevisionInput): Promise<RepositoryResult<ProcurementListDetailDto>> {
+    return live(await this.postSender.send(`${procurementListPath(projectCode, listId)}/copy-as-draft`, input))
+  }
+
   async listPurchaseOrders(projectCode: string, query: PurchaseOrderListQuery = {}): Promise<RepositoryResult<PagedResult<PurchaseOrderDto>>> {
     return live(await requestJson(withQuery(purchaseOrdersPath(projectCode), query)))
   }
 
-  async createPurchaseOrder(projectCode: string, input: PurchaseOrderInput): Promise<RepositoryResult<PurchaseOrderDto>> {
-    return live(await this.postSender.send(purchaseOrdersPath(projectCode), input))
+  listDocumentVersionOptions(projectCode: string): Promise<DocumentVersionOption[]> {
+    return this.projectRepository.listDocumentVersionOptions(projectCode)
+  }
+
+  async createPurchaseOrder(projectCode: string, input: PurchaseOrderInput, files: readonly File[] = []): Promise<RepositoryResult<PurchaseOrderDto>> {
+    const path = purchaseOrdersPath(projectCode)
+    return live(files.length > 0
+      ? await this.multipartPostSender.send(path, input, files)
+      : await this.postSender.send(path, input))
   }
 
   async getPurchaseOrder(projectCode: string, orderId: number): Promise<RepositoryResult<PurchaseOrderDto>> {
@@ -160,16 +190,35 @@ class HttpProcurementRepository implements ProcurementHttpRepository {
     return live(await this.postSender.send(`${purchaseOrderPath(projectCode, orderId)}/goods-receipts`, input))
   }
 
+  async reverseGoodsReceipt(projectCode: string, receiptId: number, input: GoodsReceiptReversalInput): Promise<RepositoryResult<GoodsReceiptDto>> {
+    return live(await this.postSender.send(`${projectBasePath(projectCode)}/goods-receipts/${receiptId}/reverse`, input))
+  }
+
   async createSupplierPayment(projectCode: string, orderId: number, input: SupplierPaymentInput): Promise<RepositoryResult<SupplierPaymentDto>> {
     return live(await this.postSender.send(`${purchaseOrderPath(projectCode, orderId)}/supplier-payments`, input))
   }
 
-  async createSupplierInvoice(projectCode: string, orderId: number, input: SupplierInvoiceInput): Promise<RepositoryResult<SupplierInvoiceDto>> {
-    return live(await this.postSender.send(`${purchaseOrderPath(projectCode, orderId)}/supplier-invoices`, input))
+  async createSupplierInvoice(projectCode: string, orderId: number, input: SupplierInvoiceInput, files: readonly File[] = []): Promise<RepositoryResult<SupplierInvoiceDto>> {
+    const path = `${purchaseOrderPath(projectCode, orderId)}/supplier-invoices`
+    return live(files.length > 0
+      ? await this.multipartPostSender.send(path, input, files)
+      : await this.postSender.send(path, input))
+  }
+
+  async reverseSupplierPayment(projectCode: string, paymentId: number, input: SupplierRecordReversalInput): Promise<RepositoryResult<SupplierPaymentDto>> {
+    return live(await this.postSender.send(`${projectBasePath(projectCode)}/supplier-payments/${paymentId}/reverse`, input))
+  }
+
+  async reverseSupplierInvoice(projectCode: string, invoiceId: number, input: SupplierRecordReversalInput): Promise<RepositoryResult<SupplierInvoiceDto>> {
+    return live(await this.postSender.send(`${projectBasePath(projectCode)}/supplier-invoices/${invoiceId}/reverse`, input))
   }
 
   async createQuoteExport(projectCode: string, listId: number, input: QuoteExportInput): Promise<RepositoryResult<QuoteExportDto>> {
     return live(await this.postSender.send(`${procurementListPath(projectCode, listId)}/quote-exports`, input))
+  }
+
+  async listQuoteExports(projectCode: string, query?: PaginationQuery): Promise<RepositoryResult<PagedResult<QuoteExportDto>>> {
+    return live(await requestJson(withQuery(`${projectBasePath(projectCode)}/quote-exports`, query ?? {})))
   }
 
   downloadQuoteExport(projectCode: string, exportId: number): Promise<Blob> {
@@ -188,12 +237,19 @@ class HttpProcurementRepository implements ProcurementHttpRepository {
     return this.postSender.discard(`${procurementListPath(projectCode, listId)}/lines`, input)
   }
 
-  discardCreatePurchaseOrder(projectCode: string, input: PurchaseOrderInput): boolean {
-    return this.postSender.discard(purchaseOrdersPath(projectCode), input)
+  discardCreatePurchaseOrder(projectCode: string, input: PurchaseOrderInput, files: readonly File[] = []): boolean {
+    const path = purchaseOrdersPath(projectCode)
+    return files.length > 0
+      ? this.multipartPostSender.discard(path, input, files)
+      : this.postSender.discard(path, input)
   }
 
   discardReceiveGoods(projectCode: string, orderId: number, input: GoodsReceiptInput): boolean {
     return this.postSender.discard(`${purchaseOrderPath(projectCode, orderId)}/goods-receipts`, input)
+  }
+
+  discardReverseGoodsReceipt(projectCode: string, receiptId: number, input: GoodsReceiptReversalInput): boolean {
+    return this.postSender.discard(`${projectBasePath(projectCode)}/goods-receipts/${receiptId}/reverse`, input)
   }
 
   discardPreviewProcurementImport(projectCode: string, file: File): boolean {
@@ -204,6 +260,10 @@ class HttpProcurementRepository implements ProcurementHttpRepository {
     return this.postSender.discard(`${procurementImportsPath(projectCode)}/${importId}/confirm`, input)
   }
 
+  discardCopyProcurementListAsDraft(projectCode: string, listId: number, input: ConfirmRevisionInput): boolean {
+    return this.postSender.discard(`${procurementListPath(projectCode, listId)}/copy-as-draft`, input)
+  }
+
   discardCancelPurchaseOrder(projectCode: string, orderId: number, input: PurchaseOrderCancelInput): boolean {
     return this.postSender.discard(`${purchaseOrderPath(projectCode, orderId)}/cancel`, input)
   }
@@ -212,8 +272,19 @@ class HttpProcurementRepository implements ProcurementHttpRepository {
     return this.postSender.discard(`${purchaseOrderPath(projectCode, orderId)}/supplier-payments`, input)
   }
 
-  discardCreateSupplierInvoice(projectCode: string, orderId: number, input: SupplierInvoiceInput): boolean {
-    return this.postSender.discard(`${purchaseOrderPath(projectCode, orderId)}/supplier-invoices`, input)
+  discardCreateSupplierInvoice(projectCode: string, orderId: number, input: SupplierInvoiceInput, files: readonly File[] = []): boolean {
+    const path = `${purchaseOrderPath(projectCode, orderId)}/supplier-invoices`
+    return files.length > 0
+      ? this.multipartPostSender.discard(path, input, files)
+      : this.postSender.discard(path, input)
+  }
+
+  discardReverseSupplierPayment(projectCode: string, paymentId: number, input: SupplierRecordReversalInput): boolean {
+    return this.postSender.discard(`${projectBasePath(projectCode)}/supplier-payments/${paymentId}/reverse`, input)
+  }
+
+  discardReverseSupplierInvoice(projectCode: string, invoiceId: number, input: SupplierRecordReversalInput): boolean {
+    return this.postSender.discard(`${projectBasePath(projectCode)}/supplier-invoices/${invoiceId}/reverse`, input)
   }
 
   discardCreateQuoteExport(projectCode: string, listId: number, input: QuoteExportInput): boolean {

@@ -72,6 +72,10 @@ textarea {
 
 .workspace-aside {
   display: flex;
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  height: 100vh;
   min-height: 100vh;
   flex-direction: column;
   padding: 20px 14px;
@@ -134,50 +138,15 @@ textarea {
   box-shadow: inset 3px 0 0 var(--sunyu-accent);
 }
 
-.aside-status {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 18px 10px 0;
-  padding-top: 18px;
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
-}
-
-.aside-status strong,
-.aside-status small {
-  display: block;
-}
-
-.aside-status strong {
-  color: #e8edf3;
-  font-size: 12px;
-}
-
-.aside-status small {
-  margin-top: 2px;
-  color: #7f8da0;
-  font-size: 11px;
-}
-
-.status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #4fb386;
-  box-shadow: 0 0 0 4px rgba(79, 179, 134, 0.12);
-}
-
-.status-dot--warning {
-  background: #dc7849;
-  box-shadow: 0 0 0 4px rgba(220, 120, 73, 0.14);
-}
-
 .workspace-main {
   min-width: 0;
 }
 
 .workspace-topbar {
   display: flex;
+  position: sticky;
+  top: 0;
+  z-index: 20;
   height: 54px;
   align-items: center;
   justify-content: space-between;
@@ -478,9 +447,9 @@ textarea {
 }
 
 .stage-index {
-  color: #758195;
+  color: #5f6b7a;
   font-family: "DIN Alternate", monospace;
-  font-size: 10px;
+  font-size: 11px;
   letter-spacing: 0.12em;
 }
 
@@ -502,13 +471,13 @@ textarea {
 .stage-track--detailed .stage-node p {
   margin: 0;
   color: var(--sunyu-muted);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.55;
 }
 
 .stage-track--detailed .stage-node small {
-  color: #8792a2;
-  font-size: 10px;
+  color: #5f6b7a;
+  font-size: 12px;
 }
 
 .commercial-summary {
@@ -622,7 +591,9 @@ textarea {
   }
 
   .workspace-aside {
+    z-index: 30;
     width: 100% !important;
+    height: auto;
     min-height: auto;
     padding: 14px 16px 8px;
   }
@@ -652,11 +623,8 @@ textarea {
     box-shadow: inset 0 -3px 0 var(--sunyu-accent);
   }
 
-  .aside-status {
-    display: none;
-  }
-
   .workspace-topbar {
+    position: static;
     height: 50px;
     padding: 0 18px;
   }

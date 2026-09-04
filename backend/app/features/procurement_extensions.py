@@ -28,6 +28,7 @@ from starlette.types import Message
 
 from backend.app.core.config import Settings
 from backend.app.core.database import transaction_immediate
+from backend.app.features import business_attachments
 from backend.app.features import procurement as base
 from backend.app.features.api_common import (
     ApiError,
@@ -713,105 +714,167 @@ def create_procurement_extensions_router(
         project_code: str,
         order_id: str,
         request: Request,
-        idempotency_key: str = Header(alias="Idempotency-Key"),
         _: None = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
+        settings: Settings = settings_dependency,
     ) -> dict[str, object]:
         identifier = base._parse_identifier(order_id)
-        key = base._validate_idempotency_key(idempotency_key)
-        payload = await base._read_json(
-            request, _INVOICE_FIELDS, "Invalid supplier invoice payload"
-        )
-        normalized = _normalize_invoice(payload)
-        request_hash = base._request_hash(normalized)
-        timestamp = base._timestamp(now)
-        try:
-            with transaction_immediate(connection):
-                project = base._project(
-                    connection, base._normalize_project_path(project_code)
-                )
-                scope = _project_scope(
-                    "POST",
-                    str(project["project_code"]),
-                    f"/purchase-orders/{identifier}/supplier-invoices",
-                )
-                restored = restore_idempotent_response(
-                    connection, scope=scope, key=key, request_hash=request_hash
-                )
-                if restored is not None:
-                    return restored
-                _require_active_project(project)
-                order = _payable_order(connection, identifier, int(project["id"]))
-                base._validate_document_versions(
-                    connection,
-                    str(project["project_code"]),
-                    normalized["document_version_ids"],
-                )
-                _validate_allocation_capacity(
-                    connection,
-                    identifier,
-                    normalized["allocations"],
-                    fact="invoice",
-                )
-                storage_key = idempotency_storage_key(scope, key)
-                cursor = connection.execute(
-                    """
-                    INSERT INTO supplier_invoices
-                        (purchase_order_id, invoice_no, invoiced_on, amount_cents,
-                         status, revision, idempotency_key, request_hash,
-                         created_at, updated_at)
-                    VALUES (?, ?, ?, ?, 'active', 1, ?, ?, ?, ?)
-                    """,
-                    (
-                        order["id"],
-                        normalized["invoice_no"],
-                        normalized["invoiced_on"],
-                        normalized["amount_cents"],
-                        storage_key,
-                        request_hash,
-                        timestamp,
-                        timestamp,
+        key = _read_idempotency_key(request)
+        multipart = business_attachments.is_multipart_request(request)
+        if multipart:
+            payload, attachment_batch = (
+                await business_attachments.read_multipart_batch(
+                    request,
+                    data_dir=settings.data_dir,
+                    max_file_size_bytes=(
+                        settings.max_document_upload_mb * 1024 * 1024
                     ),
+                    invalid=_invoice_attachment_error,
+                    too_large=_attachment_too_large,
+                    batch_too_large=_attachment_batch_too_large,
                 )
-                invoice_id = base._last_insert_id(cursor)
-                for allocation in normalized["allocations"]:
-                    connection.execute(
+            )
+        else:
+            payload = await base._read_json(
+                request, _INVOICE_FIELDS, "Invalid supplier invoice payload"
+            )
+            attachment_batch = business_attachments.AttachmentBatch(
+                [], settings.data_dir
+            )
+        try:
+            with attachment_batch:
+                if set(payload) != _INVOICE_FIELDS:
+                    raise base._invalid_payload("Invalid supplier invoice payload")
+                normalized = _normalize_invoice(payload)
+                request_hash = base._request_hash(
+                    attachment_batch.hash_payload(normalized)
+                )
+                timestamp = base._timestamp(now)
+                with transaction_immediate(connection):
+                    project = base._project(
+                        connection, base._normalize_project_path(project_code)
+                    )
+                    scope = _project_scope(
+                        "POST",
+                        str(project["project_code"]),
+                        f"/purchase-orders/{identifier}/supplier-invoices",
+                    )
+                    restored = restore_idempotent_response(
+                        connection, scope=scope, key=key, request_hash=request_hash
+                    )
+                    if restored is not None:
+                        return restored
+                    _require_active_project(project)
+                    order = _payable_order(
+                        connection, identifier, int(project["id"])
+                    )
+                    base._validate_document_versions(
+                        connection,
+                        str(project["project_code"]),
+                        normalized["document_version_ids"],
+                    )
+                    _validate_allocation_capacity(
+                        connection,
+                        identifier,
+                        normalized["allocations"],
+                        fact="invoice",
+                    )
+                    storage_key = idempotency_storage_key(scope, key)
+                    cursor = connection.execute(
                         """
-                        INSERT INTO supplier_invoice_allocations
-                            (supplier_invoice_id, purchase_order_line_id, amount_cents)
-                        VALUES (?, ?, ?)
+                        INSERT INTO supplier_invoices
+                            (purchase_order_id, invoice_no, invoiced_on, amount_cents,
+                             status, revision, idempotency_key, request_hash,
+                             created_at, updated_at)
+                        VALUES (?, ?, ?, ?, 'active', 1, ?, ?, ?, ?)
                         """,
                         (
-                            invoice_id,
-                            allocation["purchase_order_line_id"],
-                            allocation["amount_cents"],
+                            order["id"],
+                            normalized["invoice_no"],
+                            normalized["invoiced_on"],
+                            normalized["amount_cents"],
+                            storage_key,
+                            request_hash,
+                            timestamp,
+                            timestamp,
                         ),
                     )
-                for document_id in normalized["document_version_ids"]:
-                    connection.execute(
-                        """
-                        INSERT INTO supplier_invoice_documents
-                            (supplier_invoice_id, document_version_id)
-                        VALUES (?, ?)
-                        """,
-                        (invoice_id, document_id),
+                    invoice_id = base._last_insert_id(cursor)
+                    for allocation in normalized["allocations"]:
+                        connection.execute(
+                            """
+                            INSERT INTO supplier_invoice_allocations
+                                (supplier_invoice_id, purchase_order_line_id, amount_cents)
+                            VALUES (?, ?, ?)
+                            """,
+                            (
+                                invoice_id,
+                                allocation["purchase_order_line_id"],
+                                allocation["amount_cents"],
+                            ),
+                        )
+                    uploaded_version_ids = attachment_batch.publish_documents(
+                        connection,
+                        project_code=str(project["project_code"]),
+                        category="invoice",
+                        documents=[
+                            business_attachments.ManagedDocument(
+                                title=(
+                                    f"进项发票 {normalized['invoice_no']}"
+                                    f" 附件 {index:02d}（发票记录 {invoice_id}）"
+                                ),
+                                managed_filename=(
+                                    business_attachments.managed_filename(
+                                        project["project_code"],
+                                        "进项发票",
+                                        normalized["invoice_no"],
+                                        f"{index:02d}",
+                                        original_filename=(
+                                            attachment.original_filename
+                                        ),
+                                    )
+                                ),
+                            )
+                            for index, attachment in enumerate(
+                                attachment_batch.attachments, start=1
+                            )
+                        ],
+                        notes=None,
+                        timestamp=timestamp,
                     )
-                invoice = _invoice_row(connection, invoice_id, int(project["id"]))
-                if invoice is None:
-                    raise sqlite3.DatabaseError("created supplier invoice is missing")
-                response = base._invoice_response(connection, invoice)
-                save_idempotent_response(
-                    connection,
-                    scope=scope,
-                    key=key,
-                    request_hash=request_hash,
-                    response=response,
-                    response_status=status.HTTP_201_CREATED,
-                    resource_type="supplier_invoice",
-                    resource_id=invoice_id,
-                    created_at=timestamp,
-                )
-                return response
+                    document_version_ids = [
+                        *normalized["document_version_ids"],
+                        *uploaded_version_ids,
+                    ]
+                    for document_id in document_version_ids:
+                        connection.execute(
+                            """
+                            INSERT INTO supplier_invoice_documents
+                                (supplier_invoice_id, document_version_id)
+                            VALUES (?, ?)
+                            """,
+                            (invoice_id, document_id),
+                        )
+                    invoice = _invoice_row(
+                        connection, invoice_id, int(project["id"])
+                    )
+                    if invoice is None:
+                        raise sqlite3.DatabaseError(
+                            "created supplier invoice is missing"
+                        )
+                    response = base._invoice_response(connection, invoice)
+                    save_idempotent_response(
+                        connection,
+                        scope=scope,
+                        key=key,
+                        request_hash=request_hash,
+                        response=response,
+                        response_status=status.HTTP_201_CREATED,
+                        resource_type="supplier_invoice",
+                        resource_id=invoice_id,
+                        created_at=timestamp,
+                    )
+                    return response
         except sqlite3.IntegrityError as exc:
             if base._is_unique_constraint(exc):
                 raise base._business_conflict(
@@ -1006,6 +1069,16 @@ def create_procurement_extensions_router(
             if restored is not None:
                 return restored
             _require_active_project(project)
+            if int(project["company_id"]) != normalized["customer_company_id"]:
+                raise ApiError(
+                    status.HTTP_409_CONFLICT,
+                    "Quote customer must match project customer",
+                    "PROJECT_CUSTOMER_MISMATCH",
+                    field_errors={
+                        "customer_company_id": ["必须使用项目绑定的客户公司"]
+                    },
+                    headers={"X-Error-Code": "PROJECT_CUSTOMER_MISMATCH"},
+                )
             procurement_list = base._list_row(connection, identifier, int(project["id"]))
             if procurement_list is None:
                 raise base._not_found("Procurement list not found")
@@ -1056,6 +1129,40 @@ def create_procurement_extensions_router(
                 created_at=timestamp,
             )
             return response
+
+    @router.get("/api/projects/{project_code}/quote-exports")
+    def list_quote_exports(
+        project_code: str,
+        request: Request,
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        project = base._project(connection, base._normalize_project_path(project_code))
+        page, page_size = base._read_pagination(request)
+        total = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM quote_exports WHERE project_id = ?",
+                (project["id"],),
+            ).fetchone()[0]
+        )
+        rows = connection.execute(
+            """
+            SELECT exports.*, companies.name AS customer_company_name
+            FROM quote_exports AS exports
+            JOIN companies ON companies.id = exports.customer_company_id
+            WHERE exports.project_id = ?
+            ORDER BY exports.created_at DESC, exports.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (project["id"], page_size, (page - 1) * page_size),
+        ).fetchall()
+        normalized_code = str(project["project_code"])
+        return {
+            "items": [_quote_response(row, normalized_code) for row in rows],
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+        }
 
     @router.get("/api/projects/{project_code}/quote-exports/{export_id}/download")
     def download_quote_export(
@@ -1614,6 +1721,49 @@ def _normalize_invoice(payload: dict[str, Any]) -> dict[str, object]:
         "allocations": allocations,
         "document_version_ids": document_ids,
     }
+
+
+def _invoice_attachment_error(field: str, message: str) -> ApiError:
+    return ApiError(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "Invalid supplier invoice payload",
+        "VALIDATION_ERROR",
+        field_errors={field: [message]},
+    )
+
+
+def _read_idempotency_key(request: Request) -> str:
+    values = request.headers.getlist("Idempotency-Key")
+    if len(values) != 1:
+        raise base._invalid_payload("Invalid Idempotency-Key")
+    return base._validate_idempotency_key(values[0])
+
+
+def _attachment_too_large(max_size_bytes: int) -> ApiError:
+    return ApiError(
+        status.HTTP_413_CONTENT_TOO_LARGE,
+        "Document file is too large",
+        "DOCUMENT_FILE_TOO_LARGE",
+        field_errors={
+            "files": [f"must not exceed {max_size_bytes // (1024 * 1024)} MB"]
+        },
+    )
+
+
+def _attachment_batch_too_large(max_size_bytes: int) -> ApiError:
+    return ApiError(
+        status.HTTP_413_CONTENT_TOO_LARGE,
+        "Document attachment batch is too large",
+        "DOCUMENT_BATCH_TOO_LARGE",
+        field_errors={
+            "files": [
+                (
+                    "must contain at most 20 files whose combined size does not "
+                    f"exceed {max_size_bytes // (1024 * 1024)} MB"
+                )
+            ]
+        },
+    )
 
 
 def _payable_order(

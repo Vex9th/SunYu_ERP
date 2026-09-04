@@ -20,6 +20,7 @@ const company = {
   bank_name: '建设银行苏州分行',
   bank_account: '622200001234',
   notes: '年度框架客户',
+  revision: 1,
   created_at: '2026-08-28T01:00:00+00:00',
   updated_at: '2026-08-28T01:00:00+00:00',
 }
@@ -32,6 +33,7 @@ const contact = {
   email: 'wang@example.com',
   position: '项目经理',
   notes: null,
+  revision: 1,
   created_at: '2026-08-28T01:10:00+00:00',
   updated_at: '2026-08-28T01:10:00+00:00',
 }
@@ -63,6 +65,13 @@ async function projectDashboardBody(options: {
     company,
     contacts: options.contacts ?? [contact],
     documents: options.documents ?? { document_count: 0, version_count: 0, categories: [] },
+    completion_check: {
+      stages_ready: true,
+      final_acceptance_ready: true,
+      receivables_ready: true,
+      ready: true,
+      blockers: [],
+    },
     ...snapshot,
   }
 }
@@ -83,6 +92,15 @@ async function settle(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
+async function clickTeleportedMenuItem(wrapper: VueWrapper, triggerSelector: string, itemSelector: string): Promise<void> {
+  await wrapper.get(triggerSelector).trigger('click')
+  await settle()
+  const item = document.body.querySelector<HTMLElement>(itemSelector)
+  if (!item) throw new Error(`未找到菜单项 ${itemSelector}`)
+  item.click()
+  await settle()
+}
+
 function mountComponent(component: object, props: Record<string, unknown> = {}): VueWrapper {
   return mount(component, {
     attachTo: document.body,
@@ -100,6 +118,7 @@ describe('CompanyCenter', () => {
   })
 
   afterEach(() => {
+    sessionStorage.clear()
     document.body.innerHTML = ''
     vi.unstubAllGlobals()
     vi.unstubAllEnvs()
@@ -122,6 +141,36 @@ describe('CompanyCenter', () => {
     await wrapper.get('[data-testid="companies-retry"]').trigger('click')
     await settle()
     expect(wrapper.get('[data-testid="companies-empty"]').text()).toContain('暂无客户')
+  })
+
+  it('可按公司名称、电话和税号搜索', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse([
+      { ...company, contact_count: 1 },
+      { ...company, id: 2, name: '昆山设备厂', taxpayer_id: 'KSTAX', registered_phone: '0512-1234', contact_count: 0 },
+    ]))
+    const wrapper = mountComponent(CompanyCenter)
+    await settle()
+
+    await wrapper.get('[data-testid="company-search"]').setValue('KSTAX')
+
+    expect(wrapper.text()).toContain('昆山设备厂')
+    expect(wrapper.text()).not.toContain('苏州出发科技')
+  })
+
+  it('公司列表每行直显详情和含义明确、不会被表格裁切的管理菜单', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse([{ ...company, contact_count: 1 }]))
+    const wrapper = mountComponent(CompanyCenter)
+    await settle()
+
+    const row = wrapper.get('.company-table .el-table__body-wrapper tbody tr')
+    expect(row.findAll('button').map((button) => button.text())).toEqual(['详情', '管理'])
+    const actionMenu = wrapper.findAllComponents({ name: 'ElDropdown' })
+      .find((dropdown) => dropdown.find('[data-testid="company-more-1"]').exists())
+    expect(actionMenu?.props('teleported')).not.toBe(false)
+    await wrapper.get('[data-testid="company-more-1"]').trigger('click')
+    await settle()
+    expect(document.body.querySelector('[data-testid="company-edit-1"]')).not.toBeNull()
+    expect(document.body.querySelector('[data-testid="company-delete-1"]')).not.toBeNull()
   })
 
   it('新增与编辑公司始终提交精确字段并修剪空值', async () => {
@@ -160,7 +209,7 @@ describe('CompanyCenter', () => {
       }),
     ])
 
-    await wrapper.get('[data-testid="company-edit-1"]').trigger('click')
+    await clickTeleportedMenuItem(wrapper, '[data-testid="company-more-1"]', '[data-testid="company-edit-1"]')
     await wrapper.get('[data-testid="company-name"]').setValue(' 苏州出发科技更新 ')
     await wrapper.get('[data-testid="company-save"]').trigger('click')
     await settle()
@@ -175,7 +224,7 @@ describe('CompanyCenter', () => {
 
     const wrapper = mountComponent(CompanyCenter)
     await settle()
-    await wrapper.get('[data-testid="company-delete-1"]').trigger('click')
+    await clickTeleportedMenuItem(wrapper, '[data-testid="company-more-1"]', '[data-testid="company-delete-1"]')
     expect(wrapper.get('[data-testid="company-delete-dialog"]').text()).toContain('苏州出发科技')
     await wrapper.get('[data-testid="company-delete-confirm"]').trigger('click')
     await settle()
@@ -189,6 +238,7 @@ describe('CompanyCenter', () => {
   })
 
   it('详情中允许两个同名联系人并支持新增、编辑和删除', async () => {
+    const firstContact = { ...contact, notes: '优先邮件联系' }
     const secondContact = { ...contact, id: 12 }
     fetchMock.mockImplementation(async (input, init) => {
       const url = String(input)
@@ -197,7 +247,7 @@ describe('CompanyCenter', () => {
         return jsonResponse([{ ...company, contact_count: 2 }])
       }
       if (url === '/api/companies/1' && method === 'GET') {
-        return jsonResponse({ ...company, contacts: [contact, secondContact] })
+        return jsonResponse({ ...company, contacts: [firstContact, secondContact] })
       }
       if (url === '/api/companies/1/contacts' && method === 'POST') {
         return jsonResponse({ ...contact, id: 13 }, 201)
@@ -218,11 +268,16 @@ describe('CompanyCenter', () => {
     await settle()
     expect(wrapper.get('[data-testid="company-detail-drawer"]').text()).toContain('年度框架客户')
     expect(wrapper.findAll('[data-testid^="contact-edit-"]')).toHaveLength(2)
+    expect(Array.from(
+      wrapper.get('[data-testid="contact-edit-11"]').element.closest('td')!.querySelectorAll('button'),
+    ).map((button) => button.textContent?.trim())).toEqual(['编辑', '删除'])
     expect(wrapper.get('[data-testid="contact-phone-value-11"]').classes()).toContain('contact-phone-value')
     expect(wrapper.get('[data-testid="company-detail-drawer"]').attributes('style')).toContain('min(100vw, 760px)')
     expect(wrapper.get('[data-testid="company-detail-content"]').classes()).toContain('company-detail-content')
     expect(wrapper.get('[data-testid="company-contact-table"]').classes()).toContain('company-contact-table')
     expect(wrapper.find('.contact-mobile-list').text()).toContain('13800138000')
+    expect(wrapper.get('[data-testid="company-detail-content"]').text()).toContain('wang@example.com')
+    expect(wrapper.get('[data-testid="company-detail-content"]').text()).toContain('优先邮件联系')
     expect(wrapper.get('[data-testid="contact-edit-11"]').element.closest('td')?.classList).not.toContain('el-table-fixed-column--right')
     expect(wrapper.find('.company-contact-table-scroll').exists()).toBe(true)
 
@@ -389,6 +444,22 @@ describe('CompanyCenter', () => {
     expect(wrapper.find('[data-testid="companies-empty"]').exists()).toBe(false)
   })
 
+  it('公司已保存但列表刷新失败时明确区分结果', async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([{ ...company, contact_count: 0 }]))
+      .mockResolvedValueOnce(jsonResponse({ ...company, id: 2, name: '新公司', contacts: [] }, 201))
+      .mockResolvedValueOnce(jsonResponse({ detail: '列表刷新失败' }, 503))
+    const wrapper = mountComponent(CompanyCenter)
+    await settle()
+    await wrapper.get('[data-testid="company-create-open"]').trigger('click')
+    await wrapper.get('[data-testid="company-name"]').setValue('新公司')
+    await wrapper.get('[data-testid="company-save"]').trigger('click')
+    await settle()
+
+    expect(wrapper.text()).toContain('公司已保存，但列表刷新失败')
+    expect(wrapper.text()).not.toContain('公司保存失败')
+  })
+
   it('旧代公司列表迟到 401 仍上报会话过期', async () => {
     let resolveInitial!: (response: Response) => void
     let companyGets = 0
@@ -430,13 +501,13 @@ describe('CompanyCenter', () => {
     })
     const wrapper = mountComponent(CompanyCenter)
     await settle()
-    await wrapper.get('[data-testid="company-edit-1"]').trigger('click')
+    await clickTeleportedMenuItem(wrapper, '[data-testid="company-more-1"]', '[data-testid="company-edit-1"]')
     await wrapper.get('[data-testid="company-name"]').setValue('A 公司已修改')
     await wrapper.get('[data-testid="company-save"]').trigger('click')
     expect(wrapper.find('[data-testid="company-form-drawer"] .el-drawer__close-btn').exists()).toBe(false)
 
     wrapper.findAllComponents({ name: 'ElDrawer' })[0]?.vm.$emit('update:modelValue', false)
-    await wrapper.get('[data-testid="company-edit-2"]').trigger('click')
+    await clickTeleportedMenuItem(wrapper, '[data-testid="company-more-2"]', '[data-testid="company-edit-2"]')
     await settle()
     expect((wrapper.get('[data-testid="company-name"]').element as HTMLInputElement).value).toBe('昆山 B 公司')
 
@@ -502,7 +573,24 @@ describe('ProjectCenter', () => {
     expect(fetchMock.mock.calls.some(([url]) => url === '/api/projects?status=all')).toBe(true)
   })
 
-  it('新建项目提交精确字段，归档后刷新并可进入独立仪表台', async () => {
+  it('可按项目编号、名称和客户搜索', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      if (String(input) === '/api/companies') return jsonResponse([{ ...company, contact_count: 0 }])
+      return jsonResponse([
+        project,
+        { ...project, id: 22, project_code: 'KS-002', name: '机器人项目', company_name: '昆山设备厂' },
+      ])
+    })
+    const wrapper = mountComponent(ProjectCenter)
+    await settle()
+
+    await wrapper.get('[data-testid="project-search"]').setValue('昆山')
+
+    expect(wrapper.text()).toContain('机器人项目')
+    expect(wrapper.text()).not.toContain('装配线改造')
+  })
+
+  it('新建项目提交精确字段，取消项目安全关闭后刷新并可进入独立仪表台', async () => {
     let archiveResolve!: (response: Response) => void
     let archived = false
     fetchMock.mockImplementation(async (input, init) => {
@@ -511,7 +599,10 @@ describe('ProjectCenter', () => {
       if (url === '/api/companies') return jsonResponse([{ ...company, contact_count: 0 }])
       if (url === '/api/projects?status=active') return jsonResponse(archived ? [] : [project])
       if (url === '/api/projects' && method === 'POST') return jsonResponse(project, 201)
-      if (url === '/api/projects/SY-2026-001/archive' && method === 'POST') {
+      if (url === '/api/projects/SY-2026-001' && method === 'GET') {
+        return jsonResponse({ ...project, closure_type: null, revision: 7 })
+      }
+      if (url === '/api/projects/SY-2026-001/close' && method === 'POST') {
         return new Promise<Response>((resolve) => {
           archiveResolve = (response) => {
             archived = true
@@ -544,24 +635,330 @@ describe('ProjectCenter', () => {
       project_code: 'SY-2026-002', company_id: 1, name: '新项目', description: null,
     }))
 
-    expect(wrapper.get('[data-testid="project-dashboard-SY-2026-001"]').text()).toBe('装配线改造')
+    expect(wrapper.get('[data-testid="project-row-actions-SY-2026-001"]').findAll('button').map((button) => button.text()))
+      .toEqual(['进入项目', '取消项目'])
+    expect(wrapper.get('[data-testid="project-dashboard-SY-2026-001"]').text()).toBe('进入项目')
     await wrapper.get('[data-testid="project-dashboard-SY-2026-001"]').trigger('click')
-    expect(wrapper.emitted('open-dashboard')).toEqual([['SY-2026-001']])
+    expect(wrapper.emitted('open-dashboard')).toEqual([
+      ['SY-2026-001'],
+      ['SY-2026-001'],
+    ])
 
     await wrapper.get('[data-testid="project-archive-SY-2026-001"]').trigger('click')
-    await wrapper.get('[data-testid="archive-reason"]').setValue('   ')
+    await wrapper.get('[data-testid="archive-reason"]').setValue('客户取消')
     const confirm = wrapper.get('[data-testid="archive-confirm"]')
     await confirm.trigger('click')
+    await vi.waitFor(() => {
+      expect(fetchMock.mock.calls.filter(([url]) =>
+        url === '/api/projects/SY-2026-001/close')).toHaveLength(1)
+    })
     await confirm.trigger('click')
-    expect(fetchMock.mock.calls.filter(([url]) =>
-      url === '/api/projects/SY-2026-001/archive')).toHaveLength(1)
+    const closeCalls = fetchMock.mock.calls.filter(([url]) =>
+      url === '/api/projects/SY-2026-001/close')
+    expect(closeCalls).toHaveLength(1)
+    expect(closeCalls[0]?.[1]?.method).toBe('POST')
+    expect((closeCalls[0]?.[1]?.headers as Record<string, string>)['Idempotency-Key'])
+      .toMatch(/^[0-9a-f-]{36}$/i)
+    expect(JSON.parse(String(closeCalls[0]?.[1]?.body))).toEqual({
+      closure_type: 'cancelled',
+      reason: '客户取消',
+      expected_revision: 7,
+    })
+    expect(fetchMock.mock.calls.some(([url]) =>
+      url === '/api/projects/SY-2026-001/archive')).toBe(false)
     expect(confirm.attributes('disabled')).toBeDefined()
-    archiveResolve(jsonResponse({ ...project, status: 'archived' }))
+    archiveResolve(jsonResponse({
+      ...project,
+      status: 'archived',
+      closure_type: 'cancelled',
+      revision: 8,
+    }))
     await settle()
     expect(fetchMock.mock.calls.filter(([url]) =>
       url === '/api/projects?status=active')).toHaveLength(3)
     expect(wrapper.find('[data-testid="project-dashboard-SY-2026-001"]').exists()).toBe(false)
     expect(wrapper.get('[data-testid="projects-empty"]').text()).toContain('暂无在建项目')
+  })
+
+  it('取消项目 revision 冲突后读取最新 revision 并保留原因再次确认', async () => {
+    let detailRead = 0
+    let closeAttempt = 0
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      if (url === '/api/companies') return jsonResponse([{ ...company, contact_count: 0 }])
+      if (url === '/api/projects?status=active') return jsonResponse([project])
+      if (url === '/api/projects/SY-2026-001' && method === 'GET') {
+        detailRead += 1
+        return jsonResponse({ ...project, closure_type: null, revision: detailRead === 1 ? 7 : 8 })
+      }
+      if (url === '/api/projects/SY-2026-001/close' && method === 'POST') {
+        closeAttempt += 1
+        if (closeAttempt === 1) {
+          return jsonResponse({
+            detail: 'Revision conflict',
+            error_code: 'REVISION_CONFLICT',
+            field_errors: {},
+            current_revision: 8,
+          }, 409)
+        }
+        return jsonResponse({
+          ...project,
+          status: 'archived',
+          closure_type: 'cancelled',
+          revision: 9,
+        })
+      }
+      throw new Error(`unexpected ${method} ${url}`)
+    })
+
+    const wrapper = mountComponent(ProjectCenter)
+    await settle()
+    await wrapper.get('[data-testid="project-archive-SY-2026-001"]').trigger('click')
+    await wrapper.get('[data-testid="archive-reason"]').setValue('客户取消')
+    await wrapper.get('[data-testid="archive-confirm"]').trigger('click')
+    await vi.waitFor(() => expect(detailRead).toBe(2))
+
+    expect((wrapper.get('[data-testid="archive-reason"]').element as HTMLTextAreaElement).value)
+      .toBe('客户取消')
+    expect(wrapper.get('[data-testid="archive-confirm"]').attributes('disabled')).toBeUndefined()
+
+    await wrapper.get('[data-testid="archive-confirm"]').trigger('click')
+    await settle()
+    const closeCalls = fetchMock.mock.calls.filter(([url]) =>
+      url === '/api/projects/SY-2026-001/close')
+    expect(closeCalls.map(([, request]) => JSON.parse(String(request?.body)))).toEqual([
+      { closure_type: 'cancelled', reason: '客户取消', expected_revision: 7 },
+      { closure_type: 'cancelled', reason: '客户取消', expected_revision: 8 },
+    ])
+  })
+
+  it('取消项目响应丢失且项目仍在建时继续锁定并只允许原样重试', async () => {
+    let closeAttempt = 0
+    let detailRead = 0
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      if (url === '/api/companies') return jsonResponse([{ ...company, contact_count: 0 }])
+      if (url === '/api/projects?status=active') return jsonResponse([project])
+      if (url === '/api/projects/SY-2026-001' && method === 'GET') {
+        detailRead += 1
+        return jsonResponse({
+          ...project,
+          closure_type: null,
+          revision: detailRead < 3 ? 7 : 8,
+        })
+      }
+      if (url === '/api/projects/SY-2026-001/close' && method === 'POST') {
+        closeAttempt += 1
+        if (closeAttempt === 1) throw new TypeError('response lost')
+        return jsonResponse({
+          detail: 'Revision conflict',
+          error_code: 'REVISION_CONFLICT',
+          field_errors: {},
+          current_revision: 8,
+        }, 409)
+      }
+      throw new Error(`unexpected ${method} ${url}`)
+    })
+
+    const wrapper = mountComponent(ProjectCenter)
+    await settle()
+    await wrapper.get('[data-testid="project-archive-SY-2026-001"]').trigger('click')
+    await wrapper.get('[data-testid="archive-reason"]').setValue('客户取消')
+    await wrapper.get('[data-testid="archive-confirm"]').trigger('click')
+    await vi.waitFor(() => expect(detailRead).toBe(2))
+    expect(wrapper.get('[data-testid="project-action-error"]').text()).toContain('结果仍未知')
+    expect(wrapper.find('[data-testid="archive-confirm"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="archive-reason"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="archive-reconcile-retry"]').text()).toContain('重新核对状态')
+
+    await wrapper.get('[data-testid="archive-original-retry"]').trigger('click')
+    await vi.waitFor(() => expect(detailRead).toBe(3))
+    expect(wrapper.find('[data-testid="archive-original-retry"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="archive-reason"]').attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('[data-testid="archive-confirm"]').attributes('disabled')).toBeUndefined()
+    const closeCalls = fetchMock.mock.calls.filter(([url]) =>
+      url === '/api/projects/SY-2026-001/close')
+    expect(closeCalls).toHaveLength(2)
+    expect(closeCalls.map(([, init]) => (init?.headers as Record<string, string>)['Idempotency-Key']))
+      .toEqual([expect.any(String), expect.any(String)])
+    expect((closeCalls[0]?.[1]?.headers as Record<string, string>)['Idempotency-Key'])
+      .toBe((closeCalls[1]?.[1]?.headers as Record<string, string>)['Idempotency-Key'])
+    expect(closeCalls.map(([, init]) => init?.body)).toEqual([
+      JSON.stringify({ closure_type: 'cancelled', reason: '客户取消', expected_revision: 7 }),
+      JSON.stringify({ closure_type: 'cancelled', reason: '客户取消', expected_revision: 7 }),
+    ])
+    expect(fetchMock.mock.calls.filter(([url, init]) =>
+      url === '/api/projects/SY-2026-001' && (init?.method ?? 'GET') === 'GET')).toHaveLength(3)
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/archive'))).toBe(false)
+  })
+
+  it('取消项目返回 503 且项目仍在建时继续锁定并复用原请求', async () => {
+    let closeAttempt = 0
+    let detailRead = 0
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      if (url === '/api/companies') return jsonResponse([{ ...company, contact_count: 0 }])
+      if (url === '/api/projects?status=active') return jsonResponse([project])
+      if (url === '/api/projects/SY-2026-001' && method === 'GET') {
+        detailRead += 1
+        return jsonResponse({ ...project, closure_type: null, revision: 7 })
+      }
+      if (url === '/api/projects/SY-2026-001/close' && method === 'POST') {
+        closeAttempt += 1
+        if (closeAttempt === 1) return jsonResponse({ detail: 'upstream unavailable' }, 503)
+        return jsonResponse({
+          ...project,
+          status: 'archived',
+          closure_type: 'cancelled',
+          revision: 8,
+        })
+      }
+      throw new Error(`unexpected ${method} ${url}`)
+    })
+
+    const wrapper = mountComponent(ProjectCenter)
+    await settle()
+    await wrapper.get('[data-testid="project-archive-SY-2026-001"]').trigger('click')
+    await wrapper.get('[data-testid="archive-reason"]').setValue('客户取消')
+    await wrapper.get('[data-testid="archive-confirm"]').trigger('click')
+    await vi.waitFor(() => expect(detailRead).toBe(2))
+
+    expect(wrapper.find('[data-testid="archive-confirm"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="archive-reason"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="archive-original-retry"]').text()).toContain('原样重试')
+
+    await wrapper.get('[data-testid="archive-original-retry"]').trigger('click')
+    await settle()
+    const closeCalls = fetchMock.mock.calls.filter(([url]) =>
+      url === '/api/projects/SY-2026-001/close')
+    expect(closeCalls).toHaveLength(2)
+    expect(closeCalls[0]?.[1]?.body).toBe(closeCalls[1]?.[1]?.body)
+    expect((closeCalls[0]?.[1]?.headers as Record<string, string>)['Idempotency-Key'])
+      .toBe((closeCalls[1]?.[1]?.headers as Record<string, string>)['Idempotency-Key'])
+  })
+
+  it('取消项目响应丢失但核对为已归档时按成功收敛', async () => {
+    let detailRead = 0
+    let archived = false
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      if (url === '/api/companies') return jsonResponse([{ ...company, contact_count: 0 }])
+      if (url === '/api/projects?status=active') return jsonResponse(archived ? [] : [project])
+      if (url === '/api/projects/SY-2026-001' && method === 'GET') {
+        detailRead += 1
+        return jsonResponse({
+          ...project,
+          status: detailRead === 1 ? 'active' : 'archived',
+          closure_type: detailRead === 1 ? null : 'cancelled',
+          revision: detailRead === 1 ? 7 : 8,
+        })
+      }
+      if (url === '/api/projects/SY-2026-001/close' && method === 'POST') {
+        archived = true
+        throw new TypeError('response lost')
+      }
+      throw new Error(`unexpected ${method} ${url}`)
+    })
+
+    const wrapper = mountComponent(ProjectCenter)
+    await settle()
+    await wrapper.get('[data-testid="project-archive-SY-2026-001"]').trigger('click')
+    await wrapper.get('[data-testid="archive-reason"]').setValue('客户取消')
+    await wrapper.get('[data-testid="archive-confirm"]').trigger('click')
+    await vi.waitFor(() => {
+      expect(wrapper.get('[data-testid="archive-dialog"]').isVisible()).toBe(false)
+    })
+
+    expect(detailRead).toBe(2)
+    expect(fetchMock.mock.calls.filter(([url]) =>
+      url === '/api/projects/SY-2026-001/close')).toHaveLength(1)
+    expect(wrapper.get('[data-testid="projects-empty"]').text()).toContain('暂无在建项目')
+  })
+
+  it('取消项目响应丢失且核对失败时锁住原请求，仅允许原样重试或重新核对', async () => {
+    let detailRead = 0
+    let closeAttempt = 0
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      if (url === '/api/companies') return jsonResponse([{ ...company, contact_count: 0 }])
+      if (url === '/api/projects?status=active') return jsonResponse([project])
+      if (url === '/api/projects/SY-2026-001' && method === 'GET') {
+        detailRead += 1
+        if (detailRead > 1) throw new TypeError('reconcile failed')
+        return jsonResponse({ ...project, closure_type: null, revision: 7 })
+      }
+      if (url === '/api/projects/SY-2026-001/close' && method === 'POST') {
+        closeAttempt += 1
+        if (closeAttempt === 1) throw new TypeError('response lost')
+        return jsonResponse({
+          ...project,
+          status: 'archived',
+          closure_type: 'cancelled',
+          revision: 8,
+        })
+      }
+      throw new Error(`unexpected ${method} ${url}`)
+    })
+
+    const wrapper = mountComponent(ProjectCenter)
+    await settle()
+    await wrapper.get('[data-testid="project-archive-SY-2026-001"]').trigger('click')
+    await wrapper.get('[data-testid="archive-reason"]').setValue('客户取消')
+    await wrapper.get('[data-testid="archive-confirm"]').trigger('click')
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-testid="archive-original-retry"]').exists()).toBe(true)
+    })
+
+    expect(wrapper.get('[data-testid="archive-reason"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="archive-reconcile-retry"]').text()).toContain('重新核对状态')
+    await wrapper.get('[data-testid="archive-reconcile-retry"]').trigger('click')
+    await settle()
+    expect(wrapper.get('[data-testid="archive-reason"]').attributes('disabled')).toBeDefined()
+
+    await wrapper.get('[data-testid="archive-original-retry"]').trigger('click')
+    await settle()
+    const closeCalls = fetchMock.mock.calls.filter(([url]) =>
+      url === '/api/projects/SY-2026-001/close')
+    expect(closeCalls).toHaveLength(2)
+    expect(closeCalls[0]?.[1]?.body).toBe(closeCalls[1]?.[1]?.body)
+    expect((closeCalls[0]?.[1]?.headers as Record<string, string>)['Idempotency-Key'])
+      .toBe((closeCalls[1]?.[1]?.headers as Record<string, string>)['Idempotency-Key'])
+  })
+
+  it('取消项目响应丢失且核对未认证时仍锁住原请求', async () => {
+    let detailRead = 0
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      if (url === '/api/companies') return jsonResponse([{ ...company, contact_count: 0 }])
+      if (url === '/api/projects?status=active') return jsonResponse([project])
+      if (url === '/api/projects/SY-2026-001' && method === 'GET') {
+        detailRead += 1
+        if (detailRead > 1) return jsonResponse({ detail: 'Authentication required' }, 401)
+        return jsonResponse({ ...project, closure_type: null, revision: 7 })
+      }
+      if (url === '/api/projects/SY-2026-001/close' && method === 'POST') {
+        throw new TypeError('response lost')
+      }
+      throw new Error(`unexpected ${method} ${url}`)
+    })
+
+    const wrapper = mountComponent(ProjectCenter)
+    await settle()
+    await wrapper.get('[data-testid="project-archive-SY-2026-001"]').trigger('click')
+    await wrapper.get('[data-testid="archive-reason"]').setValue('客户取消')
+    await wrapper.get('[data-testid="archive-confirm"]').trigger('click')
+    await vi.waitFor(() => {
+      expect(wrapper.emitted('session-expired')).toEqual([['登录状态已失效，请重新登录']])
+    })
+
+    expect(wrapper.find('[data-testid="archive-original-retry"]').exists()).toBe(true)
+    expect(wrapper.get('[data-testid="archive-reason"]').attributes('disabled')).toBeDefined()
   })
 
   it('列表错误保留在页面，401 则上报会话过期', async () => {
@@ -581,6 +978,43 @@ describe('ProjectCenter', () => {
     expect(wrapper.emitted('session-expired')).toEqual([['请重新登录']])
   })
 
+  it('公司接口失败时仍展示已读取的项目，只禁用新建项目', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      if (String(input) === '/api/companies') {
+        return jsonResponse({ detail: '公司资料暂不可用' }, 503)
+      }
+      return jsonResponse([project])
+    })
+
+    const wrapper = mountComponent(ProjectCenter)
+    await settle()
+
+    expect(wrapper.find('[data-testid="projects-error"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('SY-2026-001')
+    expect(wrapper.get('[data-testid="project-company-warning"]').text()).toContain('公司资料暂不可用')
+    expect(wrapper.get('[data-testid="project-create-open"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('公司请求悬挂时项目列表先完成并立即可用', async () => {
+    let resolveCompanies!: (response: Response) => void
+    fetchMock.mockImplementation(async (input) => {
+      if (String(input) === '/api/companies') {
+        return new Promise<Response>((resolve) => { resolveCompanies = resolve })
+      }
+      return jsonResponse([project])
+    })
+
+    const wrapper = mountComponent(ProjectCenter)
+    await settle()
+
+    expect(wrapper.find('[data-testid="projects-loading"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('SY-2026-001')
+    expect(wrapper.get('[data-testid="project-create-open"]').attributes('disabled')).toBeDefined()
+
+    resolveCompanies(jsonResponse([{ ...company, contact_count: 0 }]))
+    await settle()
+  })
+
   it('初始并行请求先返回 500 后迟到 401 仍上报会话过期', async () => {
     let resolveCompany!: (response: Response) => void
     fetchMock.mockImplementation(async (input) => {
@@ -591,9 +1025,9 @@ describe('ProjectCenter', () => {
     })
     const wrapper = mountComponent(ProjectCenter)
     await settle()
-    expect(wrapper.get('[data-testid="projects-loading"]').isVisible()).toBe(true)
-    expect(wrapper.find('[data-testid="projects-error"]').exists()).toBe(false)
-    expect(wrapper.find('[data-testid="projects-retry"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="projects-loading"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="projects-error"]').text()).toContain('项目列表暂时失败')
+    expect(wrapper.get('[data-testid="projects-retry"]').isVisible()).toBe(true)
 
     resolveCompany(jsonResponse({ detail: '迟到的会话过期' }, 401))
     await settle()
@@ -602,7 +1036,7 @@ describe('ProjectCenter', () => {
     expect(wrapper.get('[data-testid="projects-retry"]').isVisible()).toBe(true)
   })
 
-  it('旧代整轮结束后重试原子提交新项目和公司', async () => {
+  it('项目加载失败不等待公司请求结束即可重试', async () => {
     let resolveOldCompany!: (response: Response) => void
     let projectCalls = 0
     let companyCalls = 0
@@ -625,7 +1059,8 @@ describe('ProjectCenter', () => {
 
     const wrapper = mountComponent(ProjectCenter)
     await settle()
-    expect(wrapper.get('[data-testid="projects-loading"]').isVisible()).toBe(true)
+    expect(wrapper.find('[data-testid="projects-loading"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="projects-error"]').text()).toContain('旧代项目失败')
     resolveOldCompany(jsonResponse([{ ...company, contact_count: 0 }]))
     await settle()
     expect(wrapper.get('[data-testid="projects-error"]').text()).toContain('旧代项目失败')
@@ -679,6 +1114,27 @@ describe('ProjectCenter', () => {
     await wrapper.get('[data-testid="project-create-open"]').trigger('click')
     expect(wrapper.get('[data-testid="project-form-dialog"]').attributes('style')).toContain('min(92vw, 560px)')
   })
+
+  it('关闭新建和取消弹窗后把焦点还给各自触发按钮', async () => {
+    fetchMock.mockImplementation(async (input) =>
+      String(input) === '/api/companies'
+        ? jsonResponse([{ ...company, contact_count: 0 }])
+        : jsonResponse([project]))
+    const wrapper = mountComponent(ProjectCenter)
+    await settle()
+
+    const createTrigger = wrapper.get('[data-testid="project-create-open"]')
+    await createTrigger.trigger('focus')
+    await createTrigger.trigger('click')
+    await wrapper.get('[data-testid="project-form-dialog"] .el-dialog__headerbtn').trigger('click')
+    await vi.waitFor(() => expect(document.activeElement).toBe(createTrigger.element))
+
+    const archiveTrigger = wrapper.get('[data-testid="project-archive-SY-2026-001"]')
+    await archiveTrigger.trigger('focus')
+    await archiveTrigger.trigger('click')
+    await wrapper.get('[data-testid="archive-dialog"] .el-dialog__headerbtn').trigger('click')
+    await vi.waitFor(() => expect(document.activeElement).toBe(archiveTrigger.element))
+  })
 })
 
 describe('ProjectDashboard', () => {
@@ -725,14 +1181,14 @@ describe('ProjectDashboard', () => {
     expect(summary.text()).toContain('电气设计')
     expect(summary.text()).toContain('待办 2')
     expect(wrapper.find('[data-testid="project-stages"]').exists()).toBe(false)
-    expect(wrapper.text()).not.toContain('编辑排期')
-    expect(wrapper.text()).not.toContain('变更状态')
+    expect(wrapper.text()).not.toContain('维护排期')
+    expect(wrapper.text()).not.toContain('更新当前阶段')
 
     await wrapper.get('[data-testid="project-stage-flow-open"]').trigger('click')
     expect(wrapper.get('[data-testid="project-stages"]').isVisible()).toBe(true)
     expect(wrapper.findAll('[data-testid^="stage-row-"]')).toHaveLength(18)
-    expect(wrapper.text()).toContain('编辑排期')
-    expect(wrapper.text()).toContain('变更状态')
+    expect(wrapper.text()).toContain('维护排期')
+    expect(wrapper.text()).toContain('更新当前阶段')
   })
 
   it('所有阶段已完成或跳过时，当前阶段和下一步都明确表示流程完成', async () => {
@@ -775,6 +1231,21 @@ describe('ProjectDashboard', () => {
     expect(summary.text()).not.toContain('已完成全部流程')
   })
 
+  it('当前阶段阻塞时优先提示解除阻塞，不把后继待开始阶段当作下一步', async () => {
+    const snapshot = (await new MockProjectRepository().getOperatingSnapshot('SY-2026-001')).data
+    snapshot.stages = snapshot.stages.map((stage, index) => ({
+      ...stage,
+      status: index === 0 ? 'completed' : index === 1 ? 'blocked' : 'pending',
+    }))
+
+    const wrapper = mountComponent(ProjectOverviewPanel, { operating: snapshot })
+    const summary = wrapper.get('[data-testid="project-stage-summary"]')
+
+    expect(summary.get('[data-testid="project-current-stage"]').text()).toContain('现场测绘')
+    expect(summary.get('[data-testid="project-next-stage"]').text()).toContain('等待解除阻塞')
+    expect(summary.get('[data-testid="project-next-stage"]').text()).not.toContain('我方报价')
+  })
+
   it('共享合同只汇总当前项目分摊，不带入其他项目收入', async () => {
     const snapshot = (await new MockProjectRepository().getOperatingSnapshot('SY-2026-001')).data
     snapshot.commercial.contracts[0]?.allocations.push({
@@ -807,24 +1278,20 @@ describe('ProjectDashboard', () => {
 
     const wrapper = mountComponent(ProjectDashboard, { projectCode: project.project_code })
     await vi.waitFor(() => {
-      expect(wrapper.find('[data-testid="project-live-notice"]').exists()).toBe(true)
+      expect(wrapper.find('[data-testid="project-workspace-tabs"]').exists()).toBe(true)
     })
 
     expect(wrapper.find('[data-testid="project-demo-notice"]').exists()).toBe(false)
-    expect(wrapper.get('[data-testid="project-live-notice"]').text()).toContain('真实后端')
+    expect(wrapper.text()).not.toContain('真实后端')
     expect(wrapper.findAll('[data-testid^="project-nav-"]').map((item) => item.text())).toEqual([
       '项目首页', '资料与设计', '报价与收款', '采购', '施工与调试', '验收与售后',
     ])
     expect(wrapper.get('[data-testid="project-panel-overview"]').isVisible()).toBe(true)
     await wrapper.get('[data-testid="project-nav-documents"]').trigger('click')
     await vi.waitFor(() => {
-      expect(wrapper.find('[data-testid="project-records-panel"]').exists()).toBe(true)
-    })
-    await vi.waitFor(() => {
       expect(wrapper.find('[data-testid="project-documents-panel"]').exists()).toBe(true)
     })
-    expect(wrapper.get('[data-testid="project-records-panel"]').isVisible()).toBe(true)
-    expect(wrapper.get('[data-testid="project-records-panel"]').text()).not.toContain('项目文档统计')
+    expect(wrapper.find('[data-testid="project-records-panel"]').exists()).toBe(false)
     expect(wrapper.get('[data-testid="project-nav-documents"]').text()).toBe('资料与设计')
     expect(wrapper.find('.project-section-collapse').exists()).toBe(false)
     expect(fetchMock).toHaveBeenCalledTimes(2)
@@ -867,6 +1334,7 @@ describe('ProjectDashboard', () => {
     expect(wrapper.get('.project-identity').text()).toContain('机械与电气同步改造')
 
     await wrapper.get('[data-testid="project-close-open"]').trigger('click')
+    await wrapper.get('[data-testid="project-close-type"] input[value="completed"]').setValue(true)
     await wrapper.get('[data-testid="project-close-reason"]').setValue('项目已验收并完成收尾')
     await wrapper.get('[data-testid="project-close-save"]').trigger('click')
     await settle()
@@ -927,7 +1395,7 @@ describe('ProjectDashboard', () => {
     vi.stubGlobal('fetch', fetchMock)
     const wrapper = mountComponent(ProjectDashboard, { projectCode: project.project_code })
     await vi.waitFor(() => {
-      expect(wrapper.find('[data-testid="project-live-notice"]').exists()).toBe(true)
+      expect(wrapper.find('[data-testid="project-workspace-tabs"]').exists()).toBe(true)
     })
 
     expect(fetchMock).toHaveBeenCalledWith(
@@ -938,7 +1406,7 @@ describe('ProjectDashboard', () => {
       '/api/projects/SY-2026-001/dashboard',
       expect.objectContaining({ credentials: 'same-origin' }),
     )
-    expect(wrapper.get('[data-testid="project-live-notice"]').text()).toContain('真实后端')
+    expect(wrapper.text()).not.toContain('真实后端')
     expect(wrapper.find('[data-testid="project-demo-notice"]').exists()).toBe(false)
     expect(wrapper.findAll('[data-testid^="project-nav-"]').map((item) => item.text())).toEqual([
       '项目首页', '资料与设计', '报价与收款', '采购', '施工与调试', '验收与售后',
@@ -953,8 +1421,8 @@ describe('ProjectDashboard', () => {
     expect(wrapper.get('[data-testid="project-demo-finance"]').text()).toContain('实际利润')
     expect(wrapper.get('[data-testid="project-demo-costs"]').text()).toContain('已领用库存成本')
     expect(wrapper.get('[data-testid="project-demo-costs"]').text()).toContain('采购承诺（不计利润）')
-    expect(wrapper.get('[data-testid="project-demo-todos"]').text()).toContain('严重 · 2026-09-02')
-    expect(wrapper.get('[data-testid="project-demo-todos"]').text()).toContain('警告 · 2026-11-30')
+    expect(wrapper.get('[data-testid="project-demo-todos"]').text()).toContain('严重 · 2026年9月2日')
+    expect(wrapper.get('[data-testid="project-demo-todos"]').text()).toContain('警告 · 2026年11月30日')
     expect(wrapper.find('[data-testid="project-stages"]').exists()).toBe(false)
 
     await wrapper.get('[data-testid="project-nav-workforce"]').trigger('click')
@@ -999,18 +1467,15 @@ describe('ProjectDashboard', () => {
     expect(wrapper.get('[data-testid="project-demo-receivables"]').text()).toContain('预付款')
 
     await wrapper.get('[data-testid="project-nav-documents"]').trigger('click')
-    expect(wrapper.get('[data-testid="project-records-panel"]').isVisible()).toBe(true)
-    expect(wrapper.get('[data-testid="project-records-panel"]').text()).toContain('王工')
-    expect(wrapper.get('[data-testid="project-records-panel"]').text()).not.toContain('项目文档统计')
-
     await vi.waitFor(() => {
       expect(wrapper.find('[data-testid="project-documents-panel"]').exists()).toBe(true)
     })
+    expect(wrapper.find('[data-testid="project-records-panel"]').exists()).toBe(false)
     expect(wrapper.get('[data-testid="project-documents-panel"]').isVisible()).toBe(true)
     expect(fetchMock.mock.calls.some(([path]) => String(path).includes('/documents?page='))).toBe(true)
   })
 
-  it('展示联系人和文档空态，项目编号变更时重新读取', async () => {
+  it('资料页不重复展示客户联系人，项目编号变更时重新读取', async () => {
     const firstDashboard = await projectDashboardBody({ contacts: [] })
     const secondDashboard = await projectDashboardBody({
       projectRecord: { ...project, project_code: '测 试/002' },
@@ -1029,8 +1494,7 @@ describe('ProjectDashboard', () => {
     const wrapper = mountComponent(ProjectDashboard, { projectCode: 'SY-2026-001' })
     await settle()
     await wrapper.get('[data-testid="project-nav-documents"]').trigger('click')
-    expect(wrapper.get('[data-testid="contacts-empty"]').text()).toContain('暂无联系人')
-    expect(wrapper.find('[data-testid="documents-empty"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="project-records-panel"]').exists()).toBe(false)
 
     await wrapper.setProps({ projectCode: '测 试/002' })
     await settle()
@@ -1047,15 +1511,19 @@ describe('ProjectDashboard', () => {
       projectRecord: { ...project, project_code: 'SY-B', name: 'B 项目' },
       contacts: [],
     })
-    const fetchMock = vi.fn<typeof fetch>()
-      .mockResolvedValueOnce(jsonResponse(firstDashboard))
-      .mockResolvedValueOnce(jsonResponse(secondDashboard))
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/projects/SY-2026-001/dashboard') return jsonResponse(firstDashboard)
+      if (path === '/api/projects/SY-B/dashboard') return jsonResponse(secondDashboard)
+      if (path === '/api/companies') return jsonResponse([{ ...company, contact_count: 0 }])
+      throw new Error(`unexpected GET ${path}`)
+    })
     vi.stubGlobal('fetch', fetchMock)
     const wrapper = mountComponent(ProjectDashboard, { projectCode: project.project_code })
     await vi.waitFor(() => expect(wrapper.text()).toContain('装配线改造'))
 
     expect(wrapper.get('[data-testid="project-edit-open"]').text()).toBe('编辑项目')
-    expect(wrapper.get('[data-testid="project-close-open"]').text()).toBe('完结项目')
+    expect(wrapper.get('[data-testid="project-close-open"]').text()).toBe('完结并归档')
     await wrapper.get('[data-testid="project-edit-open"]').trigger('click')
     expect(wrapper.get('[aria-label="编辑项目"]').isVisible()).toBe(true)
 
@@ -1083,6 +1551,7 @@ describe('ProjectDashboard', () => {
       created_at: '2026-08-31T01:00:00+00:00',
       updated_at: '2026-08-31T01:00:00+00:00',
     }
+    const firstProjectDocuments: Array<typeof documentBase> = []
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)
       const method = init?.method ?? 'GET'
@@ -1091,11 +1560,35 @@ describe('ProjectDashboard', () => {
       if (path.includes('/api/projects/SY-B/documents?page=')) {
         return jsonResponse({ items: [documentBase], total: 1, page: 1, page_size: 100 })
       }
-      if (path.includes('/documents?page=')) {
-        return jsonResponse({ items: [], total: 0, page: 1, page_size: 100 })
+      if (path.includes('/api/projects/SY-2026-001/documents?page=')) {
+        return jsonResponse({
+          items: firstProjectDocuments,
+          total: firstProjectDocuments.length,
+          page: 1,
+          page_size: 100,
+        })
       }
       if (path.endsWith('/documents') && method === 'POST') {
-        return jsonResponse({ ...documentBase, id: 102, project_code: 'SY-2026-001', title: '仅属于 A 的文档' }, 201)
+        const created = {
+          ...documentBase,
+          id: 102,
+          project_code: 'SY-2026-001',
+          title: '仅属于 A 的文档',
+          versions: [{
+            id: 1002,
+            version_number: 1,
+            managed_filename: 'SY-2026-001_其他_仅属于-A-的文档_V01.pdf',
+            original_filename: 'only-a.pdf',
+            content_type: 'application/pdf',
+            size_bytes: 4,
+            sha256: '0'.repeat(64),
+            notes: null,
+            created_at: '2026-08-31T01:00:00+00:00',
+          }],
+        }
+        const { versions: _versions, ...summary } = created
+        firstProjectDocuments.unshift(summary)
+        return jsonResponse(created, 201)
       }
       throw new Error(`unexpected ${method} ${path}`)
     })

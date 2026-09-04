@@ -1,3 +1,7 @@
+import type { ProjectCompletionCheck } from './domain/contracts'
+
+export type { ProjectCompletionCheck } from './domain/contracts'
+
 export interface SessionState {
   authenticated: boolean
   password_configured: boolean
@@ -35,6 +39,7 @@ export interface SystemOverview {
 }
 
 export interface BackupSettingsPayload {
+  enabled: boolean
   directory: string | null
   interval_hours: number
   retention_days: number
@@ -60,6 +65,7 @@ export interface Company {
 }
 
 export interface CompanySummary extends Company {
+  revision: number
   contact_count: number
 }
 
@@ -75,8 +81,13 @@ export interface Contact {
   updated_at: string
 }
 
+export interface RevisionedContact extends Contact {
+  revision: number
+}
+
 export interface CompanyDetail extends Company {
-  contacts: Contact[]
+  revision: number
+  contacts: RevisionedContact[]
 }
 
 export interface CompanyPayload {
@@ -95,6 +106,14 @@ export interface ContactPayload {
   email: string | null
   position: string | null
   notes: string | null
+}
+
+export interface CompanyUpdatePayload extends CompanyPayload {
+  expected_revision: number
+}
+
+export interface ContactUpdatePayload extends ContactPayload {
+  expected_revision: number
 }
 
 export type ProjectStatus = 'active' | 'archived'
@@ -141,4 +160,5 @@ export interface ProjectDashboardData {
   company: Company
   contacts: Contact[]
   documents: DocumentSummary
+  completion_check: ProjectCompletionCheck
 }

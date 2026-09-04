@@ -1,0 +1,5 @@
+ALTER TABLE companies
+ADD COLUMN revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1);
+
+ALTER TABLE contacts
+ADD COLUMN revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1);

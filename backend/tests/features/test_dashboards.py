@@ -577,6 +577,7 @@ def test_project_dashboard_returns_frozen_operating_types_and_real_costs(
         "profit",
         "receivables",
         "todos",
+        "completion_check",
     }
     assert body["project"]["project_code"] == "P-A"
     assert body["project"]["company_name"] == "客户公司"
@@ -615,6 +616,17 @@ def test_project_dashboard_returns_frozen_operating_types_and_real_costs(
     assert receivables["contract_collection_basis_points"] == 3333
     assert len(receivables["terms"]) == 3
     assert len(receivables["receipts"]) == 3
+    assert body["completion_check"] == {
+        "stages_ready": False,
+        "final_acceptance_ready": False,
+        "receivables_ready": False,
+        "ready": False,
+        "blockers": [
+            "PROJECT_STAGES_INCOMPLETE",
+            "FINAL_ACCEPTANCE_NOT_PASSED",
+            "RECEIVABLES_OUTSTANDING",
+        ],
+    }
     assert {todo["code"] for todo in body["todos"]} == {
         "STAGE_BLOCKED",
         "RECEIVABLE_OVERDUE",

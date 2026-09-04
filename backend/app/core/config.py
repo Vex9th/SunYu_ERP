@@ -12,6 +12,7 @@ _ALLOWED_CONFIG_KEYS = frozenset(
     {
         "data_dir",
         "backup_dir",
+        "backup_enabled",
         "backup_interval_hours",
         "backup_retention_days",
         "host",
@@ -35,6 +36,13 @@ class Settings:
     port: int
     session_secret: str
     max_document_upload_mb: int = 4096
+    backup_enabled: bool | None = None
+
+    @property
+    def automatic_backup_enabled(self) -> bool:
+        if self.backup_enabled is not None:
+            return self.backup_enabled
+        return self.backup_dir is not None
 
 
 def load_settings(config_path: str | Path) -> Settings:
@@ -46,6 +54,7 @@ def load_settings(config_path: str | Path) -> Settings:
 def update_backup_settings(
     config_path: str | Path,
     *,
+    enabled: bool | None = None,
     directory: str | None,
     interval_hours: int,
     retention_days: int,
@@ -56,9 +65,14 @@ def update_backup_settings(
         normalized_directory = (
             directory.strip() if isinstance(directory, str) else directory
         )
+        if enabled is None:
+            raw_config["backup_dir"] = normalized_directory
+        else:
+            raw_config["backup_enabled"] = enabled
+            if normalized_directory is not None:
+                raw_config["backup_dir"] = normalized_directory
         raw_config.update(
             {
-                "backup_dir": normalized_directory,
                 "backup_interval_hours": interval_hours,
                 "backup_retention_days": retention_days,
             }
@@ -132,6 +146,7 @@ def _settings_from_config(
         port=port,
         session_secret=session_secret,
         max_document_upload_mb=raw_config.get("max_document_upload_mb", 4096),
+        backup_enabled=raw_config.get("backup_enabled", backup_dir is not None),
     )
 
 
@@ -181,6 +196,10 @@ def _validate_config(loaded_config: object) -> dict[str, object]:
     session_secret = loaded_config.get("session_secret", _MISSING)
     if session_secret is not _MISSING and not isinstance(session_secret, str):
         raise TypeError("session_secret must be a string")
+
+    backup_enabled = loaded_config.get("backup_enabled", _MISSING)
+    if backup_enabled is not _MISSING and not isinstance(backup_enabled, bool):
+        raise TypeError("backup_enabled must be a boolean")
 
     return loaded_config
 

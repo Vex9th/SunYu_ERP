@@ -1,5 +1,5 @@
 import {
-  ApiError,
+  createRetriableMultipartPostSender,
   createRetriablePostSender,
   requestBlob,
   requestJson,
@@ -19,10 +19,17 @@ import type {
   PaymentTerm,
   ProjectDashboard,
   ProjectDetail,
+  ProjectStage,
   Quote,
   QuoteStatus,
   Receipt,
 } from '../domain/contracts'
+import type { RepositoryResult } from './common'
+import type {
+  ProjectStageRepository,
+  StageScheduleInput,
+  StageTransitionInput,
+} from './project'
 
 export interface ProjectUpdateInput {
   company_id: number
@@ -33,6 +40,11 @@ export interface ProjectUpdateInput {
 
 export interface ProjectCloseInput {
   closure_type: ClosureType
+  reason: string
+  expected_revision: number
+}
+
+export interface ProjectRestoreInput {
   reason: string
   expected_revision: number
 }
@@ -135,25 +147,52 @@ export interface DocumentVersionOption {
   label: string
 }
 
+export type DocumentArchiveFilter = 'active' | 'archived' | 'all'
+
+export interface DocumentListQuery {
+  page?: number
+  page_size?: number
+  search?: string
+  category?: string
+  archived?: DocumentArchiveFilter
+}
+
+export interface DocumentListItem extends DocumentSummary {
+  search_excerpt?: string | null
+}
+
 export interface ProjectOperatingRepository {
   getGlobalDashboard(): Promise<GlobalDashboard>
   getProjectDashboard(projectCode: string): Promise<ProjectDashboard>
   updateProject(projectCode: string, input: ProjectUpdateInput): Promise<ProjectDetail>
   closeProject(projectCode: string, input: ProjectCloseInput): Promise<ProjectDetail>
-  listDocuments(projectCode: string): Promise<PagedResult<DocumentSummary>>
+  restoreProject(projectCode: string, input: ProjectRestoreInput): Promise<ProjectDetail>
+  listDocuments(
+    projectCode: string,
+    query?: DocumentListQuery,
+  ): Promise<PagedResult<DocumentListItem>>
   getDocument(projectCode: string, documentId: number): Promise<DocumentDetail>
   createDocument(projectCode: string, input: DocumentCreateInput): Promise<DocumentDetail>
+  discardCreateDocument(projectCode: string, input: DocumentCreateInput): boolean
   updateDocument(projectCode: string, documentId: number, input: DocumentUpdateInput): Promise<DocumentDetail>
   addDocumentVersion(projectCode: string, documentId: number, input: DocumentVersionInput): Promise<DocumentDetail['versions'][number]>
+  discardAddDocumentVersion(projectCode: string, documentId: number, input: DocumentVersionInput): boolean
   archiveDocument(projectCode: string, documentId: number, input: DocumentArchiveInput): Promise<DocumentDetail>
-  downloadDocumentVersion(projectCode: string, documentId: number, versionId: number): Promise<Blob>
+  downloadDocumentVersion(
+    projectCode: string,
+    documentId: number,
+    versionId: number,
+    signal?: AbortSignal,
+  ): Promise<Blob>
   listDocumentVersionOptions(projectCode: string): Promise<DocumentVersionOption[]>
   listQuotes(projectCode: string): Promise<PagedResult<Quote>>
-  createQuote(projectCode: string, input: QuoteInput): Promise<Quote>
+  createQuote(projectCode: string, input: QuoteInput, files?: readonly File[]): Promise<Quote>
+  discardCreateQuote(projectCode: string, input: QuoteInput, files?: readonly File[]): boolean
   updateQuote(projectCode: string, quoteId: number, input: QuoteUpdateInput): Promise<Quote>
   transitionQuote(projectCode: string, quoteId: number, input: StatusTransitionInput<QuoteStatus>): Promise<Quote>
   listContracts(projectCode: string): Promise<PagedResult<Contract>>
-  createContract(projectCode: string, input: ContractInput): Promise<Contract>
+  createContract(projectCode: string, input: ContractInput, files?: readonly File[]): Promise<Contract>
+  discardCreateContract(projectCode: string, input: ContractInput, files?: readonly File[]): boolean
   updateContract(projectCode: string, contractId: number, input: ContractUpdateInput): Promise<Contract>
   transitionContract(projectCode: string, contractId: number, input: StatusTransitionInput<ContractStatus>): Promise<Contract>
   getPayments(projectCode: string): Promise<PaymentOverview>
@@ -165,7 +204,7 @@ export interface ProjectOperatingRepository {
 
 class HttpProjectOperatingRepository implements ProjectOperatingRepository {
   private readonly posts = createRetriablePostSender()
-  private readonly multipartPosts = new RetriableMultipartPostSender()
+  private readonly multipartPosts = createRetriableMultipartPostSender()
 
   getGlobalDashboard(): Promise<GlobalDashboard> {
     return requestJson('/api/dashboard')
@@ -183,8 +222,49 @@ class HttpProjectOperatingRepository implements ProjectOperatingRepository {
     return this.posts.send(`${projectPath(projectCode)}/close`, input)
   }
 
-  listDocuments(projectCode: string): Promise<PagedResult<DocumentSummary>> {
-    return requestAllPages(`${projectPath(projectCode)}/documents`)
+  restoreProject(projectCode: string, input: ProjectRestoreInput): Promise<ProjectDetail> {
+    return this.posts.send(`${projectPath(projectCode)}/restore`, input)
+  }
+
+  async listProjectStages(projectCode: string): Promise<RepositoryResult<ProjectStage[]>> {
+    return live(await requestJson<ProjectStage[]>(`${projectPath(projectCode)}/stages`))
+  }
+
+  async updateStageSchedule(
+    projectCode: string,
+    stageCode: string,
+    input: StageScheduleInput,
+  ): Promise<RepositoryResult<ProjectStage>> {
+    const data = await requestJson<ProjectStage>(stagePath(projectCode, stageCode), {
+      method: 'PUT',
+      body: input,
+    })
+    return live(data)
+  }
+
+  async transitionStage(
+    projectCode: string,
+    stageCode: string,
+    input: StageTransitionInput,
+  ): Promise<RepositoryResult<ProjectStage>> {
+    const data = await this.posts.send<ProjectStage>(
+      `${stagePath(projectCode, stageCode)}/transition`,
+      input,
+    )
+    return live(data)
+  }
+
+  listDocuments(
+    projectCode: string,
+    query: DocumentListQuery = {},
+  ): Promise<PagedResult<DocumentListItem>> {
+    return requestJson(withQuery(`${projectPath(projectCode)}/documents`, {
+      page: query.page ?? 1,
+      page_size: query.page_size ?? 20,
+      search: query.search?.trim() || undefined,
+      category: query.category || undefined,
+      archived: query.archived ?? 'active',
+    }))
   }
 
   getDocument(projectCode: string, documentId: number): Promise<DocumentDetail> {
@@ -199,8 +279,17 @@ class HttpProjectOperatingRepository implements ProjectOperatingRepository {
     form.set('file', input.file)
     return this.multipartPosts.send(
       `${projectPath(projectCode)}/documents`,
-      multipartSignature(input),
+      { category: input.category, title: input.title, notes: input.notes },
+      [input.file],
       form,
+    )
+  }
+
+  discardCreateDocument(projectCode: string, input: DocumentCreateInput): boolean {
+    return this.multipartPosts.discard(
+      `${projectPath(projectCode)}/documents`,
+      { category: input.category, title: input.title, notes: input.notes },
+      [input.file],
     )
   }
 
@@ -223,8 +312,21 @@ class HttpProjectOperatingRepository implements ProjectOperatingRepository {
     form.set('file', input.file)
     return this.multipartPosts.send(
       `${documentPath(projectCode, documentId)}/versions`,
-      multipartSignature(input),
+      { notes: input.notes, expected_revision: input.expected_revision },
+      [input.file],
       form,
+    )
+  }
+
+  discardAddDocumentVersion(
+    projectCode: string,
+    documentId: number,
+    input: DocumentVersionInput,
+  ): boolean {
+    return this.multipartPosts.discard(
+      `${documentPath(projectCode, documentId)}/versions`,
+      { notes: input.notes, expected_revision: input.expected_revision },
+      [input.file],
     )
   }
 
@@ -240,25 +342,34 @@ class HttpProjectOperatingRepository implements ProjectOperatingRepository {
     projectCode: string,
     documentId: number,
     versionId: number,
+    signal?: AbortSignal,
   ): Promise<Blob> {
-    return requestBlob(`${documentPath(projectCode, documentId)}/versions/${versionId}/download`)
+    return requestBlob(
+      `${documentPath(projectCode, documentId)}/versions/${versionId}/download`,
+      { signal },
+    )
   }
 
-  async listDocumentVersionOptions(projectCode: string): Promise<DocumentVersionOption[]> {
-    const listing = await this.listDocuments(projectCode)
-    const details = await Promise.all(listing.items.map((item) => this.getDocument(projectCode, item.id)))
-    return details.flatMap((document) => document.versions.map((version) => ({
-      value: version.id,
-      label: `${document.title} V${version.version_number} · ${version.original_filename}`,
-    })))
+  listDocumentVersionOptions(projectCode: string): Promise<DocumentVersionOption[]> {
+    return requestJson(`${projectPath(projectCode)}/document-version-options`)
   }
 
   listQuotes(projectCode: string): Promise<PagedResult<Quote>> {
     return requestAllPages(`${projectPath(projectCode)}/quotes`)
   }
 
-  createQuote(projectCode: string, input: QuoteInput): Promise<Quote> {
-    return this.posts.send(`${projectPath(projectCode)}/quotes`, input)
+  createQuote(projectCode: string, input: QuoteInput, files: readonly File[] = []): Promise<Quote> {
+    const path = `${projectPath(projectCode)}/quotes`
+    return files.length > 0
+      ? this.multipartPosts.send(path, input, files)
+      : this.posts.send(path, input)
+  }
+
+  discardCreateQuote(projectCode: string, input: QuoteInput, files: readonly File[] = []): boolean {
+    const path = `${projectPath(projectCode)}/quotes`
+    return files.length > 0
+      ? this.multipartPosts.discard(path, input, files)
+      : this.posts.discard(path, input)
   }
 
   updateQuote(projectCode: string, quoteId: number, input: QuoteUpdateInput): Promise<Quote> {
@@ -277,8 +388,18 @@ class HttpProjectOperatingRepository implements ProjectOperatingRepository {
     return requestAllPages(`${projectPath(projectCode)}/contracts`)
   }
 
-  createContract(projectCode: string, input: ContractInput): Promise<Contract> {
-    return this.posts.send(`${projectPath(projectCode)}/contracts`, input)
+  createContract(projectCode: string, input: ContractInput, files: readonly File[] = []): Promise<Contract> {
+    const path = `${projectPath(projectCode)}/contracts`
+    return files.length > 0
+      ? this.multipartPosts.send(path, input, files)
+      : this.posts.send(path, input)
+  }
+
+  discardCreateContract(projectCode: string, input: ContractInput, files: readonly File[] = []): boolean {
+    const path = `${projectPath(projectCode)}/contracts`
+    return files.length > 0
+      ? this.multipartPosts.discard(path, input, files)
+      : this.posts.discard(path, input)
   }
 
   updateContract(
@@ -350,75 +471,22 @@ async function requestAllPages<T>(path: string): Promise<PagedResult<T>> {
   }
 }
 
-interface PendingMultipartPost {
-  signature: string
-  idempotencyKey: string
-  inFlight?: Promise<unknown>
-}
-
-class RetriableMultipartPostSender {
-  private readonly pendingByPath = new Map<string, PendingMultipartPost>()
-
-  send<T>(path: string, signature: string, body: FormData): Promise<T> {
-    let pending = this.pendingByPath.get(path)
-    if (pending?.inFlight) {
-      if (pending.signature === signature) return pending.inFlight as Promise<T>
-      return Promise.reject(new Error('该路径已有其他文件正在上传'))
-    }
-    if (!pending || pending.signature !== signature) {
-      pending = { signature, idempotencyKey: crypto.randomUUID() }
-      this.pendingByPath.set(path, pending)
-    }
-    const active = pending
-    const request = requestJson<T>(path, {
-      method: 'POST',
-      headers: { 'Idempotency-Key': active.idempotencyKey },
-      body,
-    }).then(
-      (result) => {
-        if (this.pendingByPath.get(path) === active) this.pendingByPath.delete(path)
-        return result
-      },
-      (error: unknown) => {
-        if (this.pendingByPath.get(path) === active) {
-          active.inFlight = undefined
-          if (isDefinitiveClientRejection(error)) this.pendingByPath.delete(path)
-        }
-        throw error
-      },
-    )
-    active.inFlight = request
-    return request
-  }
-}
-
-function isDefinitiveClientRejection(error: unknown): boolean {
-  return error instanceof ApiError
-    && error.status >= 400
-    && error.status < 500
-    && ![408, 425, 429].includes(error.status)
-}
-
-function multipartSignature(input: DocumentCreateInput | DocumentVersionInput): string {
-  return JSON.stringify({
-    ...input,
-    file: {
-      name: input.file.name,
-      size: input.file.size,
-      type: input.file.type,
-      lastModified: input.file.lastModified,
-    },
-  })
-}
-
 function projectPath(projectCode: string): string {
   return `/api/projects/${encodeURIComponent(projectCode)}`
+}
+
+function stagePath(projectCode: string, stageCode: string): string {
+  return `${projectPath(projectCode)}/stages/${encodeURIComponent(stageCode)}`
 }
 
 function documentPath(projectCode: string, documentId: number): string {
   return `${projectPath(projectCode)}/documents/${documentId}`
 }
 
-export function createHttpProjectOperatingRepository(): ProjectOperatingRepository {
+function live<T>(data: T): RepositoryResult<T> {
+  return { source: 'live', data }
+}
+
+export function createHttpProjectOperatingRepository(): ProjectOperatingRepository & ProjectStageRepository {
   return new HttpProjectOperatingRepository()
 }

@@ -45,6 +45,55 @@ afterEach(() => {
 })
 
 describe('采购扩展真实 Repository 契约', () => {
+  it('供应商付款结果未知时重试复用原 URL、DTO 和幂等键', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValueOnce(jsonResponse({ id: 21 }, 201))
+    vi.stubGlobal('fetch', fetchMock)
+    const repository = createHttpProcurementRepository()
+    const input = {
+      paid_on: '2026-08-31', amount_cents: 10000, payment_method: '银行转账',
+      reference_no: null, allocations: [{ purchase_order_line_id: 91, amount_cents: 10000 }], notes: null,
+    }
+
+    await expect(repository.createSupplierPayment('SY/001', 9, input))
+      .rejects.toThrow('无法连接本地服务')
+    const [firstUrl, firstInit] = lastRequest(fetchMock)
+    const firstKey = (firstInit.headers as Record<string, string>)['Idempotency-Key']
+    expect(firstUrl).toBe('/api/projects/SY%2F001/purchase-orders/9/supplier-payments')
+    expect(JSON.parse(String(firstInit.body))).toEqual(input)
+    expect(firstKey).toMatch(/^[0-9a-f-]{36}$/i)
+
+    await repository.createSupplierPayment('SY/001', 9, input)
+    const [retryUrl, retryInit] = lastRequest(fetchMock)
+    expect(retryUrl).toBe(firstUrl)
+    expect(retryInit.body).toBe(firstInit.body)
+    expect((retryInit.headers as Record<string, string>)['Idempotency-Key']).toBe(firstKey)
+  })
+
+  it('新建采购单有附件时使用 multipart，未知结果可用同一文件快照放弃', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    vi.stubGlobal('fetch', fetchMock)
+    const repository = createHttpProcurementRepository()
+    const input = {
+      order_no: 'PO-ATTACH-001', supplier_company_id: 8, ordered_on: '2026-08-31',
+      expected_delivery_on: null, notes: null, document_version_ids: [44],
+      lines: [{ procurement_line_id: 91, quantity: '1.000', unit_cost_cents: 1000, overage_reason: null }],
+    }
+    const attached = new File(['contract'], '供应商合同.pdf', { type: 'application/pdf' })
+    const files = [attached]
+
+    await expect(repository.createPurchaseOrder('SY/001', input, files)).rejects.toThrow('无法连接本地服务')
+    const [url, init] = lastRequest(fetchMock)
+    expect(url).toBe('/api/projects/SY%2F001/purchase-orders')
+    expect(init.method).toBe('POST')
+    expect(Object.keys(init.headers as Record<string, string>)).not.toContain('Content-Type')
+    const form = init.body as FormData
+    expect(form.get('payload')).toBe(JSON.stringify(input))
+    expect(form.getAll('files')).toEqual(files)
+    expect(repository.discardCreatePurchaseOrder('SY/001', input, files)).toBe(true)
+  })
+
   it('Excel 预览使用 multipart 且未知结果重试复用同一幂等键', async () => {
     const fetchMock = vi.fn<typeof fetch>()
       .mockRejectedValueOnce(new TypeError('Failed to fetch'))
@@ -105,13 +154,26 @@ describe('采购扩展真实 Repository 契约', () => {
     expect(paymentUrl).toBe('/api/projects/SY-001/purchase-orders/9/supplier-payments')
     expect((paymentInit.headers as Record<string, string>)['Idempotency-Key']).toBeTruthy()
 
-    await repository.createSupplierInvoice('SY-001', 9, {
+    const invoiceFiles = [
+      new File(['front'], '进项发票.jpg', { type: 'image/jpeg' }),
+      new File(['pdf'], '进项发票.pdf', { type: 'application/pdf' }),
+    ]
+    const invoiceInput = {
       invoice_no: 'INV-001', invoiced_on: '2026-08-31', amount_cents: 10000,
       allocations: [{ purchase_order_line_id: 91, amount_cents: 10000 }], document_version_ids: [],
-    })
+    }
+    await repository.createSupplierInvoice('SY-001', 9, invoiceInput, invoiceFiles)
     const [invoiceUrl, invoiceInit] = lastRequest(fetchMock)
     expect(invoiceUrl).toBe('/api/projects/SY-001/purchase-orders/9/supplier-invoices')
     expect((invoiceInit.headers as Record<string, string>)['Idempotency-Key']).toBeTruthy()
+    const invoiceForm = invoiceInit.body as FormData
+    expect(invoiceForm.get('payload')).toBe(JSON.stringify(invoiceInput))
+    expect(invoiceForm.getAll('files')).toEqual(invoiceFiles)
+
+    await repository.createSupplierInvoice('SY-001', 9, invoiceInput)
+    const [, invoiceJsonInit] = lastRequest(fetchMock)
+    expect(invoiceJsonInit.headers).toMatchObject({ 'Content-Type': 'application/json' })
+    expect(JSON.parse(String(invoiceJsonInit.body))).toEqual(invoiceInput)
 
     const quote = await repository.createQuoteExport('SY-001', 11, {
       title: '客户报价单', customer_company_id: 8, notes: null,
@@ -119,12 +181,66 @@ describe('采购扩展真实 Repository 契约', () => {
     const [quoteUrl, quoteInit] = lastRequest(fetchMock)
     expect(quoteUrl).toBe('/api/projects/SY-001/procurement-lists/11/quote-exports')
     expect((quoteInit.headers as Record<string, string>)['Idempotency-Key']).toBeTruthy()
+    await repository.listQuoteExports?.('SY-001', { page: 2, page_size: 20 })
+    expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY-001/quote-exports?page=2&page_size=20')
     await repository.downloadQuoteExport('SY-001', quote.data.id)
     expect(lastRequest(fetchMock)[0]).toBe('/api/projects/SY-001/quote-exports/1/download')
+  })
+
+  it('清单复制草稿与付款、发票冲销使用独立幂等请求路径', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () => jsonResponse({ id: 1 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const repository = createHttpProcurementRepository()
+
+    await repository.copyProcurementListAsDraft('SY/001', 11, { expected_revision: 3 })
+    let [url, init] = lastRequest(fetchMock)
+    expect(url).toBe('/api/projects/SY%2F001/procurement-lists/11/copy-as-draft')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(String(init.body))).toEqual({ expected_revision: 3 })
+    expect((init.headers as Record<string, string>)['Idempotency-Key']).toMatch(/^[0-9a-f-]{36}$/i)
+
+    await repository.reverseSupplierPayment('SY/001', 21, {
+      reason: '重复付款', expected_revision: 4,
+    })
+    ;[url, init] = lastRequest(fetchMock)
+    expect(url).toBe('/api/projects/SY%2F001/supplier-payments/21/reverse')
+    expect(JSON.parse(String(init.body))).toEqual({ reason: '重复付款', expected_revision: 4 })
+    expect((init.headers as Record<string, string>)['Idempotency-Key']).toMatch(/^[0-9a-f-]{36}$/i)
+
+    await repository.reverseSupplierInvoice('SY/001', 31, {
+      reason: '发票作废', expected_revision: 2,
+    })
+    ;[url, init] = lastRequest(fetchMock)
+    expect(url).toBe('/api/projects/SY%2F001/supplier-invoices/31/reverse')
+    expect(JSON.parse(String(init.body))).toEqual({ reason: '发票作废', expected_revision: 2 })
+    expect((init.headers as Record<string, string>)['Idempotency-Key']).toMatch(/^[0-9a-f-]{36}$/i)
   })
 })
 
 describe('库存中心真实接口', () => {
+  it('手工调整冲销未知结果重试复用原 adjustment、DTO 和幂等键', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValueOnce(jsonResponse({ id: 8, status: 'reversed', revision: 2 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const repository = createHttpInventoryRepository()
+    const input = { reason: '盘盈录错', expected_revision: 1 }
+
+    await expect(repository.reverseInventoryAdjustment(8, input))
+      .rejects.toThrow('无法连接本地服务')
+    const [firstUrl, firstInit] = lastRequest(fetchMock)
+    const firstKey = (firstInit.headers as Record<string, string>)['Idempotency-Key']
+    expect(firstUrl).toBe('/api/inventory/adjustments/8/reverse')
+    expect(firstInit.method).toBe('POST')
+    expect(JSON.parse(String(firstInit.body))).toEqual(input)
+    expect(firstKey).toMatch(/^[0-9a-f-]{36}$/i)
+
+    await repository.reverseInventoryAdjustment(8, input)
+    const [, retryInit] = lastRequest(fetchMock)
+    expect(retryInit.body).toBe(firstInit.body)
+    expect((retryInit.headers as Record<string, string>)['Idempotency-Key']).toBe(firstKey)
+  })
+
   it('领用冲销未知结果重试复用同一 URL、DTO 和幂等键', async () => {
     const fetchMock = vi.fn<typeof fetch>()
       .mockRejectedValueOnce(new TypeError('Failed to fetch'))
@@ -294,6 +410,7 @@ describe('库存中心真实接口', () => {
     await wrapper.get('[data-testid="inventory-create-name"]').setValue('接线端子')
     await wrapper.get('[data-testid="inventory-create-quantity"]').setValue('2.500')
     await wrapper.get('[data-testid="inventory-create-price"]').setValue('35.67')
+    ;(wrapper.getComponent('[data-testid="inventory-create-unit"]') as VueWrapper<any>).vm.$emit('update:modelValue', '件')
     await wrapper.get('[data-testid="inventory-create-submit"]').trigger('click')
     await settle()
     const createCall = fetchMock.mock.calls.find(([url, init]) => String(url) === '/api/inventory/items' && init?.method === 'POST')!
@@ -311,8 +428,8 @@ describe('库存中心真实接口', () => {
     const updateCall = fetchMock.mock.calls.find(([url, init]) => String(url) === '/api/inventory/items/5' && init?.method === 'PUT')!
     expect(JSON.parse(String(updateCall[1]?.body))).toMatchObject({ model: 'MS1H2-A', expected_revision: 2 })
 
-    const rowActions = wrapper.getComponent('[data-testid="inventory-row-actions-5"]') as VueWrapper
-    rowActions.vm.$emit('command', 'adjust')
+    expect(wrapper.find('[data-testid="inventory-row-actions-5"]').exists()).toBe(false)
+    await wrapper.get('[data-testid="inventory-adjust-open-5"]').trigger('click')
     await settle()
     const adjustDialog = wrapper.get('[data-testid="inventory-adjust-dialog"]')
     await adjustDialog.findAll('input')[0]!.setValue('-0.500')
@@ -323,10 +440,12 @@ describe('库存中心真实接口', () => {
     expect(JSON.parse(String(adjustCall[1]?.body))).toMatchObject({ item_id: 5, quantity_delta: '-0.500', reason: '盘亏' })
     expect((adjustCall[1]?.headers as Record<string, string>)['Idempotency-Key']).toBeTruthy()
 
-    ;(wrapper.getComponent('[data-testid="inventory-row-actions-5"]') as VueWrapper).vm.$emit('command', 'issue')
+    await wrapper.get('[data-testid="inventory-issue-open-5"]').trigger('click')
     await settle()
-    await wrapper.get('[data-testid="inventory-issue-project"]').setValue('SY-001')
-    await wrapper.get('[data-testid="inventory-issue-quantity"]').setValue('1.000')
+    const projectSelect = wrapper.getComponent('[data-testid="inventory-issue-project"]') as VueWrapper
+    projectSelect.vm.$emit('update:modelValue', 'SY-001')
+    projectSelect.vm.$emit('change', 'SY-001')
+    await wrapper.get('[data-testid="inventory-issue-quantity-5"]').setValue('1.000')
     await wrapper.get('[data-testid="inventory-issue-submit"]').trigger('click')
     await settle()
     const issueCall = fetchMock.mock.calls.find(([url]) => String(url) === '/api/projects/SY-001/inventory-issues')!
@@ -421,6 +540,7 @@ describe('采购工作台扩展动作', () => {
       if (url.endsWith('/supplier-payments')) return jsonResponse({ id: 1 }, 201)
       if (url.endsWith('/supplier-invoices')) return jsonResponse({ id: 2 }, 201)
       if (url.endsWith('/cancel')) { orderStatus = 'cancelled'; return jsonResponse(order()) }
+      if (url.includes('/quote-exports?')) return jsonResponse({ items: [], total: 0, page: 1, page_size: 50 })
       if (url.endsWith('/quote-exports')) return jsonResponse({ id: 7, download_url: '/api/projects/SY-001/quote-exports/7/download' }, 201)
       if (url.endsWith('/quote-exports/7/download')) return new Response(new Blob(['quote']))
       return jsonResponse({ detail: `unexpected ${url}` }, 404)
@@ -430,11 +550,14 @@ describe('采购工作台扩展动作', () => {
     Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectUrl })
     Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
     vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
-    const wrapper = mountWithElementPlus(ProcurementWorkspace, { projectCode: 'SY-001' })
+    const wrapper = mountWithElementPlus(ProcurementWorkspace, {
+      projectCode: 'SY-001', customerCompany: { id: company.id, name: company.name },
+    })
     await settle()
 
     await wrapper.get('[data-testid="purchase-order-detail-open"]').trigger('click')
     await settle()
+    expect(wrapper.find('[data-testid="purchase-order-actions-menu"]').exists()).toBe(false)
     await wrapper.get('[data-testid="purchase-order-edit"]').trigger('click')
     await wrapper.get('[data-testid="purchase-order-edit-number"]').setValue('PO-002')
     await wrapper.get('[data-testid="purchase-order-edit-submit"]').trigger('click')

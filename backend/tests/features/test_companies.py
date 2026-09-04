@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import sqlite3
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ COMPANY_KEYS = {
     "bank_name",
     "bank_account",
     "notes",
+    "revision",
     "created_at",
     "updated_at",
 }
@@ -46,9 +48,11 @@ CONTACT_KEYS = {
     "email",
     "position",
     "notes",
+    "revision",
     "created_at",
     "updated_at",
 }
+IDEMPOTENCY_KEY = "00000000-0000-4000-8000-000000000001"
 
 
 @dataclass
@@ -240,6 +244,7 @@ def test_create_normalizes_company_fields_and_returns_empty_contacts(
         "bank_name": "测试银行",
         "bank_account": None,
         "notes": "重点客户",
+        "revision": 1,
         "created_at": NOW.isoformat(),
         "updated_at": NOW.isoformat(),
         "contacts": [],
@@ -296,6 +301,7 @@ def test_put_company_replaces_fields_but_preserves_contacts(
             "bank_name": None,
             "bank_account": None,
             "notes": " 新备注 ",
+            "expected_revision": company["revision"],
         }
 
         response = client.put(
@@ -329,6 +335,7 @@ def test_contact_put_replaces_fields_and_wrong_company_is_404(
             "email": " ",
             "position": " 总经理 ",
             "notes": None,
+            "expected_revision": contact["revision"],
         }
 
         wrong_company = client.put(
@@ -351,6 +358,7 @@ def test_contact_put_replaces_fields_and_wrong_company_is_404(
         "email": None,
         "position": "总经理",
         "notes": None,
+        "revision": 2,
         "created_at": NOW.isoformat(),
         "updated_at": harness.clock.value.isoformat(),
     }
@@ -362,15 +370,18 @@ def test_contact_delete_checks_ownership(harness: CompaniesHarness) -> None:
         other = _create_company(client, "乙公司")
         contact = _create_contact(client, company["id"])
 
-        wrong_company = client.delete(
-            f"/api/companies/{other['id']}/contacts/{contact['id']}"
+        wrong_company = client.request("DELETE",
+            f"/api/companies/{other['id']}/contacts/{contact['id']}",
+            json={"expected_revision": contact["revision"]},
         )
         still_present = client.get(f"/api/companies/{company['id']}")
-        deleted = client.delete(
-            f"/api/companies/{company['id']}/contacts/{contact['id']}"
+        deleted = client.request("DELETE",
+            f"/api/companies/{company['id']}/contacts/{contact['id']}",
+            json={"expected_revision": contact["revision"]},
         )
-        missing = client.delete(
-            f"/api/companies/{company['id']}/contacts/{contact['id']}"
+        missing = client.request("DELETE",
+            f"/api/companies/{company['id']}/contacts/{contact['id']}",
+            json={"expected_revision": contact["revision"]},
         )
 
     assert wrong_company.status_code == 404
@@ -386,7 +397,10 @@ def test_delete_company_cascades_contacts(harness: CompaniesHarness) -> None:
         company = _create_company(client)
         contact = _create_contact(client, company["id"])
 
-        deleted = client.delete(f"/api/companies/{company['id']}")
+        deleted = client.request("DELETE",
+            f"/api/companies/{company['id']}",
+            json={"expected_revision": company["revision"]},
+        )
 
     assert deleted.status_code == 204
     connection = connect_database(harness.database_path)
@@ -438,7 +452,10 @@ def test_delete_company_rejects_every_project_reference_without_changes(
         connection.close()
 
     with harness.client() as client:
-        response = client.delete(f"/api/companies/{company['id']}")
+        response = client.request("DELETE",
+            f"/api/companies/{company['id']}",
+            json={"expected_revision": company["revision"]},
+        )
         detail = client.get(f"/api/companies/{company['id']}")
 
     assert response.status_code == 409
@@ -457,7 +474,10 @@ def test_delete_company_maps_concurrent_project_reference_to_atomic_409(
     with harness.client() as client:
         company = _create_company(client)
         contact = _create_contact(client, company["id"])
-        response = client.delete(f"/api/companies/{company['id']}")
+        response = client.request("DELETE",
+            f"/api/companies/{company['id']}",
+            json={"expected_revision": company["revision"]},
+        )
         detail = client.get(f"/api/companies/{company['id']}")
 
     assert response.status_code == 409
@@ -483,7 +503,7 @@ def test_delete_company_maps_concurrent_project_reference_to_atomic_409(
         "delete_contact",
     ],
 )
-def test_writes_do_not_upgrade_a_stale_read_snapshot(
+def test_writes_acquire_immediate_transaction_before_mutation(
     tmp_path: Path,
     operation: str,
 ) -> None:
@@ -502,7 +522,10 @@ def test_writes_do_not_upgrade_a_stale_read_snapshot(
         if operation == "replace_company":
             response = client.put(
                 f"/api/companies/{company['id']}",
-                json=_company_payload("并发更新公司"),
+                json={
+                    **_company_payload("并发更新公司"),
+                    "expected_revision": company["revision"],
+                },
             )
             assert response.status_code == 200
             assert response.json()["name"] == "并发更新公司"
@@ -516,16 +539,25 @@ def test_writes_do_not_upgrade_a_stale_read_snapshot(
             contact = _create_contact(client, company["id"])
             path = f"/api/companies/{company['id']}/contacts/{contact['id']}"
             if operation == "replace_contact":
-                response = client.put(path, json=_contact_payload("并发更新联系人"))
+                response = client.put(
+                    path,
+                    json={
+                        **_contact_payload("并发更新联系人"),
+                        "expected_revision": contact["revision"],
+                    },
+                )
                 assert response.status_code == 200
                 assert response.json()["name"] == "并发更新联系人"
             else:
-                response = client.delete(path)
+                response = client.request("DELETE",
+                    path,
+                    json={"expected_revision": contact["revision"]},
+                )
                 assert response.status_code == 204
 
     connection = connect_database(harness.database_path)
     try:
-        assert connection.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 1
     finally:
         connection.close()
 
@@ -551,7 +583,10 @@ def test_put_rejects_duplicate_company_name_without_changing_either_company(
     with harness.client() as client:
         first = _create_company(client, "Acme")
         second = _create_company(client, "Beta")
-        replacement = _company_payload("aCmE")
+        replacement = {
+            **_company_payload("aCmE"),
+            "expected_revision": second["revision"],
+        }
 
         response = client.put(
             f"/api/companies/{second['id']}",
@@ -595,7 +630,12 @@ def test_company_writes_reject_invalid_payload_with_fixed_detail(
         target = (
             "/api/companies" if method == "post" else f"/api/companies/{company['id']}"
         )
-        response = client.request(method, target, json=payload)
+        request_payload = payload
+        if method == "put" and isinstance(payload, dict) and set(payload) == set(
+            _company_payload()
+        ):
+            request_payload = {**payload, "expected_revision": company["revision"]}
+        response = client.request(method, target, json=request_payload)
 
     assert response.status_code == 422
     assert response.json() == {"detail": "Invalid company payload"}
@@ -631,7 +671,12 @@ def test_contact_writes_reject_invalid_payload_with_fixed_detail(
             if method == "post"
             else f"/api/companies/{company['id']}/contacts/{contact['id']}"
         )
-        response = client.request(method, target, json=payload)
+        request_payload = payload
+        if method == "put" and isinstance(payload, dict) and set(payload) == set(
+            _contact_payload()
+        ):
+            request_payload = {**payload, "expected_revision": contact["revision"]}
+        response = client.request(method, target, json=request_payload)
 
     assert response.status_code == 422
     assert response.json() == {"detail": "Invalid contact payload"}
@@ -677,6 +722,10 @@ def test_text_fields_reject_values_sqlite_cannot_store_safely(
             payload = _contact_payload()
             detail = "Invalid contact payload"
         payload[field] = invalid_text
+        if method == "put":
+            payload["expected_revision"] = (
+                company["revision"] if resource == "company" else contact["revision"]
+            )
         response = client.request(
             method,
             path,
@@ -885,17 +934,25 @@ def test_missing_company_and_contact_resources_return_fixed_404(
 ) -> None:
     with harness.client() as client:
         company_get = client.get("/api/companies/999")
-        company_put = client.put("/api/companies/999", json=_company_payload())
-        company_delete = client.delete("/api/companies/999")
+        company_put = client.put(
+            "/api/companies/999",
+            json={**_company_payload(), "expected_revision": 1},
+        )
+        company_delete = client.request("DELETE",
+            "/api/companies/999", json={"expected_revision": 1}
+        )
         contact_post = client.post(
             "/api/companies/999/contacts",
             json=_contact_payload(),
         )
         contact_put = client.put(
             "/api/companies/999/contacts/999",
-            json=_contact_payload(),
+            json={**_contact_payload(), "expected_revision": 1},
         )
-        contact_delete = client.delete("/api/companies/999/contacts/999")
+        contact_delete = client.request("DELETE",
+            "/api/companies/999/contacts/999",
+            json={"expected_revision": 1},
+        )
 
     for response in (company_get, company_put, company_delete, contact_post):
         assert response.status_code == 404
@@ -1021,7 +1078,10 @@ def test_expected_integrity_conflicts_do_not_log_errors(
     finally:
         connection.close()
     with harness.client() as client:
-        referenced = client.delete(f"/api/companies/{company['id']}")
+        referenced = client.request("DELETE",
+            f"/api/companies/{company['id']}",
+            json={"expected_revision": company["revision"]},
+        )
 
     assert duplicate.status_code == 409
     assert missing_company.status_code == 404
@@ -1055,7 +1115,10 @@ def test_non_foreign_key_delete_integrity_error_logs_and_returns_fixed_500(
     caplog.set_level(logging.ERROR, logger=companies_module.__name__)
 
     with harness.client() as client:
-        response = client.delete(f"/api/companies/{company['id']}")
+        response = client.request("DELETE",
+            f"/api/companies/{company['id']}",
+            json={"expected_revision": company["revision"]},
+        )
 
     assert response.status_code == 500
     assert response.json() == {"detail": "Company operation failed"}
@@ -1103,7 +1166,10 @@ def test_project_reference_confirmation_failure_logs_the_confirmation_error(
     caplog.set_level(logging.ERROR, logger=companies_module.__name__)
 
     with harness.client() as client:
-        response = client.delete(f"/api/companies/{company['id']}")
+        response = client.request("DELETE",
+            f"/api/companies/{company['id']}",
+            json={"expected_revision": company["revision"]},
+        )
 
     assert response.status_code == 500
     assert response.json() == {"detail": "Company operation failed"}
@@ -1137,6 +1203,214 @@ def test_responses_do_not_disclose_secrets_or_paths(harness: CompaniesHarness) -
     assert "password_hash" not in serialized
     assert str(harness.database_path) not in serialized
     assert harness.settings.session_secret not in serialized
+
+
+def test_revision_migration_upgrades_existing_companies_and_contacts(
+    tmp_path: Path,
+) -> None:
+    staged_migrations = tmp_path / "migrations"
+    staged_migrations.mkdir()
+    migration_paths = sorted((PROJECT_ROOT / "backend" / "migrations").glob("*.sql"))
+    for migration_path in migration_paths:
+        if migration_path.name >= "015_write_safety.sql":
+            continue
+        shutil.copy2(migration_path, staged_migrations / migration_path.name)
+
+    database_path = tmp_path / "upgrade.sqlite3"
+    connection = connect_database(database_path)
+    try:
+        apply_migrations(connection, staged_migrations)
+        company_id = connection.execute(
+            """
+            INSERT INTO companies (name, created_at, updated_at)
+            VALUES ('升级前公司', ?, ?)
+            """,
+            (NOW.isoformat(), NOW.isoformat()),
+        ).lastrowid
+        assert company_id is not None
+        contact_id = connection.execute(
+            """
+            INSERT INTO contacts (company_id, name, created_at, updated_at)
+            VALUES (?, '升级前联系人', ?, ?)
+            """,
+            (company_id, NOW.isoformat(), NOW.isoformat()),
+        ).lastrowid
+        assert contact_id is not None
+
+        migration = PROJECT_ROOT / "backend" / "migrations" / "015_write_safety.sql"
+        shutil.copy2(migration, staged_migrations / migration.name)
+        assert apply_migrations(connection, staged_migrations) == ["015_write_safety"]
+
+        assert connection.execute(
+            "SELECT revision FROM companies WHERE id = ?", (company_id,)
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT revision FROM contacts WHERE id = ?", (contact_id,)
+        ).fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_company_create_idempotency_replays_same_response_and_rejects_new_body(
+    harness: CompaniesHarness,
+) -> None:
+    headers = {"Idempotency-Key": IDEMPOTENCY_KEY}
+    with harness.client() as client:
+        created = client.post(
+            "/api/companies", json=_company_payload("幂等公司"), headers=headers
+        )
+        replayed = client.post(
+            "/api/companies", json=_company_payload("幂等公司"), headers=headers
+        )
+        reused = client.post(
+            "/api/companies", json=_company_payload("另一个公司"), headers=headers
+        )
+        listed = client.get("/api/companies")
+
+    assert created.status_code == 201
+    assert created.json()["revision"] == 1
+    assert replayed.status_code == 201
+    assert replayed.json() == created.json()
+    assert reused.status_code == 409
+    assert reused.json() == {
+        "detail": "Idempotency key reused",
+        "error_code": "IDEMPOTENCY_KEY_REUSED",
+        "field_errors": {},
+        "current_revision": None,
+    }
+    assert [row["name"] for row in listed.json()] == ["幂等公司"]
+
+
+def test_contact_create_idempotency_replays_without_duplicate(
+    harness: CompaniesHarness,
+) -> None:
+    headers = {"Idempotency-Key": IDEMPOTENCY_KEY}
+    with harness.client() as client:
+        company = _create_company(client)
+        path = f"/api/companies/{company['id']}/contacts"
+        created = client.post(path, json=_contact_payload("幂等联系人"), headers=headers)
+        replayed = client.post(path, json=_contact_payload("幂等联系人"), headers=headers)
+        reused = client.post(path, json=_contact_payload("另一个联系人"), headers=headers)
+        detail = client.get(f"/api/companies/{company['id']}")
+
+    assert created.status_code == 201
+    assert created.json()["revision"] == 1
+    assert replayed.json() == created.json()
+    assert reused.status_code == 409
+    assert reused.json()["error_code"] == "IDEMPOTENCY_KEY_REUSED"
+    assert [row["name"] for row in detail.json()["contacts"]] == ["幂等联系人"]
+
+
+def test_company_update_rejects_stale_revision_without_overwriting(
+    harness: CompaniesHarness,
+) -> None:
+    with harness.client() as client:
+        company = _create_company(client)
+        first = client.put(
+            f"/api/companies/{company['id']}",
+            json={**_company_payload("第一页修改"), "expected_revision": 1},
+        )
+        stale = client.put(
+            f"/api/companies/{company['id']}",
+            json={**_company_payload("第二页旧表单"), "expected_revision": 1},
+        )
+        current = client.get(f"/api/companies/{company['id']}")
+
+    assert first.status_code == 200
+    assert first.json()["revision"] == 2
+    assert stale.status_code == 409
+    assert stale.json() == {
+        "detail": "Resource was modified",
+        "error_code": "REVISION_CONFLICT",
+        "field_errors": {},
+        "current_revision": 2,
+    }
+    assert stale.headers["X-Current-Revision"] == "2"
+    assert current.json()["name"] == "第一页修改"
+    assert current.json()["revision"] == 2
+
+
+def test_contact_update_rejects_stale_revision_without_overwriting(
+    harness: CompaniesHarness,
+) -> None:
+    with harness.client() as client:
+        company = _create_company(client)
+        contact = _create_contact(client, company["id"])
+        path = f"/api/companies/{company['id']}/contacts/{contact['id']}"
+        first = client.put(
+            path,
+            json={**_contact_payload("第一页修改"), "expected_revision": 1},
+        )
+        stale = client.put(
+            path,
+            json={**_contact_payload("第二页旧表单"), "expected_revision": 1},
+        )
+        current = client.get(f"/api/companies/{company['id']}")
+
+    assert first.status_code == 200
+    assert first.json()["revision"] == 2
+    assert stale.status_code == 409
+    assert stale.json()["error_code"] == "REVISION_CONFLICT"
+    assert stale.json()["current_revision"] == 2
+    assert current.json()["contacts"][0]["name"] == "第一页修改"
+
+
+@pytest.mark.parametrize("resource", ["company", "contact"])
+@pytest.mark.parametrize("operation", ["update", "delete"])
+def test_existing_writes_require_expected_revision_with_structured_422(
+    harness: CompaniesHarness,
+    resource: str,
+    operation: str,
+) -> None:
+    with harness.client() as client:
+        company = _create_company(client)
+        if resource == "company":
+            path = f"/api/companies/{company['id']}"
+            payload = _company_payload("无版本号公司") if operation == "update" else {}
+        else:
+            contact = _create_contact(client, company["id"])
+            path = f"/api/companies/{company['id']}/contacts/{contact['id']}"
+            payload = _contact_payload("无版本号联系人") if operation == "update" else {}
+        response = client.request(
+            "put" if operation == "update" else "delete",
+            path,
+            json=payload,
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "VALIDATION_ERROR"
+    assert response.json()["current_revision"] is None
+
+
+@pytest.mark.parametrize("resource", ["company", "contact"])
+def test_delete_rejects_stale_revision_and_preserves_resource(
+    harness: CompaniesHarness,
+    resource: str,
+) -> None:
+    with harness.client() as client:
+        company = _create_company(client)
+        if resource == "company":
+            path = f"/api/companies/{company['id']}"
+            client.put(
+                path,
+                json={**_company_payload("已更新公司"), "expected_revision": 1},
+            )
+            stale = client.request("delete", path, json={"expected_revision": 1})
+            current = client.get(path)
+        else:
+            contact = _create_contact(client, company["id"])
+            path = f"/api/companies/{company['id']}/contacts/{contact['id']}"
+            client.put(
+                path,
+                json={**_contact_payload("已更新联系人"), "expected_revision": 1},
+            )
+            stale = client.request("delete", path, json={"expected_revision": 1})
+            current = client.get(f"/api/companies/{company['id']}")
+
+    assert stale.status_code == 409
+    assert stale.json()["error_code"] == "REVISION_CONFLICT"
+    assert stale.json()["current_revision"] == 2
+    assert current.status_code == 200
 
 
 class _CommitFailingConnection:
@@ -1178,10 +1452,21 @@ class _ProjectRaceConnection:
 
     def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
         normalized_sql = " ".join(sql.split()).upper()
-        if not self._injected and normalized_sql.startswith(
-            "DELETE FROM COMPANIES WHERE ID = ?"
-        ):
-            company_id = cast(tuple[int], parameters)[0]
+        if not self._injected and normalized_sql == "BEGIN IMMEDIATE":
+            company = self._connection.execute(
+                """
+                SELECT companies.id
+                FROM companies
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM projects WHERE projects.company_id = companies.id
+                )
+                ORDER BY companies.id
+                LIMIT 1
+                """
+            ).fetchone()
+            if company is None:
+                return self._connection.execute(sql, parameters)
+            company_id = int(company["id"])
             competitor = connect_database(self._database_path)
             try:
                 project_code = f"RACE-{company_id}"
@@ -1221,22 +1506,15 @@ class _ConcurrentWriteConnection:
         self._database_path = database_path
         self._write_prefix = write_prefix
         self._injected = False
+        self._immediate_started = False
 
     def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
         normalized_sql = " ".join(sql.split()).upper()
+        if normalized_sql == "BEGIN IMMEDIATE":
+            self._immediate_started = True
         if not self._injected and normalized_sql.startswith(self._write_prefix):
-            competitor = connect_database(self._database_path)
-            try:
-                marker = f"并发公司-{id(self)}"
-                competitor.execute(
-                    """
-                    INSERT INTO companies (name, created_at, updated_at)
-                    VALUES (?, ?, ?)
-                    """,
-                    (marker, NOW.isoformat(), NOW.isoformat()),
-                )
-            finally:
-                competitor.close()
+            if not self._immediate_started:
+                raise AssertionError("write started before BEGIN IMMEDIATE")
             self._injected = True
         return self._connection.execute(sql, parameters)
 

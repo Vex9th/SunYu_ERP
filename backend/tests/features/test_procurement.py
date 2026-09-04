@@ -280,6 +280,205 @@ def test_procurement_list_draft_crud_confirmation_and_revision_conflict(
         assert immutable.json()["detail"] == "Procurement list is not editable"
 
 
+def test_confirmed_procurement_list_can_only_be_revised_by_copying_a_new_draft(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        confirmed = _create_confirmed_list(client, harness.project_code)
+        path = (
+            f"/api/projects/{harness.project_code}/procurement-lists/"
+            f"{confirmed['id']}/copy-as-draft"
+        )
+        payload = {"expected_revision": confirmed["revision"]}
+        headers = {"Idempotency-Key": "21000000-0000-4000-8000-000000000001"}
+
+        copied = client.post(path, headers=headers, json=payload)
+        replay = client.post(path, headers=headers, json=payload)
+        assert copied.status_code == replay.status_code == 201
+        assert replay.json() == copied.json()
+        assert copied.json()["id"] != confirmed["id"]
+        assert copied.json()["name"] == "第一版采购清单（修订草稿）"
+        assert copied.json()["status"] == "draft"
+        assert copied.json()["revision"] == 1
+        assert copied.json()["confirmed_at"] is None
+        assert copied.json()["line_count"] == confirmed["line_count"]
+        assert [line["id"] for line in copied.json()["lines"]] != [
+            line["id"] for line in confirmed["lines"]
+        ]
+        business_fields = {
+            "sequence_no",
+            "category",
+            "name",
+            "specification",
+            "brand",
+            "model",
+            "quantity",
+            "unit",
+            "unit_cost_cents",
+            "quoted_unit_price_cents",
+        }
+        assert {
+            key: copied.json()["lines"][0][key] for key in business_fields
+        } == {key: confirmed["lines"][0][key] for key in business_fields}
+
+        key_reuse = client.post(
+            path,
+            headers=headers,
+            json={"expected_revision": confirmed["revision"] + 1},
+        )
+        assert key_reuse.status_code == 409
+        assert key_reuse.json()["error_code"] == "IDEMPOTENCY_KEY_REUSED"
+
+        source = client.get(
+            f"/api/projects/{harness.project_code}/procurement-lists/{confirmed['id']}"
+        )
+        assert source.status_code == 200
+        assert source.json() == confirmed
+
+
+def test_copied_line_identity_change_unlinks_inventory_and_receipt_rechecks_stale_link(
+    tmp_path: Path,
+) -> None:
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        confirmed = _create_confirmed_list(client, harness.project_code)
+        source_line = confirmed["lines"][0]
+        connection = connect_database(harness.database_path)
+        try:
+            cursor = connection.execute(
+                """
+                INSERT INTO inventory_items
+                    (brand, name, model, specification, unit, notes,
+                     quantity_milli, inventory_value_cents, revision,
+                     create_idempotency_key, create_request_hash,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, NULL, 0, 0, 1, ?, ?, ?, ?)
+                """,
+                (
+                    source_line["brand"],
+                    source_line["name"],
+                    source_line["model"],
+                    source_line["specification"],
+                    source_line["unit"],
+                    "procurement-copy-link-source",
+                    "a" * 64,
+                    NOW.isoformat(),
+                    NOW.isoformat(),
+                ),
+            )
+            assert cursor.lastrowid is not None
+            old_inventory_item_id = int(cursor.lastrowid)
+            connection.execute(
+                "UPDATE procurement_lines SET inventory_item_id = ? WHERE id = ?",
+                (old_inventory_item_id, source_line["id"]),
+            )
+        finally:
+            connection.close()
+
+        copy_path = (
+            f"/api/projects/{harness.project_code}/procurement-lists/"
+            f"{confirmed['id']}/copy-as-draft"
+        )
+        copied = client.post(
+            copy_path,
+            headers={"Idempotency-Key": "22000000-0000-4000-8000-000000000001"},
+            json={"expected_revision": confirmed["revision"]},
+        )
+        assert copied.status_code == 201, copied.text
+        copied_line = copied.json()["lines"][0]
+        assert copied_line["inventory_item_id"] == old_inventory_item_id
+
+        changed_line = client.put(
+            f"/api/projects/{harness.project_code}/procurement-lists/"
+            f"{copied.json()['id']}/lines/{copied_line['id']}",
+            json={
+                **_line_payload(),
+                "name": "伺服驱动器",
+                "model": "ATV320",
+                "expected_revision": copied_line["revision"],
+            },
+        )
+        assert changed_line.status_code == 200, changed_line.text
+        assert changed_line.json()["inventory_item_id"] is None
+
+        confirmed_copy = client.post(
+            f"/api/projects/{harness.project_code}/procurement-lists/"
+            f"{copied.json()['id']}/confirm",
+            headers={"Idempotency-Key": "22000000-0000-4000-8000-000000000002"},
+            json={"expected_revision": changed_line.json()["list_revision"]},
+        )
+        assert confirmed_copy.status_code == 200, confirmed_copy.text
+        order = client.post(
+            f"/api/projects/{harness.project_code}/purchase-orders",
+            headers={"Idempotency-Key": "22000000-0000-4000-8000-000000000003"},
+            json={
+                "order_no": "PO-COPY-IDENTITY",
+                "supplier_company_id": harness.supplier_company_id,
+                "ordered_on": "2026-08-29",
+                "expected_delivery_on": None,
+                "lines": [{
+                    "procurement_line_id": changed_line.json()["id"],
+                    "quantity": "5.000",
+                    "unit_cost_cents": 1000,
+                    "overage_reason": None,
+                }],
+                "notes": None,
+                "document_version_ids": [],
+            },
+        )
+        assert order.status_code == 201, order.text
+        confirmed_order = client.post(
+            f"/api/projects/{harness.project_code}/purchase-orders/"
+            f"{order.json()['id']}/confirm",
+            headers={"Idempotency-Key": "22000000-0000-4000-8000-000000000004"},
+            json={"expected_revision": order.json()["revision"]},
+        )
+        assert confirmed_order.status_code == 200, confirmed_order.text
+
+        connection = connect_database(harness.database_path)
+        try:
+            connection.execute(
+                "UPDATE procurement_lines SET inventory_item_id = ? WHERE id = ?",
+                (old_inventory_item_id, changed_line.json()["id"]),
+            )
+        finally:
+            connection.close()
+
+        receipt = client.post(
+            f"/api/projects/{harness.project_code}/purchase-orders/"
+            f"{order.json()['id']}/goods-receipts",
+            headers={"Idempotency-Key": "22000000-0000-4000-8000-000000000005"},
+            json={
+                "received_on": "2026-08-29",
+                "warehouse_name": "本地仓库",
+                "lines": [{
+                    "purchase_order_line_id": order.json()["lines"][0]["id"],
+                    "quantity": "1.000",
+                }],
+                "notes": None,
+            },
+        )
+        assert receipt.status_code == 201, receipt.text
+        received_item_id = receipt.json()["lines"][0]["inventory_item_id"]
+        assert received_item_id != old_inventory_item_id
+
+    connection = connect_database(harness.database_path)
+    try:
+        linked_item = connection.execute(
+            "SELECT inventory_item_id FROM procurement_lines WHERE id = ?",
+            (changed_line.json()["id"],),
+        ).fetchone()
+        inventory_item = connection.execute(
+            "SELECT name, model FROM inventory_items WHERE id = ?",
+            (received_item_id,),
+        ).fetchone()
+        assert linked_item["inventory_item_id"] == received_item_id
+        assert dict(inventory_item) == {"name": "伺服驱动器", "model": "ATV320"}
+    finally:
+        connection.close()
+
+
 def test_purchase_order_confirmation_drives_order_status_and_overview(
     tmp_path: Path,
 ) -> None:

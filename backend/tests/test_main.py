@@ -105,6 +105,7 @@ def test_create_app_registers_first_business_vertical_slice_routes() -> None:
         "/api/projects/{project_code}/stages",
         "/api/projects/{project_code}/stages/{stage_code}",
         "/api/projects/{project_code}/stages/{stage_code}/transition",
+        "/api/projects/{project_code}/restore",
         "/api/procurement/import-template.xlsx",
         "/api/projects/{project_code}/procurement-lists",
         "/api/projects/{project_code}/purchase-orders",
@@ -149,6 +150,8 @@ def test_create_app_registers_first_business_vertical_slice_routes() -> None:
         "/api/projects/{project_code}/commissioning-sessions",
         "/api/projects/{project_code}/engineering-changes",
         "/api/projects/{project_code}/acceptances",
+        "/api/projects/{project_code}/acceptances/{acceptance_id}/reschedule",
+        "/api/projects/{project_code}/acceptances/{acceptance_id}/cancel",
         "/api/projects/{project_code}/warranty",
         "/api/projects/{project_code}/invoices",
         "/api/projects/{project_code}/after-sales",
@@ -187,6 +190,32 @@ def test_create_app_serves_release_home_assets_and_keeps_api_priority(
         "authenticated": False,
         "password_configured": False,
     }
+
+
+def test_release_frontend_routes_fall_back_to_index_without_hiding_missing_api_or_assets(
+    tmp_path: Path,
+) -> None:
+    release_root = tmp_path / "release"
+    frontend_dist = release_root / "frontend" / "dist"
+    _write_frontend_dist(frontend_dist)
+    application = main_module.create_app(
+        config_path=release_root / "config.json",
+        migrations_dir=PROJECT_MIGRATIONS_DIR,
+        frontend_dist=frontend_dist,
+    )
+
+    with TestClient(application) as client:
+        document_preview = client.get(
+            "/projects/SY-2026-001/documents/12?version=31",
+            headers={"Accept": "text/html"},
+        )
+        missing_api = client.get("/api/not-a-real-route")
+        missing_asset = client.get("/assets/not-found.js")
+
+    assert document_preview.status_code == 200
+    assert "SunYu ERP Release" in document_preview.text
+    assert missing_api.status_code == 404
+    assert missing_asset.status_code == 404
 
 
 def test_release_app_restart_preserves_config_database_and_login(
@@ -300,6 +329,15 @@ def test_lifespan_applies_migrations_and_closes_every_owned_connection(
         "011_procurement_audit",
         "012_delivery_events",
         "013_workforce_events",
+        "014_managed_document_filenames",
+        "015_write_safety",
+        "016_inventory_procurement_corrections",
+        "017_acceptance_corrections",
+        "018_project_restore_events",
+        "019_project_stage_event_safety",
+        "020_acceptance_reschedule_events",
+        "021_workforce_audit_history",
+        "022_supplier_invoice_active_number",
     }
 
 

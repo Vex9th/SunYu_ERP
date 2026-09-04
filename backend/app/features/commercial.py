@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, Request, status
 from backend.app.core.config import Settings
 from backend.app.core.database import transaction_immediate
 from backend.app.core.storage_paths import normalize_project_code, project_code_identity
+from backend.app.features import business_attachments
 from backend.app.features.api_common import (
     ApiError,
     ApiErrorRoute,
@@ -148,12 +149,50 @@ def create_commercial_router(
         request: Request,
         _: None = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
+        settings: Settings = settings_dependency,
     ) -> dict[str, object]:
-        payload = await _read_json(request, _QUOTE_FIELDS, "Invalid quote payload")
-        normalized = _normalize_quote(payload)
-        timestamp = _timestamp(now)
-        with transaction_immediate(connection):
-            project = _active_project(connection, _normalize_project_path(project_code))
+        multipart = business_attachments.is_multipart_request(request)
+        if multipart:
+            key = _read_idempotency_key(request)
+            payload, attachment_batch = await business_attachments.read_multipart_batch(
+                request,
+                data_dir=settings.data_dir,
+                max_file_size_bytes=settings.max_document_upload_mb * 1024 * 1024,
+                invalid=_quote_attachment_error,
+                too_large=_attachment_too_large,
+                batch_too_large=_attachment_batch_too_large,
+            )
+        else:
+            key = _read_optional_idempotency_key(request)
+            payload = await _read_json(request, _QUOTE_FIELDS, "Invalid quote payload")
+            attachment_batch = business_attachments.AttachmentBatch(
+                [], settings.data_dir
+            )
+        with attachment_batch, transaction_immediate(connection):
+            if set(payload) != _QUOTE_FIELDS:
+                raise _invalid_payload("Invalid quote payload")
+            normalized = _normalize_quote(payload)
+            timestamp = _timestamp(now)
+            request_hash = _request_hash(
+                attachment_batch.hash_payload(normalized)
+            )
+            project = _project(
+                connection, _normalize_project_path(project_code)
+            )
+            scope = (
+                f"POST:/api/projects/{project['project_code']}/quotes"
+            )
+            if key is not None:
+                restored = restore_idempotent_response(
+                    connection,
+                    scope=scope,
+                    key=key,
+                    request_hash=request_hash,
+                )
+                if restored is not None:
+                    return restored
+            if project["status"] != "active":
+                raise _business_conflict("Project is archived", "PROJECT_ARCHIVED")
             _validate_document_versions(
                 connection,
                 str(project["project_code"]),
@@ -163,20 +202,20 @@ def create_commercial_router(
             version_number = int(
                 connection.execute(
                     """
-                    SELECT COALESCE(MAX(version_number), 0) + 1
-                    FROM quotes WHERE project_id = ?
-                    """,
+                        SELECT COALESCE(MAX(version_number), 0) + 1
+                        FROM quotes WHERE project_id = ?
+                        """,
                     (project["id"],),
                 ).fetchone()[0]
             )
             cursor = connection.execute(
                 """
-                INSERT INTO quotes
-                    (project_id, version_number, status, quote_date,
-                     amount_cents, valid_until, notes, revision,
-                     created_at, updated_at)
-                VALUES (?, ?, 'draft', ?, ?, ?, ?, 1, ?, ?)
-                """,
+                    INSERT INTO quotes
+                        (project_id, version_number, status, quote_date,
+                         amount_cents, valid_until, notes, revision,
+                         created_at, updated_at)
+                    VALUES (?, ?, 'draft', ?, ?, ?, ?, 1, ?, ?)
+                    """,
                 (
                     project["id"],
                     version_number,
@@ -189,17 +228,65 @@ def create_commercial_router(
                 ),
             )
             quote_id = _last_insert_id(cursor)
+            uploaded_version_ids = attachment_batch.publish_documents(
+                connection,
+                project_code=str(project["project_code"]),
+                category="quotation",
+                documents=[
+                    business_attachments.ManagedDocument(
+                        title=(
+                            f"报价 V{version_number} 附件 {index:02d}"
+                            f"（报价记录 {quote_id}）"
+                        ),
+                        managed_filename=business_attachments.managed_filename(
+                            project["project_code"],
+                            "报价",
+                            business_attachments.compact_iso_date(
+                                str(normalized["quote_date"])
+                            ),
+                            f"V{version_number}",
+                            f"{index:02d}",
+                            original_filename=attachment.original_filename,
+                            preserve_last_parts=3,
+                        ),
+                    )
+                    for index, attachment in enumerate(
+                        attachment_batch.attachments, start=1
+                    )
+                ],
+                notes=normalized["notes"],
+                timestamp=timestamp,
+            )
+            document_version_ids = [
+                *normalized["document_version_ids"],
+                *uploaded_version_ids,
+            ]
             _replace_document_links(
                 connection,
                 "quote_document_versions",
                 "quote_id",
                 quote_id,
-                normalized["document_version_ids"],
+                document_version_ids,
             )
             row = _quote_row(connection, quote_id, int(project["id"]))
             if row is None:
                 raise sqlite3.DatabaseError("created quote is missing")
-            return _quote_response(connection, row, str(project["project_code"]))
+            response = _quote_response(
+                connection, row, str(project["project_code"])
+            )
+            if key is not None:
+                save_idempotent_response(
+                    connection,
+                    scope=scope,
+                    key=key,
+                    request_hash=request_hash,
+                    response=response,
+                    response_status=status.HTTP_201_CREATED,
+                    resource_type="quote",
+                    resource_id=quote_id,
+                    created_at=timestamp,
+                )
+            return response
 
     @router.get("/api/projects/{project_code}/quotes/{quote_id}")
     def get_quote(
@@ -396,19 +483,55 @@ def create_commercial_router(
         request: Request,
         _: None = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
+        settings: Settings = settings_dependency,
     ) -> dict[str, object]:
-        payload = await _read_json(
-            request,
-            _CONTRACT_FIELDS,
-            "Invalid contract payload",
-        )
-        normalized = _normalize_contract(payload)
-        timestamp = _timestamp(now)
+        multipart = business_attachments.is_multipart_request(request)
+        if multipart:
+            key = _read_idempotency_key(request)
+            payload, attachment_batch = await business_attachments.read_multipart_batch(
+                request,
+                data_dir=settings.data_dir,
+                max_file_size_bytes=settings.max_document_upload_mb * 1024 * 1024,
+                invalid=_contract_attachment_error,
+                too_large=_attachment_too_large,
+                batch_too_large=_attachment_batch_too_large,
+            )
+        else:
+            key = _read_optional_idempotency_key(request)
+            payload = await _read_json(
+                request,
+                _CONTRACT_FIELDS,
+                "Invalid contract payload",
+            )
+            attachment_batch = business_attachments.AttachmentBatch(
+                [], settings.data_dir
+            )
         try:
-            with transaction_immediate(connection):
-                project = _active_project(
+            with attachment_batch, transaction_immediate(connection):
+                if set(payload) != _CONTRACT_FIELDS:
+                    raise _invalid_payload("Invalid contract payload")
+                normalized = _normalize_contract(payload)
+                timestamp = _timestamp(now)
+                request_hash = _request_hash(
+                    attachment_batch.hash_payload(normalized)
+                )
+                project = _project(
                     connection, _normalize_project_path(project_code)
                 )
+                scope = f"POST:/api/projects/{project['project_code']}/contracts"
+                if key is not None:
+                    restored = restore_idempotent_response(
+                        connection,
+                        scope=scope,
+                        key=key,
+                        request_hash=request_hash,
+                    )
+                    if restored is not None:
+                        return restored
+                if project["status"] != "active":
+                    raise _business_conflict(
+                        "Project is archived", "PROJECT_ARCHIVED"
+                    )
                 _validate_company(
                     connection,
                     int(normalized["customer_company_id"]),
@@ -446,17 +569,60 @@ def create_commercial_router(
                 )
                 contract_id = _last_insert_id(cursor)
                 _replace_allocations(connection, contract_id, allocations)
+                uploaded_version_ids = attachment_batch.publish_documents(
+                    connection,
+                    project_code=str(project["project_code"]),
+                    category="contract",
+                    documents=[
+                        business_attachments.ManagedDocument(
+                            title=(
+                                f"合同 {normalized['contract_no']} 附件 {index:02d}"
+                                f"（合同记录 {contract_id}）"
+                            ),
+                            managed_filename=business_attachments.managed_filename(
+                                project["project_code"],
+                                "合同",
+                                normalized["contract_no"],
+                                f"{index:02d}",
+                                original_filename=attachment.original_filename,
+                                preserve_last_parts=2,
+                            ),
+                        )
+                        for index, attachment in enumerate(
+                            attachment_batch.attachments, start=1
+                        )
+                    ],
+                    notes=normalized["notes"],
+                    timestamp=timestamp,
+                )
+                document_version_ids = [
+                    *normalized["document_version_ids"],
+                    *uploaded_version_ids,
+                ]
                 _replace_document_links(
                     connection,
                     "contract_document_versions",
                     "contract_id",
                     contract_id,
-                    normalized["document_version_ids"],
+                    document_version_ids,
                 )
                 row = _contract_row(connection, contract_id, int(project["id"]))
                 if row is None:
                     raise sqlite3.DatabaseError("created contract is missing")
-                return _contract_response(connection, row)
+                response = _contract_response(connection, row)
+                if key is not None:
+                    save_idempotent_response(
+                        connection,
+                        scope=scope,
+                        key=key,
+                        request_hash=request_hash,
+                        response=response,
+                        response_status=status.HTTP_201_CREATED,
+                        resource_type="contract",
+                        resource_id=contract_id,
+                        created_at=timestamp,
+                    )
+                return response
         except sqlite3.IntegrityError as exc:
             if _is_unique_constraint(exc):
                 raise _business_conflict(
@@ -525,7 +691,8 @@ def create_commercial_router(
                     normalized["document_version_ids"],
                     "Invalid contract payload",
                 )
-                if row["status"] in _LOCKED_CONTRACT_STATUSES and (
+                contract_is_locked = row["status"] in _LOCKED_CONTRACT_STATUSES
+                if contract_is_locked and (
                     int(row["total_amount_cents"])
                     != normalized["total_amount_cents"]
                     or _allocation_amounts(
@@ -537,30 +704,54 @@ def create_commercial_router(
                         "Signed contract amount cannot be changed",
                         "CONTRACT_AMOUNT_LOCKED",
                     )
+                if contract_is_locked and _contract_formal_fields_changed(
+                    connection,
+                    row,
+                    normalized,
+                ):
+                    raise _business_conflict(
+                        "Formal contract fields cannot be changed in current status",
+                        "CONTRACT_FORMAL_FIELDS_LOCKED",
+                    )
                 if row["status"] in {"signed", "completed"}:
                     _require_signing_values(normalized, allocations)
-                cursor = connection.execute(
-                    """
-                    UPDATE contracts
-                    SET contract_no = ?, title = ?, customer_company_id = ?,
-                        signed_on = ?, total_amount_cents = ?,
-                        final_delivery_on = ?, notes = ?,
-                        revision = revision + 1, updated_at = ?
-                    WHERE id = ? AND revision = ?
-                    """,
-                    (
-                        normalized["contract_no"],
-                        normalized["title"],
-                        normalized["customer_company_id"],
-                        normalized["signed_on"],
-                        normalized["total_amount_cents"],
-                        normalized["final_delivery_on"],
-                        normalized["notes"],
-                        timestamp,
-                        identifier,
-                        expected_revision,
-                    ),
-                )
+                if contract_is_locked:
+                    cursor = connection.execute(
+                        """
+                        UPDATE contracts
+                        SET notes = ?, revision = revision + 1, updated_at = ?
+                        WHERE id = ? AND revision = ?
+                        """,
+                        (
+                            normalized["notes"],
+                            timestamp,
+                            identifier,
+                            expected_revision,
+                        ),
+                    )
+                else:
+                    cursor = connection.execute(
+                        """
+                        UPDATE contracts
+                        SET contract_no = ?, title = ?, customer_company_id = ?,
+                            signed_on = ?, total_amount_cents = ?,
+                            final_delivery_on = ?, notes = ?,
+                            revision = revision + 1, updated_at = ?
+                        WHERE id = ? AND revision = ?
+                        """,
+                        (
+                            normalized["contract_no"],
+                            normalized["title"],
+                            normalized["customer_company_id"],
+                            normalized["signed_on"],
+                            normalized["total_amount_cents"],
+                            normalized["final_delivery_on"],
+                            normalized["notes"],
+                            timestamp,
+                            identifier,
+                            expected_revision,
+                        ),
+                    )
                 if cursor.rowcount != 1:
                     current = _contract_row(
                         connection, identifier, int(project["id"])
@@ -568,15 +759,15 @@ def create_commercial_router(
                     if current is None:
                         raise _not_found("Contract not found")
                     raise _revision_conflict(int(current["revision"]))
-                if row["status"] not in _LOCKED_CONTRACT_STATUSES:
+                if not contract_is_locked:
                     _replace_allocations(connection, identifier, allocations)
-                _replace_document_links(
-                    connection,
-                    "contract_document_versions",
-                    "contract_id",
-                    identifier,
-                    normalized["document_version_ids"],
-                )
+                    _replace_document_links(
+                        connection,
+                        "contract_document_versions",
+                        "contract_id",
+                        identifier,
+                        normalized["document_version_ids"],
+                    )
                 updated = _contract_row(connection, identifier, int(project["id"]))
                 if updated is None:
                     raise sqlite3.DatabaseError("updated contract is missing")
@@ -775,13 +966,16 @@ def create_commercial_router(
             if restored is not None:
                 return restored
             project = _active_project(connection, _normalize_project_path(project_code))
-            allocation_id = normalized["contract_allocation_id"]
-            if allocation_id is not None:
-                _validate_receipt_allocation(
-                    connection,
-                    int(allocation_id),
-                    int(project["id"]),
-                )
+            allocation_id = _resolve_receipt_allocation(
+                connection,
+                normalized["contract_allocation_id"],
+                int(project["id"]),
+            )
+            _validate_receipt_allocation_capacity(
+                connection,
+                allocation_id,
+                int(normalized["amount_cents"]),
+            )
             cursor = connection.execute(
                 """
                 INSERT INTO receipts
@@ -1370,6 +1564,92 @@ def _validate_receipt_allocation(
         raise _invalid_payload("Invalid receipt payload")
 
 
+def _resolve_receipt_allocation(
+    connection: sqlite3.Connection,
+    requested_allocation_id: object,
+    project_id: int,
+) -> int:
+    if requested_allocation_id is not None:
+        allocation_id = int(requested_allocation_id)
+        _validate_receipt_allocation(connection, allocation_id, project_id)
+        return allocation_id
+
+    rows = connection.execute(
+        """
+        SELECT allocations.id
+        FROM contract_project_allocations AS allocations
+        JOIN contracts ON contracts.id = allocations.contract_id
+        WHERE allocations.project_id = ?
+          AND contracts.status IN ('signed', 'completed')
+        ORDER BY allocations.id
+        """,
+        (project_id,),
+    ).fetchall()
+    if len(rows) == 1:
+        return int(rows[0]["id"])
+    if not rows:
+        raise ApiError(
+            status.HTTP_409_CONFLICT,
+            "Receipt requires an effective contract",
+            "RECEIPT_CONTRACT_REQUIRED",
+            field_errors={
+                "contract_allocation_id": ["项目暂无已生效合同，不能登记到账"]
+            },
+            headers={"X-Error-Code": "RECEIPT_CONTRACT_REQUIRED"},
+        )
+    raise ApiError(
+        status.HTTP_409_CONFLICT,
+        "Receipt contract allocation is ambiguous",
+        "RECEIPT_CONTRACT_AMBIGUOUS",
+        field_errors={
+            "contract_allocation_id": ["项目存在多份已生效合同，必须明确选择本次到账归属"]
+        },
+        headers={"X-Error-Code": "RECEIPT_CONTRACT_AMBIGUOUS"},
+    )
+
+
+def _validate_receipt_allocation_capacity(
+    connection: sqlite3.Connection,
+    allocation_id: int,
+    amount_cents: int,
+) -> None:
+    row = connection.execute(
+        """
+        SELECT
+            allocations.amount_cents,
+            COALESCE(SUM(receipts.amount_cents), 0) AS received_amount_cents
+        FROM contract_project_allocations AS allocations
+        LEFT JOIN receipts
+            ON receipts.contract_allocation_id = allocations.id
+           AND receipts.status = 'active'
+        WHERE allocations.id = ?
+        GROUP BY allocations.id, allocations.amount_cents
+        """,
+        (allocation_id,),
+    ).fetchone()
+    if row is None:
+        raise sqlite3.DatabaseError("receipt allocation is missing")
+    remaining_cents = max(
+        int(row["amount_cents"]) - int(row["received_amount_cents"]),
+        0,
+    )
+    if amount_cents > remaining_cents:
+        raise ApiError(
+            status.HTTP_409_CONFLICT,
+            "本次到账超过所选合同分摊的剩余应收",
+            "RECEIPT_ALLOCATION_EXCEEDED",
+            field_errors={
+                "amount_cents": [
+                    (
+                        f"本次到账超过该合同在本项目的剩余应收 "
+                        f"{remaining_cents / 100:.2f} 元"
+                    )
+                ]
+            },
+            headers={"X-Error-Code": "RECEIPT_ALLOCATION_EXCEEDED"},
+        )
+
+
 def _contract_row(
     connection: sqlite3.Connection,
     contract_id: int,
@@ -1488,6 +1768,36 @@ def _allocation_amounts(
     }
 
 
+def _contract_formal_fields_changed(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    normalized: dict[str, object],
+) -> bool:
+    document_version_ids = normalized["document_version_ids"]
+    if not isinstance(document_version_ids, list):
+        raise sqlite3.DatabaseError("document identifiers are not normalized")
+    current_document_version_ids = {
+        int(item[0])
+        for item in connection.execute(
+            """
+            SELECT document_version_id
+            FROM contract_document_versions
+            WHERE contract_id = ?
+            """,
+            (row["id"],),
+        ).fetchall()
+    }
+    return (
+        row["contract_no"] != normalized["contract_no"]
+        or row["title"] != normalized["title"]
+        or int(row["customer_company_id"])
+        != normalized["customer_company_id"]
+        or row["signed_on"] != normalized["signed_on"]
+        or row["final_delivery_on"] != normalized["final_delivery_on"]
+        or current_document_version_ids != set(document_version_ids)
+    )
+
+
 def _require_signing_values(
     contract: dict[str, object],
     allocations: list[dict[str, object]],
@@ -1594,6 +1904,58 @@ def _read_idempotency_key(request: Request) -> str:
     if values[0].lower() != canonical:
         raise _invalid_payload("Invalid Idempotency-Key")
     return canonical
+
+
+def _read_optional_idempotency_key(request: Request) -> str | None:
+    values = request.headers.getlist("Idempotency-Key")
+    if not values:
+        return None
+    return _read_idempotency_key(request)
+
+
+def _quote_attachment_error(field: str, message: str) -> ApiError:
+    return ApiError(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "Invalid quote payload",
+        "VALIDATION_ERROR",
+        field_errors={field: [message]},
+    )
+
+
+def _contract_attachment_error(field: str, message: str) -> ApiError:
+    return ApiError(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "Invalid contract payload",
+        "VALIDATION_ERROR",
+        field_errors={field: [message]},
+    )
+
+
+def _attachment_too_large(max_size_bytes: int) -> ApiError:
+    return ApiError(
+        status.HTTP_413_CONTENT_TOO_LARGE,
+        "Document file is too large",
+        "DOCUMENT_FILE_TOO_LARGE",
+        field_errors={
+            "files": [f"must not exceed {max_size_bytes // (1024 * 1024)} MB"]
+        },
+    )
+
+
+def _attachment_batch_too_large(max_size_bytes: int) -> ApiError:
+    return ApiError(
+        status.HTTP_413_CONTENT_TOO_LARGE,
+        "Document attachment batch is too large",
+        "DOCUMENT_BATCH_TOO_LARGE",
+        field_errors={
+            "files": [
+                (
+                    "must contain at most 20 files whose combined size does not "
+                    f"exceed {max_size_bytes // (1024 * 1024)} MB"
+                )
+            ]
+        },
+    )
 
 
 def _request_hash(payload: object) -> str:

@@ -143,7 +143,7 @@ def create_site_operations_router(
             ).fetchall()
             return _paged(
                 [
-                    _report_response(row, str(project["project_code"]))
+                    _report_response(connection, row, str(project["project_code"]))
                     for row in rows
                 ],
                 total,
@@ -221,7 +221,7 @@ def create_site_operations_router(
                     ),
                 )
                 row = _report_row(connection, int(row["id"]), int(project["id"]))
-        return _report_response(row, str(project["project_code"]))
+        return _report_response(connection, row, str(project["project_code"]))
 
     @router.post("/api/projects/{project_code}/site-daily-reports/{work_date}/confirm")
     async def confirm_report(
@@ -548,6 +548,90 @@ def create_site_operations_router(
             )
         return response
 
+    @router.post(
+        "/api/projects/{project_code}/material-advances/{advance_id}"
+        "/reimbursements/{reimbursement_id}/void"
+    )
+    async def void_reimbursement(
+        project_code: str,
+        advance_id: str,
+        reimbursement_id: str,
+        request: Request,
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        payload = await _json_object(
+            request,
+            ("reason", "expected_revision"),
+            "INVALID_REIMBURSEMENT_VOID",
+        )
+        reason = _required_text(
+            payload["reason"], "reason", "INVALID_REIMBURSEMENT_VOID"
+        )
+        expected = _positive_integer(
+            payload["expected_revision"],
+            "expected_revision",
+            "INVALID_REIMBURSEMENT_VOID",
+        )
+        parsed_advance_id = _identifier(advance_id)
+        parsed_reimbursement_id = _identifier(reimbursement_id)
+        key = _idempotency_key(request)
+        normalized = {"reason": reason, "expected_revision": expected}
+        request_hash = _payload_hash(normalized)
+        timestamp = _timestamp(now)
+        with transaction_immediate(connection):
+            project = _project(connection, project_code)
+            scope = (
+                f"POST:/api/projects/{project['id']}/material-advances/"
+                f"{parsed_advance_id}/reimbursements/{parsed_reimbursement_id}/void"
+            )
+            restored = _restore_idempotency(connection, scope, key, request_hash)
+            if restored is not None:
+                return restored
+            if project["status"] != "active":
+                raise _conflict("Project is archived", "PROJECT_ARCHIVED")
+            _advance_row(connection, int(project["id"]), parsed_advance_id)
+            reimbursement = _reimbursement_row(
+                connection, parsed_advance_id, parsed_reimbursement_id
+            )
+            _require_revision(reimbursement, expected)
+            if reimbursement["status"] != "active":
+                raise _conflict(
+                    "Voided reimbursement cannot be changed",
+                    "REIMBURSEMENT_VOIDED",
+                )
+            connection.execute(
+                """
+                UPDATE advance_reimbursements
+                SET status = 'voided', void_reason = ?, voided_at = ?,
+                    revision = revision + 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (reason, timestamp, timestamp, parsed_reimbursement_id),
+            )
+            connection.execute(
+                """
+                UPDATE material_advances
+                SET revision = revision + 1, updated_at = ? WHERE id = ?
+                """,
+                (timestamp, parsed_advance_id),
+            )
+            response = _reimbursement_response(
+                connection, parsed_reimbursement_id, parsed_advance_id
+            )
+            _save_idempotency(
+                connection,
+                scope,
+                key,
+                request_hash,
+                response,
+                parsed_reimbursement_id,
+                timestamp,
+                response_status=200,
+                resource_type="advance_reimbursement_void",
+            )
+            return response
+
     @router.post("/api/projects/{project_code}/material-advances/{advance_id}/void")
     async def void_advance(
         project_code: str,
@@ -647,6 +731,24 @@ def _transition_report(
             raise _conflict(
                 "Daily report has an invalid status", "INVALID_REPORT_STATUS"
             )
+        if action == "confirm":
+            if confirmed_at is None:
+                raise sqlite3.DatabaseError("confirmation timestamp is required")
+            report_version_id = _create_report_version(
+                connection,
+                row,
+                confirmed_at=confirmed_at,
+                created_at=timestamp,
+            )
+        else:
+            report_version_id = _latest_report_version_id(
+                connection, int(project["id"]), int(row["id"])
+            )
+            if report_version_id is None:
+                raise _conflict(
+                    "Confirmed report has no immutable version",
+                    "REPORT_VERSION_MISSING",
+                )
         connection.execute(
             """
             UPDATE site_daily_reports
@@ -659,8 +761,8 @@ def _transition_report(
             """
             INSERT INTO site_daily_report_events
                 (project_id, report_id, from_status, to_status, reason,
-                 occurred_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 occurred_at, created_at, report_version_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 project["id"],
@@ -670,10 +772,13 @@ def _transition_report(
                 reason,
                 confirmed_at or timestamp,
                 timestamp,
+                report_version_id,
             ),
         )
         row = _report_row(connection, int(row["id"]), int(project["id"]))
-        response = _report_response(row, str(project["project_code"]))
+        response = _report_response(
+            connection, row, str(project["project_code"])
+        )
         _save_idempotency(
             connection,
             scope,
@@ -815,10 +920,29 @@ def _validate_advance_references(
     payload: dict[str, object],
 ) -> None:
     worker = connection.execute(
-        "SELECT id FROM workers WHERE id = ?", (payload["worker_id"],)
+        """
+        SELECT w.id FROM workers w
+        JOIN crew_assignments assignment ON assignment.worker_id = w.id
+        WHERE w.id = ? AND w.status = 'active'
+          AND assignment.project_id = ?
+          AND assignment.status IN ('planned', 'active')
+          AND assignment.scheduled_start_on <= ?
+          AND COALESCE(assignment.scheduled_end_on, '9999-12-31') >= ?
+        LIMIT 1
+        """,
+        (
+            payload["worker_id"],
+            project["id"],
+            payload["spent_on"],
+            payload["spent_on"],
+        ),
     ).fetchone()
     if worker is None:
-        raise _invalid("INVALID_ADVANCE_PAYLOAD", "worker_id", "does not exist")
+        raise _invalid(
+            "INVALID_ADVANCE_PAYLOAD",
+            "worker_id",
+            "must have an active assignment for spent_on",
+        )
     document_ids = payload["document_version_ids"]
     if not document_ids:
         return
@@ -923,8 +1047,86 @@ def _advance_row(
     return row
 
 
-def _report_response(row: sqlite3.Row, project_code: str) -> dict[str, object]:
-    return {
+def _reimbursement_row(
+    connection: sqlite3.Connection, advance_id: int, reimbursement_id: int
+) -> sqlite3.Row:
+    row = connection.execute(
+        "SELECT * FROM advance_reimbursements WHERE id = ? AND advance_id = ?",
+        (reimbursement_id, advance_id),
+    ).fetchone()
+    if row is None:
+        raise _not_found("Reimbursement not found", "REIMBURSEMENT_NOT_FOUND")
+    return row
+
+
+def _create_report_version(
+    connection: sqlite3.Connection,
+    report: sqlite3.Row,
+    *,
+    confirmed_at: str,
+    created_at: str,
+) -> int:
+    version_ordinal = connection.execute(
+        """
+        SELECT
+            COALESCE((
+                SELECT MAX(version_number)
+                FROM site_daily_report_versions
+                WHERE report_id = ?
+            ), 0),
+            (
+                SELECT COUNT(*)
+                FROM site_daily_report_events
+                WHERE report_id = ? AND to_status = 'confirmed'
+            )
+        """,
+        (report["id"], report["id"]),
+    ).fetchone()
+    version_number = max(int(version_ordinal[0]), int(version_ordinal[1])) + 1
+    cursor = connection.execute(
+        """
+        INSERT INTO site_daily_report_versions
+            (project_id, report_id, version_number, work_date, location,
+             weather, work_summary, blockers, next_plan, notes, confirmed_at,
+             created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            report["project_id"],
+            report["id"],
+            version_number,
+            report["work_date"],
+            report["location"],
+            report["weather"],
+            report["work_summary"],
+            report["blockers"],
+            report["next_plan"],
+            report["notes"],
+            confirmed_at,
+            created_at,
+        ),
+    )
+    return _last_id(cursor)
+
+
+def _latest_report_version_id(
+    connection: sqlite3.Connection, project_id: int, report_id: int
+) -> int | None:
+    row = connection.execute(
+        """
+        SELECT id FROM site_daily_report_versions
+        WHERE project_id = ? AND report_id = ?
+        ORDER BY version_number DESC LIMIT 1
+        """,
+        (project_id, report_id),
+    ).fetchone()
+    return None if row is None else int(row["id"])
+
+
+def _report_response(
+    connection: sqlite3.Connection, row: sqlite3.Row, project_code: str
+) -> dict[str, object]:
+    response: dict[str, object] = {
         "id": row["id"],
         "project_code": project_code,
         "work_date": row["work_date"],
@@ -940,6 +1142,29 @@ def _report_response(row: sqlite3.Row, project_code: str) -> dict[str, object]:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+    versions = connection.execute(
+        """
+        SELECT id, version_number, work_date, location, weather, work_summary,
+               blockers, next_plan, notes, confirmed_at, created_at
+        FROM site_daily_report_versions
+        WHERE project_id = ? AND report_id = ?
+        ORDER BY version_number DESC
+        """,
+        (row["project_id"], row["id"]),
+    ).fetchall()
+    events = connection.execute(
+        """
+        SELECT id, from_status, to_status, reason, occurred_at, created_at,
+               report_version_id
+        FROM site_daily_report_events
+        WHERE project_id = ? AND report_id = ?
+        ORDER BY id
+        """,
+        (row["project_id"], row["id"]),
+    ).fetchall()
+    response["versions"] = [dict(version) for version in versions]
+    response["events"] = [dict(event) for event in events]
+    return response
 
 
 def _advance_summary(
@@ -1010,6 +1235,8 @@ def _advance_detail(
             "payment_method": item["payment_method"],
             "notes": item["notes"],
             "status": item["status"],
+            "void_reason": item["void_reason"],
+            "voided_at": item["voided_at"],
             "revision": item["revision"],
             "created_at": item["created_at"],
             "updated_at": item["updated_at"],
@@ -1044,8 +1271,13 @@ def _reimbursement_response(
         "payment_method": reimbursement["payment_method"],
         "notes": reimbursement["notes"],
         "status": reimbursement["status"],
+        "void_reason": reimbursement["void_reason"],
+        "voided_at": reimbursement["voided_at"],
         "revision": reimbursement["revision"],
         "advance_status": _advance_status(advance),
+        "advance_reimbursed_amount_cents": advance["reimbursed_amount_cents"],
+        "advance_outstanding_amount_cents": int(advance["total_amount_cents"])
+        - int(advance["reimbursed_amount_cents"]),
         "advance_revision": advance["revision"],
         "created_at": reimbursement["created_at"],
         "updated_at": reimbursement["updated_at"],

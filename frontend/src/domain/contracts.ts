@@ -96,6 +96,7 @@ export interface DashboardDocumentSummary {
 export interface DocumentVersion {
   id: number
   version_number: number
+  managed_filename?: string
   original_filename: string
   content_type: string
   size_bytes: number
@@ -243,6 +244,19 @@ export interface DashboardTodo {
   description: string | null
 }
 
+export type ProjectCompletionBlockerCode =
+  | 'PROJECT_STAGES_INCOMPLETE'
+  | 'FINAL_ACCEPTANCE_NOT_PASSED'
+  | 'RECEIVABLES_OUTSTANDING'
+
+export interface ProjectCompletionCheck {
+  stages_ready: boolean
+  final_acceptance_ready: boolean
+  receivables_ready: boolean
+  ready: boolean
+  blockers: ProjectCompletionBlockerCode[]
+}
+
 export interface ProjectDashboard {
   project: ProjectDetail
   company: CompanyRecord
@@ -257,6 +271,7 @@ export interface ProjectDashboard {
   profit: ProjectProfitSummary
   receivables: PaymentOverview
   todos: DashboardTodo[]
+  completion_check: ProjectCompletionCheck
 }
 
 export interface DashboardProjectRow {

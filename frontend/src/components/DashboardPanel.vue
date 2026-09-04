@@ -1,6 +1,9 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, reactive, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, inject, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
+import { routeLocationKey, routerKey } from 'vue-router'
 
+import { subscribeProtectedSessionExpired } from '../api'
+import { formatChineseDateTime } from '../domain/dates'
 import type { BackupSettingsPayload, SystemOverview } from '../types'
 import CompanyCenter from './CompanyCenter.vue'
 import HomeWorkbench from './HomeWorkbench.vue'
@@ -36,10 +39,49 @@ type WorkspacePage =
   | 'inventory'
   | 'system'
 
+const route = inject(routeLocationKey, null)
+const router = inject(routerKey, null)
 const selectedPage = ref<WorkspacePage>('overview')
 const dashboardProjectCode = ref<string | null>(null)
 
 const workspacePages: WorkspacePage[] = ['overview', 'projects', 'companies', 'inventory', 'system']
+const workspaceRouteNames: Record<WorkspacePage, string> = {
+  overview: 'home',
+  projects: 'projects',
+  companies: 'companies',
+  inventory: 'inventory',
+  system: 'settings',
+}
+const routeNameToWorkspacePage: Record<string, WorkspacePage> = {
+  home: 'overview',
+  projects: 'projects',
+  companies: 'companies',
+  inventory: 'inventory',
+  settings: 'system',
+}
+
+function routedProjectCode(): string | null {
+  const projectCode = route?.params.projectCode
+  return typeof projectCode === 'string' ? projectCode : null
+}
+
+watch(
+  () => route?.fullPath,
+  () => {
+    const projectCode = routedProjectCode()
+    if (projectCode) {
+      selectedPage.value = 'projects'
+      dashboardProjectCode.value = projectCode
+      return
+    }
+    dashboardProjectCode.value = null
+    const routeName = route?.name
+    selectedPage.value = typeof routeName === 'string'
+      ? (routeNameToWorkspacePage[routeName] ?? 'overview')
+      : 'overview'
+  },
+  { immediate: true },
+)
 
 const backupForm = reactive({
   enabled: false,
@@ -48,23 +90,52 @@ const backupForm = reactive({
   retentionDays: 30,
 })
 const validationError = ref<string | null>(null)
+let backupFormBaseline: BackupSettingsPayload | null = null
+
+function backupFormMatches(settings: BackupSettingsPayload): boolean {
+  return backupForm.enabled === settings.enabled
+    && backupForm.directory.trim() === (settings.directory ?? '')
+    && backupForm.intervalHours === settings.interval_hours
+    && backupForm.retentionDays === settings.retention_days
+}
 
 watch(
   () => props.overview?.backup,
   (backup) => {
     if (!backup) return
+    const hasUnsavedDraft = backupFormBaseline !== null && !backupFormMatches(backupFormBaseline)
+    if (hasUnsavedDraft && !backupFormMatches(backup)) return
     backupForm.enabled = backup.enabled
     backupForm.directory = backup.directory ?? ''
     backupForm.intervalHours = backup.interval_hours
     backupForm.retentionDays = backup.retention_days
+    backupFormBaseline = {
+      enabled: backup.enabled,
+      directory: backup.directory,
+      interval_hours: backup.interval_hours,
+      retention_days: backup.retention_days,
+    }
   },
   { immediate: true },
 )
 
 const backupStatus = computed(() => (props.overview?.backup.enabled ? '已启用' : '已关闭'))
+const backupFormDirty = computed(() => {
+  const backup = props.overview?.backup
+  if (!backup) return false
+  return !backupFormMatches(backup)
+})
+const schedulerSummary = computed(() => {
+  if (!props.overview) return '自动备份调度状态未知'
+  return props.overview.scheduler.alive ? '自动备份调度运行中' : '自动备份调度已停止'
+})
+const schedulerSummaryType = computed(() => {
+  if (!props.overview) return 'info'
+  return props.overview.scheduler.alive ? 'success' : 'warning'
+})
 const lastRunTime = computed(() => {
   const run = props.overview?.backup.last_run
-  return run ? (run.finished_at ?? run.started_at) : '尚未执行'
+  return run ? formatChineseDateTime(run.finished_at ?? run.started_at) : '尚未执行'
 })
 const lastRunStatus = computed(() => {
   const status = props.overview?.backup.last_run?.status
@@ -103,7 +174,8 @@ function saveBackup(): void {
     return
   }
   emit('saveBackup', {
-    directory: backupForm.enabled ? directory : null,
+    enabled: backupForm.enabled,
+    directory: directory || null,
     interval_hours: backupForm.intervalHours,
     retention_days: backupForm.retentionDays,
   })
@@ -111,8 +183,11 @@ function saveBackup(): void {
 
 function selectPage(index: string): void {
   if (!workspacePages.includes(index as WorkspacePage)) return
-  selectedPage.value = index as WorkspacePage
+  const page = index as WorkspacePage
+  selectedPage.value = page
   dashboardProjectCode.value = null
+  const routeName = workspaceRouteNames[page]
+  if (route?.name !== routeName) void router?.push({ name: routeName })
 }
 
 function navigate(page: 'projects' | 'companies' | 'system'): void {
@@ -122,7 +197,36 @@ function navigate(page: 'projects' | 'companies' | 'system'): void {
 function openProjectDashboard(projectCode: string): void {
   selectedPage.value = 'projects'
   dashboardProjectCode.value = projectCode
+  void router?.push({ name: 'project', params: { projectCode } })
 }
+
+function closeProjectDashboard(): void {
+  const projectCode = dashboardProjectCode.value
+  selectedPage.value = 'projects'
+  dashboardProjectCode.value = null
+  if (routedProjectCode()) void router?.push({ name: 'projects' })
+  void nextTick(() => {
+    const targetTestId = projectCode ? `project-dashboard-${projectCode}` : null
+    const target = targetTestId
+      ? Array.from(document.querySelectorAll<HTMLElement>('[data-testid]'))
+          .find((element) => element.dataset.testid === targetTestId)
+      : null
+    const fallback = document.querySelector<HTMLElement>('[data-testid="nav-projects"]')
+    ;(target ?? fallback)?.focus()
+  })
+}
+
+let sessionExpiryForwarded = false
+function forwardSessionExpired(message: string): void {
+  if (sessionExpiryForwarded) return
+  sessionExpiryForwarded = true
+  emit('session-expired', message)
+}
+
+const stopSessionExpiryObserver = subscribeProtectedSessionExpired((notice) => {
+  forwardSessionExpired(notice.message)
+})
+onBeforeUnmount(stopSessionExpiryObserver)
 </script>
 
 <template>
@@ -151,19 +255,12 @@ function openProjectDashboard(projectCode: string): void {
         <el-menu-item data-testid="nav-system" index="system">设置</el-menu-item>
       </el-menu>
 
-      <div class="aside-status">
-        <span class="status-dot" :class="{ 'status-dot--warning': !overview?.scheduler.alive }" />
-        <div>
-          <strong>{{ overview?.scheduler.alive ? '本地服务正常' : '系统状态待检查' }}</strong>
-          <small>数据保存在当前主机</small>
-        </div>
-      </div>
     </el-aside>
 
     <el-container class="workspace-main">
       <el-header class="workspace-topbar">
-        <el-tag :type="overview?.scheduler.alive ? 'success' : 'warning'" effect="plain">
-          {{ overview?.scheduler.alive ? '本地服务正常' : '系统状态待检查' }}
+        <el-tag data-testid="scheduler-summary" :type="schedulerSummaryType" effect="plain">
+          {{ schedulerSummary }}
         </el-tag>
         <el-button
           data-testid="logout"
@@ -187,25 +284,24 @@ function openProjectDashboard(projectCode: string): void {
         />
         <HomeWorkbench
           v-if="selectedPage === 'overview' && !dashboardProjectCode"
-          @navigate="navigate"
           @open-project="openProjectDashboard"
-          @session-expired="emit('session-expired', $event)"
+          @session-expired="forwardSessionExpired"
         />
         <ProjectDashboard
           v-if="dashboardProjectCode"
           :project-code="dashboardProjectCode"
-          @back="dashboardProjectCode = null"
-          @session-expired="emit('session-expired', $event)"
+          @back="closeProjectDashboard"
+          @session-expired="forwardSessionExpired"
         />
         <ProjectCenter
           v-if="selectedPage === 'projects'"
           v-show="!dashboardProjectCode"
           @open-dashboard="openProjectDashboard"
-          @session-expired="emit('session-expired', $event)"
+          @session-expired="forwardSessionExpired"
         />
         <CompanyCenter
           v-if="selectedPage === 'companies'"
-          @session-expired="emit('session-expired', $event)"
+          @session-expired="forwardSessionExpired"
         />
         <InventoryCenter
           v-if="InventoryCenter && selectedPage === 'inventory'"
@@ -229,10 +325,10 @@ function openProjectDashboard(projectCode: string): void {
               type="primary"
               size="large"
               :loading="backupBusy"
-              :disabled="backupBusy || saveBusy || !overview.backup.enabled"
+              :disabled="backupBusy || saveBusy || backupFormDirty || !overview.backup.directory"
               @click="emit('backupNow')"
             >
-              立即备份
+              按已保存设置立即备份
             </el-button>
           </section>
           <el-alert
@@ -247,6 +343,13 @@ function openProjectDashboard(projectCode: string): void {
             v-if="successNotice"
             :title="successNotice"
             type="success"
+            show-icon
+            :closable="false"
+          />
+          <el-alert
+            v-if="backupFormDirty"
+            title="请先保存当前修改，再执行手动备份"
+            type="warning"
             show-icon
             :closable="false"
           />
@@ -296,7 +399,7 @@ function openProjectDashboard(projectCode: string): void {
                     </el-tag>
                   </el-descriptions-item>
                   <el-descriptions-item label="最近调度错误时间">
-                    {{ overview.scheduler.last_error_at ?? '无' }}
+                    {{ overview.scheduler.last_error_at ? formatChineseDateTime(overview.scheduler.last_error_at) : '无' }}
                   </el-descriptions-item>
                   <el-descriptions-item label="最近调度错误码">
                     {{ overview.scheduler.last_error_code ?? '无' }}
@@ -308,12 +411,7 @@ function openProjectDashboard(projectCode: string): void {
             <el-col :xs="24" :lg="12">
               <el-card shadow="never">
                 <template #header>
-                  <el-row justify="space-between" align="middle">
-                    <el-text tag="strong">备份状态</el-text>
-                    <el-tag :type="overview.backup.enabled ? 'success' : 'info'">
-                      {{ overview.backup.enabled ? '策略有效' : '尚未启用' }}
-                    </el-tag>
-                  </el-row>
+                  <el-text tag="strong">备份状态</el-text>
                 </template>
                 <el-descriptions :column="1" border>
                   <el-descriptions-item label="自动备份">
@@ -377,7 +475,7 @@ function openProjectDashboard(projectCode: string): void {
                 <el-switch
                   data-testid="backup-enabled"
                   v-model="backupForm.enabled"
-                  :disabled="saveBusy"
+                  :disabled="saveBusy || backupBusy"
                   aria-label="启用自动备份"
                 />
               </el-form-item>
@@ -386,7 +484,7 @@ function openProjectDashboard(projectCode: string): void {
                   data-testid="backup-directory"
                   v-model="backupForm.directory"
                   placeholder="例如 D:\SynologyDrive\SunYu ERP Backups"
-                  :disabled="!backupForm.enabled || saveBusy"
+                  :disabled="saveBusy || backupBusy"
                   aria-label="本机备份目录"
                 />
               </el-form-item>
@@ -401,7 +499,7 @@ function openProjectDashboard(projectCode: string): void {
                       :step="1"
                       step-strictly
                       controls-position="right"
-                      :disabled="saveBusy"
+                      :disabled="saveBusy || backupBusy"
                       aria-label="自动备份间隔小时数"
                     />
                   </el-form-item>
@@ -416,7 +514,7 @@ function openProjectDashboard(projectCode: string): void {
                       :step="1"
                       step-strictly
                       controls-position="right"
-                      :disabled="saveBusy"
+                      :disabled="saveBusy || backupBusy"
                       aria-label="备份保留天数"
                     />
                   </el-form-item>
