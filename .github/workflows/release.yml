@@ -241,5 +241,5 @@ jobs:
           gh release create "${{ github.ref_name }}"
           "SunYu_ERP-windows-x64.zip"
           --verify-tag
-          --generate-notes
-          --title "SunYu ERP ${{ github.ref_name }}"
+          --notes-file README.md
+          --title "${{ github.ref_name }}"
