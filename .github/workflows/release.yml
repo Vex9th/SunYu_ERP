@@ -51,7 +51,10 @@ jobs:
 
       - name: Test frontend
         working-directory: frontend
-        run: npm test
+        # Windows 上并行挂载多个完整 jsdom 工作区会争抢资源，串行执行文件。
+        run: |
+          node -e "const os = require('node:os'); console.log({ node: process.version, platform: process.platform, workers: 1, cpus: os.availableParallelism(), memoryGiB: Math.round(os.totalmem() / 1024 ** 3) })"
+          npm test -- --maxWorkers=1
 
       - name: Type-check frontend
         working-directory: frontend
