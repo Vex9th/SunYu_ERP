@@ -1,0 +1,45 @@
+.workspace { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.header, .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.header h3, .toolbar h5 { margin: 0 0 4px !important; }
+.toolbar { margin-bottom: 18px; align-items: flex-end; }
+.secondary { font-size: 13px; color: #596579; line-height: 1.6; overflow-wrap: anywhere; }
+.materialLink { padding: 0 !important; font-weight: 600; height: auto; white-space: normal; text-align: left; }
+.number { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.number small { font-weight: 400; color: #596579; }
+.filters { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+.filterField { display: flex; flex-direction: column; gap: 6px; }
+.filterField > span:first-child { font-size: 13px; color: #596579; }
+.filterField :global(.ant-select) { min-width: 130px; }
+.filterField :global(.ant-input-affix-wrapper) { width: 260px; }
+.filterTags { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 0 0 16px; }
+.filterTags :global(.ant-tag) { margin: 0; }
+.formGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
+.issueRow { display: grid; grid-template-columns: minmax(180px, 1fr) 165px 32px; align-items: start; gap: 12px; padding: 12px; background: #f8f9fc; border: 1px solid #e1e6ee; border-radius: 6px; }
+.issueRow > button { margin-top: 29px; }
+.issueRow :global(.ant-form-item) { margin-bottom: 6px; }
+.formSection { margin: 0 0 22px; }
+.formSection h5 { margin: 0 0 6px !important; }
+.formSection > p { color: #596579; margin: 0 0 16px; font-size: 13px; line-height: 1.6; }
+.detailSummary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; padding: 18px; background: #f8f9fc; border-radius: 6px; }
+.detailSummary > div { display: flex; flex-direction: column; gap: 7px; }
+.detailSummary span { color: #596579; font-size: 13px; }
+.detailSummary strong { font-size: 20px; font-variant-numeric: tabular-nums; }
+.detailSummary small { font-weight: 400; font-size: 13px; }
+.detailActions { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
+.sectionHeading { border-top: 1px solid #e1e6ee; padding-top: 18px; margin-top: 10px; }
+.sectionHeading h5 { margin: 0 0 6px !important; }
+@media (max-width: 1050px) { .toolbar { align-items: flex-start; flex-direction: column; } }
+@media (max-width: 760px) {
+  .header { align-items: flex-start; flex-direction: column; }
+  .formGrid { grid-template-columns: 1fr; }
+  .issueRow { grid-template-columns: minmax(140px, 1fr) 120px 32px; }
+  .detailSummary { gap: 12px; padding: 12px; }
+  .detailSummary strong { font-size: 16px; }
+}
+@media (max-width: 520px) {
+  .filters, .filterField, .filterField :global(.ant-input-affix-wrapper) { width: 100%; }
+  .issueRow { grid-template-columns: 1fr 32px; }
+  .issueRow > :first-child { grid-column: 1 / -1; }
+  .issueRow > button { margin-top: 29px; }
+  .detailSummary { grid-template-columns: 1fr; }
+}

@@ -21,7 +21,10 @@
 
 ## 开发
 
-Vue 3 + TypeScript + Element Plus，Python 3.13 + FastAPI，SQLite。
+React + TypeScript（strict）+ Ant Design + Vite，Python 3.13 + FastAPI，SQLite。
+开发环境使用 Node.js 22.12+（或 24+），沿用 npm 与锁文件。
 安装 `requirements-dev.txt` 和 `frontend/package-lock.json` 对应依赖后，运行 `python dev.py`。
+
+前端结构、验证命令和迁移说明见 [frontend/README.md](frontend/README.md)。
 
 [MIT License](LICENSE)

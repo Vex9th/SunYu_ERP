@@ -1,4 +1,4 @@
-import { createRetriablePostSender, requestJson, withQuery } from '../api'
+import { ApiError, createRetriablePostSender, requestJson, withQuery } from '../api'
 import type { PagedResult } from '../domain/contracts'
 import type {
   CrewAssignmentDto,
@@ -333,6 +333,39 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
   private advances = new Map<number, MaterialAdvanceDetailDto>()
   private activeProjectKey: string | null = null
   private previewLoadVersion = 0
+  private pendingOperations = new Map<string, {
+    signature: string
+    prepare: Promise<() => Promise<unknown>>
+  }>()
+
+  // 固定第一次提交的时间和版本号；刷新或跨日后重试仍沿用原始请求。
+  private async sendStableOperation<T>(
+    path: string,
+    intent: unknown,
+    prepare: () => (() => Promise<T>) | Promise<() => Promise<T>>,
+  ): Promise<T> {
+    const signature = JSON.stringify(intent)
+    let pending = this.pendingOperations.get(path)
+    if (pending && pending.signature !== signature) {
+      throw new Error('上一笔请求结果未知，只能原样重试或先确认原操作结果')
+    }
+    if (!pending) {
+      pending = { signature, prepare: Promise.resolve().then(prepare) }
+      this.pendingOperations.set(path, pending)
+    }
+    const active = pending
+    const clear = () => { if (this.pendingOperations.get(path) === active) this.pendingOperations.delete(path) }
+    let send: () => Promise<unknown>
+    try { send = await active.prepare } catch (error) { clear(); throw error }
+    try {
+      const result = await send()
+      clear()
+      return result as T
+    } catch (error) {
+      if (error instanceof ApiError && error.status >= 400 && error.status < 500 && ![408, 425, 429].includes(error.status)) clear()
+      throw error
+    }
+  }
 
   async getWorkforcePreview(projectCode: string): Promise<RepositoryResult<WorkforceDemoViewModel>> {
     const loadVersion = ++this.previewLoadVersion
@@ -445,7 +478,7 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
   ): ReturnType<WorkforceRepository['saveLaborEntriesBatch']> {
     this.requireProjectContext(projectCode)
     const contextVersion = this.previewLoadVersion
-    const response = await this.api.saveLaborEntriesBatch(projectCode, {
+    const payload = {
       work_date: input.work_date,
       entries: input.entries.map((entry) => {
         const workerId = this.assignments.get(entry.assignment_id)?.worker_id
@@ -456,7 +489,11 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
             : this.laborByWorkerDate.get(laborKey(input.work_date, workerId))?.revision ?? null,
         }
       }),
-    })
+    }
+    const response = await this.sendStableOperation(
+      `${projectPath(projectCode)}/labor-entries/batch`, input,
+      () => () => this.api.saveLaborEntriesBatch(projectCode, payload),
+    )
     if (this.hasProjectContext(projectCode, contextVersion)) {
       for (const item of response.data.items) {
         this.cacheLabor(item)
@@ -478,14 +515,13 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
   }
 
   async setWorkerStatus(workerId: number, status: WorkerStatus): Promise<void> {
-    const current = (await this.api.getWorker(workerId)).data
-    const response = status === 'active'
-      ? await this.api.reactivateWorker(workerId, { expected_revision: current.revision })
-      : await this.api.deactivateWorker(workerId, {
-        effective_on: localBusinessDate(),
-        reason: '从施工人员页停用',
-        expected_revision: current.revision,
-      })
+    const response = await this.sendStableOperation(`${workerPath(workerId)}/status`, status, async () => {
+      const current = (await this.api.getWorker(workerId)).data
+      const payload = { effective_on: localBusinessDate(), reason: '从施工人员页停用', expected_revision: current.revision }
+      return () => status === 'active'
+        ? this.api.reactivateWorker(workerId, { expected_revision: current.revision })
+        : this.api.deactivateWorker(workerId, payload)
+    })
     this.workers.set(workerId, response.data)
   }
 
@@ -526,12 +562,16 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     const contextVersion = this.previewLoadVersion
     const current = this.assignments.get(assignmentId)
     if (!current) throw new Error('项目排单不存在，请刷新后重试')
-    const response = await this.api.transitionCrewAssignment(projectCode, assignmentId, {
+    const payload = {
       to_status: status,
       effective_at: new Date().toISOString(),
       reason,
       expected_revision: current.revision,
-    })
+    }
+    const response = await this.sendStableOperation(
+      `${assignmentCollectionPath(projectCode)}/${assignmentId}/transition`, { status, reason },
+      () => () => this.api.transitionCrewAssignment(projectCode, assignmentId, payload),
+    )
     if (this.hasProjectContext(projectCode, contextVersion)) this.assignments.set(assignmentId, response.data)
   }
 
@@ -556,10 +596,14 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     const contextVersion = this.previewLoadVersion
     const current = this.laborById.get(entryId)
     if (!current) throw new Error('上工记录不存在，请刷新后重试')
-    const response = await this.api.voidLaborEntry(projectCode, entryId, {
+    const payload = {
       reason,
       expected_revision: current.revision,
-    })
+    }
+    const response = await this.sendStableOperation(
+      `${projectPath(projectCode)}/labor-entries/${entryId}/void`, { reason },
+      () => () => this.api.voidLaborEntry(projectCode, entryId, payload),
+    )
     if (this.hasProjectContext(projectCode, contextVersion)) this.cacheLabor(response.data)
   }
 
@@ -579,9 +623,10 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     const contextVersion = this.previewLoadVersion
     const current = this.reports.get(workDate)
     if (!current) throw new Error('施工日报不存在，请刷新后重试')
-    const data = await this.postSender.send<SiteDailyReportDto>(
-      `${projectPath(projectCode)}/site-daily-reports/${workDate}/confirm`,
-      { confirmed_at: new Date().toISOString(), expected_revision: current.revision },
+    const path = `${projectPath(projectCode)}/site-daily-reports/${workDate}/confirm`
+    const payload = { confirmed_at: new Date().toISOString(), expected_revision: current.revision }
+    const data = await this.sendStableOperation(path, null,
+      () => () => this.postSender.send<SiteDailyReportDto>(path, payload),
     )
     if (this.hasProjectContext(projectCode, contextVersion)) this.reports.set(workDate, data)
   }
@@ -591,9 +636,10 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     const contextVersion = this.previewLoadVersion
     const current = this.reports.get(workDate)
     if (!current) throw new Error('施工日报不存在，请刷新后重试')
-    const data = await this.postSender.send<SiteDailyReportDto>(
-      `${projectPath(projectCode)}/site-daily-reports/${workDate}/reopen`,
-      { reason, expected_revision: current.revision },
+    const path = `${projectPath(projectCode)}/site-daily-reports/${workDate}/reopen`
+    const payload = { reason, expected_revision: current.revision }
+    const data = await this.sendStableOperation(path, { reason },
+      () => () => this.postSender.send<SiteDailyReportDto>(path, payload),
     )
     if (this.hasProjectContext(projectCode, contextVersion)) this.reports.set(workDate, data)
   }
@@ -628,9 +674,10 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     const contextVersion = this.previewLoadVersion
     const current = this.advances.get(advanceId)
     if (!current) throw new Error('垫资记录不存在，请刷新后重试')
-    const data = await this.postSender.send<MaterialAdvanceDetailDto>(
-      `${projectPath(projectCode)}/material-advances/${advanceId}/void`,
-      { reason, expected_revision: current.revision },
+    const path = `${projectPath(projectCode)}/material-advances/${advanceId}/void`
+    const payload = { reason, expected_revision: current.revision }
+    const data = await this.sendStableOperation(path, { reason },
+      () => () => this.postSender.send<MaterialAdvanceDetailDto>(path, payload),
     )
     if (this.hasProjectContext(projectCode, contextVersion)) this.advances.set(advanceId, data)
   }
@@ -664,9 +711,10 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     const current = this.advances.get(advanceId)
     const reimbursement = current?.reimbursements.find((item) => item.id === reimbursementId)
     if (!current || !reimbursement) throw new Error('报销记录不存在，请刷新后重试')
-    const data = await this.postSender.send<MaterialAdvanceReimbursementResponseDto>(
-      `${projectPath(projectCode)}/material-advances/${advanceId}/reimbursements/${reimbursementId}/void`,
-      { reason, expected_revision: reimbursement.revision },
+    const path = `${projectPath(projectCode)}/material-advances/${advanceId}/reimbursements/${reimbursementId}/void`
+    const payload = { reason, expected_revision: reimbursement.revision }
+    const data = await this.sendStableOperation(path, { reason },
+      () => () => this.postSender.send<MaterialAdvanceReimbursementResponseDto>(path, payload),
     )
     if (this.hasProjectContext(projectCode, contextVersion)) this.cacheReimbursement(current, data)
   }

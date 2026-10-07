@@ -1,4 +1,5 @@
 import {
+  ApiError,
   createRetriableMultipartPostSender,
   createRetriablePostSender,
   requestJson,
@@ -141,6 +142,38 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
   private previewLoadVersion = 0
   private contextGeneration = 0
   private activeContextGeneration = 0
+  private pendingOperations = new Map<string, {
+    signature: string
+    files: readonly File[]
+    send: () => Promise<unknown>
+    inFlight?: Promise<unknown>
+  }>()
+
+  // 版本、业务日期和附件上传键固定于第一次发送，未知结果只允许重试原意图。
+  private sendStableOperation<T>(path: string, intent: unknown, send: () => Promise<T>, files: readonly File[] = []): Promise<T> {
+    const signature = JSON.stringify(intent)
+    let pending = this.pendingOperations.get(path)
+    if (pending && (pending.signature !== signature || pending.files.length !== files.length
+      || pending.files.some((file, index) => file !== files[index]))) {
+      return Promise.reject(new Error('上一笔请求结果未知，只能原样重试或先确认原操作结果'))
+    }
+    if (!pending) {
+      pending = { signature, files: [...files], send }
+      this.pendingOperations.set(path, pending)
+    }
+    if (pending.inFlight) return pending.inFlight as Promise<T>
+    const active = pending
+    const clear = () => { if (this.pendingOperations.get(path) === active) this.pendingOperations.delete(path) }
+    active.inFlight = Promise.resolve().then(active.send).then(result => {
+      clear()
+      return result
+    }, error => {
+      active.inFlight = undefined
+      if (error instanceof ApiError && error.status >= 400 && error.status < 500 && ![408, 425, 429].includes(error.status)) clear()
+      throw error
+    })
+    return active.inFlight as Promise<T>
+  }
 
   async getDeliveryPreview(projectCode: string): Promise<RepositoryResult<DeliveryDemoViewModel>> {
     const loadVersion = ++this.previewLoadVersion
@@ -222,13 +255,14 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
     const current = this.signoffs.get(discipline)
     const path = `${projectPath(projectCode)}/drawing-signoffs/${discipline}`
     const payload = { ...input, expected_revision: current?.revision ?? null }
-    const data = files.length > 0
-      ? await requestJson<DrawingSignoffDto>(path, {
+    const uploadKey = files.length > 0 ? crypto.randomUUID() : null
+    const data = await this.sendStableOperation(path, input, () => files.length > 0
+      ? requestJson<DrawingSignoffDto>(path, {
         method: 'PUT',
-        headers: { 'Idempotency-Key': crypto.randomUUID() },
+        headers: { 'Idempotency-Key': uploadKey! },
         body: businessAttachmentForm(payload, files),
       })
-      : await requestJson<DrawingSignoffDto>(path, { method: 'PUT', body: payload })
+      : requestJson<DrawingSignoffDto>(path, { method: 'PUT', body: payload }), files)
     if (this.hasProjectContext(projectCode, contextGeneration)) this.signoffs.set(discipline, data)
   }
 
@@ -257,9 +291,11 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
   async updateCommissioningSession(projectCode: string, sessionId: number, input: CommissioningSessionInput): Promise<void> {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = requireCached(this.commissioning, sessionId, '调试记录')
-    const data = await requestJson<CommissioningDto>(`${projectPath(projectCode)}/commissioning-sessions/${sessionId}`, {
-      method: 'PUT', body: { ...normalizeCommissioning(input), expected_revision: current.revision },
-    })
+    const path = `${projectPath(projectCode)}/commissioning-sessions/${sessionId}`
+    const payload = { ...normalizeCommissioning(input), expected_revision: current.revision }
+    const data = await this.sendStableOperation(path, input, () => requestJson<CommissioningDto>(path, {
+      method: 'PUT', body: payload,
+    }))
     if (this.hasProjectContext(projectCode, contextGeneration)) this.commissioning.set(data.id, data)
   }
 
@@ -286,21 +322,25 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
   async updateEngineeringChange(projectCode: string, changeId: number, input: EngineeringChangeInput): Promise<void> {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = requireCached(this.changes, changeId, '工程变更')
-    const data = await requestJson<ChangeDto>(`${projectPath(projectCode)}/engineering-changes/${changeId}`, {
-      method: 'PUT', body: { ...input, expected_revision: current.revision },
-    })
+    const path = `${projectPath(projectCode)}/engineering-changes/${changeId}`
+    const payload = { ...input, expected_revision: current.revision }
+    const data = await this.sendStableOperation(path, input, () => requestJson<ChangeDto>(path, {
+      method: 'PUT', body: payload,
+    }))
     if (this.hasProjectContext(projectCode, contextGeneration)) this.changes.set(data.id, data)
   }
 
   async setEngineeringChangeStatus(projectCode: string, changeId: number, status: EngineeringChangeStatus, reason = ''): Promise<void> {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = requireCached(this.changes, changeId, '工程变更')
-    const data = await this.postSender.send<ChangeDto>(`${projectPath(projectCode)}/engineering-changes/${changeId}/transition`, {
+    const path = `${projectPath(projectCode)}/engineering-changes/${changeId}/transition`
+    const payload = {
       to_status: status,
       effective_on: localBusinessDate(),
       reason: reason.trim() || '从项目交付页更新状态',
       expected_revision: current.revision,
-    })
+    }
+    const data = await this.sendStableOperation(path, { status, reason }, () => this.postSender.send<ChangeDto>(path, payload))
     if (this.hasProjectContext(projectCode, contextGeneration)) this.changes.set(data.id, data)
   }
 
@@ -317,20 +357,24 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
   async rescheduleAcceptance(projectCode: string, acceptanceId: number, input: AcceptanceInput, reason: string): Promise<void> {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = requireCached(this.acceptances, acceptanceId, '验收记录')
-    const data = await this.postSender.send<AcceptanceDto>(`${projectPath(projectCode)}/acceptances/${acceptanceId}/reschedule`, {
+    const path = `${projectPath(projectCode)}/acceptances/${acceptanceId}/reschedule`
+    const payload = {
       ...input, reason: reason.trim(), expected_revision: current.revision,
-    })
+    }
+    const data = await this.sendStableOperation(path, { input, reason }, () => this.postSender.send<AcceptanceDto>(path, payload))
     if (this.hasProjectContext(projectCode, contextGeneration)) this.acceptances.set(data.id, data)
   }
 
   async cancelAcceptance(projectCode: string, acceptanceId: number, reason: string): Promise<void> {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = requireCached(this.acceptances, acceptanceId, '验收记录')
-    const data = await this.postSender.send<AcceptanceDto>(`${projectPath(projectCode)}/acceptances/${acceptanceId}/cancel`, {
+    const path = `${projectPath(projectCode)}/acceptances/${acceptanceId}/cancel`
+    const payload = {
       cancelled_on: localBusinessDate(),
       reason: reason.trim(),
       expected_revision: current.revision,
-    })
+    }
+    const data = await this.sendStableOperation(path, { reason }, () => this.postSender.send<AcceptanceDto>(path, payload))
     if (this.hasProjectContext(projectCode, contextGeneration)) this.acceptances.set(data.id, data)
   }
 
@@ -349,9 +393,9 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
       warranty: passedFinal ? input.warranty : null,
       expected_revision: current.revision,
     }
-    const data = files.length > 0
-      ? await this.multipartPostSender.send<{ acceptance: AcceptanceDto; warranty: WarrantyDto | null }>(path, payload, files)
-      : await this.postSender.send<{ acceptance: AcceptanceDto; warranty: WarrantyDto | null }>(path, payload)
+    const data = await this.sendStableOperation(path, input, () => files.length > 0
+      ? this.multipartPostSender.send<{ acceptance: AcceptanceDto; warranty: WarrantyDto | null }>(path, payload, files)
+      : this.postSender.send<{ acceptance: AcceptanceDto; warranty: WarrantyDto | null }>(path, payload), files)
     if (this.hasProjectContext(projectCode, contextGeneration)) {
       this.acceptances.set(data.acceptance.id, data.acceptance)
       this.warranty = data.warranty
@@ -360,9 +404,11 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
 
   async updateWarranty(projectCode: string, input: NullableWarrantyInput): Promise<void> {
     const contextGeneration = this.requireProjectContext(projectCode)
-    const data = await requestJson<WarrantyDto>(`${projectPath(projectCode)}/warranty`, {
-      method: 'PUT', body: { ...input, expected_revision: this.warranty?.revision ?? null },
-    })
+    const path = `${projectPath(projectCode)}/warranty`
+    const payload = { ...input, expected_revision: this.warranty?.revision ?? null }
+    const data = await this.sendStableOperation(path, input, () => requestJson<WarrantyDto>(path, {
+      method: 'PUT', body: payload,
+    }))
     if (this.hasProjectContext(projectCode, contextGeneration)) this.warranty = data
   }
 
@@ -378,9 +424,11 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
   async updateInvoice(projectCode: string, invoiceId: number, input: InvoiceInput): Promise<void> {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = requireCached(this.invoices, invoiceId, '发票记录')
-    const data = await requestJson<InvoiceDto>(`${projectPath(projectCode)}/invoices/${invoiceId}`, {
-      method: 'PUT', body: { ...input, expected_revision: current.revision },
-    })
+    const path = `${projectPath(projectCode)}/invoices/${invoiceId}`
+    const payload = { ...input, expected_revision: current.revision }
+    const data = await this.sendStableOperation(path, input, () => requestJson<InvoiceDto>(path, {
+      method: 'PUT', body: payload,
+    }))
     if (this.hasProjectContext(projectCode, contextGeneration)) this.invoices.set(data.id, data)
   }
 
@@ -394,9 +442,11 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
   async voidInvoice(projectCode: string, invoiceId: number, reason: string): Promise<void> {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = requireCached(this.invoices, invoiceId, '发票记录')
-    const data = await this.postSender.send<InvoiceDto>(`${projectPath(projectCode)}/invoices/${invoiceId}/void`, {
+    const path = `${projectPath(projectCode)}/invoices/${invoiceId}/void`
+    const payload = {
       reason: reason.trim(), expected_revision: current.revision,
-    })
+    }
+    const data = await this.sendStableOperation(path, { reason }, () => this.postSender.send<InvoiceDto>(path, payload))
     if (this.hasProjectContext(projectCode, contextGeneration)) this.invoices.set(data.id, data)
   }
 
@@ -413,22 +463,26 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
   async updateAfterSalesCase(projectCode: string, caseId: number, input: AfterSalesInput): Promise<void> {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = requireCached(this.afterSales, caseId, '售后记录')
-    const data = await requestJson<AfterSalesDto>(`${projectPath(projectCode)}/after-sales/${caseId}`, {
-      method: 'PUT', body: { ...input, expected_revision: current.revision },
-    })
+    const path = `${projectPath(projectCode)}/after-sales/${caseId}`
+    const payload = { ...input, expected_revision: current.revision }
+    const data = await this.sendStableOperation(path, input, () => requestJson<AfterSalesDto>(path, {
+      method: 'PUT', body: payload,
+    }))
     if (this.hasProjectContext(projectCode, contextGeneration)) this.afterSales.set(data.id, data)
   }
 
   async setAfterSalesStatus(projectCode: string, caseId: number, status: AfterSalesStatus, resolution: string | null): Promise<void> {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = requireCached(this.afterSales, caseId, '售后记录')
-    const data = await this.postSender.send<AfterSalesDto>(`${projectPath(projectCode)}/after-sales/${caseId}/transition`, {
+    const path = `${projectPath(projectCode)}/after-sales/${caseId}/transition`
+    const payload = {
       to_status: status,
       effective_at: new Date().toISOString(),
       resolution,
       reason: status === 'cancelled' ? resolution?.trim() : null,
       expected_revision: current.revision,
-    })
+    }
+    const data = await this.sendStableOperation(path, { status, resolution }, () => this.postSender.send<AfterSalesDto>(path, payload))
     if (this.hasProjectContext(projectCode, contextGeneration)) this.afterSales.set(data.id, data)
   }
 

@@ -1,0 +1,52 @@
+.workspace { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.header, .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.header h3 { margin: 0 0 4px !important; }
+.summaryBar { display:flex; align-items:center; justify-content:space-between; gap:16px; background:#fff; padding:12px 16px; border:1px solid #e8edf4; border-radius:6px; }
+.metrics { display:flex; flex-wrap:wrap; gap:10px 26px; font-size:13px; color:#596579; }
+.metrics > span { display:flex; gap:8px; align-items:baseline; }
+.metrics strong { color:#26354b; font-size:15px; font-variant-numeric:tabular-nums; }
+.toolbar { margin-bottom: 16px; }
+.secondary { font-size: 13px; color: #596579; margin-top: 3px; line-height: 1.6; overflow-wrap: anywhere; }
+.pagination { display: flex; justify-content: flex-end; margin-top: 16px; }
+.formGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
+.receiptRow { display: grid; grid-template-columns: 1fr 180px; gap: 16px; align-items: center; }
+.receiptRow small { display: block; color: #596579; }
+.mainCard, .listContent { min-width: 0; }
+.listsLayout { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 20px; align-items: start; }
+.listPicker { display: flex; flex-direction: column; gap: 8px; max-height: 650px; overflow-y: auto; padding: 2px; }
+.pickerLabel { padding: 0 8px 4px; font-size: 13px; }
+.listChoice { display: flex; flex-direction: column; gap: 7px; padding: 12px; text-align: left; color: inherit; font: inherit; background: #fafbfc; border: 1px solid #e1e6ee; border-radius: 6px; cursor: pointer; }
+.listChoice strong { font-size: 14px; overflow-wrap: anywhere; }
+.listChoice span, .listChoice small { color: #596579; font-size: 12px; }
+.listChoice:hover { border-color: #92ade9; }
+.listChoice:focus-visible { outline: 2px solid #245bd2; outline-offset: 1px; }
+.listChoiceActive { border-color: #245bd2; background: #edf2ff; box-shadow: inset 3px 0 #245bd2; }
+.listHeading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 14px; }
+.listHeading h5 { margin: 0 0 5px !important; }
+.listHeading :global(.ant-space) { flex-shrink: 0; }
+.listSummary { display: flex; flex-wrap: wrap; gap: 10px 22px; padding: 12px 0; border-top: 1px solid #edf0f4; border-bottom: 1px solid #edf0f4; margin-bottom: 14px; color: #596579; font-size: 13px; }
+.listSummary strong { color: #26354b; font-variant-numeric: tabular-nums; }
+.listNotes { color: #596579; overflow-wrap: anywhere; }
+.lineSearch { display: flex; gap: 16px; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.lineSearch :global(.ant-input-affix-wrapper) { max-width: 330px; }
+.lineSearch > span:last-child { font-size: 12px; }
+.materialName { display: flex; gap: 8px; align-items: baseline; }
+.sequence { color: #798598; font-size: 12px; }
+.number { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.importConfirm { display: grid; grid-template-columns: auto minmax(150px, 420px) auto; align-items: center; gap: 12px; justify-content: start; }
+@media (max-width: 1100px) {
+  .listsLayout { grid-template-columns: 1fr; gap: 16px; }
+  .listPicker { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); max-height: 220px; }
+  .pickerLabel { grid-column: 1 / -1; }
+  .listChoice { gap: 5px; padding: 10px 12px; }
+}
+@media (max-width: 900px) {
+  .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .header, .toolbar, .listHeading { align-items: flex-start; flex-direction: column; }
+  .lineSearch { align-items: flex-start; flex-direction: column; gap: 6px; }
+}
+@media (max-width: 560px) {
+  .formGrid, .receiptRow, .importConfirm { grid-template-columns: 1fr; }
+  .metrics { gap: 8px; }
+  .listPicker { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

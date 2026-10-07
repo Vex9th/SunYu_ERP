@@ -1,0 +1,44 @@
+.project-preview-stage { min-height: 360px; background: #f0f2f5; border: 1px solid #e5e7eb; overflow: auto; max-height: 68vh; }
+.project-preview-toolbar { position: sticky; top: 0; z-index: 2; width: 100%; padding: 10px 14px; background: #fff; border-bottom: 1px solid #e5e7eb; }
+.project-preview-paper { white-space: pre-wrap; overflow-wrap: anywhere; margin: 24px auto; width: min(860px, calc(100% - 40px)); min-height: 420px; padding: 32px; background: #fff; font: inherit; line-height: 1.9; }
+.project-preview-paper mark { background: #fff1b8; }
+.project-preview-paper .active-match { background: #ffd666; outline: 2px solid #1677ff; }
+.project-preview-image { min-height: 420px; display: grid; place-items: center; padding: 40px; overflow: auto; }
+.project-preview-image img { max-width: 100%; max-height: 55vh; }
+.project-preview-pdf { width: 100%; height: 65vh; border: 0; }
+@media print {
+  body > :not(:has(.project-document-preview)) { display: none !important; }
+  .project-document-preview .ant-modal-header, .project-document-preview .ant-modal-close, .project-document-preview .ant-descriptions, .project-document-preview .ant-alert, .project-preview-toolbar, .project-preview-actions { display: none !important; }
+  .ant-modal-mask { display: none !important; }
+  .ant-modal-wrap, .ant-modal { position: static !important; height: auto !important; width: 100% !important; overflow: visible !important; }
+  .project-preview-stage { max-height: none; overflow: visible; border: 0; }
+  .project-preview-paper { margin: 0; padding: 0; width: 100%; }
+}
+
+.project-stage-summary { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.project-stage-summary > div:first-child { width: min(320px, 48%); }
+.project-stage-dates { display: grid; gap: 4px; padding-block: 3px; }
+.project-record-note { margin: 0 !important; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.65; }
+.project-stage-upcoming { display: flex; align-items: baseline; flex-wrap: wrap; gap: 10px; padding: 14px 0 0; }
+.project-list-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+.project-document-search { width: min(390px, 100%); }
+.project-commercial-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; padding: 16px 20px; background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; }
+.project-commercial-metrics > div { display: grid; gap: 4px; }
+.project-commercial-metrics strong { font-size: 21px; line-height: 1.4; font-variant-numeric: tabular-nums; }
+.project-payment-terms { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.project-term-amount { display: grid; gap: 3px; margin-bottom: 14px; }
+.project-term-amount strong { font-size: 23px; font-variant-numeric: tabular-nums; }
+.project-term-facts { display: grid; gap: 7px; }
+.project-term-facts > span { display: flex; justify-content: space-between; gap: 10px; color: #64748b; }
+.project-term-facts b { font-weight: 500; color: #18283b; font-variant-numeric: tabular-nums; }
+.project-term-actions { margin-top: 16px; }
+.project-contract-detail { padding: 8px 14px; }
+.project-form-context { padding: 12px 14px; border-left: 3px solid #1677ff; background: #f6f9fd; display: grid; gap: 3px; }
+.project-allocation-balance { position: sticky; top: 0; z-index: 3; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 12px; border: 1px solid #d9e5f5; background: #f5f9ff; border-radius: 6px; margin-bottom: 12px; font-variant-numeric: tabular-nums; }
+.project-allocation-row { padding: 12px; border: 1px solid #e5e7eb; border-radius: 6px; margin-bottom: 12px; }
+.project-allocation-row .ant-form-item { margin-bottom: 8px; }
+.project-allocation-row-heading { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.project-allocation-row-heading > button { margin-left: auto; }
+.project-receipt-context { display: grid; gap: 8px; padding: 12px; background: #f5f9ff; border-radius: 6px; margin-bottom: 20px; }
+@media (max-width: 900px) { .project-payment-terms { grid-template-columns: 1fr; } .project-term-facts { grid-template-columns: 1fr 1fr; gap: 8px 18px; } }
+@media (max-width: 600px) { .project-commercial-metrics { grid-template-columns: 1fr 1fr; } .project-stage-summary { align-items: flex-start; flex-direction: column; gap: 8px; } .project-stage-summary > div:first-child { width: 100%; } .project-term-facts { grid-template-columns: 1fr; } }
