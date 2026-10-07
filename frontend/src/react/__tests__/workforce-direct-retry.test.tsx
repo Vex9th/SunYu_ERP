@@ -137,7 +137,8 @@ function serverFixture(
   }
 }
 
-describe('施工直接操作的原请求恢复', () => {
+// 原请求恢复需要多次挂载和表单确认，为 CI 留出完整流程的渲染时间。
+describe('施工直接操作的原请求恢复', { timeout: 15000 }, () => {
   const cases = [
     {
       kind: 'assignment',

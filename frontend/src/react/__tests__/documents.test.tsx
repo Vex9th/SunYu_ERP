@@ -116,7 +116,8 @@ describe('React 项目文件', () => {
     fireEvent.click(await screen.findByRole('button', { name: '预览 / 版本' }))
     const dialog = await screen.findByRole('dialog')
     await within(dialog).findByText('会议记录：安装计划与验收计划。')
-    expect(screen.getByLabelText('当前位置').textContent).toContain('version=22')
+    // 正文加载与路由 transition 独立完成，等待 URL 自身达到预期。
+    await waitFor(() => expect(screen.getByLabelText('当前位置').textContent).toContain('version=22'))
     fireEvent.click(within(dialog).getByRole('button', { name: '返回文件列表' }))
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
     expect(screen.getByLabelText('搜索文档')).toHaveProperty('value', '现场')

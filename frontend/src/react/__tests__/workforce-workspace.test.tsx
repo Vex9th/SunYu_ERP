@@ -73,7 +73,8 @@ function uiRepository() {
   return repo
 }
 
-describe('React 施工工作区', () => {
+// 多步骤工作区回归包含完整表单与重挂流程，为 CI 留出渲染时间。
+describe('React 施工工作区', { timeout: 15000 }, () => {
   it('同一工人优先使用有效的进行中安排，不包含停用和不在日期范围内的安排', async () => {
     const repo = new MockWorkforceRepository()
     const model = (await repo.getWorkforcePreview('SY-2026-001')).data

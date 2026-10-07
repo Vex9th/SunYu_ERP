@@ -75,7 +75,8 @@ function repository() {
   return repo
 }
 
-describe('React 交付工作区', () => {
+// 多步骤工作区回归包含完整表单与重挂流程，为 CI 留出渲染时间。
+describe('React 交付工作区', { timeout: 15000 }, () => {
   it('已登记发票要求完整信息与正确日期顺序', () => {
     expect(() =>
       invoiceInput({ status: 'recorded', invoice_number: 'FP-1' }, 0),
