@@ -63,9 +63,10 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
   }
   const actions = useBusinessActions(scope, refresh, () => { setDialog(null); setFiles([]); setImportVersion((value) => value + 1) })
   const locked = Boolean(actions.pending)
-  const lines = data.lists.flatMap((list) => list.lines.map((line) => ({ list, line })))
-  const availableLines = lines.filter(({ list, line }) => list.status === 'confirmed' && quantityMilli(remainingQuantity(line.quantity, line.ordered_quantity)) > 0n)
-  const confirmedLists = data.lists.filter((list) => list.status === 'confirmed')
+  const listById = new Map(data.catalog.lists.map(list => [list.id, list]))
+  const lines = data.catalog.lines.flatMap(line => { const list = listById.get(line.procurement_list_id); return list ? [{ list, line }] : [] })
+  const availableLines = lines.filter(({ list }) => list.status === 'confirmed')
+  const confirmedLists = data.catalog.lists.filter((list) => list.status === 'confirmed')
   const lineLabel = (id: number) => { const item = lines.find(({ line }) => line.id === id)?.line; return item ? `${item.name}${item.model ? ` · ${item.model}` : ''}` : `采购物料 #${id}` }
 
   useEffect(() => {
@@ -87,7 +88,7 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
     let values: FormValues = { ordered_on: today, received_on: today, paid_on: today, invoiced_on: today, document_version_ids: [], payment_method: '银行转账', lines: [] }
     if (next.kind === 'edit-list') values = { ...values, ...next.list }
     if (next.kind === 'line' || next.kind === 'edit-line') values = { ...values, list_id: next.list?.id, sequence_no: next.line?.sequence_no ?? Math.max(0, ...(next.list?.lines.map((line) => line.sequence_no) ?? [])) + 1, category: next.line?.category ?? '其他', ...next.line, cost: next.line ? centsToYuan(next.line.unit_cost_cents) : '', quoted_price: next.line ? centsToYuan(next.line.quoted_unit_price_cents) : '' }
-    if (next.kind === 'order' && next.line) values.lines = [{ procurement_line_id: next.line.id, quantity: remainingQuantity(next.line.quantity, next.line.ordered_quantity), cost: centsToYuan(next.line.unit_cost_cents), overage_reason: '' }]
+    if (next.kind === 'order' && next.line) values.lines = [{ procurement_line_id: next.line.id, quantity: quantityMilli(remainingQuantity(next.line.quantity, next.line.ordered_quantity)) > 0n ? remainingQuantity(next.line.quantity, next.line.ordered_quantity) : '', cost: centsToYuan(next.line.unit_cost_cents), overage_reason: '' }]
     if (next.kind === 'order' && !next.line) values.lines = [{ quantity: '', cost: '', overage_reason: '' }]
     if (next.kind === 'edit-order' && next.order) values = { ...values, ...next.order, lines: next.order.lines.map((line) => ({ procurement_line_id: line.procurement_line_id, quantity: line.quantity, cost: centsToYuan(line.unit_cost_cents), overage_reason: line.overage_reason ?? '' })) }
     if (next.kind === 'receipt' && next.order) values.lines = next.order.lines.map((line) => ({ purchase_order_line_id: line.id, quantity: '0' }))
@@ -343,7 +344,7 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
         ]} />
       </Space>}
     </Drawer>
-    <FormModal title={dialog ? titles[dialog.kind] : ''} form={form} open={dialog !== null} onClose={() => setDialog(null)} onSubmit={submit} busy={actions.busy} locked={locked || readonly} error={actions.error} width={dialog?.kind.includes('order') || dialog?.kind === 'receipt' ? 900 : 680}>
+    <FormModal title={dialog ? titles[dialog.kind] : ''} form={form} hasChanges={files.length > 0} open={dialog !== null} onClose={() => setDialog(null)} onSubmit={submit} busy={actions.busy} locked={locked || readonly} error={actions.error} width={dialog?.kind.includes('order') || dialog?.kind === 'receipt' ? 900 : 680}>
       {(dialog?.kind === 'list' || dialog?.kind === 'edit-list') && <><TextField name="name" label="清单名称" required /><TextField name="notes" label="备注" type="textarea" /></>}
       {(dialog?.kind === 'line' || dialog?.kind === 'edit-line') && <>
         <Form.Item name="list_id" label="采购清单" rules={[{ required: true }]}><Select disabled={Boolean(dialog.list) || dialog.kind === 'edit-line'} placeholder="请选择草稿清单" options={data.lists.filter((list) => list.status === 'draft').map((list) => ({ value: list.id, label: list.name }))} /></Form.Item>
@@ -353,7 +354,7 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
       {(dialog?.kind === 'order' || dialog?.kind === 'edit-order') && <>
         <div className={styles.formGrid}><TextField name="order_no" label="采购单号" required /><Form.Item name="supplier_company_id" label="供应商" rules={[{ required: true, message: '请选择供应商' }]}><Select placeholder="请明确选择供应商" showSearch optionFilterProp="label" options={data.companies.map((company) => ({ value: company.id, label: company.name }))} /></Form.Item><TextField name="ordered_on" label="下单日期" type="date" required /><TextField name="expected_delivery_on" label="预计到货日期" type="date" /></div>
         <Form.List name="lines">{(fields, { add, remove }) => <Space orientation="vertical" style={{ width: '100%' }}>{fields.map((field) => <Card size="small" key={field.key} title={`物料 ${field.name + 1}`} extra={dialog.kind === 'order' && <Button size="small" type="text" danger icon={<MinusCircleOutlined />} onClick={() => remove(field.name)}>删除</Button>}>
-          <Form.Item name={[field.name, 'procurement_line_id']} label="采购物料" rules={[{ required: true, message: '请选择采购物料' }]}><Select disabled={dialog.kind === 'edit-order'} showSearch optionFilterProp="label" options={dialog.kind === 'edit-order' ? dialog.order?.lines.map((line) => ({ value: line.procurement_line_id, label: lineLabel(line.procurement_line_id) })) : availableLines.map(({ list, line }) => ({ value: line.id, label: `${line.name} · ${list.name} · 剩余 ${remainingQuantity(line.quantity, line.ordered_quantity)} ${line.unit}` }))} onChange={(id) => { const item = lines.find(({ line }) => line.id === id)?.line; if (item) { form.setFieldValue(['lines', field.name, 'cost'], centsToYuan(item.unit_cost_cents)); form.setFieldValue(['lines', field.name, 'quantity'], remainingQuantity(item.quantity, item.ordered_quantity)) } }} /></Form.Item>
+          <Form.Item name={[field.name, 'procurement_line_id']} label="采购物料" rules={[{ required: true, message: '请选择采购物料' }]}><Select disabled={dialog.kind === 'edit-order'} showSearch optionFilterProp="label" options={dialog.kind === 'edit-order' ? dialog.order?.lines.map((line) => ({ value: line.procurement_line_id, label: lineLabel(line.procurement_line_id) })) : availableLines.map(({ list, line }) => ({ value: line.id, label: `${line.name} · ${list.name} · ${quantityMilli(remainingQuantity(line.quantity, line.ordered_quantity)) === 0n ? "已满额，可补采" : `剩余 ${remainingQuantity(line.quantity, line.ordered_quantity)} ${line.unit}`}` }))} onChange={(id) => { const item = lines.find(({ line }) => line.id === id)?.line; if (item) { form.setFieldValue(['lines', field.name, 'cost'], centsToYuan(item.unit_cost_cents)); form.setFieldValue(['lines', field.name, 'quantity'], quantityMilli(remainingQuantity(item.quantity, item.ordered_quantity)) > 0n ? remainingQuantity(item.quantity, item.ordered_quantity) : '') } }} /></Form.Item>
           <div className={styles.formGrid}><TextField name={[field.name, 'quantity']} label="采购数量" required /><TextField name={[field.name, 'cost']} label="成本单价（元）" required /></div><TextField name={[field.name, 'overage_reason']} label="超采原因（超出剩余数量时必填）" />
         </Card>)}{dialog.kind === 'order' && <Button block type="dashed" icon={<PlusOutlined />} onClick={() => add({ quantity: '', cost: '' })}>添加采购物料</Button>}</Space>}</Form.List>
         <TextField name="notes" label="采购说明" type="textarea" />

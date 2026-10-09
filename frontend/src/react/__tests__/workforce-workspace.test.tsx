@@ -17,6 +17,7 @@ import WorkforceWorkspace, {
 } from '../workforce/WorkforceWorkspace'
 import { MockWorkforceRepository } from '../../repositories/workforce'
 import { ApiError } from '../../api'
+import { formatMoney } from '../../domain/formatters'
 import { localISODate } from '../../domain/dates'
 import type { WorkforceDemoViewModel } from '../../domain/workforce'
 
@@ -417,4 +418,25 @@ describe('React 施工工作区', { timeout: 15000 }, () => {
     expect(create).toHaveBeenCalledTimes(1)
     expect(screen.queryByRole('button', { name: '恢复并重试' })).toBeNull()
   })
+})
+
+it('旧日薪记录在安排涨薪及改时薪后仍展示历史日薪并提交日薪更正', async () => {
+  const repo = new MockWorkforceRepository()
+  const model = (await repo.getWorkforcePreview('HISTORICAL')).data
+  const assignment = model.crew_assignments[0]!
+  const entry = { ...model.labor_entries[0]!, pay_basis: 'daily' as const, rate_cents: 20000, revision: 1, day_fraction: '1.000' }
+  vi.spyOn(repo, 'getWorkforcePreview').mockResolvedValue({ source: 'demo', data: {
+    ...model,
+    crew_assignments: [{ ...assignment, pay_basis: 'hourly', rate_cents: 30000 }],
+    labor_entries: [entry],
+  } })
+  const update = vi.spyOn(repo, 'updateLaborEntry').mockResolvedValue()
+  render(<WorkforceWorkspace projectCode="HISTORICAL" repository={repo} />)
+  fireEvent.click(await screen.findByRole('tab', { name: '上工历史' }))
+  fireEvent.click(await screen.findByRole('button', { name: '更正' }))
+  const dialog = await screen.findByRole('dialog')
+  expect(await within(dialog).findByText(`历史计薪：${formatMoney(20000)} / 日；更正费用预览：${formatMoney(20000)}`)).toBeTruthy()
+  expect(within(dialog).queryByLabelText('上工小时数')).toBeNull()
+  fireEvent.click(within(dialog).getByRole('button', { name: '更正上工记录' }))
+  await waitFor(() => expect(update).toHaveBeenCalledWith('HISTORICAL', entry.entry_id, expect.objectContaining({ expected_revision: 1, day_fraction: '1.000', work_minutes: null })))
 })

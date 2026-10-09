@@ -42,6 +42,7 @@ import {
   LoadingBlock,
 } from './shared'
 import styles from './Workspace.module.css'
+import { useUnsavedChanges } from './unsavedChanges'
 
 import {
   clearPendingCreate,
@@ -185,7 +186,7 @@ export default function CompaniesPage() {
           size="middle"
           scroll={{ x: 620 }}
           pagination={{
-            pageSize: 10,
+            defaultPageSize: 10,
             showSizeChanger: true,
             hideOnSinglePage: true,
           }}
@@ -476,6 +477,7 @@ function CompanyEditor({
     }
   }, [])
   const locked = busy || Boolean(pending) || Boolean(uncertainUpdate)
+  useUnsavedChanges(() => dirty.current || locked)
   const path =
     target.kind === 'company'
       ? `/api/companies/${target.record?.id}`
@@ -746,6 +748,7 @@ function CompanyEditor({
         )}
         <Form
           form={form}
+          scrollToFirstError={{ focus: true }}
           layout="vertical"
           initialValues={initial}
           disabled={locked || missing}

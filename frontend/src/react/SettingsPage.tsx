@@ -13,9 +13,8 @@ import {
   Tag,
 } from 'antd'
 import { CloudDownloadOutlined, SaveOutlined } from '@ant-design/icons'
-import { requestJson } from '../api'
+import { ApiError, requestJson } from '../api'
 import type {
-  BackupCreated,
   BackupSettingsPayload,
   BackupSettingsResponse,
   SystemOverview,
@@ -39,7 +38,7 @@ interface SettingsOperationResult {
   warning?: string
 }
 type SettingsOperation =
-  | { kind: SettingsOperationKind; status: 'running' }
+  | { kind: SettingsOperationKind; status: 'running'; phase?: string }
   | {
       kind: SettingsOperationKind
       status: 'success'
@@ -77,6 +76,41 @@ async function runOperation(
   }
 }
 
+async function pollBackupTask(taskId: string): Promise<SettingsOperationResult> {
+  let consecutiveFailures = 0
+  for (;;) {
+    try {
+      const task = await requestJson<{
+        status: string; phase: string; warning?: string; error_code?: string
+      }>(`/api/system/backup-tasks/${taskId}`)
+      consecutiveFailures = 0
+      if (task.status === 'success') {
+        sessionStorage.removeItem('sunyu-backup-task')
+        return { warning: task.warning }
+      }
+      if (task.status === 'failed' || task.status === 'interrupted') {
+        sessionStorage.removeItem('sunyu-backup-task')
+        throw new Error(`备份${task.status === 'interrupted' ? '被服务重启中断' : '失败'}：${task.error_code ?? '请检查服务日志'}`)
+      }
+      publishOperation({ kind: 'backup', status: 'running', phase: task.phase === 'queued' ? '等待当前备份任务完成' : task.phase === 'cleaning' ? '备份已创建，正在检查并清理过期备份' : '正在创建并校验备份' })
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 404) {
+        sessionStorage.removeItem('sunyu-backup-task')
+        throw new Error('备份任务记录不存在，执行结果无法确认。已停止自动查询，请核对最近备份。')
+      }
+      if (cause instanceof ApiError && (cause.status === 401 || cause.status === 403))
+        throw new Error('无法读取备份状态，请重新登录后返回此页查询。执行结果尚未确认。')
+      if (cause instanceof Error && /^备份(失败|被服务重启中断)/.test(cause.message)) throw cause
+      consecutiveFailures += 1
+      if (consecutiveFailures >= 5)
+        throw new Error('暂时无法确认备份结果，已停止自动查询。请恢复连接后重新打开设置页，继续核对任务状态。')
+      // 状态请求失败不代表后台任务失败，恢复连接后继续查询真实结果。
+      publishOperation({ kind: 'backup', status: 'running', phase: '暂时无法读取状态，正在重新连接；后台任务可能仍在执行' })
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+  }
+}
+
 export default function SettingsPage() {
   const overview = useLoad(
     () => requestJson<SystemOverview>('/api/system/overview'),
@@ -84,6 +118,7 @@ export default function SettingsPage() {
   )
   const [form] = Form.useForm<BackupSettingsPayload>()
   const operation = useSyncExternalStore(subscribeOperation, operationSnapshot)
+  const pendingTaskId = sessionStorage.getItem('sunyu-backup-task')
   const saving = operation?.status === 'running' && operation.kind === 'save'
   const backingUp =
     operation?.status === 'running' && operation.kind === 'backup'
@@ -91,6 +126,14 @@ export default function SettingsPage() {
   const [formDirty, setFormDirty] = useState(Boolean(settingsDraft))
   const [error, setError] = useState<string | null>(null)
   const { message } = App.useApp()
+  useEffect(() => {
+    const pendingTask = sessionStorage.getItem('sunyu-backup-task')
+    if (pendingTask && settingsOperation?.status !== 'running') {
+      publishOperation(null)
+      void runOperation('backup', () => pollBackupTask(pendingTask))
+    }
+  }, [])
+
   useEffect(() => {
     if (settingsDraft) form.setFieldsValue(settingsDraft)
     else if (overview.data && !dirty.current)
@@ -163,14 +206,22 @@ export default function SettingsPage() {
     })
   }
   function backup() {
-    if (settingsOperation || dirty.current || !overview.data?.backup.directory)
+    const pendingTask = sessionStorage.getItem('sunyu-backup-task')
+    if (settingsOperation || (!pendingTask && (dirty.current || !overview.data?.backup.directory)))
       return
     setError(null)
     void runOperation('backup', async () => {
-      const result = await requestJson<BackupCreated>('/api/system/backups', {
-        method: 'POST',
-      })
-      return { warning: result.warning }
+      if (pendingTask) return pollBackupTask(pendingTask)
+      let started: { task_id: string }
+      try {
+        started = await requestJson<{ task_id: string }>(
+          '/api/system/backup-tasks', { method: 'POST' },
+        )
+      } catch (cause) {
+        throw new Error(`备份任务提交结果尚未确认。请刷新核对最近备份；再次点击会接续正在执行的任务。${errorText(cause)}`)
+      }
+      sessionStorage.setItem('sunyu-backup-task', started.task_id)
+      return pollBackupTask(started.task_id)
     })
   }
   return (
@@ -315,15 +366,17 @@ export default function SettingsPage() {
                 disabled={
                   saving ||
                   backingUp ||
-                  formDirty ||
-                  !overview.data.backup.directory
+                  (!pendingTaskId && (formDirty || !overview.data.backup.directory))
                 }
                 onClick={() => void backup()}
               >
-                立即备份
+                {pendingTaskId ? '继续查询' : '立即备份'}
               </Button>
             }
           >
+            {backingUp && (
+              <Alert type="info" showIcon title={operation?.status === 'running' ? operation.phase ?? '正在提交备份任务' : '正在备份'} style={{ marginBottom: 16 }} />
+            )}
             {(formDirty || !overview.data.backup.directory) && (
               <Alert
                 type="info"

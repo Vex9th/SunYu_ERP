@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { CompanyRecord, PagedResult } from '../../domain/contracts'
 import type { ProcurementListDetailDto, ProcurementListSummaryDto, ProcurementOverviewDto, PurchaseOrderDto } from '../../domain/operations-api'
 import type { QuoteExportDto } from '../../domain/procurement-extensions'
-import type { ProcurementHttpRepository } from '../../repositories/procurement.live'
+import type { ProcurementHttpRepository, ProcurementOptions } from '../../repositories/procurement.live'
 import { createHttpProjectRepository } from '../../repositories/project'
 import type { DocumentVersionOption } from '../../repositories/project-operating.live'
 import { errorText } from './ui'
@@ -12,6 +12,7 @@ const emptyPage = <T,>(): PagedResult<T> => ({ items: [], page: 1, page_size: 20
 
 export function useProcurementData(repository: ProcurementHttpRepository, projectCode: string, suppliedCustomer?: Customer) {
   const [lists, setLists] = useState<ProcurementListDetailDto[]>([])
+  const [options, setOptions] = useState<ProcurementOptions | null>(null)
   const [listPage, setListPage] = useState(emptyPage<ProcurementListSummaryDto>)
   const [orders, setOrders] = useState(emptyPage<PurchaseOrderDto>)
   const [overview, setOverview] = useState<ProcurementOverviewDto | null>(null)
@@ -44,10 +45,15 @@ export function useProcurementData(repository: ProcurementHttpRepository, projec
     })
   }
   function loadOrders(page = orders.page, pageSize = orders.page_size) { return section('采购单', () => repository.listPurchaseOrders(projectCode, { page, page_size: pageSize }), (result) => setOrders(result.data)) }
+  function loadOptions() {
+    return repository.getProcurementOptions
+      ? section('采购选料', () => repository.getProcurementOptions!(projectCode), result => setOptions(result.data))
+      : Promise.resolve()
+  }
   function loadQuotes(page = quotes.page, pageSize = quotes.page_size) { return section('报价历史', async () => repository.listQuoteExports ? (await repository.listQuoteExports(projectCode, { page, page_size: pageSize })).data : emptyPage<QuoteExportDto>(), setQuotes) }
   async function refresh() {
     const result = await Promise.allSettled([
-      loadLists(), loadOrders(), loadQuotes(),
+      loadLists(), loadOrders(), loadQuotes(), loadOptions(),
       section('采购概览', () => repository.getProcurementOverview(projectCode), (value) => setOverview(value.data)),
       section('往来单位', () => repository.listSupplierCompanies(), (value) => setCompanies(value.data)),
       section('附件资料', () => repository.listDocumentVersionOptions?.(projectCode) ?? Promise.resolve([]), setDocuments),
@@ -58,9 +64,10 @@ export function useProcurementData(repository: ProcurementHttpRepository, projec
   }
   useEffect(() => {
     state.current.mounted = true; state.current.generation++; state.current.sequence = {}
+    setOptions(null)
     setLists([]); setListPage(emptyPage()); setOrders(emptyPage()); setOverview(null); setCompanies([]); setDocuments([]); setQuotes(emptyPage()); setCustomer(suppliedCustomer ?? null); setErrors({}); setLoading({})
     const result = Promise.allSettled([
-      loadLists(1, 20), loadOrders(1, 20), loadQuotes(1, 20),
+      loadLists(1, 20), loadOrders(1, 20), loadQuotes(1, 20), loadOptions(),
       section('采购概览', () => repository.getProcurementOverview(projectCode), (value) => setOverview(value.data)),
       section('往来单位', () => repository.listSupplierCompanies(), (value) => setCompanies(value.data)),
       section('附件资料', () => repository.listDocumentVersionOptions?.(projectCode) ?? Promise.resolve([]), setDocuments),
@@ -69,5 +76,8 @@ export function useProcurementData(repository: ProcurementHttpRepository, projec
     void result
     return () => { state.current.mounted = false; state.current.generation++ }
   }, [repository, projectCode, suppliedCustomer?.id])
-  return { lists, listPage, orders, overview, companies, documents, quotes, customer, errors, loading, loadLists, loadOrders, loadQuotes, refresh }
+  const catalog: ProcurementOptions = repository.getProcurementOptions
+    ? options ?? { lists: [], lines: [] }
+    : { lists, lines: lists.flatMap(list => list.lines) }
+  return { lists, catalog, listPage, orders, overview, companies, documents, quotes, customer, errors, loading, loadLists, loadOrders, loadQuotes, refresh }
 }

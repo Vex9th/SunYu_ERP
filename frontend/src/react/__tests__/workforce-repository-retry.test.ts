@@ -120,6 +120,7 @@ function fixture() {
     .fn<typeof fetch>()
     .mockImplementation(async (request, init) => {
       const path = String(request)
+      if (init?.method === 'PUT') return body(worker())
       if (init?.method === 'POST') {
         attempts += 1
         if (attempts === 1) {
@@ -302,4 +303,25 @@ describe('施工工作区生成载荷的幂等重试', () => {
     await repository.setCrewAssignmentStatus(projectCode, 7, 'active', null)
     expect(server.writes()).toHaveLength(2)
   })
+})
+
+it('旧施工员表单首次提交保留打开时版本，工时保留计薪快照', async () => {
+ const f = fixture(); const repo = createHttpWorkforceWorkspaceRepository()
+ const original = (await repo.getWorkforcePreview(projectCode)).data
+ f.setRevision(2); await repo.getWorkforcePreview(projectCode)
+ await repo.updateWorker(1, { name: '更正姓名', phone: null, notes: null, expected_revision: 1 } as never)
+ const write = f.fetchMock.mock.calls.find(([, init]) => init?.method === 'PUT')![1]!
+ expect(JSON.parse(String(write.body)).expected_revision).toBe(1)
+ expect(original.workers[0]).toMatchObject({ revision: 1 })
+ expect(original.labor_entries[0]).toMatchObject({ revision: 1, pay_basis: 'daily', rate_cents: 30000 })
+})
+
+it('旧作废原因弹窗首次提交保留打开时工时版本', async () => {
+  const server = fixture()
+  const repository = createHttpWorkforceWorkspaceRepository()
+  await repository.getWorkforcePreview(projectCode)
+  server.setRevision(2)
+  await repository.getWorkforcePreview(projectCode)
+  await expect(repository.voidLaborEntry(projectCode, 9, '重复登记', 1)).rejects.toThrow('无法连接本地服务')
+  expect(JSON.parse(String(server.writes()[0]!.body))).toMatchObject({ reason: '重复登记', expected_revision: 1 })
 })

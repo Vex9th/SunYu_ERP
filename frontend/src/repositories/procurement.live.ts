@@ -50,7 +50,13 @@ export interface PurchaseOrderListQuery extends PaginationQuery {
   status?: PurchaseOrderStatus
 }
 
+export interface ProcurementOptions {
+  lists: Pick<ProcurementListSummaryDto, 'id' | 'name' | 'status' | 'revision'>[]
+  lines: Pick<ProcurementLineDto, 'id' | 'procurement_list_id' | 'name' | 'model' | 'quantity' | 'ordered_quantity' | 'unit' | 'unit_cost_cents'>[]
+}
+
 export interface ProcurementHttpRepository {
+  getProcurementOptions?(projectCode: string): Promise<RepositoryResult<ProcurementOptions>>
   listSupplierCompanies(): Promise<RepositoryResult<CompanyRecord[]>>
   downloadImportTemplate(): Promise<Blob>
   previewProcurementImport(projectCode: string, file: File): Promise<RepositoryResult<ProcurementImportPreviewDto>>
@@ -102,6 +108,10 @@ class HttpProcurementRepository implements ProcurementHttpRepository {
   private readonly multipartPostSender = createRetriableMultipartPostSender()
   private readonly uploadSender = new RetriableFileUploadSender()
   private readonly projectRepository = createHttpProjectOperatingRepository()
+
+  async getProcurementOptions(projectCode: string): Promise<RepositoryResult<ProcurementOptions>> {
+    return live(await requestJson(`${projectBasePath(projectCode)}/procurement-options`))
+  }
 
   async listSupplierCompanies(): Promise<RepositoryResult<CompanyRecord[]>> {
     return live(await requestJson('/api/companies'))

@@ -87,7 +87,7 @@ def _global_dashboard(
         "outstanding_receivable_cents": 0,
     }
     for project in _active_projects(connection):
-        operating = build_project_operating_snapshot(connection, project, today=today)
+        operating = build_project_operating_snapshot(connection, project, today=today, include_details=False)
         final_delivery_on = _final_delivery_on(connection, int(project["id"]))
         project_rows.append(_global_project_row(project, operating, final_delivery_on))
         project_todos = operating["todos"]
@@ -167,34 +167,39 @@ def build_project_operating_snapshot(
     project: sqlite3.Row | dict[str, object],
     *,
     today: str,
+    include_details: bool = True,
 ) -> dict[str, object]:
     project_id = int(project["id"])
     project_code = str(project["project_code"])
     stages = project_stages._stage_list(connection, project_id)
-    accepted_quote = connection.execute(
-        """
-        SELECT * FROM quotes
-        WHERE project_id = ? AND status = 'accepted'
-        ORDER BY version_number DESC, id DESC
-        LIMIT 1
-        """,
-        (project_id,),
-    ).fetchone()
-    contract_rows = connection.execute(
-        """
-        SELECT contracts.*
-        FROM contracts
-        JOIN contract_project_allocations AS allocations
-            ON allocations.contract_id = contracts.id
-        WHERE allocations.project_id = ?
-        ORDER BY contracts.created_at DESC, contracts.id DESC
-        """,
-        (project_id,),
-    ).fetchall()
+    accepted_quote = None
+    contract_rows = []
+    if include_details:
+        accepted_quote = connection.execute(
+            """
+            SELECT * FROM quotes
+            WHERE project_id = ? AND status = 'accepted'
+            ORDER BY version_number DESC, id DESC
+            LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+        contract_rows = connection.execute(
+            """
+            SELECT contracts.*
+            FROM contracts
+            JOIN contract_project_allocations AS allocations
+                ON allocations.contract_id = contracts.id
+            WHERE allocations.project_id = ?
+            ORDER BY contracts.created_at DESC, contracts.id DESC
+            """,
+            (project_id,),
+        ).fetchall()
     receivables = commercial._payment_overview(
         connection,
         project,  # type: ignore[arg-type]
         today,
+        include_receipts=include_details,
     )
     costs = _project_costs(connection, project_id)
     contracted_amount = int(receivables["contracted_amount_cents"])

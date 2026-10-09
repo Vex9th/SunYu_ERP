@@ -334,3 +334,12 @@ describe('交付修改操作原样重试', () => {
     expect(server.writes()).toHaveLength(2)
   })
 })
+
+it('旧调试草稿首次提交不采用刷新后的版本', async () => {
+ const f = fixture(); const repo = createHttpDeliveryRepository()
+ const old = (await repo.getDeliveryPreview(projectCode)).data
+ f.setRevision(2); await repo.getDeliveryPreview(projectCode)
+ await expect(repo.updateCommissioningSession(projectCode, 1, { ...commissioningInput, expected_revision: 1 } as never)).rejects.toThrow()
+ expect(payload(f.writes()[0]!)).toMatchObject({ expected_revision: 1 })
+ expect(old.commissioning_sessions[0]).toMatchObject({ revision: 1 })
+})

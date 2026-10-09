@@ -82,7 +82,11 @@ export class ApiError extends Error {
   }
 }
 
-async function sendRequest(path: string, options: RequestOptions = {}): Promise<Response> {
+async function sendRequest<T>(
+  path: string,
+  options: RequestOptions,
+  consume: (response: Response) => Promise<T>,
+): Promise<T> {
   const sessionObserver = protectedSessionObserver
   const controller = new AbortController()
   let timedOut = false
@@ -111,30 +115,34 @@ async function sendRequest(path: string, options: RequestOptions = {}): Promise<
   }
   if (Object.keys(headers).length > 0) init.headers = headers
 
-  let response: Response
   try {
-    response = await fetch(path, init)
-  } catch {
+    let response: Response
+    try {
+      response = await fetch(path, init)
+    } catch {
+      throw new ApiError('无法连接本地服务，请确认服务仍在运行', 0)
+    }
+    if (!response.ok) {
+      const error = await responseError(response)
+      if (
+        response.status === 401
+        && isProtectedApiPath(path)
+        && sessionObserver?.active
+      ) {
+        sessionObserver.notify({ message: error.message, path })
+      }
+      throw error
+    }
+    // 超时与调用方取消必须覆盖正文读取，而不只是等待响应头。
+    return await consume(response)
+  } catch (error) {
     if (timedOut) throw new ApiError('请求超时，请重试', 0, 'REQUEST_TIMEOUT')
     if (options.signal?.aborted) throw new ApiError('请求已取消', 0, 'REQUEST_ABORTED')
-    throw new ApiError('无法连接本地服务，请确认服务仍在运行', 0)
+    throw error
   } finally {
     clearTimeout(timeout)
     options.signal?.removeEventListener('abort', abortFromCaller)
   }
-
-  if (!response.ok) {
-    const error = await responseError(response)
-    if (
-      response.status === 401
-      && isProtectedApiPath(path)
-      && sessionObserver?.active
-    ) {
-      sessionObserver.notify({ message: error.message, path })
-    }
-    throw error
-  }
-  return response
 }
 
 function isProtectedApiPath(path: string): boolean {
@@ -177,16 +185,17 @@ export async function requestJson<T>(
   path: string,
   options: RequestOptions = {},
 ): Promise<T> {
-  const response = await sendRequest(path, options)
-  if (response.status === 204) return undefined as T
-  return (await response.json()) as T
+  return sendRequest(path, options, async response => {
+    if (response.status === 204) return undefined as T
+    return (await response.json()) as T
+  })
 }
 
 export async function requestVoid(
   path: string,
   options: RequestOptions = {},
 ): Promise<void> {
-  await sendRequest(path, options)
+  await sendRequest(path, options, async response => { await response.arrayBuffer() })
 }
 
 function requestPlannedPostJson<T>(
@@ -453,8 +462,7 @@ export async function requestBlob(
   path: string,
   options: RequestOptions = {},
 ): Promise<Blob> {
-  const response = await sendRequest(path, options)
-  return response.blob()
+  return sendRequest(path, options, response => response.blob())
 }
 
 export function withQuery(

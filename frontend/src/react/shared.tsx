@@ -175,9 +175,11 @@ export function LoadingBlock() {
 export function RefreshButton({
   onClick,
   loading,
+  label = '刷新',
 }: {
   onClick: () => unknown
   loading?: boolean
+  label?: string
 }) {
   return (
     <Button
@@ -185,7 +187,7 @@ export function RefreshButton({
       loading={loading}
       onClick={() => void onClick()}
     >
-      刷新
+      {label}
     </Button>
   )
 }

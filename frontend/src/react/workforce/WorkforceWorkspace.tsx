@@ -81,6 +81,7 @@ function yuanToCents(value: string) {
   }
 }
 interface LaborDraft {
+  revision?: number | null
   attendance: AttendanceStatus
   fraction: string
   hours: number
@@ -295,7 +296,15 @@ export default function WorkforceWorkspace({
     if (readonly) setEditor(null)
   }, [readonly])
   const active = useMemo(
-    () => (model ? eligibleAssignments(model, workDate) : []),
+    () => model ? eligibleAssignments(model, workDate).map((assignment) => {
+      const entry = model.labor_entries.find((item) => item.status === 'active'
+        && item.work_date === workDate && item.assignment_id === assignment.assignment_id)
+      return entry ? {
+        ...assignment,
+        pay_basis: entry.pay_basis ?? assignment.pay_basis,
+        rate_cents: entry.rate_cents ?? assignment.rate_cents,
+      } : assignment
+    }) : [],
     [model, workDate],
   )
   const workers = new Map(
@@ -341,6 +350,7 @@ export default function WorkforceWorkspace({
             assignment.worker_id,
       )
       next[assignment.assignment_id] = {
+        revision: entry?.revision ?? (repository.source === 'live' ? null : undefined),
         attendance: entry?.attendance_status ?? 'present',
         fraction: entry?.day_fraction ?? '1.000',
         hours: entry?.work_minutes == null ? 8 : entry.work_minutes / 60,
@@ -507,7 +517,7 @@ export default function WorkforceWorkspace({
       await execute(recoverable.send, recoverable)
       return
     }
-    const captured = structuredClone(values)
+    const captured = structuredClone({ ...editor.initial, ...values })
     const submission: Pending = {
       snapshot: model,
       editor: { ...editor, initial: captured, files },
@@ -537,6 +547,7 @@ export default function WorkforceWorkspace({
       ],
       async (values) => {
         const input = {
+          expected_revision: values.revision as number | null | undefined,
           name: textValue(values, 'name'),
           phone: optionalText(values, 'phone'),
           notes: optionalText(values, 'notes'),
@@ -581,6 +592,7 @@ export default function WorkforceWorkspace({
       ],
       async (values) => {
         const input = {
+          expected_revision: values.revision as number | null | undefined,
           worker_id: numberValue(values, 'worker_id'),
           role: textValue(values, 'role'),
           scheduled_start_on: textValue(values, 'scheduled_start_on'),
@@ -604,6 +616,12 @@ export default function WorkforceWorkspace({
   function openLabor(entry: DemoLaborEntryViewModel) {
     if (entry.status === 'voided') return
     const identityLocked = entry.replaces_entry_id !== null
+    const salaryFor = (values: Values) => {
+      const assignment = assignments.get(numberValue(values, 'assignment_id'))
+      return assignment && assignment.assignment_id === entry.assignment_id
+        ? { ...assignment, pay_basis: entry.pay_basis ?? assignment.pay_basis, rate_cents: entry.rate_cents ?? assignment.rate_cents }
+        : assignment
+    }
     open(
       '更正上工记录',
       {
@@ -638,7 +656,7 @@ export default function WorkforceWorkspace({
           options: options({ '1.000': '全天', '0.500': '半天' }),
           visible: (values) =>
             values.attendance_status === 'present' &&
-            assignments.get(numberValue(values, 'assignment_id'))?.pay_basis ===
+            salaryFor(values)?.pay_basis ===
               'daily',
         },
         {
@@ -647,7 +665,7 @@ export default function WorkforceWorkspace({
           type: 'text',
           visible: (values) =>
             values.attendance_status === 'present' &&
-            assignments.get(numberValue(values, 'assignment_id'))?.pay_basis ===
+            salaryFor(values)?.pay_basis ===
               'hourly',
           required: true,
         },
@@ -655,7 +673,7 @@ export default function WorkforceWorkspace({
         note,
       ],
       async (values) => {
-        const assignment = assignments.get(numberValue(values, 'assignment_id'))
+        const assignment = salaryFor(values)
         if (!assignment) throw new InputError('项目安排不存在')
         const present = values.attendance_status === 'present'
         const hours = numberValue(values, 'hours')
@@ -666,6 +684,7 @@ export default function WorkforceWorkspace({
         )
           throw new InputError('上工小时数必须大于 0 且不超过 24')
         await repository.updateLaborEntry(projectCode, entry.entry_id, {
+          expected_revision: values.revision as number | null | undefined,
           assignment_id: assignment.assignment_id,
           work_date: textValue(values, 'work_date'),
           attendance_status: values.attendance_status as AttendanceStatus,
@@ -681,20 +700,36 @@ export default function WorkforceWorkspace({
           notes: optionalText(values, 'notes'),
         })
       },
-      () =>
-        identityLocked ? (
-          <Alert
-            type="info"
-            title="替代记录的人员和日期已锁定，仅可更正上工内容。"
-          />
-        ) : null,
+      (values) => {
+        const salary = salaryFor(values)
+        const quantity = salary?.pay_basis === 'hourly'
+          ? numberValue(values, 'hours')
+          : Number(textValue(values, 'day_fraction'))
+        const preview = values.attendance_status === 'present' && Number.isFinite(quantity)
+          ? Math.round((salary?.rate_cents ?? 0) * quantity)
+          : 0
+        return (
+          <>
+            <Alert
+              type="info"
+              title={`历史计薪：${formatMoney(salary?.rate_cents ?? 0)} / ${salary?.pay_basis === 'hourly' ? '小时' : '日'}；更正费用预览：${formatMoney(preview)}`}
+            />
+            {identityLocked && (
+              <Alert
+                type="info"
+                title="替代记录的人员和日期已锁定，仅可更正上工内容。"
+              />
+            )}
+          </>
+        )
+      },
     )
   }
   function openReport(report?: DemoSiteDailyReportViewModel) {
     if (report?.status === 'confirmed') return
     open(
       report ? '编辑施工日报' : '新建施工日报',
-      report ? { ...report } : { work_date: workDate },
+      report ? { ...report } : { work_date: workDate, revision: null },
       [
         dateField('work_date', '施工日期', Boolean(report)),
         { key: 'location', label: '施工地点' },
@@ -706,6 +741,7 @@ export default function WorkforceWorkspace({
       ],
       async (values) => {
         await repository.saveSiteDailyReport(projectCode, {
+          expected_revision: values.revision as number | null | undefined,
           work_date: textValue(values, 'work_date'),
           location: optionalText(values, 'location'),
           weather: optionalText(values, 'weather'),
@@ -767,6 +803,7 @@ export default function WorkforceWorkspace({
         )
           throw new InputError('垫付人员在该日期没有有效项目安排')
         const input = {
+          expected_revision: values.revision as number | null | undefined,
           worker_id: workerId,
           spent_on: spentOn,
           vendor_name: textValue(values, 'vendor_name'),
@@ -933,10 +970,11 @@ export default function WorkforceWorkspace({
     const input: LaborEntryBatchInput = {
       work_date: workDate,
       entries: selected.map((id) => {
-        const assignment = assignments.get(id)!
+        const assignment = active.find((item) => item.assignment_id === id)!
         const draft = drafts[id]!
         return {
           assignment_id: id,
+          ...(draft.revision !== undefined ? { expected_revision: draft.revision } : {}),
           attendance_status: draft.attendance,
           day_fraction:
             draft.attendance === 'present' && assignment.pay_basis === 'daily'
@@ -1044,7 +1082,9 @@ export default function WorkforceWorkspace({
             disabled={mutationDisabled || row.status !== 'active'}
             onClick={() =>
               reason('作废上工记录', (reason) =>
-                repository.voidLaborEntry(projectCode, row.entry_id, reason),
+                repository.voidLaborEntry(projectCode, row.entry_id, reason,
+                row.revision,
+              ),
               )
             }
           >
@@ -1538,6 +1578,7 @@ export default function WorkforceWorkspace({
                             row.assignment_id,
                             'active',
                             null,
+                            row.revision,
                           ),
                       )
                     }
@@ -1559,6 +1600,7 @@ export default function WorkforceWorkspace({
                               row.assignment_id,
                               'completed',
                               reason || null,
+                              row.revision,
                             ),
                           false,
                         )
@@ -1577,6 +1619,7 @@ export default function WorkforceWorkspace({
                             row.assignment_id,
                             'cancelled',
                             reason,
+                            row.revision,
                           ),
                         )
                       }
@@ -1661,6 +1704,7 @@ export default function WorkforceWorkspace({
                         repository.setWorkerStatus(
                           row.worker_id,
                           row.status === 'active' ? 'inactive' : 'active',
+                          row.revision,
                         ),
                     )
                   }
@@ -1765,6 +1809,7 @@ export default function WorkforceWorkspace({
                           repository.confirmSiteDailyReport(
                             projectCode,
                             row.work_date,
+                            row.revision,
                           ),
                         )
                       }
@@ -1785,6 +1830,7 @@ export default function WorkforceWorkspace({
                           projectCode,
                           row.work_date,
                           reason,
+                          row.revision,
                         ),
                       )
                     }
@@ -1908,6 +1954,7 @@ export default function WorkforceWorkspace({
                         projectCode,
                         row.advance_id,
                         reason,
+                        row.revision,
                       ),
                     )
                   }
@@ -2006,6 +2053,7 @@ export default function WorkforceWorkspace({
                               row.advance_id,
                               item.reimbursement_id,
                               reason,
+                              item.revision,
                             ),
                           )
                         }

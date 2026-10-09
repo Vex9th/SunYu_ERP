@@ -24,6 +24,41 @@ function material(id: number, name: string, quantity: string): ProcurementLineDt
 }
 function LocationProbe() { return <output aria-label="当前地址">{useLocation().search}</output> }
 describe('React 采购工作区', () => {
+  it('采购与报价可选择当前清单页之外的已确认物料', async () => {
+    const repo = repository()
+    const list = { id: 21, name: '第二页清单', status: 'confirmed', revision: 1 }
+    const line = { ...material(21, '第二页电机', '2.000'), procurement_list_id: 21 }
+    Object.assign(repo, { getProcurementOptions: async () => ({ source: 'live', data: { lists: [list], lines: [line] } }) })
+    render(<ProcurementWorkspace projectCode="SY-CROSS-PAGE" repository={repo} customerCompany={{ id: 2, name: '客户甲' }} />)
+    await screen.findByRole('button', { name: '查看清单 弱电物料' })
+    fireEvent.click(screen.getByRole('tab', { name: /采购单/ }))
+    await waitFor(() => expect((screen.getByRole('button', { name: /新建采购单/ }) as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(screen.getByRole('button', { name: /新建采购单/ }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.mouseDown(within(dialog).getByLabelText('采购物料'))
+    expect(await screen.findByText(/第二页电机 · 第二页清单/)).toBeTruthy()
+    fireEvent.click(within(dialog).getByRole('button', { name: /取\s*消/ }))
+    fireEvent.click(screen.getByRole('tab', { name: '客户报价' }))
+    fireEvent.click(screen.getByRole('button', { name: /生成报价单/ }))
+    const quote = await screen.findByRole('dialog')
+    fireEvent.mouseDown(within(quote).getByLabelText('已确认采购清单'))
+    expect(await screen.findByText('第二页清单')).toBeTruthy()
+  })
+
+  it('已满额物料保留补采入口，补采数量与原因由用户填写', async () => {
+    const repo = repository()
+    const full = { ...(await repo.getProcurementList('SY-001', 1)).data, status: 'confirmed' as const, lines: [{ ...material(1, '已满额电机', '10.000'), ordered_quantity: '10.000', order_status: 'ordered' as const }] }
+    repo.getProcurementList = async () => ({ source: 'live', data: full })
+    render(<ProcurementWorkspace projectCode="SY-SUPPLEMENT" repository={repo} customerCompany={{ id: 2, name: '客户甲' }} />)
+    await screen.findByText('已满额电机')
+    const entry = screen.getByRole('button', { name: /补充采购|建立采购单/ }) as HTMLButtonElement
+    expect(entry.disabled).toBe(false)
+    fireEvent.click(entry)
+    const dialog = await screen.findByRole('dialog')
+    expect((within(dialog).getByLabelText('采购数量') as HTMLInputElement).value).toBe('')
+    expect(within(dialog).getByLabelText('超采原因（超出剩余数量时必填）')).toBeTruthy()
+  })
+
   it('读取 URL 的采购页签，切换页签时保留其他查询条件', async () => {
     render(<MemoryRouter initialEntries={['/projects/SY-URL-001/procurement?section=orders&keep=1']}><WorkspaceNavigationProvider>
       <ProcurementWorkspace projectCode="SY-URL-001" repository={repository()} customerCompany={{ id: 2, name: '客户甲' }} /><LocationProbe />

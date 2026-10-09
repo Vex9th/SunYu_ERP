@@ -7,6 +7,7 @@ import { localISODate } from '../../domain/dates'
 import { centsToYuan, formatBasisPoints, formatMoney, yuanToCents } from '../../domain/formatters'
 import { createHttpProjectOperatingRepository, type ContractInput, type DocumentVersionOption, type ProjectOperatingRepository } from '../../repositories/project-operating.live'
 import { useWorkspaceTab } from '../shared'
+import { useUnsavedChanges } from '../unsavedChanges'
 import './project.css'
 import { errorText, nullable, useProjectLoad, useProjectWrite, type ProjectProps } from './useProjectWork'
 
@@ -65,6 +66,7 @@ export default function ProjectCommercial({ projectCode, readonly = false, repos
   const remainingAllocation = draftTotal === null ? null : draftTotal - allocatedTotal
   const dirty = useRef(false)
   const write = useProjectWrite(`commercial:${projectCode}`, () => { setDialog(null); setFiles([]); load.reload() })
+  useUnsavedChanges(() => Boolean(dialog) && (dirty.current || write.busy))
   useEffect(() => { setDialog(null); setFiles([]); setFormError(null); form.resetFields() }, [projectCode, form])
   const data = load.data
   const quotes = data?.quotes ?? []; const contracts = data?.contracts ?? []; const payments = data?.payments

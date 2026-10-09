@@ -571,7 +571,7 @@ export default function DeliveryWorkspace({
     setSuccess('')
     const submitted = {
       ...editor,
-      initial: structuredClone(values),
+      initial: structuredClone({ ...editor.initial, ...values }),
       files: [...files],
     }
     submittingEditor.current = submitted
@@ -591,7 +591,7 @@ export default function DeliveryWorkspace({
     try {
       if (recoverable) {
         await recoverable.send()
-      } else await editor.submit(structuredClone(values), [...files])
+      } else await editor.submit(structuredClone(submitted.initial), [...files])
       pendingMap(repository).delete(projectCode)
       clearEditorDraft(repository, projectCode, submission.editor.key)
       if (!current(projectCode, repository, version)) return
@@ -678,6 +678,7 @@ export default function DeliveryWorkspace({
       row
         ? { ...row }
         : {
+            revision: null,
             status: 'confirmed',
             confirmed_on: localISODate(),
             document_version_ids: [],
@@ -697,6 +698,7 @@ export default function DeliveryWorkspace({
       ],
       async (values, files) => {
         const input: DrawingSignoffInput = {
+          expected_revision: values.revision as number | null | undefined,
           status: values.status as DrawingSignoffInput['status'],
           confirmed_on:
             values.status === 'confirmed'
@@ -746,6 +748,7 @@ export default function DeliveryWorkspace({
       ],
       async (values, files) => {
         const input: CommissioningSessionInput = {
+          expected_revision: values.revision as number | null | undefined,
           started_at: textValue(values, 'started_at'),
           ended_at: optionalText(values, 'ended_at'),
           status: values.status as CommissioningSessionInput['status'],
@@ -818,6 +821,7 @@ export default function DeliveryWorkspace({
       ],
       async (values, files) => {
         const input: EngineeringChangeInput = {
+          expected_revision: values.revision as number | null | undefined,
           source: values.source as EngineeringChangeInput['source'],
           title: textValue(values, 'title'),
           description: textValue(values, 'description'),
@@ -889,8 +893,7 @@ export default function DeliveryWorkspace({
           projectCode,
           row.change_id,
           status,
-          textValue(values, 'reason'),
-        )
+          textValue(values, 'reason'), row.revision)
       },
     )
   }
@@ -908,6 +911,7 @@ export default function DeliveryWorkspace({
       ],
       async (values) => {
         const input: AcceptanceInput = {
+          expected_revision: values.revision as number | null | undefined,
           acceptance_type:
             values.acceptance_type as AcceptanceInput['acceptance_type'],
           scheduled_on: textValue(values, 'scheduled_on'),
@@ -950,6 +954,7 @@ export default function DeliveryWorkspace({
     open(
       '登记验收结果',
       {
+        revision: row.revision,
         performed_on: row.performed_on ?? localISODate(),
         notes: row.notes,
         document_version_ids: row.document_version_ids,
@@ -969,6 +974,7 @@ export default function DeliveryWorkspace({
       ],
       async (values, files) => {
         const input: DeliveryAcceptanceCompletionInput = {
+          expected_revision: values.revision as number | null | undefined,
           status: values.status as 'passed' | 'passed_with_punch' | 'failed',
           performed_on: textValue(values, 'performed_on'),
           notes: optionalText(values, 'notes'),
@@ -1008,7 +1014,7 @@ export default function DeliveryWorkspace({
             : (row.renewal_price_cents / 100).toFixed(2),
       },
       warrantyFields(),
-      (values) => repository.updateWarranty(projectCode, warrantyInput(values)),
+      (values) => repository.updateWarranty(projectCode, { ...warrantyInput(values), expected_revision: values.revision as number | null | undefined }),
     )
   }
   function openInvoice(row?: DemoInvoiceViewModel) {
@@ -1056,7 +1062,7 @@ export default function DeliveryWorkspace({
         documentsField,
       ],
       async (values, files) => {
-        const input = invoiceInput(values, files.length)
+        const input = { ...invoiceInput(values, files.length), expected_revision: values.revision as number | null | undefined }
         if (row)
           await repository.updateInvoice(projectCode, row.invoice_id, input)
         else
@@ -1104,6 +1110,7 @@ export default function DeliveryWorkspace({
         )
           throw new Error('报修日期不在质保期内，不能选择保内处理')
         const input: AfterSalesInput = {
+          expected_revision: values.revision as number | null | undefined,
           reported_on: textValue(values, 'reported_on'),
           service_on: optionalText(values, 'service_on'),
           reason: textValue(values, 'reason'),
@@ -1166,6 +1173,7 @@ export default function DeliveryWorkspace({
           row.case_id,
           values.status as AfterSalesStatus,
           optionalText(values, 'resolution'),
+          row.revision,
         ),
     )
   }
@@ -1555,6 +1563,7 @@ export default function DeliveryWorkspace({
                         projectCode,
                         row.acceptance_id,
                         reason,
+                        row.revision,
                       ),
                     )
                   }
@@ -1756,6 +1765,7 @@ export default function DeliveryWorkspace({
                         projectCode,
                         row.invoice_id,
                         reason,
+                        row.revision,
                       ),
                     )
                   }

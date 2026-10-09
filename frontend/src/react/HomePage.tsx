@@ -1,3 +1,4 @@
+import { RouterButton } from './RouterButton'
 import { Alert, Button, Empty, Input, Segmented, Space, Tag } from 'antd'
 import {
   ArrowRightOutlined,
@@ -59,11 +60,9 @@ export default function HomePage() {
               onClick={dashboard.reload}
               loading={dashboard.loading}
             />
-            <Link to="/projects?create=1">
-              <Button type="primary" icon={<PlusOutlined />}>
-                新建项目
-              </Button>
-            </Link>
+            <RouterButton to="/projects?create=1" type="primary" icon={<PlusOutlined />}>
+              新建项目
+            </RouterButton>
           </>
         }
       />
@@ -71,6 +70,16 @@ export default function HomePage() {
       {!data && dashboard.loading && <LoadingBlock />}
       {data && (
         <>
+          {!data.backup.healthy && (
+            <Alert
+              type="warning"
+              showIcon
+              title={businessText(data.backup.message) || '请检查备份设置'}
+              action={
+                <RouterButton to="/settings" size="small">设置备份</RouterButton>
+              }
+            />
+          )}
           <div className={styles.metrics}>
             <DataValue
               label="进行中项目"
@@ -195,16 +204,7 @@ export default function HomePage() {
                           利润 {formatMoney(row.actual_profit_cents)}
                         </small>
                       </div>
-                      <Link
-                        className={styles.rowEnter}
-                        to={base}
-                        aria-label={`进入${row.project.name}`}
-                      >
-                        <Button
-                          icon={<ArrowRightOutlined />}
-                          aria-label={`打开${row.project.name}`}
-                        />
-                      </Link>
+                      <RouterButton className={styles.rowEnter} to={base} icon={<ArrowRightOutlined />} aria-label={`进入${row.project.name}`} />
                     </li>
                   )
                 })}
@@ -227,25 +227,11 @@ export default function HomePage() {
                     清除筛选
                   </Button>
                 ) : (
-                  <Link to="/projects?create=1">
-                    <Button type="primary">新建项目</Button>
-                  </Link>
+                  <RouterButton to="/projects?create=1" type="primary">新建项目</RouterButton>
                 )}
               </Empty>
             )}
           </Section>
-          {!data.backup.healthy && (
-            <Alert
-              type="warning"
-              showIcon
-              title={businessText(data.backup.message) || '请检查备份设置'}
-              action={
-                <Link to="/settings">
-                  <Button size="small">设置备份</Button>
-                </Link>
-              }
-            />
-          )}
         </>
       )}
     </div>

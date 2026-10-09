@@ -1,3 +1,4 @@
+import { RouterButton } from './RouterButton'
 import { useEffect, useState } from 'react'
 import {
   Button,
@@ -107,7 +108,7 @@ export default function ProjectsPage() {
           ]}
         />
         <div className={styles.toolbar}>
-          <Space wrap>
+          <Space wrap className={styles.projectFilters}>
             <Input
               prefix={<SearchOutlined />}
               value={search}
@@ -118,7 +119,7 @@ export default function ProjectsPage() {
               }}
               placeholder="搜索项目名称、编号或客户"
               aria-label="搜索项目"
-              style={{ width: 290 }}
+              className={styles.projectSearch}
             />
             <Select
               placeholder="全部客户"
@@ -232,15 +233,14 @@ export default function ProjectsPage() {
               width: 110,
               fixed: 'right',
               render: (_, row) => (
-                <Link to={`/projects/${encodeURIComponent(row.project_code)}`}>
-                  <Button
-                    type="link"
-                    icon={<ArrowRightOutlined />}
-                    iconPlacement="end"
-                  >
-                    进入项目
-                  </Button>
-                </Link>
+                <RouterButton
+                  to={`/projects/${encodeURIComponent(row.project_code)}`}
+                  type="link"
+                  icon={<ArrowRightOutlined />}
+                  iconPlacement="end"
+                >
+                  进入项目
+                </RouterButton>
               ),
             },
           ]}

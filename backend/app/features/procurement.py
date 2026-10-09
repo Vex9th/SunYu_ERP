@@ -16,7 +16,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from backend.app.core.config import Settings
-from backend.app.core.database import transaction_immediate
+from backend.app.core.database import transaction, transaction_immediate
 from backend.app.core.storage_paths import normalize_project_code, project_code_identity
 from backend.app.features import business_attachments
 from backend.app.features.api_common import (
@@ -1200,6 +1200,30 @@ def create_procurement_router(
             )
             return response
 
+    @router.get("/api/projects/{project_code}/procurement-options")
+    def get_procurement_options(
+        project_code: str,
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        project = _project(connection, _normalize_project_path(project_code))
+        with transaction(connection):
+            lists = connection.execute(
+                "SELECT id, name, status, revision FROM procurement_lists "
+                "WHERE project_id = ? ORDER BY id", (project["id"],),
+            ).fetchall()
+            rows = _project_line_quantities(connection, int(project["id"]))
+        return {
+            "lists": [dict(row) for row in lists],
+            "lines": [{
+                "id": row["id"], "procurement_list_id": row["procurement_list_id"],
+                "name": row["name"], "model": row["model"], "unit": row["unit"],
+                "unit_cost_cents": row["unit_cost_cents"],
+                "quantity": format_quantity(int(row["quantity_milli"])),
+                "ordered_quantity": format_quantity(int(row["ordered_quantity_milli"])),
+            } for row in rows],
+        }
+
     @router.get("/api/projects/{project_code}/procurement-overview")
     def get_procurement_overview(
         project_code: str,
@@ -1207,9 +1231,11 @@ def create_procurement_router(
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         project = _project(connection, _normalize_project_path(project_code))
-        line_rows = _project_line_rows(connection, int(project["id"]))
-        line_responses = [_line_response(connection, row, None) for row in line_rows]
-        counts = Counter(str(line["order_status"]) for line in line_responses)
+        line_rows = _project_line_quantities(connection, int(project["id"]), confirmed_only=True)
+        counts = Counter(_quantity_status(
+            int(row["ordered_quantity_milli"]), int(row["quantity_milli"]),
+            zero="not_ordered", partial="partial", complete="ordered", over="over_ordered",
+        ) for row in line_rows)
         for label in ("not_ordered", "partial", "ordered", "over_ordered"):
             counts.setdefault(label, 0)
         committed = connection.execute(
@@ -1264,7 +1290,7 @@ def create_procurement_router(
         ).fetchone()[0]
         return {
             "project_code": project["project_code"],
-            "line_count": len(line_responses),
+            "line_count": len(line_rows),
             "line_status_counts": dict(counts),
             "procurement_committed_cents": committed,
             "procurement_received_cents": received,
@@ -1995,6 +2021,34 @@ def _procurement_inventory_identity(
         record["model"],
         record["specification"],
     )
+
+
+def _project_line_quantities(
+    connection: sqlite3.Connection,
+    project_id: int,
+    *,
+    confirmed_only: bool = False,
+) -> list[sqlite3.Row]:
+    """选料和总览只需要已订购数量，一次聚合避免每行六组关联查询。"""
+    return connection.execute(
+        """
+        WITH ordered AS (
+            SELECT ol.procurement_line_id, SUM(ol.quantity_milli) AS quantity
+            FROM purchase_order_lines AS ol
+            JOIN purchase_orders AS orders ON orders.id = ol.purchase_order_id
+            WHERE orders.project_id = ?
+              AND orders.status IN ('confirmed', 'partially_received', 'received')
+            GROUP BY ol.procurement_line_id
+        )
+        SELECT lines.*, COALESCE(ordered.quantity, 0) AS ordered_quantity_milli
+        FROM procurement_lines AS lines
+        JOIN procurement_lists AS lists ON lists.id = lines.procurement_list_id
+        LEFT JOIN ordered ON ordered.procurement_line_id = lines.id
+        WHERE lists.project_id = ? AND (? = 0 OR lists.status = 'confirmed')
+        ORDER BY lists.id, lines.sequence_no, lines.id
+        """,
+        (project_id, project_id, int(confirmed_only)),
+    ).fetchall()
 
 
 def _project_line_rows(

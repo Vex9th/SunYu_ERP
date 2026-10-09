@@ -201,6 +201,7 @@ export interface WorkforceWorkspaceRepository extends WorkforceWorkspaceMethods 
     assignmentId: number,
     status: CrewAssignmentStatus,
     reason: string | null,
+    expectedRevision?: number | null,
   ): Promise<void>
 }
 
@@ -484,7 +485,7 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
         const workerId = this.assignments.get(entry.assignment_id)?.worker_id
         return {
           ...entry,
-          expected_revision: workerId === undefined
+          expected_revision: entry.expected_revision !== undefined ? entry.expected_revision : workerId === undefined
             ? null
             : this.laborByWorkerDate.get(laborKey(input.work_date, workerId))?.revision ?? null,
         }
@@ -510,16 +511,16 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
 
   async updateWorker(workerId: number, input: Parameters<WorkforceRepository['updateWorker']>[1]): Promise<void> {
     const current = (await this.api.getWorker(workerId)).data
-    const response = await this.api.updateWorker(workerId, { ...input, expected_revision: current.revision })
+    const response = await this.api.updateWorker(workerId, { ...input, expected_revision: input.expected_revision ?? current.revision })
     this.workers.set(workerId, response.data)
   }
 
-  async setWorkerStatus(workerId: number, status: WorkerStatus): Promise<void> {
+  async setWorkerStatus(workerId: number, status: WorkerStatus, expectedRevision?: number | null): Promise<void> {
     const response = await this.sendStableOperation(`${workerPath(workerId)}/status`, status, async () => {
       const current = (await this.api.getWorker(workerId)).data
-      const payload = { effective_on: localBusinessDate(), reason: '从施工人员页停用', expected_revision: current.revision }
+      const payload = { effective_on: localBusinessDate(), reason: '从施工人员页停用', expected_revision: expectedRevision ?? current.revision }
       return () => status === 'active'
-        ? this.api.reactivateWorker(workerId, { expected_revision: current.revision })
+        ? this.api.reactivateWorker(workerId, { expected_revision: expectedRevision ?? current.revision })
         : this.api.deactivateWorker(workerId, payload)
     })
     this.workers.set(workerId, response.data)
@@ -547,7 +548,7 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     }
     const response = await this.api.updateCrewAssignment(projectCode, assignmentId, {
       ...input,
-      expected_revision: current.revision,
+      expected_revision: input.expected_revision ?? current.revision,
     })
     if (this.hasProjectContext(projectCode, contextVersion)) this.assignments.set(assignmentId, response.data)
   }
@@ -557,6 +558,7 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     assignmentId: number,
     status: CrewAssignmentStatus,
     reason: string | null,
+    expectedRevision?: number | null,
   ): Promise<void> {
     this.requireProjectContext(projectCode)
     const contextVersion = this.previewLoadVersion
@@ -566,7 +568,7 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
       to_status: status,
       effective_at: new Date().toISOString(),
       reason,
-      expected_revision: current.revision,
+      expected_revision: expectedRevision ?? current.revision,
     }
     const response = await this.sendStableOperation(
       `${assignmentCollectionPath(projectCode)}/${assignmentId}/transition`, { status, reason },
@@ -586,19 +588,19 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     if (!current) throw new Error('上工记录不存在，请刷新后重试')
     const response = await this.api.updateLaborEntry(projectCode, entryId, {
       ...input,
-      expected_revision: current.revision,
+      expected_revision: input.expected_revision ?? current.revision,
     })
     if (this.hasProjectContext(projectCode, contextVersion)) this.cacheLabor(response.data)
   }
 
-  async voidLaborEntry(projectCode: string, entryId: number, reason: string): Promise<void> {
+  async voidLaborEntry(projectCode: string, entryId: number, reason: string, expectedRevision?: number | null): Promise<void> {
     this.requireProjectContext(projectCode)
     const contextVersion = this.previewLoadVersion
     const current = this.laborById.get(entryId)
     if (!current) throw new Error('上工记录不存在，请刷新后重试')
     const payload = {
       reason,
-      expected_revision: current.revision,
+      expected_revision: expectedRevision ?? current.revision,
     }
     const response = await this.sendStableOperation(
       `${projectPath(projectCode)}/labor-entries/${entryId}/void`, { reason },
@@ -612,32 +614,32 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     const contextVersion = this.previewLoadVersion
     const data = await requestJson<SiteDailyReportDto>(
       `${projectPath(projectCode)}/site-daily-reports/${input.work_date}`,
-      { method: 'PUT', body: { ...input, work_date: undefined, expected_revision: this.reports.get(input.work_date)?.revision ?? null } },
+      { method: 'PUT', body: { ...input, work_date: undefined, expected_revision: input.expected_revision !== undefined ? input.expected_revision : this.reports.get(input.work_date)?.revision ?? null } },
     )
     if (this.hasProjectContext(projectCode, contextVersion)) this.reports.set(data.work_date, data)
     return live(mapReport(data))
   }
 
-  async confirmSiteDailyReport(projectCode: string, workDate: string): Promise<void> {
+  async confirmSiteDailyReport(projectCode: string, workDate: string, expectedRevision?: number | null): Promise<void> {
     this.requireProjectContext(projectCode)
     const contextVersion = this.previewLoadVersion
     const current = this.reports.get(workDate)
     if (!current) throw new Error('施工日报不存在，请刷新后重试')
     const path = `${projectPath(projectCode)}/site-daily-reports/${workDate}/confirm`
-    const payload = { confirmed_at: new Date().toISOString(), expected_revision: current.revision }
+    const payload = { confirmed_at: new Date().toISOString(), expected_revision: expectedRevision ?? current.revision }
     const data = await this.sendStableOperation(path, null,
       () => () => this.postSender.send<SiteDailyReportDto>(path, payload),
     )
     if (this.hasProjectContext(projectCode, contextVersion)) this.reports.set(workDate, data)
   }
 
-  async reopenSiteDailyReport(projectCode: string, workDate: string, reason: string): Promise<void> {
+  async reopenSiteDailyReport(projectCode: string, workDate: string, reason: string, expectedRevision?: number | null): Promise<void> {
     this.requireProjectContext(projectCode)
     const contextVersion = this.previewLoadVersion
     const current = this.reports.get(workDate)
     if (!current) throw new Error('施工日报不存在，请刷新后重试')
     const path = `${projectPath(projectCode)}/site-daily-reports/${workDate}/reopen`
-    const payload = { reason, expected_revision: current.revision }
+    const payload = { reason, expected_revision: expectedRevision ?? current.revision }
     const data = await this.sendStableOperation(path, { reason },
       () => () => this.postSender.send<SiteDailyReportDto>(path, payload),
     )
@@ -664,18 +666,18 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     if (current.reimbursed_amount_cents !== 0) throw new Error('已有有效报销的垫资不能编辑')
     const data = await requestJson<MaterialAdvanceDetailDto>(
       `${projectPath(projectCode)}/material-advances/${advanceId}`,
-      { method: 'PUT', body: { ...materialAdvancePayload(input), expected_revision: current.revision } },
+      { method: 'PUT', body: { ...materialAdvancePayload(input), expected_revision: input.expected_revision ?? current.revision } },
     )
     if (this.hasProjectContext(projectCode, contextVersion)) this.advances.set(advanceId, data)
   }
 
-  async voidMaterialAdvance(projectCode: string, advanceId: number, reason: string): Promise<void> {
+  async voidMaterialAdvance(projectCode: string, advanceId: number, reason: string, expectedRevision?: number | null): Promise<void> {
     this.requireProjectContext(projectCode)
     const contextVersion = this.previewLoadVersion
     const current = this.advances.get(advanceId)
     if (!current) throw new Error('垫资记录不存在，请刷新后重试')
     const path = `${projectPath(projectCode)}/material-advances/${advanceId}/void`
-    const payload = { reason, expected_revision: current.revision }
+    const payload = { reason, expected_revision: expectedRevision ?? current.revision }
     const data = await this.sendStableOperation(path, { reason },
       () => () => this.postSender.send<MaterialAdvanceDetailDto>(path, payload),
     )
@@ -705,6 +707,7 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     advanceId: number,
     reimbursementId: number,
     reason: string,
+    expectedRevision?: number | null,
   ): Promise<void> {
     this.requireProjectContext(projectCode)
     const contextVersion = this.previewLoadVersion
@@ -712,7 +715,7 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     const reimbursement = current?.reimbursements.find((item) => item.id === reimbursementId)
     if (!current || !reimbursement) throw new Error('报销记录不存在，请刷新后重试')
     const path = `${projectPath(projectCode)}/material-advances/${advanceId}/reimbursements/${reimbursementId}/void`
-    const payload = { reason, expected_revision: reimbursement.revision }
+    const payload = { reason, expected_revision: expectedRevision ?? reimbursement.revision }
     const data = await this.sendStableOperation(path, { reason },
       () => () => this.postSender.send<MaterialAdvanceReimbursementResponseDto>(path, payload),
     )
@@ -779,11 +782,13 @@ function live<T>(data: T): RepositoryResult<T> {
 }
 
 function mapWorker(item: WorkerDto): DemoWorkerViewModel {
-  return { worker_id: item.id, name: item.name, phone: item.phone, notes: item.notes, status: item.status }
+  return {
+    revision: item.revision, worker_id: item.id, name: item.name, phone: item.phone, notes: item.notes, status: item.status }
 }
 
 function mapAssignment(item: CrewAssignmentDto): DemoCrewAssignmentViewModel {
   return {
+    revision: item.revision,
     assignment_id: item.id,
     worker_id: item.worker_id,
     role: item.role,
@@ -798,7 +803,10 @@ function mapAssignment(item: CrewAssignmentDto): DemoCrewAssignmentViewModel {
 
 function mapLabor(item: LiveLaborEntryDto): DemoLaborEntryViewModel {
   return {
+    revision: item.revision,
     entry_id: item.id,
+    pay_basis: item.pay_basis,
+    rate_cents: item.rate_cents,
     assignment_id: item.assignment_id,
     replaces_entry_id: item.replaces_entry_id ?? null,
     work_date: item.work_date,
@@ -815,6 +823,7 @@ function mapLabor(item: LiveLaborEntryDto): DemoLaborEntryViewModel {
 
 function mapReport(item: SiteDailyReportDto): DemoSiteDailyReportViewModel {
   return {
+    revision: item.revision,
     work_date: item.work_date,
     location: item.location,
     weather: item.weather,
@@ -830,6 +839,7 @@ function mapReport(item: SiteDailyReportDto): DemoSiteDailyReportViewModel {
 
 function mapAdvance(item: MaterialAdvanceDetailDto): DemoMaterialAdvanceViewModel {
   return {
+    revision: item.revision,
     advance_id: item.id,
     worker_id: item.worker_id,
     spent_on: item.spent_on,
@@ -850,6 +860,7 @@ function mapAdvance(item: MaterialAdvanceDetailDto): DemoMaterialAdvanceViewMode
     voided_at: item.voided_at,
     reimbursements: item.reimbursements.map((entry) => ({
       reimbursement_id: entry.id,
+      revision: entry.revision,
       amount_cents: entry.amount_cents,
       reimbursed_on: entry.reimbursed_on,
       payment_method: entry.payment_method,

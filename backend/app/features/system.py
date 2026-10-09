@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -11,12 +13,14 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from backend.app.core.config import Settings, update_backup_settings
+from backend.app.core.database import connect_database
 from backend.app.features.auth import require_authenticated_session
-from backend.app.features.backups import create_backup, prune_backups
+from backend.app.features.backups import _BACKUP_LOCK, create_backup, prune_backups
 
 _SCHEDULER_POLL_SECONDS = 60.0
 _SCHEDULER_STOP_TIMEOUT_SECONDS = 5.0
 _MAX_RETRY_DELAY = timedelta(hours=1)
+_TASK_SUBMISSION_LOCK = Lock()
 _CLEANUP_WARNING = "Backup created but cleanup failed"
 
 BackupCreator = Callable[..., Path]
@@ -249,6 +253,28 @@ class BackupSettingsUpdate:
     retention_days: int
 
 
+def recover_interrupted_backups(connection: sqlite3.Connection) -> None:
+    # 单进程启动、调度器启动之前运行；不根据目录名字猜测文件归属。
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='backup_runs'"
+    ).fetchone() is not None:
+        connection.execute(
+            "UPDATE backup_runs SET status='failed', finished_at=?, "
+            "error_message='Backup interrupted by service restart' WHERE status='running'",
+            (_utc_now().isoformat(),),
+        )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS backup_tasks "
+        "(id TEXT PRIMARY KEY, status TEXT NOT NULL, phase TEXT NOT NULL, "
+        "started_at TEXT NOT NULL, finished_at TEXT, path TEXT, warning TEXT, error_code TEXT)"
+    )
+    connection.execute(
+        "UPDATE backup_tasks SET status='interrupted', phase='interrupted', "
+        "finished_at=?, error_code='service_restart' WHERE status='running'",
+        (_utc_now().isoformat(),),
+    )
+
+
 def run_backup_job(
     connection: sqlite3.Connection,
     settings: Settings,
@@ -256,17 +282,49 @@ def run_backup_job(
     *,
     creator: BackupCreator = create_backup,
     pruner: BackupPruner = prune_backups,
+    on_phase: Callable[[str], None] | None = None,
+) -> BackupJobResult:
+    with _BACKUP_LOCK:
+        try:
+            return _run_backup_job_locked(
+                connection, settings, now,
+                creator=creator, pruner=pruner, on_phase=on_phase,
+            )
+        except BaseException as failure:
+            logging.getLogger(__name__).error(
+                "backup stage=job error=%s errno=%s",
+                type(failure).__name__, getattr(failure, "errno", None),
+            )
+            raise
+
+
+def _run_backup_job_locked(
+    connection: sqlite3.Connection,
+    settings: Settings,
+    now: datetime,
+    *,
+    creator: BackupCreator = create_backup,
+    pruner: BackupPruner = prune_backups,
+    on_phase: Callable[[str], None] | None = None,
 ) -> BackupJobResult:
     if settings.backup_dir is None:
         raise RuntimeError("backup_dir is not configured")
+    if on_phase is not None:
+        on_phase("creating")
     target = creator(connection, settings, now=now)
     try:
+        if on_phase is not None:
+            on_phase("cleaning")
         pruner(
             settings.backup_dir,
             settings.backup_retention_days,
             now=now,
         )
     except BaseException as failure:  # noqa: BLE001 - backup already succeeded
+        logging.getLogger(__name__).error(
+            "backup stage=cleanup error=%s errno=%s",
+            type(failure).__name__, getattr(failure, "errno", None),
+        )
         return BackupJobResult(
             target,
             warning=_CLEANUP_WARNING,
@@ -291,6 +349,31 @@ def create_system_router(
     scheduler_snapshot_dependency = Depends(get_scheduler_snapshot)
     payload_dependency = Depends(_read_backup_settings_update)
     now = clock or _utc_now
+    live_tasks: set[str] = set()
+    unrecorded_success: dict[str, dict[str, object]] = {}
+
+    def reconcile_task(connection: sqlite3.Connection, task_id: str) -> dict[str, object] | None:
+        completed = unrecorded_success.get(task_id)
+        if completed is not None:
+            try:
+                connection.execute(
+                    "UPDATE backup_tasks SET status='success',phase='finished',"
+                    "finished_at=?,path=?,warning=?,error_code=NULL WHERE id=?",
+                    (completed["finished_at"], completed["path"], completed["warning"], task_id),
+                )
+                unrecorded_success.pop(task_id, None)
+            except (OSError, sqlite3.Error) as failure:
+                logging.getLogger(__name__).error(
+                    "backup task=%s stage=status_reconcile error=%s errno=%s",
+                    task_id, type(failure).__name__, getattr(failure, "errno", None),
+                )
+            return completed
+        if task_id not in live_tasks:
+            connection.execute(
+                "UPDATE backup_tasks SET status='interrupted',phase='interrupted',"
+                "finished_at=?,error_code='worker_stopped' WHERE id=? AND status='running'",
+                (now().isoformat(), task_id),
+            )
 
     def require_session(
         request: Request,
@@ -376,6 +459,143 @@ def create_system_router(
         if result.warning is not None:
             response["warning"] = result.warning
         return response
+
+    @router.post("/backup-tasks", status_code=status.HTTP_202_ACCEPTED)
+    def start_backup_task(
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+        settings: Settings = settings_dependency,
+    ) -> dict[str, object]:
+        if settings.backup_dir is None:
+            raise HTTPException(status_code=409, detail="Backup directory is not configured")
+        with _TASK_SUBMISSION_LOCK:
+            active = connection.execute(
+                "SELECT id FROM backup_tasks WHERE status='running' "
+                "ORDER BY started_at DESC LIMIT 1"
+            ).fetchone()
+            if active is not None:
+                if active["id"] in live_tasks:
+                    return {"task_id": active["id"], "status": "running"}
+                completed = reconcile_task(connection, active["id"])
+                if completed is not None:
+                    return {"task_id": active["id"], "status": "success"}
+            task_id = uuid.uuid4().hex
+            started_at = now().isoformat()
+            try:
+                task_connection = connect_database(settings.data_dir / "iapm.sqlite")
+            except (OSError, sqlite3.Error) as failure:
+                logging.getLogger(__name__).error(
+                    "backup task=%s stage=connection error=%s errno=%s",
+                    task_id, type(failure).__name__, getattr(failure, "errno", None),
+                )
+                raise HTTPException(status_code=503, detail="Backup worker connection unavailable") from None
+            try:
+                connection.execute(
+                    "INSERT INTO backup_tasks(id,status,phase,started_at) "
+                    "VALUES(?,'running','queued',?)",
+                    (task_id, started_at),
+                )
+                live_tasks.add(task_id)
+            except BaseException:
+                task_connection.close()
+                raise
+
+        def execute() -> None:
+            worker_connection = task_connection
+            result: BackupJobResult | None = None
+            try:
+                with _BACKUP_LOCK:
+                    def report_phase(phase: str) -> None:
+                        worker_connection.execute(
+                            "UPDATE backup_tasks SET phase=? WHERE id=?",
+                            (phase, task_id),
+                        )
+
+                    result = run_backup_job(
+                        worker_connection, settings, now(),
+                        creator=backup_creator, pruner=backup_pruner,
+                        on_phase=report_phase,
+                    )
+                    worker_connection.execute(
+                        "UPDATE backup_tasks SET status='success',phase='finished',"
+                        "finished_at=?,path=?,warning=? WHERE id=?",
+                        (now().isoformat(), str(result.path), result.warning, task_id),
+                    )
+            except BaseException as failure:  # noqa: BLE001 - persist worker outcome before exit
+                error_code = (
+                    f"backup:{type(failure).__name__}:"
+                    f"errno={getattr(failure, 'errno', None)}"
+                )
+                logging.getLogger(__name__).error(
+                    "backup task=%s stage=%s error=%s",
+                    task_id, "status" if result is not None else "worker", error_code,
+                )
+                if result is not None:
+                    # 文件与 backup_runs 已成功；任务记录失败不能反转业务结果。
+                    with _TASK_SUBMISSION_LOCK:
+                        unrecorded_success[task_id] = {
+                            "id": task_id, "status": "success", "phase": "finished",
+                            "started_at": started_at, "finished_at": now().isoformat(),
+                            "path": str(result.path), "warning": result.warning,
+                            "error_code": None,
+                        }
+                elif worker_connection is not None:
+                    try:
+                        worker_connection.execute(
+                            "UPDATE backup_tasks SET status='failed',phase='failed',"
+                            "finished_at=?,error_code=? WHERE id=?",
+                            (now().isoformat(), error_code, task_id),
+                        )
+                    except (OSError, sqlite3.Error) as record_failure:
+                        logging.getLogger(__name__).error(
+                            "backup task=%s stage=status error=%s errno=%s",
+                            task_id, type(record_failure).__name__,
+                            getattr(record_failure, "errno", None),
+                        )
+            finally:
+                try:
+                    worker_connection.close()
+                except (OSError, sqlite3.Error) as close_failure:
+                    logging.getLogger(__name__).error(
+                        "backup task=%s stage=connection_close error=%s errno=%s",
+                        task_id, type(close_failure).__name__,
+                        getattr(close_failure, "errno", None),
+                    )
+                finally:
+                    with _TASK_SUBMISSION_LOCK:
+                        live_tasks.discard(task_id)
+
+        worker = Thread(target=execute, name=f"backup-{task_id[:8]}", daemon=True)
+        try:
+            worker.start()
+        except RuntimeError:
+            with _TASK_SUBMISSION_LOCK:
+                live_tasks.discard(task_id)
+            task_connection.close()
+            connection.execute(
+                "UPDATE backup_tasks SET status='failed',phase='failed',"
+                "finished_at=?,error_code='worker_start:RuntimeError' WHERE id=?",
+                (now().isoformat(), task_id),
+            )
+            raise HTTPException(status_code=503, detail="Backup worker could not start") from None
+        return {"task_id": task_id, "status": "running"}
+
+    @router.get("/backup-tasks/{task_id}")
+    def get_backup_task(
+        task_id: str,
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        with _TASK_SUBMISSION_LOCK:
+            completed = reconcile_task(connection, task_id)
+            if completed is not None:
+                return completed
+            row = connection.execute(
+                "SELECT * FROM backup_tasks WHERE id=?", (task_id,),
+            ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Backup task not found")
+        return dict(row)
 
     return router
 

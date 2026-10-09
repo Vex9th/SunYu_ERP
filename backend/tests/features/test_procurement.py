@@ -643,3 +643,50 @@ def test_archived_project_does_not_block_successful_procurement_replays(
     assert list_confirm_replay.json() == confirmed_list.json()
     assert order_confirm_replay.status_code == 200
     assert order_confirm_replay.json() == confirmed_order.json()
+
+
+def test_procurement_options_and_overview_cover_all_pages_with_bounded_queries(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import sys
+
+    harness = _build_harness(tmp_path)
+    with harness.client() as client:
+        base = _create_confirmed_list(client, harness.project_code)
+        with connect_database(harness.database_path) as connection:
+            for index in range(2, 26):
+                cursor = connection.execute(
+                    "INSERT INTO procurement_lists (project_id, name, status, create_idempotency_key, create_request_hash, confirmed_at, created_at, updated_at) "
+                    "SELECT project_id, ?, status, ?, create_request_hash, confirmed_at, created_at, updated_at FROM procurement_lists WHERE id = ?",
+                    (f"清单{index}", f"list-{index}", base["id"]),
+                )
+                connection.execute(
+                    "INSERT INTO procurement_lines (procurement_list_id, sequence_no, category, name, "
+                    "quantity_milli, unit, unit_cost_cents, quoted_unit_price_cents, create_idempotency_key, create_request_hash, created_at, updated_at) "
+                    "SELECT ?, sequence_no, category, ?, quantity_milli, unit, unit_cost_cents, "
+                    "quoted_unit_price_cents, ?, create_request_hash, created_at, updated_at FROM procurement_lines WHERE id = ?",
+                    (cursor.lastrowid, f"物料{index}", f"line-{index}", base["lines"][0]["id"]),
+                )
+        statements: list[str] = []
+        original_connect = connect_database
+        def traced_connection(path):
+            owned = original_connect(path)
+            owned.set_trace_callback(statements.append)
+            return owned
+        monkeypatch.setattr(sys.modules[__name__], "connect_database", traced_connection)
+        options = client.get(f"/api/projects/{harness.project_code}/procurement-options")
+        assert options.status_code == 200
+        assert len(options.json()["lists"]) == 25
+        assert len(options.json()["lines"]) == 25
+        assert options.json()["lines"][-1]["name"] == "物料25"
+        assert options.json()["lines"][-1]["ordered_quantity"] == "0.000"
+        assert client.get("/api/projects/MISSING/procurement-options").status_code == 404
+        statements.clear()
+        overview = client.get(f"/api/projects/{harness.project_code}/procurement-overview")
+        assert overview.status_code == 200
+        assert overview.json()["line_count"] == 25
+        assert overview.json()["line_status_counts"]["not_ordered"] == 25
+        selects = [sql for sql in statements if sql.lstrip().upper().startswith(("SELECT", "WITH"))]
+        assert len(selects) <= 10, f"total queries: {len(selects)}"
+    with TestClient(harness.app) as anonymous:
+        assert anonymous.get(f"/api/projects/{harness.project_code}/procurement-options").status_code == 401

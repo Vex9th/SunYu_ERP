@@ -1,3 +1,4 @@
+import { RouterButton } from './RouterButton'
 import { lazy, Suspense, useEffect, useState } from 'react'
 import {
   Alert,
@@ -108,13 +109,7 @@ function ProjectWorkspace({ projectCode }: { projectCode: string }) {
           <section className={styles.projectContext}>
             <div className={styles.toolbar}>
               <div className={styles.projectHeader}>
-                <Link to="/projects" aria-label="返回项目中心">
-                  <Button
-                    type="text"
-                    icon={<ArrowLeftOutlined />}
-                    aria-label="返回项目中心"
-                  />
-                </Link>
+                <RouterButton to="/projects" type="text" icon={<ArrowLeftOutlined />} aria-label="返回项目中心" />
                 <span className={styles.projectAvatar}>
                   <FolderOpenOutlined />
                 </span>
@@ -134,6 +129,7 @@ function ProjectWorkspace({ projectCode }: { projectCode: string }) {
               </div>
               <Space wrap>
                 <RefreshButton
+                  label="刷新概况"
                   loading={dashboard.loading}
                   onClick={dashboard.reload}
                 />
@@ -431,15 +427,13 @@ function ProjectOverview({ data }: { data: ProjectDashboard }) {
                 : '查看阶段计划，安排接下来的工作'}
           </p>
         </div>
-        <Link to={`${base}/stages`}>
-          <Button type="primary" icon={<ArrowRightOutlined />}>
-            {archived
-              ? '查看阶段记录'
-              : current?.status === 'blocked'
-                ? '处理阶段阻塞'
-                : '查看并更新进度'}
-          </Button>
-        </Link>
+        <RouterButton to={`${base}/stages`} type="primary" icon={<ArrowRightOutlined />}>
+          {archived
+            ? '查看阶段记录'
+            : current?.status === 'blocked'
+              ? '处理阶段阻塞'
+              : '查看并更新进度'}
+        </RouterButton>
       </div>
       {data.todos.length > 0 && (
         <Section title={`项目待办 · ${data.todos.length} 项`}>

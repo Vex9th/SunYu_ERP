@@ -40,18 +40,18 @@ export interface WorkforceRepository {
   ): Promise<RepositoryResult<DemoLaborEntryViewModel[]>>
   createWorker(input: WorkerInput): Promise<RepositoryResult<DemoWorkerViewModel>>
   updateWorker(workerId: number, input: WorkerInput): Promise<void>
-  setWorkerStatus(workerId: number, status: WorkerStatus): Promise<void>
+  setWorkerStatus(workerId: number, status: WorkerStatus, expectedRevision?: number | null): Promise<void>
   assignWorker(projectCode: string, input: CrewAssignmentInput): Promise<RepositoryResult<DemoCrewAssignmentViewModel>>
   updateCrewAssignment(projectCode: string, assignmentId: number, input: CrewAssignmentInput): Promise<void>
-  setCrewAssignmentStatus(projectCode: string, assignmentId: number, status: CrewAssignmentStatus): Promise<void>
+  setCrewAssignmentStatus(projectCode: string, assignmentId: number, status: CrewAssignmentStatus, reason?: string | null, expectedRevision?: number | null): Promise<void>
   updateLaborEntry(projectCode: string, entryId: number, input: LaborEntryUpdateInput): Promise<void>
-  voidLaborEntry(projectCode: string, entryId: number, reason: string): Promise<void>
+  voidLaborEntry(projectCode: string, entryId: number, reason: string, expectedRevision?: number | null): Promise<void>
   saveSiteDailyReport(projectCode: string, input: SiteDailyReportInput): Promise<RepositoryResult<DemoSiteDailyReportViewModel>>
-  confirmSiteDailyReport(projectCode: string, workDate: string): Promise<void>
-  reopenSiteDailyReport(projectCode: string, workDate: string, reason: string): Promise<void>
+  confirmSiteDailyReport(projectCode: string, workDate: string, expectedRevision?: number | null): Promise<void>
+  reopenSiteDailyReport(projectCode: string, workDate: string, reason: string, expectedRevision?: number | null): Promise<void>
   saveMaterialAdvance(projectCode: string, input: MaterialAdvanceInput): Promise<RepositoryResult<DemoMaterialAdvanceViewModel>>
   updateMaterialAdvance(projectCode: string, advanceId: number, input: MaterialAdvanceInput): Promise<void>
-  voidMaterialAdvance(projectCode: string, advanceId: number, reason: string): Promise<void>
+  voidMaterialAdvance(projectCode: string, advanceId: number, reason: string, expectedRevision?: number | null): Promise<void>
   recordMaterialAdvanceReimbursement(
     projectCode: string,
     advanceId: number,
@@ -62,6 +62,7 @@ export interface WorkforceRepository {
     advanceId: number,
     reimbursementId: number,
     reason: string,
+    expectedRevision?: number | null,
   ): Promise<void>
   getDeliveryPreview(projectCode: string): Promise<RepositoryResult<DeliveryDemoViewModel>>
   getDeliverySummary(projectCode: string): Promise<RepositoryResult<DeliverySummaryViewModel>>
@@ -72,21 +73,21 @@ export interface WorkforceRepository {
   saveEngineeringChange(projectCode: string, input: EngineeringChangeInput): Promise<void>
   discardSaveEngineeringChange(projectCode: string, input: EngineeringChangeInput, files?: readonly File[]): boolean
   updateEngineeringChange(projectCode: string, changeId: number, input: EngineeringChangeInput): Promise<void>
-  setEngineeringChangeStatus(projectCode: string, changeId: number, status: EngineeringChangeStatus): Promise<void>
+  setEngineeringChangeStatus(projectCode: string, changeId: number, status: EngineeringChangeStatus, expectedRevision?: number | null): Promise<void>
   saveAcceptance(projectCode: string, input: AcceptanceInput): Promise<void>
   discardSaveAcceptance(projectCode: string, input: AcceptanceInput): boolean
   rescheduleAcceptance(projectCode: string, acceptanceId: number, input: AcceptanceInput, reason: string): Promise<void>
-  cancelAcceptance(projectCode: string, acceptanceId: number, reason: string): Promise<void>
+  cancelAcceptance(projectCode: string, acceptanceId: number, reason: string, expectedRevision?: number | null): Promise<void>
   completeAcceptance(projectCode: string, acceptanceId: number, input: AcceptanceCompletionInput): Promise<void>
   updateWarranty(projectCode: string, input: WarrantyInput): Promise<void>
   saveInvoice(projectCode: string, input: InvoiceInput, files?: readonly File[]): Promise<void>
   updateInvoice(projectCode: string, invoiceId: number, input: InvoiceInput): Promise<void>
   discardSaveInvoice(projectCode: string, input: InvoiceInput, files?: readonly File[]): boolean
-  voidInvoice(projectCode: string, invoiceId: number, reason: string): Promise<void>
+  voidInvoice(projectCode: string, invoiceId: number, reason: string, expectedRevision?: number | null): Promise<void>
   saveAfterSalesCase(projectCode: string, input: AfterSalesInput): Promise<void>
   discardSaveAfterSalesCase(projectCode: string, input: AfterSalesInput): boolean
   updateAfterSalesCase(projectCode: string, caseId: number, input: AfterSalesInput): Promise<void>
-  setAfterSalesStatus(projectCode: string, caseId: number, status: AfterSalesStatus, resolution: string | null): Promise<void>
+  setAfterSalesStatus(projectCode: string, caseId: number, status: AfterSalesStatus, resolution: string | null, expectedRevision?: number | null): Promise<void>
 }
 
 export class MockWorkforceRepository implements WorkforceRepository {
@@ -139,10 +140,14 @@ export class MockWorkforceRepository implements WorkforceRepository {
       if (!assignment) throw new Error('项目排单不存在')
       if (workerIds.has(assignment.worker_id)) throw new Error('同一施工员不能重复提交')
       workerIds.add(assignment.worker_id)
+      const previous = workspace.labor_entries.find(
+        (item) => item.status === 'active' && item.assignment_id === entry.assignment_id
+          && item.work_date === input.work_date,
+      )
       return {
         assignment,
         entry,
-        costCents: laborCost(assignment, entry),
+        costCents: laborCost(historicalAssignment(assignment, previous), entry),
       }
     })
 
@@ -171,6 +176,8 @@ export class MockWorkforceRepository implements WorkforceRepository {
         work_minutes: entry.work_minutes,
         work_summary: normalizedOptionalText(entry.work_summary),
         notes: normalizedOptionalText(entry.notes),
+        pay_basis: existing?.assignment_id === entry.assignment_id ? existing.pay_basis ?? assignment.pay_basis : assignment.pay_basis,
+        rate_cents: existing?.assignment_id === entry.assignment_id ? existing.rate_cents ?? assignment.rate_cents : assignment.rate_cents,
         cost_cents: costCents,
         status: 'active',
         void_reason: null,
@@ -276,8 +283,7 @@ export class MockWorkforceRepository implements WorkforceRepository {
   async setCrewAssignmentStatus(
     projectCode: string,
     assignmentId: number,
-    status: CrewAssignmentStatus,
-  ): Promise<void> {
+    status: CrewAssignmentStatus): Promise<void> {
     const assignment = this.workspace(projectCode).crew_assignments.find((item) => item.assignment_id === assignmentId)
     if (!assignment) throw new Error('项目排单不存在')
     assignment.status = status
@@ -305,7 +311,9 @@ export class MockWorkforceRepository implements WorkforceRepository {
       ...clone(input),
       work_summary: normalizedOptionalText(input.work_summary),
       notes: normalizedOptionalText(input.notes),
-      cost_cents: laborCost(assignment, input),
+      pay_basis: entry.assignment_id === input.assignment_id ? entry.pay_basis ?? assignment.pay_basis : assignment.pay_basis,
+      rate_cents: entry.assignment_id === input.assignment_id ? entry.rate_cents ?? assignment.rate_cents : assignment.rate_cents,
+      cost_cents: laborCost(historicalAssignment(assignment, entry), input),
       status: 'active' as const,
       void_reason: null,
     })
@@ -474,8 +482,7 @@ export class MockWorkforceRepository implements WorkforceRepository {
     projectCode: string,
     advanceId: number,
     reimbursementId: number,
-    reason: string,
-  ): Promise<void> {
+    reason: string): Promise<void> {
     const advance = this.workspace(projectCode).material_advances.find((item) => item.advance_id === advanceId)
     if (!advance) throw new Error('垫资记录不存在')
     const reimbursement = advance.reimbursements.find((item) => item.reimbursement_id === reimbursementId)
@@ -551,8 +558,7 @@ export class MockWorkforceRepository implements WorkforceRepository {
   async setEngineeringChangeStatus(
     projectCode: string,
     changeId: number,
-    status: EngineeringChangeStatus,
-  ): Promise<void> {
+    status: EngineeringChangeStatus): Promise<void> {
     const change = this.deliveryWorkspace(projectCode).engineering_changes.find((item) => item.change_id === changeId)
     if (!change) throw new Error('工程变更不存在')
     change.status = status
@@ -702,8 +708,7 @@ export class MockWorkforceRepository implements WorkforceRepository {
     projectCode: string,
     caseId: number,
     status: AfterSalesStatus,
-    resolution: string | null,
-  ): Promise<void> {
+    resolution: string | null): Promise<void> {
     const item = this.deliveryWorkspace(projectCode).after_sales.find((candidate) => candidate.case_id === caseId)
     if (!item) throw new Error('售后案件不存在')
     const transitions: Record<AfterSalesStatus, AfterSalesStatus[]> = {
@@ -804,6 +809,18 @@ function materialAdvanceStatus(advance: DemoMaterialAdvanceViewModel): DemoMater
   const total = advance.items.reduce((sum, item) => sum + item.line_amount_cents, 0)
   if (reimbursed === 0) return 'unreimbursed'
   return reimbursed === total ? 'reimbursed' : 'partial'
+}
+
+function historicalAssignment(
+  assignment: DemoCrewAssignmentViewModel,
+  entry?: DemoLaborEntryViewModel,
+): DemoCrewAssignmentViewModel {
+  if (!entry || assignment.assignment_id !== entry.assignment_id) return assignment
+  return {
+    ...assignment,
+    pay_basis: entry.pay_basis ?? assignment.pay_basis,
+    rate_cents: entry.rate_cents ?? assignment.rate_cents,
+  }
 }
 
 function laborCost(
@@ -928,6 +945,8 @@ function createWorkforcePreview(projectCode: string): WorkforceDemoViewModel {
     labor_entries: [
       {
         entry_id: 301,
+        pay_basis: 'daily',
+        rate_cents: 68000,
         assignment_id: 201,
         replaces_entry_id: null,
         work_date: '2026-09-03',
@@ -942,6 +961,8 @@ function createWorkforcePreview(projectCode: string): WorkforceDemoViewModel {
       },
       {
         entry_id: 302,
+        pay_basis: 'hourly',
+        rate_cents: 9500,
         assignment_id: 202,
         replaces_entry_id: null,
         work_date: '2026-09-09',

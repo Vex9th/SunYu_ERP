@@ -7,6 +7,7 @@ import type { DocumentSummary } from '../../domain/contracts'
 import { createHttpProjectOperatingRepository, type DocumentArchiveFilter, type ProjectOperatingRepository } from '../../repositories/project-operating.live'
 import DocumentPreview from './DocumentPreview'
 import { useWorkspaceValue } from '../shared'
+import { useUnsavedChanges } from '../unsavedChanges'
 import './project.css'
 import { nullable, useProjectLoad, useProjectWrite, type ProjectProps } from './useProjectWork'
 
@@ -36,6 +37,7 @@ export default function ProjectDocuments({ projectCode, readonly = false, reposi
   const [modal, modalContext] = Modal.useModal()
   const draftDirty = useRef(false)
   const write = useProjectWrite(`documents:${projectCode}`, () => { setDialog(null); setFiles([]); load.reload() })
+  useUnsavedChanges(() => Boolean(dialog) && (draftDirty.current || write.busy))
   useEffect(() => { setDialog(null); setFiles([]); setFileError(null); form.resetFields(); draftDirty.current = false }, [projectCode, form])
   function open(mode: Mode, document?: DocumentSummary) {
     write.clearError(); setFileError(null); setFiles([]); form.resetFields(); form.setFieldsValue({ category: document?.category ?? 'other', title: document?.title ?? '', notes: document?.notes ?? '', reason: '', content: '' }); draftDirty.current = false; setDialog({ mode, document })

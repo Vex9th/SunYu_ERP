@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { Alert, Button, Popconfirm, Space } from 'antd'
 import { ApiError } from '../../api'
+import { protectPendingWrites } from '../pendingUnload'
 
 export const errorText = (error: unknown): string => error instanceof Error ? error.message : '操作失败，请重试'
 export const nullable = (value?: string | null): string | null => value?.trim() || null
@@ -13,6 +14,8 @@ const listeners = new Set<() => void>()
 const successListeners = new Set<(scope: string) => void>()
 function publish() { listeners.forEach((listener) => listener()) }
 function subscribe(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener) } }
+const releaseUnloadGuard = protectPendingWrites(() => pending.size > 0, subscribe)
+if (import.meta.hot) import.meta.hot.dispose(releaseUnloadGuard)
 function unknownResult(error: unknown) { return !(error instanceof ApiError) || error.status === 0 || [408, 425, 429].includes(error.status) || error.status >= 500 }
 
 export function useProjectWrite(scope: string, onSaved: () => void) {

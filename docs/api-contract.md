@@ -133,8 +133,12 @@
 | GET | `/api/system/overview` | 返回数据目录、SQLite 路径、备份设置、调度状态和最后一次备份 |
 | PUT | `/api/system/backup-settings` | `directory`、`interval_hours`、`retention_days`，返回保存后的设置 |
 | POST | `/api/system/backups` | 立即备份，返回 `201 {path, created_at, warning?}` |
+| POST | `/api/system/backup-tasks` | 提交后台备份，返回 `202 {task_id, status}`；已有手动任务运行时返回同一任务编号 |
+| GET | `/api/system/backup-tasks/{task_id}` | 查询 `status`、`phase`、起止时间、`path`、`warning`、`error_code`；任务不存在返回 `404` |
 
 备份目录是本机可访问文件夹，允许选择群晖同步目录；SQLite 主库仍放在本机 `Data` 目录。
+
+后台备份状态为 `running | success | failed | interrupted`；运行阶段为 `queued | creating | cleaning`，结束阶段为 `finished | failed | interrupted`。状态查询超时不代表备份失败。手动和自动备份共用单进程互斥；重启时将遗留任务标记为中断。旧同步接口继续保留。
 
 ## 4. P0：项目经营主线
 
@@ -571,6 +575,7 @@ interface GlobalDashboard {
 | POST | `/api/projects/{project_code}/procurement-imports/preview` | multipart `file`；返回 `201` 导入批次、预览行和逐格错误 |
 | POST | `/api/projects/{project_code}/procurement-imports/{import_id}/confirm` | Header `Idempotency-Key`；`list_name`、`expected_revision`；原子生成正式清单 |
 | GET | `/api/projects/{project_code}/procurement-lists?page=&page_size=` | 返回采购清单分页列表 |
+| GET | `/api/projects/{project_code}/procurement-options` | 返回项目全部清单与物料的轻量选项目录 `{lists, lines}`，独立于列表分页 |
 | POST | `/api/projects/{project_code}/procurement-lists` | `name`、`notes`；返回 `201 ProcurementList` |
 | GET | `/api/projects/{project_code}/procurement-lists/{list_id}` | 返回清单、行和派生状态汇总 |
 | PUT | `/api/projects/{project_code}/procurement-lists/{list_id}` | `name`、`notes`、`expected_revision` |
@@ -581,6 +586,8 @@ interface GlobalDashboard {
 | GET | `/api/projects/{project_code}/procurement-overview` | 返回采购状态计数、金额和异常待办 |
 
 Excel 限制：`.xlsx`、最大 20 MB、最多 10,000 条数据行；预检不写正式采购数据和库存；确认必须全有或全无。物料自动匹配只做规范化后的精确匹配，模糊匹配必须由用户确认。
+
+选项目录保留所有清单状态用于历史名称展示，新采购单只选择已确认清单。已订足数量的物料仍允许补充采购，超量原因沿用采购单接口校验。
 
 ### 5.2 采购单、付款、到货与进项票（已实现）
 

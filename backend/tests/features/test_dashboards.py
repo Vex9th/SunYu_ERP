@@ -838,3 +838,18 @@ class _CostRaceConnection:
 
     def rollback(self) -> None:
         self._connection.rollback()
+
+
+def test_global_dashboard_does_not_load_unused_commercial_details(harness: DashboardHarness) -> None:
+    from backend.app.features.dashboards import _global_dashboard
+
+    _seed_operating_data(harness)
+    statements: list[str] = []
+    with connect_database(harness.database_path) as connection:
+        connection.set_trace_callback(statements.append)
+        summary = _global_dashboard(connection, harness.settings, NOW, TODAY)
+    assert summary["summary"]["active_project_count"] == 3
+    normalized = [" ".join(sql.lower().split()) for sql in statements]
+    assert not any("select * from quotes" in sql for sql in normalized)
+    assert not any("select contracts.*" in sql for sql in normalized)
+    assert not any("select * from receipts" in sql for sql in normalized)

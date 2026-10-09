@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, Header, Request, status
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import Message
@@ -115,109 +116,111 @@ def create_procurement_extensions_router(
     ) -> dict[str, object]:
         key = base._validate_idempotency_key(idempotency_key)
         filename, content = await _read_xlsx_upload(request)
-        digest = hashlib.sha256(content).hexdigest()
-        request_hash = base._request_hash({"filename": filename, "sha256": digest})
-        timestamp = base._timestamp(now)
-        expires_at = (
-            datetime.fromisoformat(timestamp) + timedelta(hours=24)
-        ).isoformat()
-        with transaction_immediate(connection):
-            project = base._project(
-                connection, base._normalize_project_path(project_code)
-            )
-            scope = _project_scope(
-                "POST", str(project["project_code"]), "/procurement-imports/preview"
-            )
-            restored = restore_idempotent_response(
-                connection, scope=scope, key=key, request_hash=request_hash
-            )
-            if restored is not None:
-                return restored
-            _require_active_project(project)
-            _reject_confirmed_import(connection, int(project["id"]), digest)
-        preview = _parse_import_workbook(content)
-        with transaction_immediate(connection):
-            project = base._project(
-                connection, base._normalize_project_path(project_code)
-            )
-            scope = _project_scope(
-                "POST", str(project["project_code"]), "/procurement-imports/preview"
-            )
-            restored = restore_idempotent_response(
-                connection, scope=scope, key=key, request_hash=request_hash
-            )
-            if restored is not None:
-                return restored
-            _require_active_project(project)
-            _reject_confirmed_import(connection, int(project["id"]), digest)
-            existing = connection.execute(
-                """
-                SELECT * FROM procurement_imports
-                WHERE project_id = ? AND sha256 = ? AND status = 'preview'
-                """,
-                (project["id"], digest),
-            ).fetchone()
-            if existing is not None:
-                if str(existing["expires_at"]) <= timestamp:
-                    connection.execute(
+        def process_workbook() -> dict[str, object]:
+            digest = hashlib.sha256(content).hexdigest()
+            request_hash = base._request_hash({"filename": filename, "sha256": digest})
+            timestamp = base._timestamp(now)
+            expires_at = (
+                datetime.fromisoformat(timestamp) + timedelta(hours=24)
+            ).isoformat()
+            with transaction_immediate(connection):
+                project = base._project(
+                    connection, base._normalize_project_path(project_code)
+                )
+                scope = _project_scope(
+                    "POST", str(project["project_code"]), "/procurement-imports/preview"
+                )
+                restored = restore_idempotent_response(
+                    connection, scope=scope, key=key, request_hash=request_hash
+                )
+                if restored is not None:
+                    return restored
+                _require_active_project(project)
+                _reject_confirmed_import(connection, int(project["id"]), digest)
+            preview = _parse_import_workbook(content)
+            with transaction_immediate(connection):
+                project = base._project(
+                    connection, base._normalize_project_path(project_code)
+                )
+                scope = _project_scope(
+                    "POST", str(project["project_code"]), "/procurement-imports/preview"
+                )
+                restored = restore_idempotent_response(
+                    connection, scope=scope, key=key, request_hash=request_hash
+                )
+                if restored is not None:
+                    return restored
+                _require_active_project(project)
+                _reject_confirmed_import(connection, int(project["id"]), digest)
+                existing = connection.execute(
+                    """
+                    SELECT * FROM procurement_imports
+                    WHERE project_id = ? AND sha256 = ? AND status = 'preview'
+                    """,
+                    (project["id"], digest),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing["expires_at"]) <= timestamp:
+                        connection.execute(
+                            """
+                            UPDATE procurement_imports
+                            SET filename = ?, preview_json = ?, revision = revision + 1,
+                                expires_at = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                filename,
+                                json.dumps(preview, ensure_ascii=False, sort_keys=True),
+                                expires_at,
+                                timestamp,
+                                existing["id"],
+                            ),
+                        )
+                        existing = _import_row(
+                            connection, int(existing["id"]), int(project["id"])
+                        )
+                        if existing is None:
+                            raise sqlite3.DatabaseError(
+                                "refreshed procurement import is missing"
+                            )
+                    row = existing
+                else:
+                    cursor = connection.execute(
                         """
-                        UPDATE procurement_imports
-                        SET filename = ?, preview_json = ?, revision = revision + 1,
-                            expires_at = ?, updated_at = ?
-                        WHERE id = ?
+                        INSERT INTO procurement_imports
+                            (project_id, filename, sha256, preview_json, status,
+                             revision, expires_at, confirmed_list_id, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, 'preview', 1, ?, NULL, ?, ?)
                         """,
                         (
+                            project["id"],
                             filename,
+                            digest,
                             json.dumps(preview, ensure_ascii=False, sort_keys=True),
                             expires_at,
                             timestamp,
-                            existing["id"],
+                            timestamp,
                         ),
                     )
-                    existing = _import_row(
-                        connection, int(existing["id"]), int(project["id"])
+                    row = _import_row(
+                        connection, base._last_insert_id(cursor), int(project["id"])
                     )
-                    if existing is None:
-                        raise sqlite3.DatabaseError(
-                            "refreshed procurement import is missing"
-                        )
-                row = existing
-            else:
-                cursor = connection.execute(
-                    """
-                    INSERT INTO procurement_imports
-                        (project_id, filename, sha256, preview_json, status,
-                         revision, expires_at, confirmed_list_id, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, 'preview', 1, ?, NULL, ?, ?)
-                    """,
-                    (
-                        project["id"],
-                        filename,
-                        digest,
-                        json.dumps(preview, ensure_ascii=False, sort_keys=True),
-                        expires_at,
-                        timestamp,
-                        timestamp,
-                    ),
+                    if row is None:
+                        raise sqlite3.DatabaseError("created procurement import is missing")
+                response = _import_response(row, str(project["project_code"]))
+                save_idempotent_response(
+                    connection,
+                    scope=scope,
+                    key=key,
+                    request_hash=request_hash,
+                    response=response,
+                    response_status=status.HTTP_201_CREATED,
+                    resource_type="procurement_import",
+                    resource_id=int(row["id"]),
+                    created_at=timestamp,
                 )
-                row = _import_row(
-                    connection, base._last_insert_id(cursor), int(project["id"])
-                )
-                if row is None:
-                    raise sqlite3.DatabaseError("created procurement import is missing")
-            response = _import_response(row, str(project["project_code"]))
-            save_idempotent_response(
-                connection,
-                scope=scope,
-                key=key,
-                request_hash=request_hash,
-                response=response,
-                response_status=status.HTTP_201_CREATED,
-                resource_type="procurement_import",
-                resource_id=int(row["id"]),
-                created_at=timestamp,
-            )
-            return response
+                return response
+        return await run_in_threadpool(process_workbook)
 
     @router.post(
         "/api/projects/{project_code}/procurement-imports/{import_id}/confirm",
@@ -1229,7 +1232,7 @@ async def _read_xlsx_upload(request: Request) -> tuple[str, bytes]:
                 ".xlsx"
             ):
                 raise base._invalid_payload("Invalid procurement import file")
-            content = await upload.read(_MAX_IMPORT_BYTES + 1)
+            content = await run_in_threadpool(upload.file.read, _MAX_IMPORT_BYTES + 1)
     except ApiError:
         raise
     except (

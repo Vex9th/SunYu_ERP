@@ -1,3 +1,4 @@
+import { RouterButton } from './RouterButton'
 import {
   Component,
   lazy,
@@ -28,7 +29,8 @@ import {
   TeamOutlined,
 } from '@ant-design/icons'
 import {
-  BrowserRouter,
+  createBrowserRouter,
+  RouterProvider,
   Link,
   Route,
   Routes,
@@ -45,6 +47,7 @@ import { AuthPage, Brand } from './AuthPage'
 import { errorText, LoadingBlock } from './shared'
 import styles from './Workspace.module.css'
 import { WorkspaceNavigationProvider } from './navigationState'
+import { UnsavedChangesProvider } from './unsavedChanges'
 
 const HomePage = lazy(() => import('./HomePage'))
 const ProjectsPage = lazy(() => import('./ProjectsPage'))
@@ -319,9 +322,7 @@ function Shell({
                         title="页面不存在"
                         subTitle="该地址可能已变更，请从项目中心重新进入。"
                         extra={
-                          <Link to="/projects">
-                            <Button type="primary">打开项目中心</Button>
-                          </Link>
+                          <RouterButton to="/projects" type="primary">打开项目中心</RouterButton>
                         }
                       />
                     }
@@ -337,6 +338,10 @@ function Shell({
 }
 
 export default function RootApp() {
+  const [router] = useState(() => createBrowserRouter([{
+    path: '*',
+    element: <UnsavedChangesProvider><ScreenBoundary><Application /></ScreenBoundary></UnsavedChangesProvider>,
+  }]))
   return (
     <ConfigProvider
       locale={zhCN}
@@ -376,11 +381,7 @@ export default function RootApp() {
       }}
     >
       <AntApp>
-        <BrowserRouter>
-          <ScreenBoundary>
-            <Application />
-          </ScreenBoundary>
-        </BrowserRouter>
+        <RouterProvider router={router} />
       </AntApp>
     </ConfigProvider>
   )

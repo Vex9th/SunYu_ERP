@@ -20,6 +20,7 @@ export interface WorkforceLoadWarning {
 }
 
 export interface DemoWorkerViewModel {
+  revision?: number | null
   worker_id: number
   name: string
   phone: string | null
@@ -28,6 +29,7 @@ export interface DemoWorkerViewModel {
 }
 
 export interface DemoCrewAssignmentViewModel {
+  revision?: number | null
   assignment_id: number
   worker_id: number
   role: string
@@ -40,6 +42,9 @@ export interface DemoCrewAssignmentViewModel {
 }
 
 export interface DemoLaborEntryViewModel {
+  pay_basis?: WorkerPayBasis
+  rate_cents?: MoneyCents
+  revision?: number | null
   entry_id: number
   assignment_id: number
   replaces_entry_id: number | null
@@ -55,6 +60,7 @@ export interface DemoLaborEntryViewModel {
 }
 
 export interface LaborEntryBatchItemInput {
+  expected_revision?: number | null
   assignment_id: number
   attendance_status: AttendanceStatus
   day_fraction: DecimalString | null
@@ -69,6 +75,7 @@ export interface LaborEntryBatchInput {
 }
 
 export interface DemoSiteDailyReportViewModel {
+  revision?: number | null
   work_date: ISODate
   location: string | null
   weather: string | null
@@ -116,6 +123,7 @@ export interface DemoMaterialAdvanceItemViewModel {
 }
 
 export interface DemoReimbursementViewModel {
+  revision?: number | null
   reimbursement_id: number
   amount_cents: MoneyCents
   reimbursed_on: ISODate
@@ -127,6 +135,7 @@ export interface DemoReimbursementViewModel {
 }
 
 export interface DemoMaterialAdvanceViewModel {
+  revision?: number | null
   advance_id: number
   worker_id: number
   spent_on: ISODate
@@ -151,12 +160,14 @@ export interface WorkforceDemoViewModel {
 }
 
 export interface WorkerInput {
+  expected_revision?: number | null
   name: string
   phone: string | null
   notes: string | null
 }
 
 export interface CrewAssignmentInput {
+  expected_revision?: number | null
   worker_id: number
   role: string
   scheduled_start_on: ISODate
@@ -169,8 +180,8 @@ export interface CrewAssignmentInput {
 export type LaborEntryUpdateInput = LaborEntryBatchItemInput & { work_date: ISODate }
 export type SiteDailyReportInput = Omit<
   DemoSiteDailyReportViewModel,
-  'status' | 'versions' | 'events'
->
+  'status' | 'versions' | 'events' | 'revision'
+> & { expected_revision?: number | null }
 
 export interface MaterialAdvanceItemInput {
   name: string
@@ -182,6 +193,7 @@ export interface MaterialAdvanceItemInput {
 }
 
 export interface MaterialAdvanceInput {
+  expected_revision?: number | null
   worker_id: number
   spent_on: ISODate
   vendor_name: string
@@ -214,6 +226,7 @@ export type AfterSalesCoverageType = 'warranty' | 'paid' | 'goodwill'
 export type AfterSalesStatus = 'open' | 'in_progress' | 'completed' | 'cancelled'
 
 export interface DemoDrawingSignoffViewModel {
+  revision?: number | null
   discipline: DrawingDiscipline
   status: DrawingSignoffStatus
   confirmed_on: ISODate | null
@@ -223,6 +236,7 @@ export interface DemoDrawingSignoffViewModel {
 }
 
 export interface DemoCommissioningSessionViewModel {
+  revision?: number | null
   session_id: number
   started_at: ISODateTime
   ended_at: ISODateTime | null
@@ -235,6 +249,7 @@ export interface DemoCommissioningSessionViewModel {
 }
 
 export interface DemoEngineeringChangeViewModel {
+  revision?: number | null
   change_id: number
   source: EngineeringChangeSource
   title: string
@@ -250,6 +265,7 @@ export interface DemoEngineeringChangeViewModel {
 }
 
 export interface DemoAcceptanceViewModel {
+  revision?: number | null
   acceptance_id: number
   acceptance_type: AcceptanceType
   status: AcceptanceStatus
@@ -262,6 +278,7 @@ export interface DemoAcceptanceViewModel {
 }
 
 export interface DemoWarrantyViewModel {
+  revision?: number | null
   starts_on: ISODate
   duration_months: number
   renewal_price_cents: MoneyCents | null
@@ -272,6 +289,7 @@ export interface DemoWarrantyViewModel {
 }
 
 export interface DemoInvoiceViewModel {
+  revision?: number | null
   invoice_id: number
   invoice_type: InvoiceType
   status: InvoiceStatus
@@ -286,6 +304,7 @@ export interface DemoInvoiceViewModel {
 }
 
 export interface DemoAfterSalesCaseViewModel {
+  revision?: number | null
   case_id: number
   reported_on: ISODate
   service_on: ISODate | null
@@ -322,20 +341,20 @@ export interface DeliverySummaryViewModel {
   }
 }
 
-export type DrawingSignoffInput = Omit<DemoDrawingSignoffViewModel, 'discipline'>
-export type CommissioningSessionInput = Omit<DemoCommissioningSessionViewModel, 'session_id'>
-export type EngineeringChangeInput = Omit<DemoEngineeringChangeViewModel, 'change_id' | 'status'>
-export type AcceptanceInput = Pick<DemoAcceptanceViewModel, 'acceptance_type' | 'scheduled_on' | 'notes'>
-export type AcceptanceCompletionInput = Pick<DemoAcceptanceViewModel, 'performed_on' | 'notes'> & {
+export type DrawingSignoffInput = Omit<DemoDrawingSignoffViewModel, 'discipline' | 'revision'> & { expected_revision?: number | null }
+export type CommissioningSessionInput = Omit<DemoCommissioningSessionViewModel, 'session_id' | 'revision'> & { expected_revision?: number | null }
+export type EngineeringChangeInput = Omit<DemoEngineeringChangeViewModel, 'change_id' | 'status' | 'revision'> & { expected_revision?: number | null }
+export type AcceptanceInput = Pick<DemoAcceptanceViewModel, 'acceptance_type' | 'scheduled_on' | 'notes'> & { expected_revision?: number | null }
+export type AcceptanceCompletionInput = { expected_revision?: number | null } & Pick<DemoAcceptanceViewModel, 'performed_on' | 'notes'> & {
   status: Extract<AcceptanceStatus, 'passed' | 'passed_with_punch' | 'failed'>
   document_version_ids?: number[]
   warranty?: WarrantyInput | null
 }
-export type WarrantyInput = Pick<DemoWarrantyViewModel, 'starts_on' | 'duration_months' | 'notes'> & {
+export type WarrantyInput = { expected_revision?: number | null } & Pick<DemoWarrantyViewModel, 'starts_on' | 'duration_months' | 'notes'> & {
   renewal_price_cents: MoneyCents
 }
-export type InvoiceInput = Omit<DemoInvoiceViewModel, 'invoice_id' | 'void_reason'>
-export type AfterSalesInput = Omit<DemoAfterSalesCaseViewModel, 'case_id' | 'status' | 'resolution' | 'completed_at' | 'is_under_warranty'>
+export type InvoiceInput = Omit<DemoInvoiceViewModel, 'invoice_id' | 'void_reason' | 'revision'> & { expected_revision?: number | null }
+export type AfterSalesInput = Omit<DemoAfterSalesCaseViewModel, 'case_id' | 'status' | 'resolution' | 'completed_at' | 'is_under_warranty' | 'revision'> & { expected_revision?: number | null }
 
 export function optionalYuanToCents(value: string): MoneyCents | null {
   const normalized = value.trim()

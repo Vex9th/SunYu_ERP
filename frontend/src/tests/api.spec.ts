@@ -42,6 +42,49 @@ describe('API client', () => {
     await rejection
   })
 
+  it.each(['json', 'blob', 'error'] as const)('收到响应头后 %s 正文未完成仍受超时限制', async (kind) => {
+    vi.useFakeTimers()
+    let body!: ReadableStreamDefaultController<Uint8Array>
+    let signal!: AbortSignal
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (_input, init) => {
+      signal = init!.signal!
+      const stream = new ReadableStream<Uint8Array>({ start(controller) { body = controller } })
+      signal.addEventListener('abort', () => body.error(new DOMException('aborted', 'AbortError')))
+      return new Response(stream, { status: kind === 'error' ? 503 : 200 })
+    }))
+    const pending = (kind === 'blob' ? requestBlob : requestJson)('/api/slow-body', { timeoutMs: 25 })
+    const outcome = pending.then(value => ({ value }), error => ({ error }))
+    await vi.advanceTimersByTimeAsync(25)
+    const aborted = signal.aborted
+    if (!aborted) { body.enqueue(new TextEncoder().encode('{}')); body.close() }
+    const result = await outcome
+    expect(aborted).toBe(true)
+    expect(result).toMatchObject({ error: { errorCode: 'REQUEST_TIMEOUT' } })
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('读取正文期间仍传递调用方取消，结束后移除监听器', async () => {
+    const caller = new AbortController()
+    let body!: ReadableStreamDefaultController<Uint8Array>
+    let signal!: AbortSignal
+    const remove = vi.spyOn(caller.signal, 'removeEventListener')
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (_input, init) => {
+      signal = init!.signal!
+      const stream = new ReadableStream<Uint8Array>({ start(controller) { body = controller } })
+      signal.addEventListener('abort', () => body.error(new DOMException('aborted', 'AbortError')))
+      return new Response(stream)
+    }))
+    const outcome = requestJson('/api/cancel-body', { signal: caller.signal })
+      .then(value => ({ value }), error => ({ error }))
+    await Promise.resolve()
+    caller.abort()
+    const aborted = signal.aborted
+    if (!aborted) { body.enqueue(new TextEncoder().encode('{}')); body.close() }
+    expect(await outcome).toMatchObject({ error: { errorCode: 'REQUEST_ABORTED' } })
+    expect(aborted).toBe(true)
+    expect(remove).toHaveBeenCalledWith('abort', expect.any(Function))
+  })
+
   it('任意受保护接口 401 广播统一会话失效，但登录失败不广播', async () => {
     const expired = vi.fn()
     const unsubscribe = subscribeProtectedSessionExpired(expired)

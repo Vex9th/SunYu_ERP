@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import FormData, UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.formparsers import MultiPartException
@@ -264,7 +265,8 @@ def create_documents_router(
             SELECT
                 document_versions.id,
                 document_versions.version_number,
-                document_versions.original_filename,
+                document_versions.id AS search_version_id,
+            document_versions.original_filename,
                 document_versions.managed_filename,
                 documents.logical_name AS title
             FROM document_versions
@@ -304,146 +306,146 @@ def create_documents_router(
             request,
             max_file_size_bytes=max_file_size_bytes,
         )
-        try:
+        def process_upload() -> dict[str, object]:
             staged = _stage_upload(upload, max_size_bytes=max_file_size_bytes)
-        except BaseException:
-            await upload.close()
-            raise
-        prepared: files.StagedFileVersion | None = None
-        stored: files.StoredFileVersion | None = None
-        try:
-            prepared = files.stage_version(
-                staged.path,
-                settings.data_dir,
-                original_name=staged.original_filename,
-            )
-            timestamp = _timestamp(now)
-            request_hash = _request_hash(
-                {
-                    "category": category,
-                    "title": title,
-                    "notes": notes,
-                    "filename": staged.original_filename,
-                    "content_type": staged.content_type,
-                    "size_bytes": staged.size_bytes,
-                    "sha256": staged.sha256,
-                }
-            )
+            prepared: files.StagedFileVersion | None = None
+            stored: files.StoredFileVersion | None = None
             try:
-                with transaction_immediate(connection):
-                    project = _require_project(connection, project_code)
-                    scope = _document_scope(
-                        request,
-                        str(project["project_code"]),
-                        "documents",
-                    )
-                    storage_key = idempotency_storage_key(scope, key)
-                    replay = restore_idempotent_response(
-                        connection,
-                        scope=scope,
-                        key=storage_key,
-                        request_hash=request_hash,
-                    )
-                    if replay is not None:
-                        return replay
-                    _require_active_project_record(project)
-                    cursor = connection.execute(
-                        """
-                        INSERT INTO documents
-                            (project_code, category, logical_name, notes,
-                             revision, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, 1, ?, ?)
-                        """,
-                        (
-                            project["project_code"],
-                            category,
-                            title,
-                            notes,
-                            timestamp,
-                            timestamp,
-                        ),
-                    )
-                    document_id = _last_insert_id(cursor)
-                    managed_filename = document_managed_filename(
-                        project_code=str(project["project_code"]),
-                        category=category,
-                        title=title,
-                        business_date=_managed_business_date(timestamp),
-                        version_number=1,
-                        original_filename=staged.original_filename,
-                    )
-                    files.reconcile_document_versions(
-                        settings.data_dir,
-                        str(project["project_code"]),
-                        category,
-                        document_id,
-                        [],
-                    )
-                    stored = files.publish_staged_version(
-                        prepared,
-                        str(project["project_code"]),
-                        category,
-                        document_id=document_id,
-                        verify_content=False,
-                        managed_name=managed_filename,
-                        version_number=1,
-                    )
-                    if stored.version_number != 1:
-                        raise sqlite3.DatabaseError(
-                            "new document storage did not start at version one"
+                prepared = files.stage_version(
+                    staged.path,
+                    settings.data_dir,
+                    original_name=staged.original_filename,
+                )
+                timestamp = _timestamp(now)
+                request_hash = _request_hash(
+                    {
+                        "category": category,
+                        "title": title,
+                        "notes": notes,
+                        "filename": staged.original_filename,
+                        "content_type": staged.content_type,
+                        "size_bytes": staged.size_bytes,
+                        "sha256": staged.sha256,
+                    }
+                )
+                try:
+                    with transaction_immediate(connection):
+                        project = _require_project(connection, project_code)
+                        scope = _document_scope(
+                            request,
+                            str(project["project_code"]),
+                            "documents",
                         )
-                    connection.execute(
-                        """
-                        INSERT INTO document_versions
-                            (document_id, version_number, original_filename,
-                             managed_filename, content_type, stored_relative_path,
-                             size_bytes, sha256, notes, created_at)
-                        VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
+                        storage_key = idempotency_storage_key(scope, key)
+                        replay = restore_idempotent_response(
+                            connection,
+                            scope=scope,
+                            key=storage_key,
+                            request_hash=request_hash,
+                        )
+                        if replay is not None:
+                            return replay
+                        _require_active_project_record(project)
+                        cursor = connection.execute(
+                            """
+                            INSERT INTO documents
+                                (project_code, category, logical_name, notes,
+                                 revision, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, 1, ?, ?)
+                            """,
+                            (
+                                project["project_code"],
+                                category,
+                                title,
+                                notes,
+                                timestamp,
+                                timestamp,
+                            ),
+                        )
+                        document_id = _last_insert_id(cursor)
+                        managed_filename = document_managed_filename(
+                            project_code=str(project["project_code"]),
+                            category=category,
+                            title=title,
+                            business_date=_managed_business_date(timestamp),
+                            version_number=1,
+                            original_filename=staged.original_filename,
+                        )
+                        files.reconcile_document_versions(
+                            settings.data_dir,
+                            str(project["project_code"]),
+                            category,
                             document_id,
-                            staged.original_filename,
-                            managed_filename,
-                            staged.content_type,
-                            str(stored.relative_path),
-                            stored.size_bytes,
-                            stored.sha256,
-                            notes,
-                            timestamp,
-                        ),
-                    )
-                    response = _require_document_detail(
-                        connection,
-                        str(project["project_code"]),
-                        document_id,
-                    )
-                    save_idempotent_response(
-                        connection,
-                        scope=scope,
-                        key=storage_key,
-                        request_hash=request_hash,
-                        response=response,
-                        response_status=status.HTTP_201_CREATED,
-                        resource_type="document",
-                        resource_id=document_id,
-                        created_at=timestamp,
-                    )
-                    return response
-            except sqlite3.IntegrityError as failure:
-                _cleanup_stored_after_failure(failure, stored, settings.data_dir)
-                if _is_document_title_conflict(failure):
-                    raise _conflict(
-                        "Document title already exists",
-                        "DOCUMENT_TITLE_EXISTS",
-                    ) from None
-                raise
-            except BaseException as failure:
-                _cleanup_stored_after_failure(failure, stored, settings.data_dir)
-                raise
+                            [],
+                        )
+                        stored = files.publish_staged_version(
+                            prepared,
+                            str(project["project_code"]),
+                            category,
+                            document_id=document_id,
+                            verify_content=False,
+                            managed_name=managed_filename,
+                            version_number=1,
+                        )
+                        if stored.version_number != 1:
+                            raise sqlite3.DatabaseError(
+                                "new document storage did not start at version one"
+                            )
+                        connection.execute(
+                            """
+                            INSERT INTO document_versions
+                                (document_id, version_number, original_filename,
+                                 managed_filename, content_type, stored_relative_path,
+                                 size_bytes, sha256, notes, created_at)
+                            VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                document_id,
+                                staged.original_filename,
+                                managed_filename,
+                                staged.content_type,
+                                str(stored.relative_path),
+                                stored.size_bytes,
+                                stored.sha256,
+                                notes,
+                                timestamp,
+                            ),
+                        )
+                        response = _require_document_detail(
+                            connection,
+                            str(project["project_code"]),
+                            document_id,
+                        )
+                        save_idempotent_response(
+                            connection,
+                            scope=scope,
+                            key=storage_key,
+                            request_hash=request_hash,
+                            response=response,
+                            response_status=status.HTTP_201_CREATED,
+                            resource_type="document",
+                            resource_id=document_id,
+                            created_at=timestamp,
+                        )
+                        return response
+                except sqlite3.IntegrityError as failure:
+                    _cleanup_stored_after_failure(failure, stored, settings.data_dir)
+                    if _is_document_title_conflict(failure):
+                        raise _conflict(
+                            "Document title already exists",
+                            "DOCUMENT_TITLE_EXISTS",
+                        ) from None
+                    raise
+                except BaseException as failure:
+                    _cleanup_stored_after_failure(failure, stored, settings.data_dir)
+                    raise
+            finally:
+                if prepared is not None:
+                    files.discard_staged_version(prepared)
+                _discard_staged_upload(staged)
+        try:
+            return await run_in_threadpool(process_upload)
         finally:
-            if prepared is not None:
-                files.discard_staged_version(prepared)
-            _discard_staged_upload(staged)
             await upload.close()
 
     @router.get("/{project_code}/documents/{document_id}")
@@ -539,148 +541,148 @@ def create_documents_router(
             request,
             max_file_size_bytes=max_file_size_bytes,
         )
-        try:
+        def process_upload() -> dict[str, object]:
             staged = _stage_upload(upload, max_size_bytes=max_file_size_bytes)
-        except BaseException:
-            await upload.close()
-            raise
-        prepared: files.StagedFileVersion | None = None
-        stored: files.StoredFileVersion | None = None
-        try:
-            prepared = files.stage_version(
-                staged.path,
-                settings.data_dir,
-                original_name=staged.original_filename,
-            )
-            timestamp = _timestamp(now)
-            request_hash = _request_hash(
-                {
-                    "notes": notes,
-                    "expected_revision": expected_revision,
-                    "filename": staged.original_filename,
-                    "content_type": staged.content_type,
-                    "size_bytes": staged.size_bytes,
-                    "sha256": staged.sha256,
-                }
-            )
+            prepared: files.StagedFileVersion | None = None
+            stored: files.StoredFileVersion | None = None
             try:
-                with transaction_immediate(connection):
-                    project = _require_project(connection, project_code)
-                    scope = _document_scope(
-                        request,
-                        str(project["project_code"]),
-                        f"documents/{identifier}/versions",
-                    )
-                    storage_key = idempotency_storage_key(scope, key)
-                    replay = restore_idempotent_response(
-                        connection,
-                        scope=scope,
-                        key=storage_key,
-                        request_hash=request_hash,
-                    )
-                    if replay is not None:
-                        return replay
-                    _require_active_project_record(project)
-                    current = _require_document_record(
-                        connection,
-                        str(project["project_code"]),
-                        identifier,
-                    )
-                    _require_editable_document(current)
-                    _require_revision(current, expected_revision)
-                    next_version = int(current["latest_version_number"]) + 1
-                    managed_filename = document_managed_filename(
-                        project_code=str(project["project_code"]),
-                        category=str(current["category"]),
-                        title=str(current["title"]),
-                        business_date=_managed_business_date(timestamp),
-                        version_number=next_version,
-                        original_filename=staged.original_filename,
-                    )
-                    files.reconcile_document_versions(
-                        settings.data_dir,
-                        str(project["project_code"]),
-                        str(current["category"]),
-                        identifier,
-                        _document_stored_paths(connection, identifier),
-                    )
-                    stored = files.publish_staged_version(
-                        prepared,
-                        str(project["project_code"]),
-                        str(current["category"]),
-                        document_id=identifier,
-                        verify_content=False,
-                        managed_name=managed_filename,
-                        version_number=next_version,
-                    )
-                    if stored.version_number != next_version:
-                        raise sqlite3.DatabaseError(
-                            "physical and database document versions diverged"
+                prepared = files.stage_version(
+                    staged.path,
+                    settings.data_dir,
+                    original_name=staged.original_filename,
+                )
+                timestamp = _timestamp(now)
+                request_hash = _request_hash(
+                    {
+                        "notes": notes,
+                        "expected_revision": expected_revision,
+                        "filename": staged.original_filename,
+                        "content_type": staged.content_type,
+                        "size_bytes": staged.size_bytes,
+                        "sha256": staged.sha256,
+                    }
+                )
+                try:
+                    with transaction_immediate(connection):
+                        project = _require_project(connection, project_code)
+                        scope = _document_scope(
+                            request,
+                            str(project["project_code"]),
+                            f"documents/{identifier}/versions",
                         )
-                    cursor = connection.execute(
-                        """
-                        INSERT INTO document_versions
-                            (document_id, version_number, original_filename,
-                             managed_filename, content_type, stored_relative_path,
-                             size_bytes, sha256, notes, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            identifier,
-                            next_version,
-                            staged.original_filename,
-                            managed_filename,
-                            staged.content_type,
-                            str(stored.relative_path),
-                            stored.size_bytes,
-                            stored.sha256,
-                            notes,
-                            timestamp,
-                        ),
-                    )
-                    version_id = _last_insert_id(cursor)
-                    updated = connection.execute(
-                        """
-                        UPDATE documents
-                        SET revision = revision + 1, updated_at = ?
-                        WHERE id = ? AND project_code = ? COLLATE NOCASE
-                            AND revision = ? AND archived_at IS NULL
-                        """,
-                        (
-                            timestamp,
-                            identifier,
-                            project["project_code"],
-                            expected_revision,
-                        ),
-                    )
-                    if updated.rowcount != 1:
-                        refreshed = _require_document_record(
+                        storage_key = idempotency_storage_key(scope, key)
+                        replay = restore_idempotent_response(
+                            connection,
+                            scope=scope,
+                            key=storage_key,
+                            request_hash=request_hash,
+                        )
+                        if replay is not None:
+                            return replay
+                        _require_active_project_record(project)
+                        current = _require_document_record(
                             connection,
                             str(project["project_code"]),
                             identifier,
                         )
-                        _require_revision(refreshed, expected_revision)
-                        raise sqlite3.DatabaseError("document disappeared during update")
-                    response = _require_version(connection, identifier, version_id)
-                    save_idempotent_response(
-                        connection,
-                        scope=scope,
-                        key=storage_key,
-                        request_hash=request_hash,
-                        response=response,
-                        response_status=status.HTTP_201_CREATED,
-                        resource_type="document_version",
-                        resource_id=version_id,
-                        created_at=timestamp,
-                    )
-                    return response
-            except BaseException as failure:
-                _cleanup_stored_after_failure(failure, stored, settings.data_dir)
-                raise
+                        _require_editable_document(current)
+                        _require_revision(current, expected_revision)
+                        next_version = int(current["latest_version_number"]) + 1
+                        managed_filename = document_managed_filename(
+                            project_code=str(project["project_code"]),
+                            category=str(current["category"]),
+                            title=str(current["title"]),
+                            business_date=_managed_business_date(timestamp),
+                            version_number=next_version,
+                            original_filename=staged.original_filename,
+                        )
+                        files.reconcile_document_versions(
+                            settings.data_dir,
+                            str(project["project_code"]),
+                            str(current["category"]),
+                            identifier,
+                            _document_stored_paths(connection, identifier),
+                        )
+                        stored = files.publish_staged_version(
+                            prepared,
+                            str(project["project_code"]),
+                            str(current["category"]),
+                            document_id=identifier,
+                            verify_content=False,
+                            managed_name=managed_filename,
+                            version_number=next_version,
+                        )
+                        if stored.version_number != next_version:
+                            raise sqlite3.DatabaseError(
+                                "physical and database document versions diverged"
+                            )
+                        cursor = connection.execute(
+                            """
+                            INSERT INTO document_versions
+                                (document_id, version_number, original_filename,
+                                 managed_filename, content_type, stored_relative_path,
+                                 size_bytes, sha256, notes, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                identifier,
+                                next_version,
+                                staged.original_filename,
+                                managed_filename,
+                                staged.content_type,
+                                str(stored.relative_path),
+                                stored.size_bytes,
+                                stored.sha256,
+                                notes,
+                                timestamp,
+                            ),
+                        )
+                        version_id = _last_insert_id(cursor)
+                        updated = connection.execute(
+                            """
+                            UPDATE documents
+                            SET revision = revision + 1, updated_at = ?
+                            WHERE id = ? AND project_code = ? COLLATE NOCASE
+                                AND revision = ? AND archived_at IS NULL
+                            """,
+                            (
+                                timestamp,
+                                identifier,
+                                project["project_code"],
+                                expected_revision,
+                            ),
+                        )
+                        if updated.rowcount != 1:
+                            refreshed = _require_document_record(
+                                connection,
+                                str(project["project_code"]),
+                                identifier,
+                            )
+                            _require_revision(refreshed, expected_revision)
+                            raise sqlite3.DatabaseError("document disappeared during update")
+                        response = _require_version(connection, identifier, version_id)
+                        save_idempotent_response(
+                            connection,
+                            scope=scope,
+                            key=storage_key,
+                            request_hash=request_hash,
+                            response=response,
+                            response_status=status.HTTP_201_CREATED,
+                            resource_type="document_version",
+                            resource_id=version_id,
+                            created_at=timestamp,
+                        )
+                        return response
+                except BaseException as failure:
+                    _cleanup_stored_after_failure(failure, stored, settings.data_dir)
+                    raise
+            finally:
+                if prepared is not None:
+                    files.discard_staged_version(prepared)
+                _discard_staged_upload(staged)
+        try:
+            return await run_in_threadpool(process_upload)
         finally:
-            if prepared is not None:
-                files.discard_staged_version(prepared)
-            _discard_staged_upload(staged)
             await upload.close()
 
     @router.get(
@@ -1378,6 +1380,10 @@ def _document_search_matches(
     category: str | None,
     archive_filter: str,
 ) -> dict[int, str | None]:
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS document_search_cache "
+        "(version_id INTEGER PRIMARY KEY, signature TEXT NOT NULL, content TEXT)"
+    )
     rows = _document_search_rows(
         connection,
         project_code=project_code,
@@ -1394,8 +1400,8 @@ def _document_search_matches(
             matches.setdefault(document_id, metadata_excerpt)
         if document_id in content_matches or not _is_searchable_minutes_version(row):
             continue
-        content = _read_minutes_search_text(
-            row,
+        content = _indexed_minutes_search_text(
+            connection, row,
             settings,
             project_code=project_code,
             document_id=document_id,
@@ -1429,6 +1435,7 @@ def _document_search_rows(
             documents.category,
             documents.logical_name,
             documents.notes AS document_notes,
+            document_versions.id AS search_version_id,
             document_versions.original_filename,
             document_versions.managed_filename,
             document_versions.content_type,
@@ -1475,6 +1482,57 @@ def _is_searchable_minutes_version(row: sqlite3.Row) -> bool:
         and row["content_type"] == "text/plain"
         and int(row["size_bytes"]) <= _TEXT_SEARCH_FILE_LIMIT_BYTES
     )
+
+
+def _indexed_minutes_search_text(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    settings: Settings,
+    *,
+    project_code: str,
+    document_id: int,
+) -> str | None:
+    # 派生表不影响业务数据；每个版本独立缓存，保留历史正文搜索。
+    path = settings.data_dir / str(row["stored_relative_path"])
+    try:
+        relative = Path(str(row["stored_relative_path"]))
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.parts[:4] != ("Projects", project_code, "planning_minutes", str(document_id))
+            or len(relative.parts) != 5
+            or path.resolve(strict=True) != path.absolute()
+        ):
+            raise OSError("unsafe document path")
+        info = path.stat()
+        if info.st_size != int(row["size_bytes"]):
+            raise OSError("document size changed")
+        signature = f"{info.st_dev}:{info.st_ino}:{info.st_size}:{info.st_mtime_ns}:{info.st_ctime_ns}"
+    except OSError:
+        signature = "missing"
+    cached = connection.execute(
+        "SELECT signature, content FROM document_search_cache WHERE version_id=?",
+        (row["search_version_id"],),
+    ).fetchone()
+    if cached is not None and cached["signature"] == signature and cached["content"] is not None:
+        return cached["content"]
+    content = _read_minutes_search_text(
+        row, settings, project_code=project_code, document_id=document_id,
+    )
+    if content is None:
+        # 读取失败不代表正文为空；不把临时权限/磁盘故障永久缓存。
+        connection.execute(
+            "DELETE FROM document_search_cache WHERE version_id=?",
+            (row["search_version_id"],),
+        )
+        return None
+    connection.execute(
+        "INSERT INTO document_search_cache(version_id,signature,content) VALUES(?,?,?) "
+        "ON CONFLICT(version_id) DO UPDATE SET "
+        "signature=excluded.signature,content=excluded.content",
+        (row["search_version_id"], signature, content),
+    )
+    return content
 
 
 def _read_minutes_search_text(

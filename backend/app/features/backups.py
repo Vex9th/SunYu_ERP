@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -32,7 +33,13 @@ _BACKUP_LOCK = threading.RLock()
 _FileIdentity = tuple[int, int]
 
 
-def create_backup(
+def create_backup(connection: sqlite3.Connection, settings: Settings, *, now: datetime | None = None) -> Path:
+    # 整个快照与发布共用同一把锁，避免手动任务与定时任务并行复制。
+    with _BACKUP_LOCK:
+        return _create_backup_locked(connection, settings, now=now)
+
+
+def _create_backup_locked(
     connection: sqlite3.Connection,
     settings: Settings,
     *,
@@ -195,7 +202,11 @@ def prune_backups(
                 candidate_stat = candidate.lstat()
                 if not stat.S_ISDIR(candidate_stat.st_mode):
                     continue
-                _, created_at = _verify_backup_contents(candidate)
+                _require_regular_unsymlinked_file(candidate.resolve(strict=True), candidate / "manifest.json")
+                manifest = _read_manifest(candidate / "manifest.json")
+                _, created_at = _validate_manifest(manifest)
+                if candidate.name != created_at.strftime("%Y-%m-%d_%H%M%S"):
+                    continue
             except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
                 continue
             managed.append((created_at, candidate))
@@ -203,8 +214,17 @@ def prune_backups(
         managed.sort(key=lambda item: (item[0], item[1].name), reverse=True)
         cutoff = current_time - timedelta(days=retention_days)
         removed: list[Path] = []
-        for timestamp, candidate in managed[2:]:
-            if timestamp >= cutoff:
+        retained_valid = 0
+        for timestamp, candidate in managed:
+            # 首先验证两份保底；其余未过期备份无需读取大文件。
+            if retained_valid >= 2 and timestamp >= cutoff:
+                continue
+            try:
+                _verify_backup_contents(candidate)
+            except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
+                continue
+            if retained_valid < 2:
+                retained_valid += 1
                 continue
             shutil.rmtree(candidate)
             removed.append(candidate)
@@ -356,6 +376,7 @@ def _handle_failed_creation(
     target: Path,
     published_identity: _FileIdentity | None,
 ) -> None:
+    logging.getLogger(__name__).error("backup task=%s stage=create error=%s errno=%s", run_id, type(primary).__name__, getattr(primary, "errno", None))
     status = _read_run_status(connection, run_id, primary)
     confirmed_failed = status == "failed"
     if status == "success" and published_identity is not None:

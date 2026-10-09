@@ -1343,6 +1343,8 @@ def _payment_overview(
     connection: sqlite3.Connection,
     project: sqlite3.Row,
     today: str,
+    *,
+    include_receipts: bool = True,
 ) -> dict[str, object]:
     project_id = int(project["id"])
     contract_rows = connection.execute(
@@ -1361,18 +1363,33 @@ def _payment_overview(
         (project_id,),
     ).fetchall()
     terms_by_milestone = {str(row["milestone"]): row for row in term_rows}
-    receipt_rows = connection.execute(
-        """
-        SELECT * FROM receipts
-        WHERE project_id = ?
-        ORDER BY created_at DESC, id DESC
-        """,
-        (project_id,),
-    ).fetchall()
-    active_rows = [row for row in receipt_rows if row["status"] == "active"]
     received_by_milestone = {milestone: 0 for milestone in _PAYMENT_MILESTONES}
-    for row in active_rows:
-        received_by_milestone[str(row["milestone"])] += int(row["amount_cents"])
+    receipt_rows = []
+    if include_receipts:
+        receipt_rows = connection.execute(
+            "SELECT * FROM receipts WHERE project_id = ? ORDER BY created_at DESC, id DESC",
+            (project_id,),
+        ).fetchall()
+        active_rows = [row for row in receipt_rows if row["status"] == "active"]
+        for row in active_rows:
+            received_by_milestone[str(row["milestone"])] += int(row["amount_cents"])
+        allocated_received = sum(
+            int(row["amount_cents"]) for row in active_rows
+            if row["contract_allocation_id"] is not None
+        )
+    else:
+        totals = connection.execute(
+            """
+            SELECT milestone, SUM(amount_cents) AS received,
+                SUM(CASE WHEN contract_allocation_id IS NOT NULL THEN amount_cents ELSE 0 END) AS allocated
+            FROM receipts WHERE project_id = ? AND status = 'active'
+            GROUP BY milestone
+            """,
+            (project_id,),
+        ).fetchall()
+        for row in totals:
+            received_by_milestone[str(row["milestone"])] = int(row["received"])
+        allocated_received = sum(int(row["allocated"]) for row in totals)
     term_responses = [
         _payment_term_response(
             terms_by_milestone.get(milestone),
@@ -1385,12 +1402,7 @@ def _payment_overview(
     receivable_amount = sum(
         int(term["planned_amount_cents"]) for term in term_responses
     )
-    received_amount = sum(int(row["amount_cents"]) for row in active_rows)
-    allocated_received = sum(
-        int(row["amount_cents"])
-        for row in active_rows
-        if row["contract_allocation_id"] is not None
-    )
+    received_amount = sum(received_by_milestone.values())
     unallocated_received = received_amount - allocated_received
     return {
         "contracted_amount_cents": contracted_amount,

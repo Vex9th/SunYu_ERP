@@ -46,21 +46,21 @@ export interface DeliveryWorkspaceRepository {
   saveEngineeringChange(projectCode: string, input: EngineeringChangeInput, files?: readonly File[]): Promise<void>
   discardSaveEngineeringChange(projectCode: string, input: EngineeringChangeInput, files?: readonly File[]): boolean
   updateEngineeringChange(projectCode: string, changeId: number, input: EngineeringChangeInput): Promise<void>
-  setEngineeringChangeStatus(projectCode: string, changeId: number, status: EngineeringChangeStatus, reason?: string): Promise<void>
+  setEngineeringChangeStatus(projectCode: string, changeId: number, status: EngineeringChangeStatus, reason?: string, expectedRevision?: number | null): Promise<void>
   saveAcceptance(projectCode: string, input: AcceptanceInput): Promise<void>
   discardSaveAcceptance(projectCode: string, input: AcceptanceInput): boolean
   rescheduleAcceptance(projectCode: string, acceptanceId: number, input: AcceptanceInput, reason: string): Promise<void>
-  cancelAcceptance(projectCode: string, acceptanceId: number, reason: string): Promise<void>
+  cancelAcceptance(projectCode: string, acceptanceId: number, reason: string, expectedRevision?: number | null): Promise<void>
   completeAcceptance(projectCode: string, acceptanceId: number, input: DeliveryAcceptanceCompletionInput, files?: readonly File[]): Promise<void>
   updateWarranty(projectCode: string, input: NullableWarrantyInput): Promise<void>
   saveInvoice(projectCode: string, input: InvoiceInput, files?: readonly File[]): Promise<void>
   updateInvoice(projectCode: string, invoiceId: number, input: InvoiceInput): Promise<void>
   discardSaveInvoice(projectCode: string, input: InvoiceInput, files?: readonly File[]): boolean
-  voidInvoice(projectCode: string, invoiceId: number, reason: string): Promise<void>
+  voidInvoice(projectCode: string, invoiceId: number, reason: string, expectedRevision?: number | null): Promise<void>
   saveAfterSalesCase(projectCode: string, input: AfterSalesInput): Promise<void>
   discardSaveAfterSalesCase(projectCode: string, input: AfterSalesInput): boolean
   updateAfterSalesCase(projectCode: string, caseId: number, input: AfterSalesInput): Promise<void>
-  setAfterSalesStatus(projectCode: string, caseId: number, status: AfterSalesStatus, resolution: string | null): Promise<void>
+  setAfterSalesStatus(projectCode: string, caseId: number, status: AfterSalesStatus, resolution: string | null, expectedRevision?: number | null): Promise<void>
 }
 
 export type NullableWarrantyInput = Omit<WarrantyInput, 'renewal_price_cents'> & {
@@ -79,7 +79,7 @@ interface ResourceDto {
   updated_at: string
 }
 
-interface DrawingSignoffDto extends Omit<DemoDrawingSignoffViewModel, never> {
+interface DrawingSignoffDto extends Omit<DemoDrawingSignoffViewModel, 'revision'> {
   id: number | null
   project_code: string
   revision: number | null
@@ -87,18 +87,18 @@ interface DrawingSignoffDto extends Omit<DemoDrawingSignoffViewModel, never> {
   updated_at: string | null
 }
 
-interface CommissioningDto extends ResourceDto, Omit<DemoCommissioningSessionViewModel, 'session_id'> {}
-interface ChangeDto extends ResourceDto, Omit<DemoEngineeringChangeViewModel, 'change_id'> { change_number: number }
-interface AcceptanceDto extends ResourceDto, Omit<DemoAcceptanceViewModel, 'acceptance_id'> {}
-interface InvoiceDto extends ResourceDto, Omit<DemoInvoiceViewModel, 'invoice_id'> {}
-interface AfterSalesDto extends ResourceDto, Omit<DemoAfterSalesCaseViewModel, 'case_id' | 'contact_name' | 'contact_phone'> {
+interface CommissioningDto extends ResourceDto, Omit<DemoCommissioningSessionViewModel, 'session_id' | 'revision'> {}
+interface ChangeDto extends ResourceDto, Omit<DemoEngineeringChangeViewModel, 'change_id' | 'revision'> { change_number: number }
+interface AcceptanceDto extends ResourceDto, Omit<DemoAcceptanceViewModel, 'acceptance_id' | 'revision'> {}
+interface InvoiceDto extends ResourceDto, Omit<DemoInvoiceViewModel, 'invoice_id' | 'revision'> {}
+interface AfterSalesDto extends ResourceDto, Omit<DemoAfterSalesCaseViewModel, 'case_id' | 'contact_name' | 'contact_phone' | 'revision'> {
   contact_name: string | null
   contact_phone: string | null
   is_under_warranty: boolean
   completed_at: string | null
   document_version_ids: number[]
 }
-interface WarrantyDto extends Omit<DemoWarrantyViewModel, 'renewal_price_cents'> {
+interface WarrantyDto extends Omit<DemoWarrantyViewModel, 'renewal_price_cents' | 'revision'> {
   id: number
   project_id: number
   acceptance_id: number
@@ -254,7 +254,7 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = this.signoffs.get(discipline)
     const path = `${projectPath(projectCode)}/drawing-signoffs/${discipline}`
-    const payload = { ...input, expected_revision: current?.revision ?? null }
+    const payload = { ...input, expected_revision: input.expected_revision !== undefined ? input.expected_revision : current?.revision ?? null }
     const uploadKey = files.length > 0 ? crypto.randomUUID() : null
     const data = await this.sendStableOperation(path, input, () => files.length > 0
       ? requestJson<DrawingSignoffDto>(path, {
@@ -292,7 +292,7 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = requireCached(this.commissioning, sessionId, '调试记录')
     const path = `${projectPath(projectCode)}/commissioning-sessions/${sessionId}`
-    const payload = { ...normalizeCommissioning(input), expected_revision: current.revision }
+    const payload = { ...normalizeCommissioning(input), expected_revision: input.expected_revision ?? current.revision }
     const data = await this.sendStableOperation(path, input, () => requestJson<CommissioningDto>(path, {
       method: 'PUT', body: payload,
     }))
@@ -323,14 +323,14 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = requireCached(this.changes, changeId, '工程变更')
     const path = `${projectPath(projectCode)}/engineering-changes/${changeId}`
-    const payload = { ...input, expected_revision: current.revision }
+    const payload = { ...input, expected_revision: input.expected_revision ?? current.revision }
     const data = await this.sendStableOperation(path, input, () => requestJson<ChangeDto>(path, {
       method: 'PUT', body: payload,
     }))
     if (this.hasProjectContext(projectCode, contextGeneration)) this.changes.set(data.id, data)
   }
 
-  async setEngineeringChangeStatus(projectCode: string, changeId: number, status: EngineeringChangeStatus, reason = ''): Promise<void> {
+  async setEngineeringChangeStatus(projectCode: string, changeId: number, status: EngineeringChangeStatus, reason = '', expectedRevision?: number | null): Promise<void> {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = requireCached(this.changes, changeId, '工程变更')
     const path = `${projectPath(projectCode)}/engineering-changes/${changeId}/transition`
@@ -338,7 +338,7 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
       to_status: status,
       effective_on: localBusinessDate(),
       reason: reason.trim() || '从项目交付页更新状态',
-      expected_revision: current.revision,
+      expected_revision: expectedRevision ?? current.revision,
     }
     const data = await this.sendStableOperation(path, { status, reason }, () => this.postSender.send<ChangeDto>(path, payload))
     if (this.hasProjectContext(projectCode, contextGeneration)) this.changes.set(data.id, data)
@@ -359,20 +359,20 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
     const current = requireCached(this.acceptances, acceptanceId, '验收记录')
     const path = `${projectPath(projectCode)}/acceptances/${acceptanceId}/reschedule`
     const payload = {
-      ...input, reason: reason.trim(), expected_revision: current.revision,
+      ...input, reason: reason.trim(), expected_revision: input.expected_revision ?? current.revision,
     }
     const data = await this.sendStableOperation(path, { input, reason }, () => this.postSender.send<AcceptanceDto>(path, payload))
     if (this.hasProjectContext(projectCode, contextGeneration)) this.acceptances.set(data.id, data)
   }
 
-  async cancelAcceptance(projectCode: string, acceptanceId: number, reason: string): Promise<void> {
+  async cancelAcceptance(projectCode: string, acceptanceId: number, reason: string, expectedRevision?: number | null): Promise<void> {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = requireCached(this.acceptances, acceptanceId, '验收记录')
     const path = `${projectPath(projectCode)}/acceptances/${acceptanceId}/cancel`
     const payload = {
       cancelled_on: localBusinessDate(),
       reason: reason.trim(),
-      expected_revision: current.revision,
+      expected_revision: expectedRevision ?? current.revision,
     }
     const data = await this.sendStableOperation(path, { reason }, () => this.postSender.send<AcceptanceDto>(path, payload))
     if (this.hasProjectContext(projectCode, contextGeneration)) this.acceptances.set(data.id, data)
@@ -391,7 +391,7 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
       notes: input.notes,
       document_version_ids: input.document_version_ids ?? [],
       warranty: passedFinal ? input.warranty : null,
-      expected_revision: current.revision,
+      expected_revision: input.expected_revision ?? current.revision,
     }
     const data = await this.sendStableOperation(path, input, () => files.length > 0
       ? this.multipartPostSender.send<{ acceptance: AcceptanceDto; warranty: WarrantyDto | null }>(path, payload, files)
@@ -405,7 +405,7 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
   async updateWarranty(projectCode: string, input: NullableWarrantyInput): Promise<void> {
     const contextGeneration = this.requireProjectContext(projectCode)
     const path = `${projectPath(projectCode)}/warranty`
-    const payload = { ...input, expected_revision: this.warranty?.revision ?? null }
+    const payload = { ...input, expected_revision: input.expected_revision !== undefined ? input.expected_revision : this.warranty?.revision ?? null }
     const data = await this.sendStableOperation(path, input, () => requestJson<WarrantyDto>(path, {
       method: 'PUT', body: payload,
     }))
@@ -425,7 +425,7 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = requireCached(this.invoices, invoiceId, '发票记录')
     const path = `${projectPath(projectCode)}/invoices/${invoiceId}`
-    const payload = { ...input, expected_revision: current.revision }
+    const payload = { ...input, expected_revision: input.expected_revision ?? current.revision }
     const data = await this.sendStableOperation(path, input, () => requestJson<InvoiceDto>(path, {
       method: 'PUT', body: payload,
     }))
@@ -439,12 +439,12 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
       : this.postSender.discard(path, input)
   }
 
-  async voidInvoice(projectCode: string, invoiceId: number, reason: string): Promise<void> {
+  async voidInvoice(projectCode: string, invoiceId: number, reason: string, expectedRevision?: number | null): Promise<void> {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = requireCached(this.invoices, invoiceId, '发票记录')
     const path = `${projectPath(projectCode)}/invoices/${invoiceId}/void`
     const payload = {
-      reason: reason.trim(), expected_revision: current.revision,
+      reason: reason.trim(), expected_revision: expectedRevision ?? current.revision,
     }
     const data = await this.sendStableOperation(path, { reason }, () => this.postSender.send<InvoiceDto>(path, payload))
     if (this.hasProjectContext(projectCode, contextGeneration)) this.invoices.set(data.id, data)
@@ -464,14 +464,14 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = requireCached(this.afterSales, caseId, '售后记录')
     const path = `${projectPath(projectCode)}/after-sales/${caseId}`
-    const payload = { ...input, expected_revision: current.revision }
+    const payload = { ...input, expected_revision: input.expected_revision ?? current.revision }
     const data = await this.sendStableOperation(path, input, () => requestJson<AfterSalesDto>(path, {
       method: 'PUT', body: payload,
     }))
     if (this.hasProjectContext(projectCode, contextGeneration)) this.afterSales.set(data.id, data)
   }
 
-  async setAfterSalesStatus(projectCode: string, caseId: number, status: AfterSalesStatus, resolution: string | null): Promise<void> {
+  async setAfterSalesStatus(projectCode: string, caseId: number, status: AfterSalesStatus, resolution: string | null, expectedRevision?: number | null): Promise<void> {
     const contextGeneration = this.requireProjectContext(projectCode)
     const current = requireCached(this.afterSales, caseId, '售后记录')
     const path = `${projectPath(projectCode)}/after-sales/${caseId}/transition`
@@ -480,7 +480,7 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
       effective_at: new Date().toISOString(),
       resolution,
       reason: status === 'cancelled' ? resolution?.trim() : null,
-      expected_revision: current.revision,
+      expected_revision: expectedRevision ?? current.revision,
     }
     const data = await this.sendStableOperation(path, { status, resolution }, () => this.postSender.send<AfterSalesDto>(path, payload))
     if (this.hasProjectContext(projectCode, contextGeneration)) this.afterSales.set(data.id, data)
@@ -530,6 +530,7 @@ function requireCached<T>(items: Map<number, T>, id: number, name: string): T {
 
 function mapSignoff(item: DrawingSignoffDto): DemoDrawingSignoffViewModel {
   return {
+    revision: item.revision,
     discipline: item.discipline, status: item.status, confirmed_on: item.confirmed_on,
     not_required_reason: item.not_required_reason, notes: item.notes,
     document_version_ids: item.document_version_ids,
@@ -538,6 +539,7 @@ function mapSignoff(item: DrawingSignoffDto): DemoDrawingSignoffViewModel {
 
 function mapCommissioning(item: CommissioningDto): DemoCommissioningSessionViewModel {
   return {
+    revision: item.revision,
     session_id: item.id, started_at: item.started_at, ended_at: item.ended_at,
     status: item.status, summary: item.summary, issues: item.issues,
     next_action: item.next_action, notes: item.notes, document_version_ids: item.document_version_ids,
@@ -546,6 +548,7 @@ function mapCommissioning(item: CommissioningDto): DemoCommissioningSessionViewM
 
 function mapChange(item: ChangeDto): DemoEngineeringChangeViewModel {
   return {
+    revision: item.revision,
     change_id: item.id, source: item.source, title: item.title, description: item.description,
     reason: item.reason, contract_delta_cents: item.contract_delta_cents,
     estimated_cost_delta_cents: item.estimated_cost_delta_cents,
@@ -556,6 +559,7 @@ function mapChange(item: ChangeDto): DemoEngineeringChangeViewModel {
 
 function mapAcceptance(item: AcceptanceDto): DemoAcceptanceViewModel {
   return {
+    revision: item.revision,
     acceptance_id: item.id, acceptance_type: item.acceptance_type, status: item.status,
     scheduled_on: item.scheduled_on, performed_on: item.performed_on, notes: item.notes,
     document_version_ids: item.document_version_ids,
@@ -566,6 +570,7 @@ function mapAcceptance(item: AcceptanceDto): DemoAcceptanceViewModel {
 
 function mapWarranty(item: WarrantyDto): DemoWarrantyViewModel {
   return {
+    revision: item.revision,
     starts_on: item.starts_on, duration_months: item.duration_months,
     renewal_price_cents: item.renewal_price_cents, notes: item.notes,
     ends_on: item.ends_on, days_remaining: item.days_remaining, status: item.status,
@@ -574,6 +579,7 @@ function mapWarranty(item: WarrantyDto): DemoWarrantyViewModel {
 
 function mapInvoice(item: InvoiceDto): DemoInvoiceViewModel {
   return {
+    revision: item.revision,
     invoice_id: item.id, invoice_type: item.invoice_type, status: item.status,
     requested_on: item.requested_on, recorded_on: item.recorded_on,
     invoice_number: item.invoice_number, amount_cents: item.amount_cents,
@@ -584,6 +590,7 @@ function mapInvoice(item: InvoiceDto): DemoInvoiceViewModel {
 
 function mapAfterSales(item: AfterSalesDto): DemoAfterSalesCaseViewModel {
   return {
+    revision: item.revision,
     case_id: item.id, reported_on: item.reported_on, service_on: item.service_on,
     reason: item.reason, contact_name: item.contact_name ?? '', contact_phone: item.contact_phone ?? '',
     coverage_type: item.coverage_type, is_under_warranty: item.is_under_warranty,

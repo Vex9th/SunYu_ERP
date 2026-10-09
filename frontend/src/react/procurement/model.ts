@@ -1,4 +1,5 @@
 import { ApiError } from '../../api'
+import { protectPendingWrites } from '../pendingUnload'
 
 export function textValue(value: unknown): string { return String(value ?? '').trim() }
 export function optional(value: unknown): string | null { return textValue(value) || null }
@@ -63,6 +64,7 @@ export class MutationLedger {
   snapshot = () => this.revision
   private notify() { this.revision++; for (const listener of this.listeners) listener() }
   get(scope: string): PendingMutation | null { return this.pending.get(scope) ?? null }
+  hasPending(): boolean { return this.pending.size > 0 }
   lastCompleted(scope: string): { title: string } | null { return this.completed.get(scope) ?? null }
   start(scope: string, title: string, execute: () => Promise<unknown>, discardRequest?: () => boolean): PendingMutation {
     if (this.pending.has(scope)) throw new Error('请先处理上一次结果未知的请求')
@@ -93,6 +95,8 @@ export class MutationLedger {
   }
 }
 export const mutationLedger = new MutationLedger()
+const releaseUnloadGuard = protectPendingWrites(() => mutationLedger.hasPending(), mutationLedger.subscribe)
+if (import.meta.hot) import.meta.hot.dispose(releaseUnloadGuard)
 const owners = new WeakMap<object, number>()
 let ownerSequence = 0
 export function mutationScope(repository: object, area: string, projectCode = ''): string {

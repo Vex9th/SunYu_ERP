@@ -17,7 +17,7 @@ import {
   it,
   vi,
 } from 'vitest'
-import { requestJson } from '../../api'
+import { ApiError, requestJson } from '../../api'
 import type {
   BackupCreated,
   BackupSettingsResponse,
@@ -80,7 +80,8 @@ function deferred<T>() {
 function mockApi(data: SystemOverview, backup?: Promise<BackupCreated>) {
   vi.mocked(requestJson).mockImplementation((async (path) => {
     if (path === '/api/system/overview') return data
-    if (path === '/api/system/backups' && backup) return backup
+    if (path === '/api/system/backup-tasks' && backup) return { task_id: 'test-task' }
+    if (path === '/api/system/backup-tasks/test-task' && backup) return backup.then((result) => ({ status: 'success', phase: 'finished', warning: result.warning }))
     throw new Error(`未预期的请求：${path}`)
   }) as typeof requestJson)
 }
@@ -110,10 +111,10 @@ describe('系统备份设置保护', () => {
   it('未配置已保存目录时禁用手动备份，不发送请求', async () => {
     mockApi(overview(null))
     renderSettings()
-    const backup = await screen.findByRole('button', { name: /立即备份/ })
+    const backup = await screen.findByRole('button', { name: /立即备份|继续查询/ })
     expect((backup as HTMLButtonElement).disabled).toBe(true)
     fireEvent.click(backup)
-    expect(requests('/api/system/backups')).toHaveLength(0)
+    expect(requests('/api/system/backup-tasks')).toHaveLength(0)
     expect(screen.getByText('请先配置并保存备份目录。')).toBeTruthy()
   })
 
@@ -122,7 +123,7 @@ describe('系统备份设置保护', () => {
     renderSettings()
     const directory = await screen.findByLabelText('备份目录')
     fireEvent.change(directory, { target: { value: '/new-backups' } })
-    const backup = screen.getByRole('button', { name: /立即备份/ })
+    const backup = screen.getByRole('button', { name: /立即备份|继续查询/ })
     expect((backup as HTMLButtonElement).disabled).toBe(true)
     fireEvent.click(backup)
     fireEvent.click(screen.getByRole('button', { name: /刷新/ }))
@@ -130,7 +131,7 @@ describe('系统备份设置保护', () => {
       expect(requests('/api/system/overview')).toHaveLength(2),
     )
     expect((directory as HTMLInputElement).value).toBe('/new-backups')
-    expect(requests('/api/system/backups')).toHaveLength(0)
+    expect(requests('/api/system/backup-tasks')).toHaveLength(0)
   })
 
   it('切换业务再返回仍保留未提交设置，恢复已保存设置后允许备份', async () => {
@@ -145,7 +146,7 @@ describe('系统备份设置保护', () => {
       ((await screen.findByLabelText('备份目录')) as HTMLInputElement).value,
     ).toBe('/draft-backups')
     expect(
-      (screen.getByRole('button', { name: /立即备份/ }) as HTMLButtonElement)
+      (screen.getByRole('button', { name: /立即备份|继续查询/ }) as HTMLButtonElement)
         .disabled,
     ).toBe(true)
     fireEvent.click(screen.getByRole('button', { name: '恢复已保存设置' }))
@@ -153,7 +154,7 @@ describe('系统备份设置保护', () => {
       '/test-backups',
     )
     expect(
-      (screen.getByRole('button', { name: /立即备份/ }) as HTMLButtonElement)
+      (screen.getByRole('button', { name: /立即备份|继续查询/ }) as HTMLButtonElement)
         .disabled,
     ).toBe(false)
   })
@@ -162,11 +163,11 @@ describe('系统备份设置保护', () => {
     const pending = deferred<BackupCreated>()
     mockApi(overview(), pending.promise)
     renderSettings()
-    fireEvent.click(await screen.findByRole('button', { name: /立即备份/ }))
-    await waitFor(() => expect(requests('/api/system/backups')).toHaveLength(1))
+    fireEvent.click(await screen.findByRole('button', { name: /立即备份|继续查询/ }))
+    await waitFor(() => expect(requests('/api/system/backup-tasks')).toHaveLength(1))
     fireEvent.click(screen.getByRole('link', { name: '打开其他业务' }))
     fireEvent.click(screen.getByRole('link', { name: '返回系统设置' }))
-    const backup = await screen.findByRole('button', { name: /立即备份/ })
+    const backup = await screen.findByRole('button', { name: /立即备份|继续查询/ })
     try {
       expect(
         (
@@ -176,7 +177,7 @@ describe('系统备份设置保护', () => {
         ).disabled,
       ).toBe(true)
       fireEvent.click(backup)
-      expect(requests('/api/system/backups')).toHaveLength(1)
+      expect(requests('/api/system/backup-tasks')).toHaveLength(1)
     } finally {
       await act(async () => pending.resolve(completed))
     }
@@ -198,13 +199,13 @@ describe('系统备份设置保护', () => {
     const pending = deferred<BackupCreated>()
     mockApi(overview(), pending.promise)
     renderSettings()
-    fireEvent.click(await screen.findByRole('button', { name: /立即备份/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /立即备份|继续查询/ }))
     fireEvent.click(screen.getByRole('link', { name: '打开其他业务' }))
     await act(async () => pending.resolve(completed))
     expect(requests('/api/system/overview')).toHaveLength(1)
     expect(screen.queryByText('备份已完成')).toBeNull()
     fireEvent.click(screen.getByRole('link', { name: '返回系统设置' }))
-    expect(await screen.findByRole('button', { name: /立即备份/ })).toBeTruthy()
+    expect(await screen.findByRole('button', { name: /立即备份|继续查询/ })).toBeTruthy()
     await screen.findByText('备份已完成')
   })
 
@@ -226,7 +227,7 @@ describe('系统备份设置保护', () => {
     )
     fireEvent.click(screen.getByRole('link', { name: '打开其他业务' }))
     fireEvent.click(screen.getByRole('link', { name: '返回系统设置' }))
-    const backup = await screen.findByRole('button', { name: /立即备份/ })
+    const backup = await screen.findByRole('button', { name: /立即备份|继续查询/ })
     try {
       expect((backup as HTMLButtonElement).disabled).toBe(true)
       fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
@@ -248,7 +249,7 @@ describe('系统备份设置保护', () => {
     )
     await waitFor(() =>
       expect(
-        (screen.getByRole('button', { name: /立即备份/ }) as HTMLButtonElement)
+        (screen.getByRole('button', { name: /立即备份|继续查询/ }) as HTMLButtonElement)
           .disabled,
       ).toBe(false),
     )
@@ -260,3 +261,89 @@ describe('系统备份设置保护', () => {
     })
   })
 })
+
+it('轮询暂时超时继续等待后台任务，不把网络错误显示为备份失败', async () => {
+  let polls = 0
+  vi.mocked(requestJson).mockImplementation((async (path) => {
+    if (path === '/api/system/overview') return overview()
+    if (path === '/api/system/backup-tasks') return { task_id: 'slow-task' }
+    if (path === '/api/system/backup-tasks/slow-task') {
+      polls += 1
+      if (polls === 1) throw new Error('Request timed out')
+      return { status: 'success', phase: 'finished' }
+    }
+    throw new Error(`未预期的请求：${path}`)
+  }) as typeof requestJson)
+  renderSettings()
+  fireEvent.click(await screen.findByRole('button', { name: /立即备份|继续查询/ }))
+  expect(await screen.findByText(/暂时无法读取状态/)).toBeTruthy()
+  expect(screen.queryByText('Request timed out')).toBeNull()
+  expect((screen.getByRole('button', { name: '保存设置' }) as HTMLButtonElement).disabled).toBe(true)
+  await screen.findByText('备份已完成', {}, { timeout: 3000 })
+  expect(polls).toBe(2)
+  expect(sessionStorage.getItem('sunyu-backup-task')).toBeNull()
+})
+
+
+it('恢复的任务编号确定不存在时停止轮询并解除设置锁，结果标记为无法确认', async () => {
+  sessionStorage.setItem('sunyu-backup-task', 'restored-task')
+  vi.mocked(requestJson).mockImplementation((async (path) => {
+    if (path === '/api/system/overview') return overview()
+    if (path === '/api/system/backup-tasks/restored-task')
+      throw new ApiError('Backup task not found', 404)
+    throw new Error(`未预期的请求：${path}`)
+  }) as typeof requestJson)
+  renderSettings()
+  await screen.findByText(/备份任务记录不存在/)
+  expect(sessionStorage.getItem('sunyu-backup-task')).toBeNull()
+  expect(requests('/api/system/backup-tasks/restored-task')).toHaveLength(1)
+  expect((screen.getByRole('button', { name: '保存设置' }) as HTMLButtonElement).disabled).toBe(false)
+})
+
+it('连续五次无法读取状态后停止自动查询，保留编号供用户恢复连接后核对', async () => {
+  sessionStorage.setItem('sunyu-backup-task', 'offline-task')
+  vi.mocked(requestJson).mockImplementation((async (path) => {
+    if (path === '/api/system/overview') return overview()
+    if (path === '/api/system/backup-tasks/offline-task')
+      throw new ApiError('请求超时', 0, 'REQUEST_TIMEOUT')
+    throw new Error(`未预期的请求：${path}`)
+  }) as typeof requestJson)
+  renderSettings()
+  await screen.findByText(/暂时无法确认备份结果，已停止自动查询/, {}, { timeout: 7000 })
+  expect(requests('/api/system/backup-tasks/offline-task')).toHaveLength(5)
+  expect(sessionStorage.getItem('sunyu-backup-task')).toBe('offline-task')
+  expect((screen.getByRole('button', { name: '保存设置' }) as HTMLButtonElement).disabled).toBe(false)
+  vi.mocked(requestJson).mockImplementation((async (path) => {
+    if (path === '/api/system/overview') return overview()
+    if (path === '/api/system/backup-tasks/offline-task') return { status: 'success', phase: 'finished' }
+    throw new Error(`未预期的请求：${path}`)
+  }) as typeof requestJson)
+  fireEvent.click(screen.getByRole('button', { name: /继续查询/ }))
+  await screen.findByText('备份已完成')
+  expect(requests('/api/system/backup-tasks')).toHaveLength(0)
+  expect(sessionStorage.getItem('sunyu-backup-task')).toBeNull()
+}, 10000)
+
+it('离页期间达到查询上限后，首次返回继续核对保留任务且不创建新备份', async () => {
+  sessionStorage.setItem('sunyu-backup-task', 'away-task')
+  let recovered = false
+  vi.mocked(requestJson).mockImplementation((async (path) => {
+    if (path === '/api/system/overview') return overview()
+    if (path === '/api/system/backup-tasks/away-task') {
+      if (!recovered) throw new ApiError('请求超时', 0, 'REQUEST_TIMEOUT')
+      return { status: 'success', phase: 'finished' }
+    }
+    throw new Error(`未预期的请求：${path}`)
+  }) as typeof requestJson)
+  renderSettings()
+  await screen.findByText(/暂时无法读取状态/)
+  fireEvent.click(screen.getByRole('link', { name: '打开其他业务' }))
+  await waitFor(() => expect(requests('/api/system/backup-tasks/away-task')).toHaveLength(5), { timeout: 7000 })
+  await act(async () => { await Promise.resolve() })
+  recovered = true
+  fireEvent.click(screen.getByRole('link', { name: '返回系统设置' }))
+  await screen.findByText('备份已完成')
+  expect(requests('/api/system/backup-tasks/away-task')).toHaveLength(6)
+  expect(requests('/api/system/backup-tasks')).toHaveLength(0)
+  expect(sessionStorage.getItem('sunyu-backup-task')).toBeNull()
+}, 10000)

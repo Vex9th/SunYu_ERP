@@ -297,7 +297,7 @@ export function ActionDrawer({
     if (editor && !editor.frozen && draftOwner && draftKey)
       keepEditorDraft(draftOwner, draftKey, {
         ...editor,
-        initial: structuredClone(next),
+        initial: structuredClone({ ...editor.initial, ...next }),
         files: nextFiles,
         draft: true,
       })
@@ -369,7 +369,7 @@ export function ActionDrawer({
             layout="vertical"
             disabled={busy || editor?.frozen}
             onValuesChange={(_, next) => rememberDraft(next)}
-            onFinish={(next) => void onSave(next, files)}
+            onFinish={(next) => void onSave({ ...editor?.initial, ...next }, files)}
           >
             {Array.from(
               new Set(

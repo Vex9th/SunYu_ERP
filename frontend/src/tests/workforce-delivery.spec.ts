@@ -2417,3 +2417,21 @@ describe('P2 交付售后演示边界', () => {
     expect(wrapper.find('[data-testid^="after-sales-status-"]').exists()).toBe(false)
   })
 })
+
+it('更正历史上工沿用登记时的日薪，安排涨薪或改时薪不改变历史工资', async () => {
+  const repo = new MockWorkforceRepository()
+  const project = 'SALARY-SNAPSHOT'
+  const initial = (await repo.getWorkforcePreview(project)).data
+  const assignment = initial.crew_assignments[0]!
+  await repo.updateCrewAssignment(project, assignment.assignment_id, { ...assignment, rate_cents: 20000 })
+  const [entry] = (await repo.saveLaborEntriesBatch(project, {
+    work_date: '2026-09-15',
+    entries: [{ assignment_id: assignment.assignment_id, attendance_status: 'present', day_fraction: '1.000', work_minutes: null, work_summary: null, notes: null }],
+  })).data
+  for (const salary of [{ pay_basis: 'daily' as const, rate_cents: 30000 }, { pay_basis: 'hourly' as const, rate_cents: 5000 }]) {
+    await repo.updateCrewAssignment(project, assignment.assignment_id, { ...assignment, ...salary })
+    await repo.updateLaborEntry(project, entry!.entry_id, { ...entry!, day_fraction: '0.500' })
+    const saved = (await repo.getWorkforcePreview(project)).data.labor_entries.find(row => row.entry_id === entry!.entry_id)!
+    expect(saved).toMatchObject({ pay_basis: 'daily', rate_cents: 20000, cost_cents: 10000, work_minutes: null })
+  }
+})

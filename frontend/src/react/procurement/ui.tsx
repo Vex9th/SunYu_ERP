@@ -4,6 +4,7 @@ import { InboxOutlined } from '@ant-design/icons'
 import type { RcFile } from 'antd/es/upload'
 import { mutationLedger, type PendingMutation } from './model'
 import type { DocumentVersionOption } from '../../repositories/project-operating.live'
+import { useUnsavedChanges } from '../unsavedChanges'
 
 export type FormValues = Record<string, unknown>
 export const errorText = (error: unknown) => error instanceof Error ? error.message : '操作失败，请重试'
@@ -61,20 +62,23 @@ export function ActionFeedback({ actions, readonly = false }: { actions: ReturnT
       </Space>} />}
   </Space>
 }
-export function FormModal({ title, form, open, onClose, onSubmit, children, busy, locked, error, width = 680, submitText = '保存' }: {
+export function FormModal({ title, form, open, onClose, onSubmit, children, busy, locked, error, width = 680, submitText = '保存', hasChanges = false }: {
   title: string; form: FormInstance; open: boolean; onClose: () => void; onSubmit: (values: FormValues) => void | Promise<void>;
-  children: ReactNode; busy: boolean; locked?: boolean; error?: string; width?: number; submitText?: string
+  children: ReactNode; busy: boolean; locked?: boolean; error?: string; width?: number; submitText?: string; hasChanges?: boolean
 }) {
   const [modal, context] = Modal.useModal()
+  const dirty = useRef(false)
+  useEffect(() => { if (open) dirty.current = false }, [open])
+  useUnsavedChanges(() => open && (busy || hasChanges || dirty.current))
   function close() {
     if (busy) return
-    if (form.isFieldsTouched()) modal.confirm({ title: '关闭当前表单？', content: locked ? '原请求仍会保留，可在页面顶部原样重试。' : '未保存的内容将丢失。', okText: '关闭', cancelText: '继续填写', onOk: onClose })
+    if (hasChanges || dirty.current) modal.confirm({ title: '关闭当前表单？', content: locked ? '原请求仍会保留，可在页面顶部原样重试。' : '未保存的内容将丢失。', okText: '关闭', cancelText: '继续填写', onOk: onClose })
     else onClose()
   }
   return <>{context}<Modal title={title} open={open} onCancel={close} width={width} mask={{ closable: false }} keyboard={!busy} closable={!busy} destroyOnHidden
     footer={<Space><Button disabled={busy} onClick={close}>取消</Button><Button type="primary" loading={busy} disabled={locked} onClick={() => form.submit()}>{submitText}</Button></Space>}>
     <Space orientation="vertical" style={{ width: '100%' }}>{error && <Alert type="error" showIcon title={error} />}
-      <Form form={form} layout="vertical" disabled={busy || locked} onFinish={onSubmit}>{children}</Form>
+      <Form form={form} layout="vertical" scrollToFirstError={{ focus: true }} disabled={busy || locked} onValuesChange={() => { dirty.current = true }} onFinish={onSubmit}>{children}</Form>
     </Space>
   </Modal></>
 }

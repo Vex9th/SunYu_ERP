@@ -38,6 +38,7 @@ from backend.app.features.system import (
     BackupScheduler,
     SettingsStore,
     create_system_router,
+    recover_interrupted_backups,
     run_backup_job,
 )
 from backend.app.features.workforce import create_workforce_router
@@ -101,6 +102,7 @@ def create_app(
         migration_failure: BaseException | None = None
         try:
             apply_migrations(connection, selected_migrations_dir)
+            recover_interrupted_backups(connection)
         except BaseException as failure:
             migration_failure = failure
             raise
