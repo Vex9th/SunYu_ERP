@@ -1,18 +1,46 @@
 name: Windows Release
+run-name: Windows ${{ inputs.version || '候选构建' }}
 
 'on':
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: '正式版本号，例如 v1.2.3；留空仅构建候选包'
+        required: false
+        type: string
+
+concurrency:
+  group: windows-release-${{ inputs.version || github.ref }}
+  cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build_needed: ${{ steps.gate.outputs.build_needed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Check version and existing release
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.version }}
+        run: python .github/scripts/release_gate.py
+
   release:
+    needs: prepare
+    if: needs.prepare.outputs.build_needed == 'true'
     runs-on: windows-latest
     timeout-minutes: 35
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -32,11 +60,11 @@ jobs:
       - name: Install backend dependencies
         run: python -m pip install --requirement requirements-dev.txt
 
+      - name: Lint backend
+        run: python -m ruff check . .github/scripts
+
       - name: Test backend
         run: python -m pytest
-
-      - name: Lint backend
-        run: python -m ruff check .
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -228,21 +256,46 @@ jobs:
           if (@(Compare-Object $required $actual).Count -ne 0) {
             throw "Unexpected release zip contents: $($actual -join ', ')"
           }
+          $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  SunYu_ERP-windows-x64.zip" | Set-Content -Encoding utf8NoBOM 'SHA256SUMS.txt'
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v7
         with:
           name: SunYu_ERP-windows-x64
-          path: SunYu_ERP-windows-x64.zip
+          path: |
+            SunYu_ERP-windows-x64.zip
+            SHA256SUMS.txt
           if-no-files-found: error
 
-      - name: Create GitHub Release for tag
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Recheck release before publishing
+        if: inputs.version != ''
+        id: publish_gate
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "${{ github.ref_name }}"
-          "SunYu_ERP-windows-x64.zip"
-          --verify-tag
-          --notes-file README.md
-          --title "${{ github.ref_name }}"
+          RELEASE_TAG: ${{ inputs.version }}
+        run: |
+          git fetch --tags origin
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot refresh release tags' }
+          python .github/scripts/release_gate.py
+
+      - name: Create release draft
+        if: steps.publish_gate.outputs.state == 'new'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.version }}
+        run: gh release create "$env:RELEASE_TAG" --draft --target "$env:GITHUB_SHA" --notes-file RELEASE_NOTES.md --title "$env:RELEASE_TAG"
+
+      - name: Upload verified assets to draft
+        if: steps.publish_gate.outputs.state == 'new' || steps.publish_gate.outputs.state == 'draft'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.version }}
+        run: gh release upload "$env:RELEASE_TAG" SunYu_ERP-windows-x64.zip SHA256SUMS.txt --clobber
+
+      - name: Publish complete release
+        if: steps.publish_gate.outputs.state == 'new' || steps.publish_gate.outputs.state == 'draft'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.version }}
+        run: gh release edit "$env:RELEASE_TAG" --draft=false --latest

@@ -28,3 +28,11 @@ React + TypeScript（strict）+ Ant Design + Vite，Python 3.13 + FastAPI，SQLi
 前端结构、验证命令和迁移说明见 [frontend/README.md](frontend/README.md)。
 
 [MIT License](LICENSE)
+
+## 构建与发布
+
+普通 CI 检查主分支推送和 PR，同一分支的新运行会取消过期运行；标签不会重复触发测试。
+
+在 Actions 中手动运行 **Windows Release**，填写 `version`（例如 `v1.2.3`）即可在测试、EXE 启动与重启持久化验证通过后发布。版本号留空时只上传候选构建产物。不要再单独推送标签或提前创建正式 Release。
+
+同一提交的完整版本会直接跳过；未完成的草稿可重跑续传；已有标签指向不同提交时会停止，避免覆盖旧版本。正式附件包括 Windows 安装包和 `SHA256SUMS.txt`。
