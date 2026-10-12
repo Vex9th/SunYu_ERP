@@ -35,6 +35,12 @@ from backend.app.features.inventory import (
     parse_quantity,
     post_receipt_movement,
 )
+from backend.app.features.purchase_order_numbers import next_purchase_order_number
+from backend.app.features.purchase_order_tax import (
+    calculate_line_amounts,
+    gross_line_value,
+    validate_tax_rate,
+)
 
 Clock = Callable[[], datetime]
 
@@ -63,6 +69,7 @@ _ORDER_FIELDS = {
     "notes",
     "document_version_ids",
 }
+_ORDER_OPTIONAL_FIELDS = {"tax_rate_bps"}
 _ORDER_LINE_FIELDS = {
     "procurement_line_id",
     "quantity",
@@ -699,6 +706,28 @@ def create_procurement_router(
             )
             return response
 
+    @router.get("/api/projects/{project_code}/purchase-order-number-preview")
+    def preview_purchase_order_number(
+        project_code: str,
+        request: Request,
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, str]:
+        supplier_parameter = _single_query(request, "supplier_company_id")
+        if supplier_parameter is None:
+            raise _invalid_payload("Invalid supplier_company_id")
+        supplier_id = _parse_identifier(supplier_parameter)
+        ordered_on = _business_date(
+            _single_query(request, "ordered_on"), "Invalid ordered_on"
+        )
+        project = _active_project(connection, _normalize_project_path(project_code))
+        supplier = _order_supplier(connection, supplier_id)
+        return {
+            "order_no": next_purchase_order_number(
+                connection, project=project, supplier=supplier, ordered_on=ordered_on
+            )
+        }
+
     @router.get("/api/projects/{project_code}/purchase-orders")
     def list_purchase_orders(
         project_code: str,
@@ -766,16 +795,17 @@ def create_procurement_router(
             )
         else:
             payload = await _read_json(
-                request, _ORDER_FIELDS, "Invalid purchase order payload"
+                request, _ORDER_FIELDS, "Invalid purchase order payload",
+                optional_fields=_ORDER_OPTIONAL_FIELDS,
             )
             attachment_batch = business_attachments.AttachmentBatch(
                 [], settings.data_dir
             )
         try:
             with attachment_batch:
-                if set(payload) != _ORDER_FIELDS:
+                if not _ORDER_FIELDS <= set(payload) <= _ORDER_FIELDS | _ORDER_OPTIONAL_FIELDS:
                     raise _invalid_payload("Invalid purchase order payload")
-                normalized = _normalize_order(payload)
+                normalized = _normalize_order(payload, allow_auto_number=True)
                 request_hash = _request_hash(
                     attachment_batch.hash_payload(normalized)
                 )
@@ -799,14 +829,16 @@ def create_procurement_router(
                         raise _business_conflict(
                             "Project is archived", "PROJECT_ARCHIVED"
                         )
-                    if (
-                        connection.execute(
-                            "SELECT 1 FROM companies WHERE id = ?",
-                            (normalized["supplier_company_id"],),
-                        ).fetchone()
-                        is None
-                    ):
-                        raise _not_found("Company not found")
+                    supplier = _order_supplier(
+                        connection, int(normalized["supplier_company_id"])
+                    )
+                    if normalized["order_no"] == "":
+                        normalized["order_no"] = next_purchase_order_number(
+                            connection,
+                            project=project,
+                            supplier=supplier,
+                            ordered_on=str(normalized["ordered_on"]),
+                        )
                     _validate_document_versions(
                         connection,
                         str(project["project_code"]),
@@ -817,10 +849,10 @@ def create_procurement_router(
                         """
                         INSERT INTO purchase_orders
                             (project_id, order_no, supplier_company_id, ordered_on,
-                             expected_delivery_on, notes, status, revision,
+                             expected_delivery_on, notes, tax_rate_bps, status, revision,
                              create_idempotency_key, create_request_hash,
                              created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, 'draft', 1, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', 1, ?, ?, ?, ?)
                         """,
                         (
                             project["id"],
@@ -829,6 +861,7 @@ def create_procurement_router(
                             normalized["ordered_on"],
                             normalized["expected_delivery_on"],
                             normalized["notes"],
+                            normalized.get("tax_rate_bps"),
                             storage_key,
                             request_hash,
                             timestamp,
@@ -856,14 +889,15 @@ def create_procurement_router(
                             INSERT INTO purchase_order_lines
                                 (purchase_order_id, procurement_line_id,
                                  quantity_milli, received_quantity_milli,
-                                 unit_cost_cents, overage_reason, created_at)
-                            VALUES (?, ?, ?, 0, ?, ?, ?)
+                                 unit_cost_cents, tax_amount_cents, overage_reason, created_at)
+                            VALUES (?, ?, ?, 0, ?, ?, ?, ?)
                             """,
                             (
                                 order_id,
                                 line["procurement_line_id"],
                                 line["quantity_milli"],
                                 line["unit_cost_cents"],
+                                line.get("tax_amount_cents", 0),
                                 line["overage_reason"],
                                 timestamp,
                             ),
@@ -1142,7 +1176,7 @@ def create_procurement_router(
                     order_line,
                     timestamp=timestamp,
                 )
-                value_cents = line_value(int(order_line["unit_cost_cents"]), quantity)
+                value_cents = _receipt_line_value(connection, order, order_line, quantity)
                 movement_id = post_receipt_movement(
                     connection,
                     item=item,
@@ -1238,18 +1272,24 @@ def create_procurement_router(
         ) for row in line_rows)
         for label in ("not_ordered", "partial", "ordered", "over_ordered"):
             counts.setdefault(label, 0)
-        committed = connection.execute(
+        committed_lines = connection.execute(
             """
-            SELECT COALESCE(SUM(
-                (order_lines.unit_cost_cents * order_lines.quantity_milli + 500) / 1000
-            ), 0)
+            SELECT order_lines.unit_cost_cents, order_lines.quantity_milli,
+                   order_lines.tax_amount_cents
             FROM purchase_order_lines AS order_lines
             JOIN purchase_orders AS orders ON orders.id = order_lines.purchase_order_id
             WHERE orders.project_id = ?
               AND orders.status IN ('confirmed', 'partially_received', 'received')
             """,
             (project["id"],),
-        ).fetchone()[0]
+        ).fetchall()
+        committed = sum(
+            gross_line_value(
+                int(line["unit_cost_cents"]), int(line["quantity_milli"]),
+                int(line["tax_amount_cents"]),
+            )
+            for line in committed_lines
+        )
         received = connection.execute(
             """
             SELECT COALESCE(SUM(receipt_lines.value_cents), 0)
@@ -1366,7 +1406,10 @@ def _normalize_line(payload: dict[str, Any]) -> dict[str, object]:
     }
 
 
-def _normalize_order(payload: dict[str, Any]) -> dict[str, object]:
+def _normalize_order(
+    payload: dict[str, Any], *, allow_auto_number: bool = False
+) -> dict[str, object]:
+    tax_rate = validate_tax_rate(payload.get("tax_rate_bps"))
     raw_lines = payload["lines"]
     if not isinstance(raw_lines, list) or not raw_lines:
         raise _invalid_payload("Invalid purchase order payload")
@@ -1385,26 +1428,24 @@ def _normalize_order(payload: dict[str, Any]) -> dict[str, object]:
         unit_cost_cents = _money(
             raw_line["unit_cost_cents"], "Invalid purchase order payload"
         )
-        line_value(
-            unit_cost_cents,
-            quantity_milli,
-            detail="Invalid purchase order payload",
-        )
+        amounts = calculate_line_amounts(unit_cost_cents, quantity_milli, tax_rate)
         lines.append(
             {
                 "procurement_line_id": procurement_line_id,
                 "quantity_milli": quantity_milli,
                 "unit_cost_cents": unit_cost_cents,
+                **({"tax_amount_cents": amounts["tax_amount_cents"]}
+                   if "tax_rate_bps" in payload else {}),
                 "overage_reason": _optional_text(
                     raw_line["overage_reason"], "Invalid purchase order payload"
                 ),
             }
         )
     order_total = sum(
-        line_value(
+        gross_line_value(
             int(line["unit_cost_cents"]),
             int(line["quantity_milli"]),
-            detail="Invalid purchase order payload",
+            int(line.get("tax_amount_cents", 0)),
         )
         for line in lines
     )
@@ -1428,8 +1469,11 @@ def _normalize_order(payload: dict[str, Any]) -> dict[str, object]:
     if expected_delivery is not None and expected_delivery < ordered_on:
         raise _invalid_payload("Invalid purchase order payload")
     return {
-        "order_no": _required_text(
-            payload["order_no"], "Invalid purchase order payload"
+        **({"tax_rate_bps": tax_rate} if "tax_rate_bps" in payload else {}),
+        "order_no": (
+            ""
+            if allow_auto_number and payload["order_no"] == ""
+            else _required_text(payload["order_no"], "Invalid purchase order payload")
         ),
         "supplier_company_id": _positive_integer(
             payload["supplier_company_id"], "Invalid purchase order payload"
@@ -1440,6 +1484,41 @@ def _normalize_order(payload: dict[str, Any]) -> dict[str, object]:
         "notes": _optional_text(payload["notes"], "Invalid purchase order payload"),
         "document_version_ids": normalized_documents,
     }
+
+
+def _receipt_line_value(
+    connection: sqlite3.Connection,
+    order: sqlite3.Row,
+    line: sqlite3.Row,
+    quantity_milli: int,
+) -> int:
+    if order["tax_rate_bps"] is None:
+        # 未设置税率的旧单继续沿用原来的逐次入库舍入规则。
+        return line_value(int(line["unit_cost_cents"]), quantity_milli)
+    gross = gross_line_value(
+        int(line["unit_cost_cents"]), int(line["quantity_milli"]),
+        int(line["tax_amount_cents"]),
+    )
+    received_value = int(connection.execute(
+        """
+        SELECT COALESCE(SUM(lines.value_cents), 0)
+        FROM goods_receipt_lines AS lines
+        JOIN goods_receipts AS receipts ON receipts.id = lines.goods_receipt_id
+        WHERE lines.purchase_order_line_id = ? AND receipts.status = 'active'
+        """,
+        (line["id"],),
+    ).fetchone()[0])
+    remaining_value = gross - received_value
+    if remaining_value < 0:
+        raise sqlite3.DatabaseError("purchase order receipt value exceeds order amount")
+    remaining_quantity = int(line["quantity_milli"]) - int(line["received_quantity_milli"])
+    if quantity_milli == remaining_quantity:
+        return remaining_value
+    # 反冲任意批次后仍按本批比例分配；不能用累计目标减已入库值，后者可能为负。
+    rounded_value = (2 * gross * quantity_milli + int(line["quantity_milli"])) // (
+        2 * int(line["quantity_milli"])
+    )
+    return min(rounded_value, remaining_value)
 
 
 def _normalize_receipt(payload: dict[str, Any]) -> dict[str, object]:
@@ -1613,19 +1692,6 @@ def _line_facts(connection: sqlite3.Connection, line_id: int) -> dict[str, int]:
                   )
             ), 0) AS ordered_quantity_milli,
             COALESCE((
-                SELECT SUM(
-                    (order_lines.unit_cost_cents * order_lines.quantity_milli + 500)
-                    / 1000
-                )
-                FROM purchase_order_lines AS order_lines
-                JOIN purchase_orders AS orders
-                    ON orders.id = order_lines.purchase_order_id
-                WHERE order_lines.procurement_line_id = procurement_lines.id
-                  AND orders.status IN (
-                      'confirmed', 'partially_received', 'received'
-                  )
-            ), 0) AS ordered_amount_cents,
-            COALESCE((
                 SELECT SUM(receipt_lines.quantity_milli)
                 FROM goods_receipt_lines AS receipt_lines
                 JOIN goods_receipts AS receipts
@@ -1670,7 +1736,27 @@ def _line_facts(connection: sqlite3.Connection, line_id: int) -> dict[str, int]:
     ).fetchone()
     if row is None:
         raise sqlite3.DatabaseError("procurement line facts are missing")
-    return {key: int(value) for key, value in dict(row).items()}
+    amounts = connection.execute(
+        """
+        SELECT order_lines.unit_cost_cents, order_lines.quantity_milli,
+               order_lines.tax_amount_cents
+        FROM purchase_order_lines AS order_lines
+        JOIN purchase_orders AS orders ON orders.id = order_lines.purchase_order_id
+        WHERE order_lines.procurement_line_id = ?
+          AND orders.status IN ('confirmed', 'partially_received', 'received')
+        """,
+        (line_id,),
+    ).fetchall()
+    return {
+        **{key: int(value) for key, value in dict(row).items()},
+        "ordered_amount_cents": sum(
+            gross_line_value(
+                int(line["unit_cost_cents"]), int(line["quantity_milli"]),
+                int(line["tax_amount_cents"]),
+            )
+            for line in amounts
+        ),
+    }
 
 
 def _order_response(
@@ -1690,10 +1776,11 @@ def _order_response(
         """,
         (row["id"],),
     ).fetchall()
-    ordered_amount = sum(
+    net_amount = sum(
         line_value(int(line["unit_cost_cents"]), int(line["quantity_milli"]))
         for line in lines
     )
+    tax_amount = sum(int(line["tax_amount_cents"]) for line in lines)
     payments = [
         _payment_response(connection, payment)
         for payment in connection.execute(
@@ -1736,7 +1823,10 @@ def _order_response(
         "status": row["status"],
         "cancelled_at": row["cancelled_at"],
         "cancel_reason": row["cancel_reason"],
-        "ordered_amount_cents": ordered_amount,
+        "tax_rate_bps": row["tax_rate_bps"],
+        "net_amount_cents": net_amount,
+        "tax_amount_cents": tax_amount,
+        "ordered_amount_cents": net_amount + tax_amount,
         "paid_amount_cents": sum(
             int(payment["amount_cents"])
             for payment in payments
@@ -1765,8 +1855,13 @@ def _order_response(
                     int(line["received_quantity_milli"])
                 ),
                 "unit_cost_cents": line["unit_cost_cents"],
-                "line_amount_cents": line_value(
+                "net_amount_cents": line_value(
                     int(line["unit_cost_cents"]), int(line["quantity_milli"])
+                ),
+                "tax_amount_cents": line["tax_amount_cents"],
+                "line_amount_cents": gross_line_value(
+                    int(line["unit_cost_cents"]), int(line["quantity_milli"]),
+                    int(line["tax_amount_cents"]),
                 ),
                 "overage_reason": line["overage_reason"],
             }
@@ -1960,6 +2055,15 @@ def _active_project(connection: sqlite3.Connection, project_key: str) -> sqlite3
     return row
 
 
+def _order_supplier(connection: sqlite3.Connection, supplier_id: int) -> sqlite3.Row:
+    row = connection.execute(
+        "SELECT id, name FROM companies WHERE id = ?", (supplier_id,)
+    ).fetchone()
+    if row is None:
+        raise _not_found("Company not found")
+    return row
+
+
 def _list_row(
     connection: sqlite3.Connection,
     list_id: int,
@@ -2141,12 +2245,16 @@ async def _read_json(
     request: Request,
     expected_fields: set[str],
     detail: str,
+    *,
+    optional_fields: set[str] | None = None,
 ) -> dict[str, Any]:
     try:
         payload: Any = await request.json()
     except (RecursionError, UnicodeError, ValueError):
         raise _invalid_payload(detail) from None
-    if not isinstance(payload, dict) or set(payload) != expected_fields:
+    if not isinstance(payload, dict) or not (
+        expected_fields <= set(payload) <= expected_fields | (optional_fields or set())
+    ):
         raise _invalid_payload(detail)
     return payload
 
@@ -2237,7 +2345,11 @@ def _business_date(value: object, detail: str) -> str:
 def _parse_identifier(value: str) -> int:
     if not value.isascii() or not value.isdecimal():
         raise _invalid_payload("Invalid identifier")
-    return _positive_integer(int(value), "Invalid identifier")
+    try:
+        identifier = int(value)
+    except ValueError:
+        raise _invalid_payload("Invalid identifier") from None
+    return _positive_integer(identifier, "Invalid identifier")
 
 
 def _validate_idempotency_key(value: str) -> str:

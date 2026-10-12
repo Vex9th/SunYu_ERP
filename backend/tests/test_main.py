@@ -209,13 +209,59 @@ def test_release_frontend_routes_fall_back_to_index_without_hiding_missing_api_o
             "/projects/SY-2026-001/documents/12?version=31",
             headers={"Accept": "text/html"},
         )
-        missing_api = client.get("/api/not-a-real-route")
-        missing_asset = client.get("/assets/not-found.js")
+        missing_api = client.get(
+            "/api/not-a-real-route", headers={"Accept": "text/html"}
+        )
+        missing_asset = client.get(
+            "/assets/not-found.js", headers={"Accept": "text/html"}
+        )
+        unknown_page = client.get("/not-a-real-route", headers={"Accept": "text/html"})
+        unknown_company_page = client.get(
+            "/companies/not-a-real-route", headers={"Accept": "text/html"}
+        )
 
     assert document_preview.status_code == 200
     assert "SunYu ERP Release" in document_preview.text
     assert missing_api.status_code == 404
     assert missing_asset.status_code == 404
+    assert unknown_page.status_code == 404
+    assert unknown_company_page.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        "/companies?company=1&companyTab=ledger",
+        "/companies",
+        "/companies/",
+        "/projects",
+        "/inventory",
+        "/settings",
+    ],
+)
+def test_release_top_level_frontend_routes_support_direct_html_navigation(
+    tmp_path: Path,
+    route: str,
+) -> None:
+    frontend_dist = tmp_path / "frontend" / "dist"
+    _write_frontend_dist(frontend_dist)
+    application = main_module.create_app(
+        config_path=tmp_path / "config.json",
+        migrations_dir=PROJECT_MIGRATIONS_DIR,
+        frontend_dist=frontend_dist,
+    )
+
+    with TestClient(application) as client:
+        response = client.get(route, headers={"Accept": "text/html"})
+        head = client.head(route, headers={"Accept": "text/html"})
+        non_navigation = client.get(route, headers={"Accept": "application/json"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "SunYu ERP Release" in response.text
+    assert head.status_code == 200
+    assert head.content == b""
+    assert non_navigation.status_code == 404
 
 
 def test_frontend_navigation_uses_url_path_instead_of_os_normalized_path() -> None:
@@ -351,6 +397,7 @@ def test_lifespan_applies_migrations_and_closes_every_owned_connection(
         "020_acceptance_reschedule_events",
         "021_workforce_audit_history",
         "022_supplier_invoice_active_number",
+        "023_purchase_order_tax",
     }
 
 

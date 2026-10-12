@@ -1,0 +1,113 @@
+.ledger {
+  container: company-ledger / inline-size;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  min-width: 0;
+}
+.ledger > * {
+  min-width: 0;
+}
+.toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px 16px;
+}
+.filters {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: 10px 16px;
+}
+.filterActions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+.filterActions :global(.ant-checkbox-wrapper) {
+  align-items: center;
+  min-height: var(--ant-control-height, 34px);
+}
+.field {
+  display: grid;
+  gap: 5px;
+  color: #596779;
+  font-size: 12px;
+}
+.projectFilter {
+  width: 210px;
+  max-width: 100%;
+}
+.dateFilter {
+  width: 154px;
+}
+.summary {
+  padding: 12px 0;
+  border-top: 1px solid #e5e9f0;
+  border-bottom: 1px solid #e5e9f0;
+}
+.summary dl {
+  --summary-column-min: calc((100% - 64px) / 5);
+  --summary-amount-min: calc(var(--summary-money-characters) * 0.65em + 8px);
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, max(var(--summary-column-min), var(--summary-amount-min))), 1fr));
+  gap: 16px;
+  margin: 12px 0 0;
+  font-size: 18px;
+}
+.summary dt {
+  color: #596779;
+  font-size: 12px;
+}
+.summary dd {
+  margin: 6px 0 0;
+  color: #202a38;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.summary .outstanding {
+  color: #ad5c00;
+}
+.note {
+  margin: 0;
+  color: #6c7789;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.amount {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.wrappable {
+  overflow-wrap: anywhere;
+}
+.wrappable > a {
+  display: block;
+}
+.loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-height: 200px;
+  color: #596779;
+}
+.contractTable {
+  padding: 8px 0;
+}
+@container company-ledger (max-width: 880px) {
+  .summary dl {
+    --summary-column-min: calc((100% - 32px) / 3);
+  }
+}
+@container company-ledger (max-width: 560px) {
+  .summary dl {
+    --summary-column-min: calc((100% - 16px) / 2);
+    font-size: 16px;
+  }
+}

@@ -396,6 +396,7 @@ def test_workforce_audit_migration_preserves_existing_voided_labor(
         assert apply_migrations(connection, source_migrations) == [
             "021_workforce_audit_history",
             "022_supplier_invoice_active_number",
+            "023_purchase_order_tax",
         ]
         preserved = connection.execute(
             "SELECT * FROM labor_entries WHERE id = 1"
@@ -1848,6 +1849,7 @@ def test_workforce_audit_migration_preserves_legacy_report_cycles_without_fake_s
         assert apply_migrations(connection, source_migrations) == [
             "021_workforce_audit_history",
             "022_supplier_invoice_active_number",
+            "023_purchase_order_tax",
         ]
         confirmed_versions = connection.execute(
             "SELECT * FROM site_daily_report_versions WHERE report_id = 1"

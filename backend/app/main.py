@@ -72,7 +72,16 @@ def _is_frontend_navigation(_path: str, scope: Scope) -> bool:
     return (
         "text/html" in headers.get("accept", "")
         and isinstance(url_path, str)
-        and url_path.startswith("/projects/")
+        and (
+            url_path.rstrip("/")
+            in {
+                "/companies",
+                "/projects",
+                "/inventory",
+                "/settings",
+            }
+            or url_path.startswith("/projects/")
+        )
     )
 
 

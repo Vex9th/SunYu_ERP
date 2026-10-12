@@ -12,7 +12,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from backend.app.core.config import Settings
-from backend.app.core.database import transaction_immediate
+from backend.app.core.database import transaction, transaction_immediate
 from backend.app.features.api_common import (
     ApiError,
     ApiErrorRoute,
@@ -21,6 +21,7 @@ from backend.app.features.api_common import (
     save_idempotent_response,
 )
 from backend.app.features.auth import require_authenticated_session
+from backend.app.features.company_ledger import company_ledger
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +193,20 @@ def create_companies_router(
         if response is None:
             raise _company_not_found()
         return response
+
+    @router.get("/{company_id}/ledger")
+    def get_company_ledger(
+        _: None = authentication_dependency,
+        company_id: int = company_id_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        try:
+            with transaction(connection):
+                if _company_revision_row(connection, company_id) is None:
+                    raise _company_not_found()
+                return company_ledger(connection, company_id)
+        except sqlite3.Error as exc:
+            raise _unexpected_database_failure("Company", exc) from None
 
     @router.put("/{company_id}")
     def replace_company(

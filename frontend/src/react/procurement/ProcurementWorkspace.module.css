@@ -9,6 +9,20 @@
 .secondary { font-size: 13px; color: #596579; margin-top: 3px; line-height: 1.6; overflow-wrap: anywhere; }
 .pagination { display: flex; justify-content: flex-end; margin-top: 16px; }
 .formGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
+.orderHeader { display: grid; grid-template-columns: minmax(0, 1.4fr) repeat(2, minmax(0, 1fr)); gap: 0 16px; }
+.numberingGrid { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 0 16px; }
+.orderHeader > *, .numberingGrid > * { min-width: 0; }
+.taxSection { margin: 20px 0 16px; padding: 16px; background: #fafbfc; border: 1px solid #e1e6ee; border-radius: 6px; }
+.taxControl { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+.taxControl > :global(.ant-input-affix-wrapper) { width: 210px; max-width: 100%; }
+.taxShortcuts { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.taxShortcuts > span { font-size: 12px; color: #596579; margin-right: 2px; }
+.orderTotals { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 24px; padding-top: 14px; border-top: 1px solid #e1e6ee; }
+.orderTotals > div { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.orderTotals span { color: #596579; font-size: 13px; }
+.orderTotals strong { font-size: 18px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.orderTotals .totalPayable strong { color: #245bd2; }
+.taxPreviewHint { grid-column: 1 / -1; color: #596579; font-size: 12px; margin: 0; }
 .receiptRow { display: grid; grid-template-columns: 1fr 180px; gap: 16px; align-items: center; }
 .receiptRow small { display: block; color: #596579; }
 .mainCard, .listContent { min-width: 0; }
@@ -45,7 +59,16 @@
   .header, .toolbar, .listHeading { align-items: flex-start; flex-direction: column; }
   .lineSearch { align-items: flex-start; flex-direction: column; gap: 6px; }
 }
+@media (max-width: 760px) {
+  .orderHeader { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .orderHeader > :first-child { grid-column: 1 / -1; }
+}
 @media (max-width: 560px) {
+  .taxSection { padding: 12px; }
+  .orderTotals { grid-template-columns: 1fr; gap: 8px; }
+  .orderTotals > div { flex-direction: row; justify-content: space-between; align-items: baseline; gap: 10px; }
+  .orderTotals strong { font-size: 16px; }
+  .orderHeader, .numberingGrid { grid-template-columns: 1fr; }
   .formGrid, .receiptRow, .importConfirm { grid-template-columns: 1fr; }
   .metrics { gap: 8px; }
   .listPicker { grid-template-columns: repeat(2, minmax(0, 1fr)); }

@@ -12,6 +12,7 @@ import {
   Popconfirm,
   Space,
   Table,
+  Tabs,
   Tag,
   Typography,
 } from 'antd'
@@ -39,10 +40,12 @@ import {
   Section,
   useLoad,
   useWorkspaceValue,
+  useWorkspaceTab,
   LoadingBlock,
 } from './shared'
 import styles from './Workspace.module.css'
 import { useUnsavedChanges } from './unsavedChanges'
+import CompanyLedger from './company/CompanyLedger'
 
 import {
   clearPendingCreate,
@@ -95,9 +98,18 @@ export default function CompaniesPage() {
   )
   const [search, setSearch] = useWorkspaceValue('q', '')
   const [selectedValue, setSelectedValue] = useWorkspaceValue('company', '')
+  const [detailTab, setDetailTab] = useWorkspaceTab(
+    'companyTab',
+    ['ledger', 'profile'],
+    'ledger',
+  )
   const selected = Number(selectedValue) > 0 ? Number(selectedValue) : null
   const setSelected = (value: number | null) =>
     setSelectedValue(value ? String(value) : '')
+  function openCompany(id: number, tab = 'ledger') {
+    setDetailTab(tab)
+    setSelected(id)
+  }
   const detail = useLoad(
     () =>
       selected
@@ -105,6 +117,7 @@ export default function CompaniesPage() {
         : Promise.resolve(null),
     [selected],
   )
+  const companyDetail = detail.data?.id === selected ? detail.data : null
   const [pendingCreates, setPendingCreates] = useState(listPendingCreates)
   const [editor, setEditor] = useState<CompanyEditorTarget | null>(() => {
     const pending = listPendingCreates()[0]
@@ -200,7 +213,7 @@ export default function CompaniesPage() {
                   <Button
                     type="link"
                     style={{ padding: 0, fontWeight: 600 }}
-                    onClick={() => setSelected(row.id)}
+                    onClick={() => openCompany(row.id)}
                   >
                     {name}
                   </Button>
@@ -223,7 +236,16 @@ export default function CompaniesPage() {
                 <Button
                   type="link"
                   size="small"
-                  onClick={() => value ? setSelected(row.id) : setEditor({kind:'contact', companyId:row.id, companyName:row.name, record:null})}
+                  onClick={() =>
+                    value
+                      ? openCompany(row.id, 'profile')
+                      : setEditor({
+                          kind: 'contact',
+                          companyId: row.id,
+                          companyName: row.name,
+                          record: null,
+                        })
+                  }
                 >
                   {value ? `${value} 位联系人` : '添加联系人'}
                 </Button>
@@ -236,7 +258,10 @@ export default function CompaniesPage() {
               fixed: 'right',
               render: (_, row) => (
                 <Space>
-                  <Button size="small" onClick={() => setSelected(row.id)}>
+                  <Button
+                    size="small"
+                    onClick={() => openCompany(row.id, 'profile')}
+                  >
                     查看资料
                   </Button>
                   <Button
@@ -266,125 +291,141 @@ export default function CompaniesPage() {
       {selected && (
         <Drawer
           open
-          title={detail.data?.name ?? '公司详情'}
-          size={820}
+          title={companyDetail?.name ?? '公司详情'}
+          size={detailTab === 'ledger' ? 1120 : 820}
           onClose={() => setSelected(null)}
         >
-          {!detail.data && detail.loading && <LoadingBlock />}
-          <ErrorNotice error={detail.error} retry={detail.reload} />
-          {detail.data && (
-            <Space orientation="vertical" size={24} style={{ width: '100%' }}>
-              <Descriptions
-                column={{ xs: 1, sm: 2, lg: 3 }}
-                items={companyFields
-                  .filter(([key]) => key !== 'name')
-                  .map(([key, label]) => ({
-                    key,
-                    label,
-                    children: detail.data?.[key] || '—',
-                  }))}
-              />
-              <Space wrap>
-                <Button
-                  icon={<EditOutlined />}
-                  onClick={() =>
-                    setEditor({ kind: 'company', record: detail.data })
-                  }
-                >
-                  编辑公司资料
-                </Button>
-                <Button
-                  icon={<UserAddOutlined />}
-                  type="primary"
-                  onClick={() =>
-                    detail.data &&
-                    setEditor({
-                      kind: 'contact',
-                      companyId: detail.data.id,
-                      companyName: detail.data.name,
-                      record: null,
-                    })
-                  }
-                >
-                  添加联系人
-                </Button>
-                <Button
-                  type="text"
-                  danger
-                  icon={<DeleteOutlined />}
-                  onClick={() =>
-                    detail.data &&
-                    setDeleting({ kind: 'company', record: detail.data })
-                  }
-                >
-                  删除公司
-                </Button>
-              </Space>
-              <Table<RevisionedContact>
-                rowKey="id"
-                size="small"
-                dataSource={detail.data.contacts}
-                pagination={false}
-                scroll={{ x: 630 }}
-                columns={[
-                  { title: '姓名', dataIndex: 'name' },
-                  { title: '职位', dataIndex: 'position' },
-                  {
-                    title: '电话',
-                    dataIndex: 'phone',
-                    render: (value: string) =>
-                      value ? <a href={`tel:${value}`}>{value}</a> : '—',
-                  },
-                  {
-                    title: '邮箱',
-                    dataIndex: 'email',
-                    render: (value: string) =>
-                      value ? <a href={`mailto:${value}`}>{value}</a> : '—',
-                  },
-                  { title: '备注', dataIndex: 'notes' },
-                  {
-                    title: '操作',
-                    key: 'actions',
-                    render: (_, row) => (
-                      <Space>
-                        <Button
-                          type="link"
+          <Tabs
+            activeKey={detailTab}
+            onChange={setDetailTab}
+            destroyOnHidden
+            items={[
+              {
+                key: 'ledger',
+                label: '往来账',
+                children: <CompanyLedger key={selected} companyId={selected} />,
+              },
+              {
+                key: 'profile',
+                label: '资料与联系人',
+                children: (
+                  <>
+                    {!companyDetail && detail.loading && <LoadingBlock />}
+                    <ErrorNotice error={detail.error} retry={detail.reload} />
+                    {companyDetail && (
+                      <Space orientation="vertical" size={24} style={{ width: '100%' }}>
+                        <Descriptions
+                          column={{ xs: 1, sm: 2, lg: 3 }}
+                          items={companyFields
+                            .filter(([key]) => key !== 'name')
+                            .map(([key, label]) => ({
+                              key,
+                              label,
+                              children: companyDetail[key] || '—',
+                            }))}
+                        />
+                        <Space wrap>
+                          <Button
+                            icon={<EditOutlined />}
+                            onClick={() =>
+                              setEditor({ kind: 'company', record: companyDetail })
+                            }
+                          >
+                            编辑公司资料
+                          </Button>
+                          <Button
+                            icon={<UserAddOutlined />}
+                            type="primary"
+                            onClick={() =>
+                              setEditor({
+                                kind: 'contact',
+                                companyId: companyDetail.id,
+                                companyName: companyDetail.name,
+                                record: null,
+                              })
+                            }
+                          >
+                            添加联系人
+                          </Button>
+                          <Button
+                            type="text"
+                            danger
+                            icon={<DeleteOutlined />}
+                            onClick={() =>
+                              setDeleting({ kind: 'company', record: companyDetail })
+                            }
+                          >
+                            删除公司
+                          </Button>
+                        </Space>
+                        <Table<RevisionedContact>
+                          rowKey="id"
                           size="small"
-                          onClick={() =>
-                            detail.data &&
-                            setEditor({
-                              kind: 'contact',
-                              companyId: detail.data.id,
-                              companyName: detail.data.name,
-                              record: row,
-                            })
-                          }
-                        >
-                          编辑
-                        </Button>
-                        <Button
-                          type="link"
-                          danger
-                          size="small"
-                          onClick={() =>
-                            detail.data &&
-                            setDeleting({
-                              kind: 'contact',
-                              companyId: detail.data.id,
-                              companyName: detail.data.name,
-                              record: row,
-                            })
-                          }
-                        >
-                          删除
-                        </Button>
+                          dataSource={companyDetail.contacts}
+                          pagination={false}
+                          scroll={{ x: 630 }}
+                          columns={[
+                            { title: '姓名', dataIndex: 'name' },
+                            { title: '职位', dataIndex: 'position' },
+                            {
+                              title: '电话',
+                              dataIndex: 'phone',
+                              render: (value: string) =>
+                                value ? <a href={`tel:${value}`}>{value}</a> : '—',
+                            },
+                            {
+                              title: '邮箱',
+                              dataIndex: 'email',
+                              render: (value: string) =>
+                                value ? <a href={`mailto:${value}`}>{value}</a> : '—',
+                            },
+                            { title: '备注', dataIndex: 'notes' },
+                            {
+                              title: '操作',
+                              key: 'actions',
+                              render: (_, row) => (
+                                <Space>
+                                  <Button
+                                    type="link"
+                                    size="small"
+                                    onClick={() =>
+                                      setEditor({
+                                        kind: 'contact',
+                                        companyId: companyDetail.id,
+                                        companyName: companyDetail.name,
+                                        record: row,
+                                      })
+                                    }
+                                  >
+                                    编辑
+                                  </Button>
+                                  <Button
+                                    type="link"
+                                    danger
+                                    size="small"
+                                    onClick={() =>
+                                      setDeleting({
+                                        kind: 'contact',
+                                        companyId: companyDetail.id,
+                                        companyName: companyDetail.name,
+                                        record: row,
+                                      })
+                                    }
+                                  >
+                                    删除
+                                  </Button>
+                                </Space>
+                              ),
+                            },
+                          ]}
+                        />
                       </Space>
-                    ),
-                  },
-                ]}
-              />
-            </Space>
-          )}
+                    )}
+                  </>
+                ),
+              },
+            ]}
+          />
         </Drawer>
       )}
       {editor && (
@@ -397,7 +438,7 @@ export default function CompaniesPage() {
           }}
           onSaved={(result) => {
             if (editor.kind === 'company' && !editor.record)
-              setSelected(result.id)
+              openCompany(result.id, 'profile')
             setPendingCreates(listPendingCreates())
             setEditor(null)
             void refresh()

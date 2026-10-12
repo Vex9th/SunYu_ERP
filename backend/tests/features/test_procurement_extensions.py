@@ -1265,6 +1265,12 @@ def test_supplier_invoice_active_number_uniqueness_migrates_existing_history(
         )
 
     harness = _build_harness(tmp_path, migrations_dir=legacy_migrations)
+    with harness.connection() as connection:
+        # 此测试保留旧发票结构；当前 API 造数所需的采购税率列与 022 无关。
+        connection.executescript(
+            (PROJECT_ROOT / "backend" / "migrations" / "023_purchase_order_tax.sql")
+            .read_text(encoding="utf-8")
+        )
     invoice_payload: dict[str, object]
     with harness.client() as client:
         order = _create_confirmed_order(client, harness)

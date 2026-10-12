@@ -9,8 +9,11 @@ import { createHttpProcurementRepository, type ProcurementHttpRepository } from 
 import { allocateAmount, mutationScope, optional, positiveQuantity, quantityMilli, remainingQuantity, required, textValue } from './model'
 import { ActionFeedback, AttachmentField, AttachmentLinks, downloadBlob, errorText, FormModal, TextField, useBusinessActions, type FormValues } from './ui'
 import { useProcurementData, type Customer } from './useProcurementData'
-import { useWorkspaceTab } from '../shared'
+import { useWorkspaceTab, useWorkspaceValue } from '../shared'
 import ProcurementLists from './ProcurementLists'
+import PurchaseOrderNumberField from './PurchaseOrderNumberField'
+import PurchaseOrderTaxFields from './PurchaseOrderTaxFields'
+import { calculatePurchaseTax, taxRateToBps, taxRateToInput } from './purchaseTax'
 import styles from './ProcurementWorkspace.module.css'
 
 const defaultRepository = createHttpProcurementRepository()
@@ -27,6 +30,7 @@ function statusTag(status: string) { return <Tag color={status === 'draft' ? 'de
 export default function ProcurementWorkspace({ projectCode, readonly = false, repository = defaultRepository, customerCompany }: { projectCode: string; readonly?: boolean; repository?: ProcurementHttpRepository; customerCompany?: Customer }) {
   const data = useProcurementData(repository, projectCode, customerCompany)
   const [tab, setTab] = useWorkspaceTab('section', sections, 'lists')
+  const [selectedOrderValue, setSelectedOrderValue] = useWorkspaceValue('order', '')
   const [selectedListId, setSelectedListId] = useState<number | null>(null)
   const [dialog, setDialog] = useState<Dialog | null>(null)
   const [order, setOrder] = useState<PurchaseOrderRecordDto | null>(null)
@@ -81,21 +85,32 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
     }
   }, [scope])
 
+  useEffect(() => {
+    const id = Number(selectedOrderValue)
+    setOrder(null); setDetailError(''); context.current.detailSequence++
+    if (tab !== 'orders' || !/^\d+$/.test(selectedOrderValue) || !Number.isSafeInteger(id) || id <= 0) {
+      setDrawer(false); setDetailLoading(false); requestedOrderId.current = null
+      return
+    }
+    setDrawer(true)
+    void loadOrder(id).catch(() => undefined)
+  }, [scope, selectedOrderValue, tab])
+
   function open(next: Dialog) {
     if (!canAct() || locked) return
     actions.setError(''); setFiles([]); form.resetFields()
     const today = localISODate()
-    let values: FormValues = { ordered_on: today, received_on: today, paid_on: today, invoiced_on: today, document_version_ids: [], payment_method: '银行转账', lines: [] }
+    let values: FormValues = { number_mode: 'auto', order_no: '', ordered_on: today, received_on: today, paid_on: today, invoiced_on: today, document_version_ids: [], payment_method: '银行转账', lines: [] }
     if (next.kind === 'edit-list') values = { ...values, ...next.list }
     if (next.kind === 'line' || next.kind === 'edit-line') values = { ...values, list_id: next.list?.id, sequence_no: next.line?.sequence_no ?? Math.max(0, ...(next.list?.lines.map((line) => line.sequence_no) ?? [])) + 1, category: next.line?.category ?? '其他', ...next.line, cost: next.line ? centsToYuan(next.line.unit_cost_cents) : '', quoted_price: next.line ? centsToYuan(next.line.quoted_unit_price_cents) : '' }
     if (next.kind === 'order' && next.line) values.lines = [{ procurement_line_id: next.line.id, quantity: quantityMilli(remainingQuantity(next.line.quantity, next.line.ordered_quantity)) > 0n ? remainingQuantity(next.line.quantity, next.line.ordered_quantity) : '', cost: centsToYuan(next.line.unit_cost_cents), overage_reason: '' }]
     if (next.kind === 'order' && !next.line) values.lines = [{ quantity: '', cost: '', overage_reason: '' }]
-    if (next.kind === 'edit-order' && next.order) values = { ...values, ...next.order, lines: next.order.lines.map((line) => ({ procurement_line_id: line.procurement_line_id, quantity: line.quantity, cost: centsToYuan(line.unit_cost_cents), overage_reason: line.overage_reason ?? '' })) }
+    if (next.kind === 'edit-order' && next.order) values = { ...values, ...next.order, tax_rate: taxRateToInput(next.order.tax_rate_bps), lines: next.order.lines.map((line) => ({ procurement_line_id: line.procurement_line_id, quantity: line.quantity, cost: centsToYuan(line.unit_cost_cents), overage_reason: line.overage_reason ?? '' })) }
     if (next.kind === 'receipt' && next.order) values.lines = next.order.lines.map((line) => ({ purchase_order_line_id: line.id, quantity: '0' }))
     if (next.kind === 'quote') values = { ...values, list_id: next.list?.id, title: next.list ? `${next.list.name} 报价单` : '' }
     form.setFieldsValue(values); setDialog(next)
   }
-  async function openOrder(item: PurchaseOrderRecordDto) { setOrder(null); setDrawer(true); await loadOrder(item.id).catch(() => undefined) }
+  async function openOrder(item: PurchaseOrderRecordDto) { setSelectedOrderValue(String(item.id)) }
 
   async function confirmList(list: ProcurementListDetailDto) {
     if (!canAct() || locked || list.status !== 'draft') return
@@ -146,7 +161,9 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
       if (capacity && quantityMilli(quantity) > quantityMilli(capacity) && !overage) throw new Error(`${lineLabel(id)}超出采购数量，请填写超采原因`)
       return { procurement_line_id: id, quantity, unit_cost_cents: yuanToCents(required(draft.cost, '成本单价')), overage_reason: overage }
     })
-    return { order_no: required(values.order_no, '采购单号'), supplier_company_id: supplier, ordered_on: required(values.ordered_on, '下单日期'), expected_delivery_on: optional(values.expected_delivery_on), lines: result, notes: optional(values.notes), document_version_ids: [...((values.document_version_ids as number[] | undefined) ?? [])] }
+    const taxRate = taxRateToBps(values.tax_rate)
+    calculatePurchaseTax(drafts, taxRate)
+    return { tax_rate_bps: taxRate, order_no: dialog?.kind === 'order' && values.number_mode !== 'manual' ? '' : required(values.order_no, '采购单号'), supplier_company_id: supplier, ordered_on: required(values.ordered_on, '下单日期'), expected_delivery_on: optional(values.expected_delivery_on), lines: result, notes: optional(values.notes), document_version_ids: [...((values.document_version_ids as number[] | undefined) ?? [])] }
   }
 
   async function submit(values: FormValues) {
@@ -296,7 +313,7 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
         { key: 'orders', label: `采购单 (${data.orders.total})`, children: <>
           <div className={styles.toolbar}><Typography.Text type="secondary">点击采购单号查看明细、确认订单或登记到货与付款。</Typography.Text></div>
           <Table<PurchaseOrderRecordDto> rowKey="id" size="small" dataSource={data.orders.items} loading={data.loading['采购单']} scroll={{ x: 850 }} locale={{ emptyText: <Empty description={readonly ? '此项目没有采购单' : availableLines.length ? '还没有采购单，选择供应商和清单物料开始下单' : '先建立并确认采购清单，再创建采购单'}>{!readonly && <Button onClick={() => availableLines.length ? open({ kind: 'order' }) : setTab('lists')} disabled={locked}>{availableLines.length ? '创建第一张采购单' : '前往采购清单'}</Button>}</Empty> }} pagination={{ current: data.orders.page, pageSize: data.orders.page_size, total: data.orders.total, showSizeChanger: true, onChange: (page, size) => void data.loadOrders(size !== data.orders.page_size ? 1 : page, size).catch(() => undefined) }} columns={[
-            { title: '采购单号', dataIndex: 'order_no', render: (value: string, item) => <Button type="link" onClick={() => void openOrder(item)}>{value}</Button> }, { title: '供应商', dataIndex: 'supplier_company_name' }, { title: '状态', dataIndex: 'status', render: statusTag }, { title: '下单日期', dataIndex: 'ordered_on' }, { title: '预计到货', dataIndex: 'expected_delivery_on', render: (value: string | null) => value || '—' }, { title: '采购金额', dataIndex: 'ordered_amount_cents', align: 'right', render: formatMoney },
+            { title: '采购单号', dataIndex: 'order_no', render: (value: string, item) => <Button type="link" onClick={() => void openOrder(item)}>{value}</Button> }, { title: '供应商', dataIndex: 'supplier_company_name' }, { title: '状态', dataIndex: 'status', render: statusTag }, { title: '下单日期', dataIndex: 'ordered_on' }, { title: '预计到货', dataIndex: 'expected_delivery_on', render: (value: string | null) => value || '—' }, { title: '采购总额', dataIndex: 'ordered_amount_cents', align: 'right', render: formatMoney },
           ]} />
         </> },
         { key: 'import', label: 'Excel 导入', children: <Space orientation="vertical" style={{ width: '100%' }}>
@@ -320,16 +337,16 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
         </> },
       ]} />
     </Card>
-    <Drawer title={order ? `采购单 · ${order.order_no}` : '采购单详情'} open={drawer} size={1000} onClose={() => { setDrawer(false); context.current.detailSequence++ }} loading={detailLoading}>
+    <Drawer title={order ? `采购单 · ${order.order_no}` : '采购单详情'} open={drawer} size={1000} onClose={() => { setSelectedOrderValue(''); setDrawer(false); context.current.detailSequence++ }} loading={detailLoading}>
       {detailError && <Alert type="error" showIcon title={detailError} action={<Button onClick={() => requestedOrderId.current !== null && void loadOrder(requestedOrderId.current).catch(() => undefined)}>重试</Button>} />}
       {order && <Space orientation="vertical" style={{ width: '100%' }}>
-        <Descriptions bordered size="small" column={2} items={[{ key: 'supplier', label: '供应商', children: order.supplier_company_name }, { key: 'status', label: '状态', children: statusTag(order.status) }, { key: 'date', label: '下单 / 预计到货', children: `${order.ordered_on} / ${order.expected_delivery_on || '未填写'}` }, { key: 'amount', label: '采购金额', children: formatMoney(order.ordered_amount_cents) }, { key: 'paid', label: '已付款', children: formatMoney(order.paid_amount_cents ?? 0) }, { key: 'invoiced', label: '已开票', children: formatMoney(order.invoiced_amount_cents ?? 0) }, { key: 'files', label: '合同与附件', span: 2, children: <AttachmentLinks projectCode={projectCode} ids={order.document_version_ids} options={data.documents} /> }, { key: 'notes', label: '备注', span: 2, children: order.cancel_reason || order.notes || '—' }]} />
+        <Descriptions bordered size="small" column={2} items={[{ key: 'supplier', label: '供应商', children: order.supplier_company_name }, { key: 'status', label: '状态', children: statusTag(order.status) }, { key: 'date', label: '下单 / 预计到货', children: `${order.ordered_on} / ${order.expected_delivery_on || '未填写'}` }, { key: 'amount', label: order.tax_rate_bps == null ? '采购总额' : '含税总额', children: formatMoney(order.ordered_amount_cents) }, { key: 'tax-rate', label: '采购税率', children: order.tax_rate_bps == null ? '未设置' : `${taxRateToInput(order.tax_rate_bps)}%` }, { key: 'net', label: order.tax_rate_bps == null ? '原采购金额' : '未税合计', children: formatMoney(order.net_amount_cents ?? order.ordered_amount_cents) }, { key: 'tax', label: '税额', children: order.tax_rate_bps == null ? '未设置' : formatMoney(order.tax_amount_cents ?? null) }, { key: 'paid', label: '已付款', children: formatMoney(order.paid_amount_cents ?? 0) }, { key: 'invoiced', label: '已开票', children: formatMoney(order.invoiced_amount_cents ?? 0) }, { key: 'unpaid', label: '未付款', children: formatMoney(Math.max(0, order.ordered_amount_cents - (order.paid_amount_cents ?? 0))) }, { key: 'files', label: '合同与附件', span: 2, children: <AttachmentLinks projectCode={projectCode} ids={order.document_version_ids} options={data.documents} /> }, { key: 'notes', label: '备注', span: 2, children: order.cancel_reason || order.notes || '—' }]} />
         {!readonly && <Space wrap>{order.status === 'draft' && <><Button disabled={locked} onClick={() => open({ kind: 'edit-order', order })}>编辑采购单</Button><Button type="primary" disabled={locked} onClick={() => void confirmOrder()}>确认采购单</Button></>}
           {['confirmed', 'partially_received'].includes(order.status) && <Button type="primary" disabled={locked} onClick={() => open({ kind: 'receipt', order })}>登记到货</Button>}
           {['confirmed', 'partially_received', 'received'].includes(order.status) && <><Button disabled={locked} onClick={() => open({ kind: 'payment', order })}>登记付款</Button><Button disabled={locked} onClick={() => open({ kind: 'invoice', order })}>登记进项发票</Button></>}
           {['draft', 'confirmed'].includes(order.status) && <Button danger disabled={locked} onClick={() => open({ kind: 'cancel-order', order })}>取消采购单</Button>}
         </Space>}
-        <Table size="small" rowKey="id" dataSource={order.lines} pagination={false} scroll={{ x: 720 }} columns={[{ title: '物料', dataIndex: 'procurement_line_id', render: lineLabel }, { title: '采购数量', dataIndex: 'quantity' }, { title: '到货数量', dataIndex: 'received_quantity' }, { title: '成本单价', dataIndex: 'unit_cost_cents', render: formatMoney }, { title: '金额', dataIndex: 'line_amount_cents', render: formatMoney }, { title: '超采原因', dataIndex: 'overage_reason', render: (value: string | null) => value || '—' }]} />
+        <Table size="small" rowKey="id" dataSource={order.lines} pagination={false} scroll={{ x: 720 }} columns={[{ title: '物料', dataIndex: 'procurement_line_id', render: lineLabel }, { title: '采购数量', dataIndex: 'quantity' }, { title: '到货数量', dataIndex: 'received_quantity' }, { title: order.tax_rate_bps == null ? '成本单价' : '未税成本单价', dataIndex: 'unit_cost_cents', render: formatMoney }, { title: '税额', dataIndex: 'tax_amount_cents', render: (value: number | undefined) => order.tax_rate_bps == null ? '未设置' : formatMoney(value ?? null) }, { title: order.tax_rate_bps == null ? '金额' : '含税金额', dataIndex: 'line_amount_cents', render: formatMoney }, { title: '超采原因', dataIndex: 'overage_reason', render: (value: string | null) => value || '—' }]} />
         <Tabs items={[
           { key: 'receipts', label: '到货历史', children: <Space orientation="vertical" style={{ width: '100%' }}>{!(order.goods_receipts?.length) && <Empty description="暂无到货记录" />}{order.goods_receipts?.map((receipt) => <Card key={receipt.id} size="small" title={`${receipt.received_on} · ${receipt.warehouse_name} · #${receipt.id}`} extra={<Space><Tag>{receipt.status === 'active' ? '有效' : '已冲销'}</Tag>{!readonly && receipt.status === 'active' && <Button size="small" danger disabled={locked} onClick={() => open({ kind: 'reverse-receipt', order, record: receipt })}>冲销</Button>}</Space>}>
             {receipt.reversal_reason && <Alert type="warning" title={`冲销原因：${receipt.reversal_reason}`} />}
@@ -352,11 +369,13 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
         <TextField name="specification" label="规格" /><div className={styles.formGrid}><TextField name="quantity" label="需求数量" required /><TextField name="cost" label="成本单价（元）" required /><TextField name="quoted_price" label="报价单价（元）" required /></div>
       </>}
       {(dialog?.kind === 'order' || dialog?.kind === 'edit-order') && <>
-        <div className={styles.formGrid}><TextField name="order_no" label="采购单号" required /><Form.Item name="supplier_company_id" label="供应商" rules={[{ required: true, message: '请选择供应商' }]}><Select placeholder="请明确选择供应商" showSearch optionFilterProp="label" options={data.companies.map((company) => ({ value: company.id, label: company.name }))} /></Form.Item><TextField name="ordered_on" label="下单日期" type="date" required /><TextField name="expected_delivery_on" label="预计到货日期" type="date" /></div>
+        <div className={styles.orderHeader}><Form.Item name="supplier_company_id" label="供应商" rules={[{ required: true, message: '请选择供应商' }]}><Select placeholder="请明确选择供应商" showSearch optionFilterProp="label" options={data.companies.map((company) => ({ value: company.id, label: company.name }))} /></Form.Item><TextField name="ordered_on" label="下单日期" type="date" required /><TextField name="expected_delivery_on" label="预计到货日期" type="date" /></div>
+        {dialog.kind === 'order' ? <PurchaseOrderNumberField form={form} projectCode={projectCode} repository={repository} disabled={locked || actions.busy} /> : <TextField name="order_no" label="采购单号" required />}
         <Form.List name="lines">{(fields, { add, remove }) => <Space orientation="vertical" style={{ width: '100%' }}>{fields.map((field) => <Card size="small" key={field.key} title={`物料 ${field.name + 1}`} extra={dialog.kind === 'order' && <Button size="small" type="text" danger icon={<MinusCircleOutlined />} onClick={() => remove(field.name)}>删除</Button>}>
           <Form.Item name={[field.name, 'procurement_line_id']} label="采购物料" rules={[{ required: true, message: '请选择采购物料' }]}><Select disabled={dialog.kind === 'edit-order'} showSearch optionFilterProp="label" options={dialog.kind === 'edit-order' ? dialog.order?.lines.map((line) => ({ value: line.procurement_line_id, label: lineLabel(line.procurement_line_id) })) : availableLines.map(({ list, line }) => ({ value: line.id, label: `${line.name} · ${list.name} · ${quantityMilli(remainingQuantity(line.quantity, line.ordered_quantity)) === 0n ? "已满额，可补采" : `剩余 ${remainingQuantity(line.quantity, line.ordered_quantity)} ${line.unit}`}` }))} onChange={(id) => { const item = lines.find(({ line }) => line.id === id)?.line; if (item) { form.setFieldValue(['lines', field.name, 'cost'], centsToYuan(item.unit_cost_cents)); form.setFieldValue(['lines', field.name, 'quantity'], quantityMilli(remainingQuantity(item.quantity, item.ordered_quantity)) > 0n ? remainingQuantity(item.quantity, item.ordered_quantity) : '') } }} /></Form.Item>
-          <div className={styles.formGrid}><TextField name={[field.name, 'quantity']} label="采购数量" required /><TextField name={[field.name, 'cost']} label="成本单价（元）" required /></div><TextField name={[field.name, 'overage_reason']} label="超采原因（超出剩余数量时必填）" />
+          <div className={styles.formGrid}><TextField name={[field.name, 'quantity']} label="采购数量" required /><TextField name={[field.name, 'cost']} label="未税成本单价（元）" required /></div><TextField name={[field.name, 'overage_reason']} label="超采原因（超出剩余数量时必填）" />
         </Card>)}{dialog.kind === 'order' && <Button block type="dashed" icon={<PlusOutlined />} onClick={() => add({ quantity: '', cost: '' })}>添加采购物料</Button>}</Space>}</Form.List>
+        <PurchaseOrderTaxFields form={form} disabled={locked || actions.busy || readonly} />
         <TextField name="notes" label="采购说明" type="textarea" />
         {dialog.kind === 'order' ? <AttachmentField files={files} onChange={setFiles} options={data.documents} disabled={locked} /> : <Form.Item name="document_version_ids" label="关联已有资料"><Select mode="multiple" options={data.documents} /></Form.Item>}
       </>}
@@ -365,7 +384,7 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
         <div className={styles.formGrid}><TextField name="received_on" label="到货日期" type="date" required /><TextField name="warehouse_name" label="仓库名称" required /></div>
         <Form.List name="lines">{(fields) => fields.map((field) => { const item = dialog.order?.lines.find((line) => line.id === receiptDrafts?.[field.name]?.purchase_order_line_id); return <div key={field.key} className={styles.receiptRow}><Form.Item name={[field.name, 'purchase_order_line_id']} hidden><Input /></Form.Item><span>{item ? lineLabel(item.procurement_line_id) : '采购物料'}<small>剩余 {item ? remainingQuantity(item.quantity, item.received_quantity) : '—'}</small></span><TextField name={[field.name, 'quantity']} label="本次到货数量" required /></div> })}</Form.List><TextField name="notes" label="到货说明" type="textarea" />
       </>}
-      {dialog?.kind === 'payment' && <><div className={styles.formGrid}><TextField name="paid_on" label="付款日期" type="date" required /><TextField name="amount" label="付款金额（元）" required /><TextField name="payment_method" label="付款方式" required /><TextField name="reference_no" label="参考号" /></div><TextField name="notes" label="付款说明" type="textarea" /></>}
+      {dialog?.kind === 'payment' && <><Alert type="info" title={`采购总额 ${formatMoney(dialog.order?.ordered_amount_cents ?? 0)} · 未付金额 ${formatMoney(Math.max(0, (dialog.order?.ordered_amount_cents ?? 0) - (dialog.order?.paid_amount_cents ?? 0)))}`} /><div className={styles.formGrid}><TextField name="paid_on" label="付款日期" type="date" required /><TextField name="amount" label="付款金额（元）" required /><TextField name="payment_method" label="付款方式" required /><TextField name="reference_no" label="参考号" /></div><TextField name="notes" label="付款说明" type="textarea" /></>}
       {dialog?.kind === 'invoice' && <><TextField name="invoice_no" label="发票号码" required /><div className={styles.formGrid}><TextField name="invoiced_on" label="开票日期" type="date" required /><TextField name="amount" label="发票金额（元）" required /></div><AttachmentField files={files} onChange={setFiles} options={data.documents} disabled={locked} /></>}
       {(dialog?.kind === 'cancel-order' || dialog?.kind.startsWith('reverse-')) && <><Alert type="warning" title={dialog.kind === 'cancel-order' ? `取消采购单 ${dialog.order?.order_no}` : `冲销原记录 #${dialog.record?.id}，保留历史流水`} /><TextField name="reason" label={dialog.kind === 'cancel-order' ? '取消原因' : '冲销原因'} required type="textarea" /></>}
       {dialog?.kind === 'quote' && <><Alert type="info" title={`报价客户：${data.customer?.name ?? '未绑定客户'}（随项目固定）`} /><Form.Item name="list_id" label="已确认采购清单" rules={[{ required: true, message: '请选择已确认采购清单' }]}><Select placeholder="请选择用于报价的清单" options={confirmedLists.map((list) => ({ value: list.id, label: list.name }))} onChange={(id) => {

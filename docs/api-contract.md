@@ -114,11 +114,19 @@
 | GET | `/api/companies` | 返回 `CompanySummary[]`，包含 `contact_count` |
 | POST | `/api/companies` | 请求 `CompanyInput`，返回 `201 CompanyDetail` |
 | GET | `/api/companies/{company_id}` | 返回 `CompanyDetail`，包含 `contacts` |
+| GET | `/api/companies/{company_id}/ledger` | 返回只读公司往来汇总及项目、采购单、合同明细 |
 | PUT | `/api/companies/{company_id}` | 完整 `CompanyInput`，返回 `CompanyDetail` |
 | DELETE | `/api/companies/{company_id}` | 未被项目引用时返回 `204` |
 | POST | `/api/companies/{company_id}/contacts` | 请求 `ContactInput`，返回 `201 Contact` |
 | PUT | `/api/companies/{company_id}/contacts/{contact_id}` | 完整 `ContactInput`，返回 `Contact` |
 | DELETE | `/api/companies/{company_id}/contacts/{contact_id}` | 返回 `204` |
+
+公司往来响应为 `{company_id, supplier: {summary, orders}, customer: {summary, projects}}`，所有金额均为整数分。同一公司兼有客户与供应商身份时两侧分别汇总，不互相抵扣；读取不写入或补造历史账目。
+
+- `supplier.orders` 按采购单列出 `order_id`、`order_no`、`project_id`、`project_code`、`project_name`、`ordered_on`、`status`，以及 `ordered_amount_cents`、`paid_amount_cents`、`unpaid_amount_cents`、`invoiced_amount_cents`、`uninvoiced_amount_cents`。仅计入已确认、部分到货和已到货采购单，付款与进项票仅计入未冲销记录；未付/未开票分别按每单差额取非负值。`summary` 为同名金额合计及 `project_count`、`order_count`。
+- `customer.projects` 包含项目标识、名称及 `contracts`；有效合同额仅计入该公司作为合同客户的已签署/已完成合同，金额按项目分摊。已终止合同存在有效历史到账的分摊也保留明细和实收，但不计入有效合同额，未收为零。每份合同返回 `allocation_id`、`contract_id`、`contract_no`、`title`、`status`（`signed/completed/terminated`）、`signed_on`、`allocated_amount_cents`（原分摊额）、`received_amount_cents`、`unreceived_amount_cents`。
+- 客户项目与 `summary` 的金额字段为 `contracted_amount_cents`、`allocated_received_amount_cents`、`unreceived_amount_cents`、`unallocated_received_amount_cents`、`invoiced_amount_cents`。未关联合同的有效收款按项目甲方单列；仅已登记销项发票按项目甲方汇总，不推断对应合同、不推算合同未开票。`summary` 另含 `project_count`、去重后的 `contract_count`。
+- 页面筛选后的合计覆盖全部符合条件的记录，不受分页影响。供应商支持项目/下单日期/未付/未开票筛选，客户按项目筛选。
 
 ### 3.3 项目与备份
 
@@ -594,7 +602,8 @@ Excel 限制：`.xlsx`、最大 20 MB、最多 10,000 条数据行；预检不�
 | Method | Path | 请求/响应 |
 |---|---|---|
 | GET | `/api/projects/{project_code}/purchase-orders?page=&page_size=&status=` | 返回采购单分页列表 |
-| POST | `/api/projects/{project_code}/purchase-orders` | `order_no`、`supplier_company_id`、`ordered_on`、`expected_delivery_on`、`lines`、`notes`、`document_version_ids` |
+| GET | `/api/projects/{project_code}/purchase-order-number-preview?supplier_company_id=&ordered_on=YYYY-MM-DD` | 返回 `{order_no}`，只预览、不占号 |
+| POST | `/api/projects/{project_code}/purchase-orders` | `order_no`、`supplier_company_id`、`ordered_on`、`expected_delivery_on`、`lines`、`notes`、`document_version_ids`；可选 `tax_rate_bps` |
 | GET | `/api/projects/{project_code}/purchase-orders/{order_id}` | 返回采购单、付款、到货和发票汇总 |
 | PUT | `/api/projects/{project_code}/purchase-orders/{order_id}` | 草稿可编辑字段加 `expected_revision` |
 | POST | `/api/projects/{project_code}/purchase-orders/{order_id}/confirm` | `expected_revision` |
@@ -607,6 +616,16 @@ Excel 限制：`.xlsx`、最大 20 MB、最多 10,000 条数据行；预检不�
 | POST | `/api/projects/{project_code}/supplier-invoices/{invoice_id}/reverse` | `reason`、`expected_revision`；冲销进项票记录 |
 
 P1 不允许超付款、超到货或超开票；超下单必须填写原因。到货确认和库存入库处于同一 SQLite 事务。
+
+新建采购单时 `order_no` 为空字符串表示自动编号，手动非空编号仍沿用原校验。格式为 `PO_<项目名称缩写>_<YYYYMMDD>_<供应商名称缩写>_<至少三位流水号>`：中文取拼音首字母，英文和数字保留并转大写，名称片段最多 24 位；无法提取名称时用 `P<项目ID>` / `S<供应商ID>`。下单日期决定编号日期。预览不保证占号，保存时在同一写事务中分配最终唯一号码，响应中的 `order_no` 为准；相同幂等请求重试返回原订单及编号。编辑已有采购单仍须提供非空单号，不会自动重编号，历史编号保持不变。
+
+税率采用未税加税口径：`unit_cost_cents` 为未税成本单价，订单可选 `tax_rate_bps` 为 `0..10000` 的整数，`1300` 表示 `13%`，`125` 表示 `1.25%`。禁止布尔值、字符串和小数类型。创建时省略或传 `null` 表示未设置、不加税；`0` 表示明确设置为零税率。草稿编辑省略该字段保留原税率，显式 `null` 清除税率；已确认订单不允许直接修改金额或税率。
+
+金额逐行计算，以分为单位四舍五入：先由单价和数量得到 `net_amount_cents`，再计算 `tax_amount_cents = HALF_UP(net_amount_cents × tax_rate_bps / 10000)`。行 `line_amount_cents` 是未税金额与税额之和；订单返回 `tax_rate_bps`、`net_amount_cents`、`tax_amount_cents` 和含税 `ordered_amount_cents`，各合计取对应行金额之和。例：未税 `10000` 分、税率 `1300`，税额为 `1300` 分、含税采购额为 `11300` 分。后端校验每行及整单含税金额不得溢出 SQLite 整数范围。
+
+付款与进项票按含税行金额校验上限；公司供应商往来、项目采购概览及成本看板的采购承诺使用同一含税金额。设置过税率的订单以含税金额入库，分批到货分摊成本，最后一批吸收尾差；冲销保留原到货金额并反向写库存流水。未设置税率的历史订单保留原到货成本规则。
+
+升级只新增字段，旧订单税率为 `null`、行税额为 `0`，不重算历史付款、开票和库存流水。旧请求省略税率时保持原请求指纹，升级前的幂等缓存仍原样返回；缓存响应可能没有新增税率字段，客户端应按未设置兼容。前后端应一起升级。
 
 - 采购单 `lines`：`procurement_line_id`、`quantity`、`unit_cost_cents`、`overage_reason`。
 - 到货 `lines`：`purchase_order_line_id`、`quantity`。

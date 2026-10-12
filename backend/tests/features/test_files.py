@@ -65,6 +65,7 @@ def test_documents_migration_creates_tables_and_enforces_constraints(
             "020_acceptance_reschedule_events",
             "021_workforce_audit_history",
             "022_supplier_invoice_active_number",
+            "023_purchase_order_tax",
         ]
         assert {
             row["name"]

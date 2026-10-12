@@ -24,6 +24,87 @@ function material(id: number, name: string, quantity: string): ProcurementLineDt
 }
 function LocationProbe() { return <output aria-label="当前地址">{useLocation().search}</output> }
 describe('React 采购工作区', () => {
+  it('新采购单预览自动编号但提交空号，让后台分配唯一号码', async () => {
+    const repo = repository()
+    const list = (await repo.getProcurementList('SY-AUTO', 1)).data
+    repo.getProcurementList = async () => ({ source: 'live', data: { ...list, status: 'confirmed', lines: [material(1, '自动编号物料', '2.000')] } })
+    const preview = vi.fn(async () => ({ order_no: 'PO_CSXM_20261011_GYS_001' }))
+    Object.assign(repo, { previewPurchaseOrderNumber: preview })
+    repo.createPurchaseOrder = vi.fn().mockResolvedValue({ source: 'live', data: { id: 17, order_no: 'PO_CSXM_20261011_GYS_002' } })
+    repo.discardCreatePurchaseOrder = () => true
+    render(<ProcurementWorkspace projectCode="SY-AUTO" repository={repo} />)
+    fireEvent.click(await screen.findByRole('button', { name: '建立采购单' }))
+    const dialog = await screen.findByRole('dialog')
+    expect((within(dialog).getByRole('radio', { name: '自动生成' }) as HTMLInputElement).checked).toBe(true)
+    fireEvent.change(within(dialog).getByLabelText('下单日期'), { target: { value: '2026-10-11' } })
+    fireEvent.mouseDown(within(dialog).getByLabelText('供应商'))
+    fireEvent.click(await screen.findByText('供应商甲'))
+    expect(await within(dialog).findByDisplayValue('PO_CSXM_20261011_GYS_001')).toBeTruthy()
+    fireEvent.change(within(dialog).getByLabelText('未税成本单价（元）'), { target: { value: '50' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: '13%' }))
+    expect(await within(dialog).findByText('¥113.00')).toBeTruthy()
+    fireEvent.click(within(dialog).getByRole('button', { name: /^保\s*存$/ }))
+    await waitFor(() => expect(repo.createPurchaseOrder).toHaveBeenCalledWith('SY-AUTO', expect.objectContaining({ order_no: '', supplier_company_id: 1, ordered_on: '2026-10-11', tax_rate_bps: 1300, lines: [{ procurement_line_id: 1, quantity: '2.000', unit_cost_cents: 5000, overage_reason: null }] }), []))
+  })
+
+  it.each([undefined, 0, 125])('编辑草稿回填税率 %s，保留未税单价和原单号', async (rate) => {
+    const repo = repository()
+    const record: PurchaseOrderRecordDto = { id: 8, project_code: 'SY-EDIT-TAX', order_no: 'OLD-008', supplier_company_id: 1, supplier_company_name: '供应商甲', status: 'draft', ordered_on: '2026-10-06', expected_delivery_on: null, notes: null, document_version_ids: [], revision: 2, tax_rate_bps: rate, ordered_amount_cents: rate ? 10125 : 10000, created_at: '', updated_at: '', lines: [{ id: 81, purchase_order_id: 8, procurement_line_id: 7, quantity: '1.000', unit_cost_cents: 10000, line_amount_cents: rate ? 10125 : 10000, overage_reason: null, received_quantity: '0.000' }] }
+    repo.listPurchaseOrders = async () => ({ source: 'live', data: { items: [record], total: 1, page: 1, page_size: 20 } })
+    repo.getPurchaseOrder = async () => ({ source: 'live', data: record })
+    repo.updatePurchaseOrder = vi.fn().mockResolvedValue({ source: 'live', data: record })
+    render(<ProcurementWorkspace projectCode="SY-EDIT-TAX" repository={repo} />)
+    await screen.findByRole('button', { name: '查看清单 弱电物料' })
+    fireEvent.click(screen.getByRole('tab', { name: /采购单/ }))
+    fireEvent.click(await screen.findByRole('button', { name: 'OLD-008' }))
+    fireEvent.click(await screen.findByRole('button', { name: '编辑采购单' }))
+    const dialogs = screen.getAllByRole('dialog')
+    const dialog = dialogs[dialogs.length - 1]!
+    expect((within(dialog).getByLabelText('采购税率（%）') as HTMLInputElement).value).toBe(rate == null ? '' : rate === 0 ? '0' : '1.25')
+    expect((within(dialog).getByLabelText('未税成本单价（元）') as HTMLInputElement).value).toBe('100.00')
+    expect((within(dialog).getByLabelText('采购单号') as HTMLInputElement).value).toBe('OLD-008')
+    fireEvent.click(within(dialog).getByRole('button', { name: /^保\s*存$/ }))
+    await waitFor(() => expect(repo.updatePurchaseOrder).toHaveBeenCalledWith('SY-EDIT-TAX', 8, expect.objectContaining({ tax_rate_bps: rate ?? null, expected_revision: 2, lines: [{ procurement_line_id: 7, quantity: '1.000', unit_cost_cents: 10000, overage_reason: null }] })))
+  })
+
+  it('含税单据按服务器含税行金额付款，超额仍被阻止', async () => {
+    const repo = repository()
+    const record: PurchaseOrderRecordDto = { id: 18, project_code: 'SY-PAY-TAX', order_no: 'PO-TAX-018', supplier_company_id: 1, supplier_company_name: '供应商甲', status: 'confirmed', ordered_on: '2026-10-12', expected_delivery_on: null, notes: null, document_version_ids: [], revision: 2, tax_rate_bps: 1300, net_amount_cents: 10000, tax_amount_cents: 1300, ordered_amount_cents: 11300, paid_amount_cents: 0, created_at: '', updated_at: '', lines: [{ id: 181, purchase_order_id: 18, procurement_line_id: 7, quantity: '1.000', unit_cost_cents: 10000, net_amount_cents: 10000, tax_amount_cents: 1300, line_amount_cents: 11300, overage_reason: null, received_quantity: '0.000' }] }
+    repo.listPurchaseOrders = async () => ({ source: 'live', data: { items: [record], total: 1, page: 1, page_size: 20 } })
+    repo.getPurchaseOrder = async () => ({ source: 'live', data: record })
+    repo.createSupplierPayment = vi.fn().mockResolvedValue({ source: 'live', data: {} })
+    repo.discardCreateSupplierPayment = () => true
+    render(<ProcurementWorkspace projectCode="SY-PAY-TAX" repository={repo} />)
+    await screen.findByRole('button', { name: '查看清单 弱电物料' })
+    fireEvent.click(screen.getByRole('tab', { name: /采购单/ }))
+    fireEvent.click(await screen.findByRole('button', { name: 'PO-TAX-018' }))
+    expect(await screen.findByText('13%')).toBeTruthy()
+    fireEvent.click(await screen.findByRole('button', { name: '登记付款' }))
+    const dialogs = screen.getAllByRole('dialog')
+    const dialog = dialogs[dialogs.length - 1]!
+    expect(within(dialog).getByText('采购总额 ¥113.00 · 未付金额 ¥113.00')).toBeTruthy()
+    fireEvent.change(within(dialog).getByLabelText('付款金额（元）'), { target: { value: '114' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: /^保\s*存$/ }))
+    await within(dialog).findByText('付款金额超过采购单未付金额')
+    expect(repo.createSupplierPayment).not.toHaveBeenCalled()
+    fireEvent.change(within(dialog).getByLabelText('付款金额（元）'), { target: { value: '113' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: /^保\s*存$/ }))
+    await waitFor(() => expect(repo.createSupplierPayment).toHaveBeenCalledWith('SY-PAY-TAX', 18, expect.objectContaining({ amount_cents: 11300, allocations: [{ purchase_order_line_id: 181, amount_cents: 11300 }] })))
+  })
+
+  it('从公司往来深链打开不在当前页的采购单，关闭时清除链接中的单据选择', async () => {
+    const repo = repository()
+    repo.getPurchaseOrder = vi.fn().mockResolvedValue({ source: 'live', data: { id: 900, project_code: 'SY-DEEP', order_no: 'OLD-900', supplier_company_id: 1, supplier_company_name: '供应商甲', status: 'confirmed', ordered_on: '2026-10-10', expected_delivery_on: null, notes: null, document_version_ids: [], revision: 2, ordered_amount_cents: 4000, created_at: '', updated_at: '', lines: [], payments: [], invoices: [], receipts: [] } })
+    render(<MemoryRouter initialEntries={['/projects/SY-DEEP/procurement?section=orders&order=900&keep=1']}><WorkspaceNavigationProvider>
+      <ProcurementWorkspace projectCode="SY-DEEP" repository={repo} /><LocationProbe />
+    </WorkspaceNavigationProvider></MemoryRouter>)
+    const drawer = await screen.findByRole('dialog')
+    expect(await within(drawer).findByText('采购单 · OLD-900')).toBeTruthy()
+    expect(repo.getPurchaseOrder).toHaveBeenCalledWith('SY-DEEP', 900)
+    fireEvent.click(within(drawer).getByRole('button', { name: /close/i }))
+    await waitFor(() => expect(screen.getByLabelText('当前地址').textContent).not.toContain('order=900'))
+    expect(screen.getByLabelText('当前地址').textContent).toContain('keep=1')
+  })
   it('采购与报价可选择当前清单页之外的已确认物料', async () => {
     const repo = repository()
     const list = { id: 21, name: '第二页清单', status: 'confirmed', revision: 1 }
@@ -282,6 +363,8 @@ describe('React 采购工作区', () => {
     await screen.findByText('交换机')
     fireEvent.click(screen.getAllByRole('button', { name: '建立采购单' })[0]!)
     const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('radio', { name: '手动填写' }))
+    await waitFor(() => expect((within(dialog).getByLabelText('采购单号') as HTMLInputElement).readOnly).toBe(false))
     fireEvent.change(within(dialog).getByLabelText('采购单号'), { target: { value: 'PO-010' } })
     fireEvent.click(within(dialog).getByRole('button', { name: /^保\s*存$/ }))
     await within(dialog).findByText('请选择供应商')

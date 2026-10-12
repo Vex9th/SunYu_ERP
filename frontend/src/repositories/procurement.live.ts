@@ -73,6 +73,7 @@ export interface ProcurementHttpRepository {
   listPurchaseOrders(projectCode: string, query?: PurchaseOrderListQuery): Promise<RepositoryResult<PagedResult<PurchaseOrderDto>>>
   listDocumentVersionOptions?(projectCode: string): Promise<DocumentVersionOption[]>
   createPurchaseOrder(projectCode: string, input: PurchaseOrderInput, files?: readonly File[]): Promise<RepositoryResult<PurchaseOrderDto>>
+  previewPurchaseOrderNumber(projectCode: string, supplierCompanyId: number, orderedOn: string, signal?: AbortSignal): Promise<{ order_no: string }>
   getPurchaseOrder(projectCode: string, orderId: number): Promise<RepositoryResult<PurchaseOrderDto>>
   confirmPurchaseOrder(projectCode: string, orderId: number, input: ConfirmRevisionInput): Promise<RepositoryResult<PurchaseOrderDto>>
   updatePurchaseOrder(projectCode: string, orderId: number, input: PurchaseOrderUpdateInput): Promise<RepositoryResult<PurchaseOrderDto>>
@@ -178,6 +179,12 @@ class HttpProcurementRepository implements ProcurementHttpRepository {
     return live(files.length > 0
       ? await this.multipartPostSender.send(path, input, files)
       : await this.postSender.send(path, input))
+  }
+
+  previewPurchaseOrderNumber(projectCode: string, supplierCompanyId: number, orderedOn: string, signal?: AbortSignal): Promise<{ order_no: string }> {
+    return requestJson(withQuery(`${projectBasePath(projectCode)}/purchase-order-number-preview`, {
+      supplier_company_id: supplierCompanyId, ordered_on: orderedOn,
+    }), { signal })
   }
 
   async getPurchaseOrder(projectCode: string, orderId: number): Promise<RepositoryResult<PurchaseOrderDto>> {

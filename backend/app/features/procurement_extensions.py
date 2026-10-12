@@ -40,6 +40,7 @@ from backend.app.features.api_common import (
 )
 from backend.app.features.auth import require_authenticated_session
 from backend.app.features.inventory import format_quantity, line_value, parse_quantity
+from backend.app.features.purchase_order_tax import gross_line_value
 
 Clock = Callable[[], datetime]
 
@@ -386,13 +387,14 @@ def create_procurement_extensions_router(
     ) -> dict[str, object]:
         identifier = base._parse_identifier(order_id)
         payload = await base._read_json(
-            request, _ORDER_UPDATE_FIELDS, "Invalid purchase order payload"
+            request, _ORDER_UPDATE_FIELDS, "Invalid purchase order payload",
+            optional_fields=base._ORDER_OPTIONAL_FIELDS,
         )
         expected_revision = base._positive_integer(
             payload["expected_revision"], "Invalid purchase order payload"
         )
         normalized = base._normalize_order(
-            {field: payload[field] for field in base._ORDER_FIELDS}
+            {field: value for field, value in payload.items() if field != "expected_revision"}
         )
         timestamp = base._timestamp(now)
         try:
@@ -408,12 +410,17 @@ def create_procurement_extensions_router(
                         "Purchase order is not editable", "PURCHASE_ORDER_NOT_EDITABLE"
                     )
                 base._require_revision(order, expected_revision)
+                if "tax_rate_bps" not in payload:
+                    normalized = base._normalize_order({
+                        **{field: payload[field] for field in base._ORDER_FIELDS},
+                        "tax_rate_bps": order["tax_rate_bps"],
+                    })
                 _validate_order_references(connection, project, normalized)
                 connection.execute(
                     """
                     UPDATE purchase_orders
                     SET order_no = ?, supplier_company_id = ?, ordered_on = ?,
-                        expected_delivery_on = ?, notes = ?, revision = revision + 1,
+                        expected_delivery_on = ?, notes = ?, tax_rate_bps = ?, revision = revision + 1,
                         updated_at = ?
                     WHERE id = ? AND revision = ?
                     """,
@@ -423,6 +430,7 @@ def create_procurement_extensions_router(
                         normalized["ordered_on"],
                         normalized["expected_delivery_on"],
                         normalized["notes"],
+                        normalized["tax_rate_bps"],
                         timestamp,
                         identifier,
                         expected_revision,
@@ -1633,14 +1641,15 @@ def _insert_order_lines(
             """
             INSERT INTO purchase_order_lines
                 (purchase_order_id, procurement_line_id, quantity_milli,
-                 received_quantity_milli, unit_cost_cents, overage_reason, created_at)
-            VALUES (?, ?, ?, 0, ?, ?, ?)
+                 received_quantity_milli, unit_cost_cents, tax_amount_cents, overage_reason, created_at)
+            VALUES (?, ?, ?, 0, ?, ?, ?, ?)
             """,
             (
                 order_id,
                 line["procurement_line_id"],
                 line["quantity_milli"],
                 line["unit_cost_cents"],
+                line.get("tax_amount_cents", 0),
                 line["overage_reason"],
                 timestamp,
             ),
@@ -1824,8 +1833,9 @@ def _validate_allocation_capacity(
             """,
             (allocation["purchase_order_line_id"],),
         ).fetchone()[0]
-        line_amount = line_value(
-            int(order_line["unit_cost_cents"]), int(order_line["quantity_milli"])
+        line_amount = gross_line_value(
+            int(order_line["unit_cost_cents"]), int(order_line["quantity_milli"]),
+            int(order_line["tax_amount_cents"]),
         )
         if int(already_allocated) + allocation["amount_cents"] > line_amount:
             raise base._business_conflict(

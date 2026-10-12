@@ -165,6 +165,7 @@ function createRepository(options: {
   }
   const order = purchaseOrder(projectCode, options.orderStatus)
   return {
+    previewPurchaseOrderNumber: vi.fn(async () => ({ order_no: 'PO_TEST_20261011_SUP_001' })),
     listSupplierCompanies: vi.fn(async () => liveResult(options.companies ?? [company()])),
     downloadImportTemplate: vi.fn(async () => new Blob(['xlsx'])),
     previewProcurementImport: vi.fn(async () => liveResult({

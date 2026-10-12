@@ -108,6 +108,7 @@ export interface PurchaseOrderLineInput {
 }
 
 export interface PurchaseOrderInput {
+  tax_rate_bps?: number | null
   order_no: string
   supplier_company_id: number
   ordered_on: ISODate
@@ -118,6 +119,8 @@ export interface PurchaseOrderInput {
 }
 
 export interface PurchaseOrderLineDto extends PurchaseOrderLineInput {
+  net_amount_cents?: MoneyCents
+  tax_amount_cents?: MoneyCents
   id: number
   purchase_order_id: number
   received_quantity: DecimalString
@@ -125,6 +128,8 @@ export interface PurchaseOrderLineDto extends PurchaseOrderLineInput {
 }
 
 export interface PurchaseOrderDto extends Omit<PurchaseOrderInput, 'lines'> {
+  net_amount_cents?: MoneyCents
+  tax_amount_cents?: MoneyCents
   id: number
   project_code: string
   supplier_company_name: string | null

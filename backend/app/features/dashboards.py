@@ -12,6 +12,7 @@ from backend.app.core.database import transaction
 from backend.app.features import commercial, project_stages
 from backend.app.features.api_common import ApiError, ApiErrorRoute
 from backend.app.features.auth import require_authenticated_session
+from backend.app.features.purchase_order_tax import gross_line_value
 
 logger = logging.getLogger(__name__)
 
@@ -275,17 +276,6 @@ def _project_costs(
             (SELECT COALESCE(SUM(total_amount_cents), 0)
              FROM material_advances
              WHERE project_id = ? AND status = 'active') AS field_material,
-            (SELECT COALESCE(SUM(
-                (order_lines.unit_cost_cents * order_lines.quantity_milli + 500)
-                / 1000
-             ), 0)
-             FROM purchase_order_lines AS order_lines
-             JOIN purchase_orders AS orders
-                 ON orders.id = order_lines.purchase_order_id
-             WHERE orders.project_id = ?
-               AND orders.status IN (
-                   'confirmed', 'partially_received', 'received'
-               )) AS committed,
             (SELECT COALESCE(SUM(receipt_lines.value_cents), 0)
              FROM goods_receipt_lines AS receipt_lines
              JOIN goods_receipts AS receipts
@@ -301,10 +291,29 @@ def _project_costs(
              WHERE orders.project_id = ?
                AND payments.status = 'active') AS paid
         """,
-        (project_id,) * 6,
+        (project_id,) * 5,
     ).fetchone()
     if row is None:
         raise sqlite3.DatabaseError("project cost query returned no row")
+    order_lines = connection.execute(
+        """
+        SELECT lines.unit_cost_cents, lines.quantity_milli, lines.tax_amount_cents
+        FROM purchase_order_lines AS lines
+        JOIN purchase_orders AS orders ON orders.id = lines.purchase_order_id
+        WHERE orders.project_id = ?
+          AND orders.status IN ('confirmed', 'partially_received', 'received')
+        """,
+        (project_id,),
+    ).fetchall()
+    # 逐行合计已舍入的未税金额和税额快照，避免联表放大或 SQLite 乘法溢出。
+    committed = sum(
+        gross_line_value(
+            int(line["unit_cost_cents"]),
+            int(line["quantity_milli"]),
+            int(line["tax_amount_cents"]),
+        )
+        for line in order_lines
+    )
     material_consumed = int(row["material_consumed"])
     labor = int(row["labor"])
     field_material = int(row["field_material"])
@@ -313,7 +322,7 @@ def _project_costs(
         "labor_cents": labor,
         "field_material_cents": field_material,
         "total_cents": material_consumed + labor + field_material,
-        "procurement_committed_cents": int(row["committed"]),
+        "procurement_committed_cents": committed,
         "procurement_received_cents": int(row["received"]),
         "procurement_paid_cents": int(row["paid"]),
         "completeness": "complete",

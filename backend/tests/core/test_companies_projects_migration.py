@@ -46,6 +46,7 @@ def business_schema(tmp_path: Path) -> Iterator[sqlite3.Connection]:
             "020_acceptance_reschedule_events",
             "021_workforce_audit_history",
             "022_supplier_invoice_active_number",
+            "023_purchase_order_tax",
         ]
         yield connection
     finally:
