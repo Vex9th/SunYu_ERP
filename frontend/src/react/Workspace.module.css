@@ -1,16 +1,25 @@
 :global(*) {
   box-sizing: border-box;
 }
+:global(:root) {
+  --sunyu-font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Segoe UI", sans-serif;
+  --sunyu-text-secondary: #526177;
+}
 :global(body) {
   margin: 0;
   color: #202a38;
   background: #f4f6f9;
-  font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-family: var(--sunyu-font-family);
+  font-size: 15px;
+  line-height: 1.6;
 }
 :global(button),
 :global(input),
 :global(textarea) {
   font: inherit;
+}
+:global(small) {
+  font-size: 13px;
 }
 :global(a) {
   text-decoration: none;
@@ -63,27 +72,23 @@
   display: grid;
   place-items: center;
   font-size: 18px;
-  font-weight: 750;
-  letter-spacing: -1px;
+  font-weight: 700;
 }
 .brandName {
   display: block;
   font-size: 17px;
   font-weight: 700;
-  letter-spacing: -0.4px;
 }
 .brandCaption {
   display: block;
-  font-size: 12px;
-  color: #6c7789;
+  font-size: 13px;
+  color: var(--sunyu-text-secondary);
   margin-top: 4px;
-  letter-spacing: 1px;
 }
 .navLabel {
   padding: 8px 26px;
-  color: #8a93a2;
-  font-size: 12px;
-  letter-spacing: 2px;
+  color: var(--sunyu-text-secondary);
+  font-size: 13px;
 }
 .sidebar :global(.ant-menu) {
   border: 0;
@@ -99,8 +104,8 @@
   margin-top: auto;
   padding: 20px 24px;
   border-top: 1px solid #eef0f4;
-  color: #8a93a2;
-  font-size: 12px;
+  color: var(--sunyu-text-secondary);
+  font-size: 13px;
 }
 .sidebarBottom strong {
   color: #556375;
@@ -119,12 +124,11 @@
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  background: #ffffffeb;
+  background: #fff;
   border-bottom: 1px solid #e5e9f0;
   position: sticky;
   top: 0;
   z-index: 20;
-  backdrop-filter: blur(12px);
 }
 .topbarRight {
   display: flex;
@@ -132,8 +136,8 @@
   gap: 20px;
 }
 .date {
-  font-size: 12px;
-  color: #5e6c80;
+  font-size: 13px;
+  color: var(--sunyu-text-secondary);
 }
 .content {
   max-width: 1760px;
@@ -156,21 +160,19 @@
 .pageHeader h1 {
   margin: 3px 0 7px;
   font-size: 24px;
-  font-weight: 650;
+  font-weight: 600;
   line-height: 1.3;
-  letter-spacing: -0.5px;
   color: #172b4d;
 }
 .pageHeader p {
   margin: 0;
-  font-size: 13px;
-  color: #5e6c80;
+  font-size: 14px;
+  color: var(--sunyu-text-secondary);
 }
 .eyebrow {
-  font-size: 10px;
-  letter-spacing: 2.3px;
-  font-weight: 700;
-  color: #5e6c80;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--sunyu-text-secondary);
   margin-bottom: 8px;
 }
 .section {
@@ -189,14 +191,14 @@
 }
 .sectionHeader h2 {
   font-size: 16px;
-  font-weight: 650;
+  font-weight: 600;
   color: #24354f;
   margin: 0;
 }
 .sectionHeader p {
   margin: 5px 0 0;
-  color: #5e6c80;
-  font-size: 12px;
+  color: var(--sunyu-text-secondary);
+  font-size: 13px;
 }
 .metrics {
   display: grid;
@@ -222,11 +224,10 @@
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   line-height: 1.25;
-  letter-spacing: -0.7px;
 }
 .metric small {
-  color: #5e6c80;
-  font-size: 12px;
+  color: var(--sunyu-text-secondary);
+  font-size: 13px;
 }
 .dashboardGrid {
   display: grid;
@@ -249,8 +250,8 @@
   margin-bottom: 4px;
 }
 .subtle {
-  color: #5e6c80;
-  font-size: 12px;
+  color: var(--sunyu-text-secondary);
+  font-size: 13px;
 }
 .todo {
   display: flex;
@@ -268,14 +269,14 @@
 }
 .todo strong {
   display: block;
-  font-weight: 500;
-  font-size: 13px;
+  font-weight: 400;
+  font-size: 15px;
   line-height: 1.65;
 }
 .todo p {
   margin: 5px 0;
-  font-size: 12px;
-  color: #7c8798;
+  font-size: 13px;
+  color: var(--sunyu-text-secondary);
   line-height: 1.8;
 }
 .quickLink {
@@ -314,8 +315,8 @@
   display: flex;
   gap: 20px;
   flex-wrap: wrap;
-  color: #5e6c80;
-  font-size: 12px;
+  color: var(--sunyu-text-secondary);
+  font-size: 13px;
   margin-top: 10px;
 }
 .projectTabs {
@@ -359,12 +360,11 @@
   font-size: clamp(32px, 3.5vw, 52px);
   line-height: 1.4;
   color: #172b4d;
-  letter-spacing: -1.6px;
   margin: 20px 0;
-  font-weight: 650;
+  font-weight: 600;
 }
 .authEditorial p {
-  color: #6b7b93;
+  color: var(--sunyu-text-secondary);
   max-width: 370px;
   line-height: 2;
   font-size: 14px;
@@ -379,14 +379,13 @@
   display: flex;
   flex-wrap: wrap;
   gap: 12px;
-  color: #78869a;
-  font-size: 12px;
+  color: var(--sunyu-text-secondary);
+  font-size: 13px;
   align-items: center;
 }
 .authFooter {
-  color: #9aa4b3;
-  font-size: 12px;
-  letter-spacing: 2px;
+  color: var(--sunyu-text-secondary);
+  font-size: 13px;
 }
 .authFormSide {
   padding: 48px;
@@ -404,15 +403,15 @@
   margin: 14px 0;
 }
 .authForm p {
-  color: #8390a2;
+  color: var(--sunyu-text-secondary);
   line-height: 1.8;
   margin-bottom: 30px;
 }
 .authPrivacy {
   margin-top: 26px;
   text-align: center;
-  color: #9ca5b3;
-  font-size: 12px;
+  color: var(--sunyu-text-secondary);
+  font-size: 13px;
 }
 .mobileMenu {
   display: none;
@@ -556,8 +555,8 @@
 }
 .projectIdentity small,
 .rowFact small {
-  color: #617085;
-  font-size: 12px;
+  color: var(--sunyu-text-secondary);
+  font-size: 13px;
 }
 .rowFact {
   display: flex;
@@ -567,12 +566,12 @@
   font-variant-numeric: tabular-nums;
 }
 .rowFact > span {
-  color: #617085;
-  font-size: 12px;
+  color: var(--sunyu-text-secondary);
+  font-size: 13px;
 }
 .rowFact strong,
 .rowFact a {
-  font-weight: 550;
+  font-weight: 400;
 }
 .attentionList {
   display: grid;
@@ -649,8 +648,8 @@
   display: block;
 }
 .taskLink small {
-  color: #617085;
-  font-size: 12px;
+  color: var(--sunyu-text-secondary);
+  font-size: 13px;
   margin-top: 5px;
 }
 .taskLink:hover {
@@ -691,7 +690,7 @@
   min-width: 180px;
 }
 .contactItem small {
-  color: #617085;
+  color: var(--sunyu-text-secondary);
 }
 @media (max-width: 1200px) {
   .projectRow {

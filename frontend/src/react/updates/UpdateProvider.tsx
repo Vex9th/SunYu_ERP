@@ -3,6 +3,7 @@ import { ApiError, requestJson } from '../../api'
 import { errorText } from '../shared'
 import { useRefreshBlockReason } from '../unsavedChanges'
 import { isRunningJob, type UpdateComponent, type UpdateState } from './types'
+import { isNewerVersion } from './version'
 
 const endpoint = '/api/system/updates'
 const checkInterval = 6 * 60 * 60 * 1000
@@ -76,9 +77,10 @@ export function UpdatesProvider({ children, pageVersion = __APP_VERSION__ }: { c
     if (path !== '/check' && !current.current.can_install) return
     if (isRunningJob(current.current.job) || current.current.job?.status === 'manual_recovery') return
     if (path === '/check' && current.current.job?.status === 'ready') return
+    const component = (path === '/install' || path === '/download') ? (body as { component: UpdateComponent }).component : null
+    if (path === '/download' && component && !isNewerVersion(current.current.latest?.components[component]?.version, current.current.current[component])) return
     actionBusy.current = true
     const previousJob = current.current.job
-    const component = (path === '/install' || path === '/download') ? (body as { component: UpdateComponent }).component : null
     const version = path === '/install' ? previousJob?.version : component ? current.current.latest?.components[component]?.version : null
     confirmsUncertainRequest.current = null
     generation.current++

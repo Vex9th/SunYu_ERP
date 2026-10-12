@@ -63,7 +63,7 @@ def zip_directory(source: Path, destination: Path) -> None:
                 archive.write(path, path.relative_to(source).as_posix())
 
 
-def component_archive(source: Path, destination: Path, component: str, version: str) -> None:
+def component_archive(source: Path, destination: Path, component: str, version: str) -> dict:
     files = {path.relative_to(source).as_posix(): path for path in sorted(source.rglob("*")) if path.is_file()}
     manifest = {
         "format": 1, "application": "SunYu_ERP", "component": component,
@@ -74,6 +74,7 @@ def component_archive(source: Path, destination: Path, component: str, version: 
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
         for name, path in files.items():
             archive.write(path, "payload/" + name)
+    return manifest
 
 
 def build_release(*, root: Path, version: str, output: Path, runtime_dir: Path, launcher: Path) -> Path:
@@ -133,7 +134,10 @@ def build_release(*, root: Path, version: str, output: Path, runtime_dir: Path, 
         components = {}
         for component in ("frontend", "backend"):
             archive = work / f"SunYu_ERP-{component}-{version}.zip"
-            component_archive(stage / "releases" / component / version, archive, component, version)
+            directory = stage / "releases" / component / version
+            manifest = component_archive(directory, archive, component, version)
+            # 完整包覆盖后也能通过同一组件包的严格校验，再由用户主动选择新版本。
+            write_json(directory / ".update-manifest.json", manifest)
             components[component] = {
                 "version": version, "url": f"{OFFICIAL_DOWNLOAD}/v{version}/{archive.name}",
                 "sha256": digest(archive),

@@ -12,6 +12,8 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
+import certifi
+
 from updater.manifest import (
     MAX_ARCHIVE_BYTES,
     PackageError,
@@ -78,9 +80,12 @@ class _OfficialRedirect(urllib.request.HTTPRedirectHandler):
 def fetch_official(url: str, limit: int) -> bytes:
     if url != RELEASE_API:
         official_asset_url(url)
+    # 保留系统/用户信任的证书，同时补充公共根证书，兼容精简或未更新的系统。
+    context = ssl.create_default_context()
+    context.load_verify_locations(cafile=certifi.where())
     opener = urllib.request.build_opener(
         _OfficialRedirect(),
-        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+        urllib.request.HTTPSHandler(context=context),
     )
     request = urllib.request.Request(
         url,
@@ -92,23 +97,34 @@ def fetch_official(url: str, limit: int) -> bytes:
         },
     )
     deadline = time.monotonic() + 60
-    with opener.open(request, timeout=15) as response:
-        if (
-            response.headers.get("Content-Length")
-            and int(response.headers["Content-Length"]) > limit
-        ):
-            raise UpdateError("Download exceeds size limit")
-        body = bytearray()
-        while True:
-            if time.monotonic() > deadline:
-                raise UpdateError("Download timed out")
-            chunk = response.read(min(1024 * 1024, limit + 1 - len(body)))
-            if not chunk:
-                break
-            body.extend(chunk)
-            if len(body) > limit:
+    try:
+        with opener.open(request, timeout=15) as response:
+            if (
+                response.headers.get("Content-Length")
+                and int(response.headers["Content-Length"]) > limit
+            ):
                 raise UpdateError("Download exceeds size limit")
-        return bytes(body)
+            body = bytearray()
+            while True:
+                if time.monotonic() > deadline:
+                    raise UpdateError("Download timed out")
+                chunk = response.read(min(1024 * 1024, limit + 1 - len(body)))
+                if not chunk:
+                    break
+                body.extend(chunk)
+                if len(body) > limit:
+                    raise UpdateError("Download exceeds size limit")
+            return bytes(body)
+    except (urllib.error.URLError, ssl.SSLCertVerificationError) as error:
+        reason = error.reason if isinstance(error, urllib.error.URLError) else error
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            raise UpdateError(
+                f"无法验证更新服务器 {urllib.parse.urlsplit(url).hostname} 的 HTTPS 证书。"
+                "请检查系统时间、系统根证书，以及代理或安全软件的 HTTPS 检查设置；"
+                "可改用可信网络，或下载官方离线更新包。"
+                f"技术详情：{reason}"
+            ) from error
+        raise
 
 
 def validate_catalog(value: object) -> dict:

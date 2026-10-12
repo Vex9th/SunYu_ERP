@@ -1,4 +1,5 @@
 export type UpdateComponent = 'frontend' | 'backend'
+export type InstallBlockReason = 'unsupported_runtime' | 'not_supervised' | 'client_unavailable' | 'non_loopback_peer' | 'non_loopback_host'
 export type UpdateJobStatus = 'checking' | 'downloading' | 'ready' | 'installing' | 'success' | 'failed' | 'manual_recovery'
 export interface UpdateJob {
   id: string
@@ -10,6 +11,7 @@ export interface UpdateJob {
 export interface UpdateState {
   supported: boolean
   can_install: boolean
+  install_block_reason?: InstallBlockReason | null
   current: { backend: string | null; frontend: string | null }
   frontend_version: string | null
   latest: null | {

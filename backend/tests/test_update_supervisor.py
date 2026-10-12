@@ -162,6 +162,55 @@ def test_shutdown_timeout_keeps_lock_until_child_really_exits(tmp_path, monkeypa
     assert child.attempts == 2
 
 
+@pytest.mark.parametrize("during_update", [False, True])
+def test_tray_shutdown_survives_backend_restart(tmp_path, monkeypatch, during_update):
+    import updater.supervisor as module
+
+    installation(tmp_path)
+    supervisor = Supervisor(tmp_path)
+    supervisor.updates.mkdir()
+
+    class Child:
+        returncode = None
+        waited = False
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout):
+            assert (supervisor.updates / "stop").exists()
+            self.waited = True
+            self.returncode = 0
+
+    child = Child()
+    monkeypatch.setattr(supervisor, "start_backend", lambda: setattr(supervisor, "child", child))
+    monkeypatch.setattr(supervisor, "wait_healthy", lambda: None)
+    if during_update:
+        write(supervisor.updates / "pending.json", {"id": "test"})
+
+        def updating(_pending):
+            # 托盘在更新时要求退出；start_backend 清掉 stop 后仍须保留退出请求。
+            (supervisor.updates / "shutdown").touch()
+            (supervisor.updates / "stop").touch()
+            (supervisor.updates / "stop").unlink()
+            (supervisor.updates / "pending.json").unlink()
+
+        monkeypatch.setattr(supervisor, "install_backend", updating)
+    else:
+        (supervisor.updates / "shutdown").touch()
+
+    iterations = 0
+
+    def bounded_sleep(_seconds):
+        nonlocal iterations
+        iterations += 1
+        assert iterations <= int(during_update), "托盘退出请求没有被处理"
+
+    monkeypatch.setattr(module.time, "sleep", bounded_sleep)
+    assert supervisor.run() == 0
+    assert child.waited
+
+
 @pytest.mark.parametrize(("host", "url"), [
     ("0.0.0.0", "http://127.0.0.1:8877/api/health"),
     ("::", "http://[::1]:8877/api/health"),

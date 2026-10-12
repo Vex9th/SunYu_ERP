@@ -271,7 +271,8 @@ class Supervisor:
             self.start_backend()
             try:
                 self.wait_healthy()
-                while not self.stopping:
+                # 托盘退出请求独立于后端重启用的 stop，更新事务完成后仍须执行。
+                while not self.stopping and not (self.updates / "shutdown").exists():
                     if self.child is None or self.child.poll() is not None:
                         return self.child.returncode if self.child is not None else 1
                     pending = read_json(self.updates / "pending.json")

@@ -2,13 +2,13 @@
 .header, .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .header h3, .toolbar h5 { margin: 0 0 4px !important; }
 .toolbar { margin-bottom: 18px; align-items: flex-end; }
-.secondary { font-size: 13px; color: #596579; line-height: 1.6; overflow-wrap: anywhere; }
+.secondary { font-size: 14px; color: var(--sunyu-text-secondary); line-height: 1.6; overflow-wrap: anywhere; }
 .materialLink { padding: 0 !important; font-weight: 600; height: auto; white-space: normal; text-align: left; }
 .number { font-variant-numeric: tabular-nums; white-space: nowrap; }
-.number small { font-weight: 400; color: #596579; }
+.number small { font-weight: 400; color: var(--sunyu-text-secondary); }
 .filters { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
 .filterField { display: flex; flex-direction: column; gap: 6px; }
-.filterField > span:first-child { font-size: 13px; color: #596579; }
+.filterField > span:first-child { font-size: 13px; color: var(--sunyu-text-secondary); }
 .filterField :global(.ant-select) { min-width: 130px; }
 .filterField :global(.ant-input-affix-wrapper) { width: 260px; }
 .filterTags { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 0 0 16px; }
@@ -19,10 +19,10 @@
 .issueRow :global(.ant-form-item) { margin-bottom: 6px; }
 .formSection { margin: 0 0 22px; }
 .formSection h5 { margin: 0 0 6px !important; }
-.formSection > p { color: #596579; margin: 0 0 16px; font-size: 13px; line-height: 1.6; }
+.formSection > p { color: var(--sunyu-text-secondary); margin: 0 0 16px; font-size: 13px; line-height: 1.6; }
 .detailSummary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; padding: 18px; background: #f8f9fc; border-radius: 6px; }
 .detailSummary > div { display: flex; flex-direction: column; gap: 7px; }
-.detailSummary span { color: #596579; font-size: 13px; }
+.detailSummary span { color: var(--sunyu-text-secondary); font-size: 13px; }
 .detailSummary strong { font-size: 20px; font-variant-numeric: tabular-nums; }
 .detailSummary small { font-weight: 400; font-size: 13px; }
 .detailActions { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin: 12px 0; }

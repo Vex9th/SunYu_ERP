@@ -112,10 +112,13 @@ def run(package_dir: Path, output: Path, legacy_zip: Path | None = None):
     process = None
     streams = []
 
-    def launch(label):
+    def launch(label, *, legacy=False):
         stream = (output / f"{label}.log").open("wb")
         streams.append(stream)
-        return subprocess.Popen([str(root / "SunYu_ERP.exe")], cwd=root, stdout=stream, stderr=subprocess.STDOUT)
+        command = [str(root / "SunYu_ERP.exe")]
+        if not legacy:
+            command.append("--headless")
+        return subprocess.Popen(command, cwd=root, stdout=stream, stderr=subprocess.STDOUT)
 
     try:
         if legacy_zip:
@@ -125,7 +128,7 @@ def run(package_dir: Path, output: Path, legacy_zip: Path | None = None):
                 (root / "SunYu_ERP.exe").write_bytes(archive.read("SunYu_ERP.exe"))
         else:
             shutil.copytree(package_dir, root, dirs_exist_ok=True)
-        process = launch("initial")
+        process = launch("initial", legacy=legacy_zip is not None)
         wait_health(client, process)
         state = BUSINESS["seed"](client)
         BUSINESS["verify"](client, state)

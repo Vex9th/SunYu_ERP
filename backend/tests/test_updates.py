@@ -251,8 +251,11 @@ def test_service_checks_official_catalog_then_downloads_verified_zip(tmp_path):
     assert read_installation(tmp_path)["frontend"] == "1.3.0"
 
 
-def client_for(root, monkeypatch, *, host="127.0.0.1", modular=True):
-    monkeypatch.setenv("SUNYU_SUPERVISED", "1")
+def client_for(root, monkeypatch, *, host="127.0.0.1", modular=True, supervised="1"):
+    if supervised is None:
+        monkeypatch.delenv("SUNYU_SUPERVISED", raising=False)
+    else:
+        monkeypatch.setenv("SUNYU_SUPERVISED", supervised)
     write_json(
         root / "config.json",
         {"data_dir": "Data", "session_secret": "test-secret-at-least-thirty-two-bytes"},
@@ -260,7 +263,8 @@ def client_for(root, monkeypatch, *, host="127.0.0.1", modular=True):
     app = create_app(
         config_path=root / "config.json", update_root=root if modular else None
     )
-    client = TestClient(app, client=(host, 32123), base_url="http://127.0.0.1:8765")
+    peer = None if host is None else (host, 32123)
+    client = TestClient(app, client=peer, base_url="http://127.0.0.1:8765")
     client.cookies.set(
         SESSION_COOKIE_NAME,
         create_session_token("test-secret-at-least-thirty-two-bytes"),
@@ -315,7 +319,75 @@ def test_development_status_is_available_and_unsupported(tmp_path, monkeypatch):
         status = client.get("/api/system/updates").json()
         assert status["supported"] is False
         assert status["can_install"] is False
+        assert status["install_block_reason"] == "unsupported_runtime"
         assert status["job"] is None
+
+
+@pytest.mark.parametrize(
+    "peer,host,supervised,reason,recovery",
+    [
+        ("127.0.0.1", "127.0.0.1:8765", None, "not_supervised", "SunYu_ERP.exe"),
+        ("127.0.0.1", "127.0.0.1:8765", "0", "not_supervised", "SunYu_ERP.exe"),
+        (None, "127.0.0.1:8765", "1", "client_unavailable", "直接访问"),
+        ("192.168.1.8", "127.0.0.1:8765", "1", "non_loopback_peer", "127.0.0.1"),
+        ("127.0.0.1", "192.168.1.8:8765", "1", "non_loopback_host", "127.0.0.1"),
+    ],
+)
+def test_update_status_explains_install_block_and_mutations_give_recovery(
+    tmp_path, monkeypatch, peer, host, supervised, reason, recovery
+):
+    installation(tmp_path)
+    with client_for(tmp_path, monkeypatch, host=peer, supervised=supervised) as client:
+        headers = {
+            "host": host,
+            "origin": f"http://{host}",
+            "forwarded": "for=127.0.0.1;host=127.0.0.1:8765",
+            "x-forwarded-for": "127.0.0.1",
+            "x-forwarded-host": "127.0.0.1:8765",
+        }
+        response = client.get("/api/system/updates", headers=headers)
+        assert response.status_code == 200
+        state = response.json()
+        assert state["supported"] is True
+        assert state["can_install"] is False
+        assert state["install_block_reason"] == reason
+        rejected = client.patch(
+            "/api/system/updates/preferences",
+            json={"auto_check": False},
+            headers=headers,
+        )
+        assert rejected.status_code == 403
+        assert recovery in rejected.json()["detail"]
+        assert "登录" not in rejected.json()["detail"]
+        assert client.app.state.update_service.status()["preferences"]["auto_check"] is True
+
+
+@pytest.mark.parametrize(
+    "peer,host",
+    [
+        ("127.0.0.1", "127.0.0.1:8765"),
+        ("127.0.0.1", "localhost:8765"),
+        ("::1", "[::1]:8765"),
+    ],
+)
+def test_update_local_status_and_mutation_have_no_install_block(
+    tmp_path, monkeypatch, peer, host
+):
+    installation(tmp_path)
+    with client_for(tmp_path, monkeypatch, host=peer) as client:
+        headers = {"host": host, "origin": f"http://{host}"}
+        state = client.get("/api/system/updates", headers=headers).json()
+        assert state["can_install"] is True
+        assert state["install_block_reason"] is None
+        response = client.patch(
+            "/api/system/updates/preferences",
+            json={"auto_check": False},
+            headers=headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["can_install"] is True
+        assert response.json()["install_block_reason"] is None
+        assert response.json()["preferences"]["auto_check"] is False
 
 
 def test_dynamic_frontend_switch_old_resource_and_maintenance(tmp_path, monkeypatch):

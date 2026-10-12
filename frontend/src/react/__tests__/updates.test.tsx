@@ -40,10 +40,10 @@ function Editor({ dirty }: { dirty: boolean }) {
 }
 function UpdateControls() {
   const updates = useUpdates()!
-  return <><button onClick={() => void updates.install('backend')}>直接安装</button><button onClick={() => void updates.check()}>直接检查</button><button onClick={() => void updates.read()}>核对后台任务</button><button onClick={updates.refreshPage}>直接刷新</button></>
+  return <><button onClick={() => void updates.install('backend')}>直接安装</button><button onClick={() => void updates.download('frontend')}>直接下载前端</button><button onClick={() => void updates.download('backend')}>直接下载后端</button><button onClick={() => void updates.check()}>直接检查</button><button onClick={() => void updates.read()}>核对后台任务</button><button onClick={updates.refreshPage}>直接刷新</button></>
 }
-function mount(dirty = false, controls = false) {
-  const router = createMemoryRouter([{ element: <UnsavedChangesProvider><Outlet /></UnsavedChangesProvider>, children: [{ path: '/', element: <UpdatesProvider pageVersion="1.3.0"><UpdateNotice /><UpdatesSection /><Editor dirty={dirty} />{controls && <UpdateControls />}</UpdatesProvider> }] }])
+function mount(dirty = false, controls = false, pageVersion = '1.3.0') {
+  const router = createMemoryRouter([{ element: <UnsavedChangesProvider><Outlet /></UnsavedChangesProvider>, children: [{ path: '/', element: <UpdatesProvider pageVersion={pageVersion}><UpdateNotice /><UpdatesSection /><Editor dirty={dirty} />{controls && <UpdateControls />}</UpdatesProvider> }] }])
   return render(<ConfigProvider theme={{ token: { motion: false } }}><App><RouterProvider router={router} /></App></ConfigProvider>)
 }
 
@@ -64,10 +64,33 @@ describe('可选模块更新', () => {
     mount()
     await screen.findByRole('button', { name: '刷新使用新版本' })
     expect(screen.getByText(/请在运行服务的本机/)).toBeTruthy()
+    expect(screen.queryByText(/登录后下载/)).toBeNull()
     expect(screen.queryByRole('button', { name: /下载前端|安装前端|导入离线更新包|忽略此版本/ })).toBeNull()
     expect(screen.queryByRole('switch')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: '检查更新' }))
     await waitFor(() => expect(writes[0]?.path).toBe('/api/system/updates/check'))
+  })
+  it.each([
+    ['not_supervised', /当前服务未通过正式启动器运行/, /完整安装目录中的 SunYu_ERP\.exe/],
+    ['client_unavailable', /暂时无法确认此连接是否来自本机/, /检查本机代理设置/],
+    ['non_loopback_peer', /当前连接未被识别为本机连接/, /检查代理是否接管本机请求/],
+    ['non_loopback_host', /当前访问地址不是本机地址/, /127\.0\.0\.1 或 localhost/],
+  ])('按后端限制原因 %s 显示恢复操作，不错误要求重新登录', async (reason, title, recovery) => {
+    Object.assign(state, { can_install: false, install_block_reason: reason })
+    mount()
+    expect(await screen.findByText(title)).toBeTruthy()
+    expect(screen.getByText(recovery)).toBeTruthy()
+    expect(screen.queryByText(/登录后下载/)).toBeNull()
+    expect(screen.queryByRole('button', { name: /下载前端|安装前端|导入离线更新包/ })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '检查更新' }))
+    await waitFor(() => expect(writes[0]?.path).toBe('/api/system/updates/check'))
+  })
+  it('未知的安装限制原因使用兼容说明，保持可检查且不开放安装', async () => {
+    Object.assign(state, { can_install: false, install_block_reason: 'future_reason' })
+    mount()
+    expect(await screen.findByText('此连接暂不允许修改更新')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '下载前端' })).toBeNull()
+    expect(screen.getByRole('button', { name: '检查更新' })).toBeTruthy()
   })
   it('忽略版本与关闭自动检查会保存偏好，更新仍可手动操作', async () => {
     state.preferences.auto_check = true
@@ -119,6 +142,71 @@ describe('可选模块更新', () => {
     mount()
     expect(await screen.findByText(/当前为开发运行环境/)).toBeTruthy()
     expect(screen.queryByRole('button', { name: '检查更新' })).toBeNull()
+  })
+})
+
+describe('在线更新按组件语义版本比较', () => {
+  function setVersions(currentFrontend: string, currentBackend: string, remoteFrontend: string, remoteBackend: string, releaseVersion: string) {
+    state.current = { frontend: currentFrontend, backend: currentBackend }
+    state.frontend_version = currentFrontend
+    state.preferences.auto_check = true
+    sessionStorage.setItem('sunyu-update-checked-at', String(Date.now()))
+    state.latest = { version: releaseVersion, notes: '线上版本说明', components: {
+      frontend: { version: remoteFrontend, url: 'https://github.com/example/frontend.zip', sha256: 'a'.repeat(64) },
+      backend: { version: remoteBackend, url: 'https://github.com/example/backend.zip', sha256: 'b'.repeat(64) },
+    } }
+  }
+  it('本机 1.3.1 高于远端 1.3.0 时不提示降级，底层下载操作也不提交', async () => {
+    setVersions('1.3.1', '1.3.1', '1.3.0', '1.3.0', '1.3.0')
+    mount(false, true, '1.3.1')
+    await screen.findByText('线上版本说明')
+    expect(screen.queryByText(/发现可选更新/)).toBeNull()
+    expect(screen.queryByText('可用版本 1.3.0')).toBeNull()
+    expect(screen.queryByRole('button', { name: /^下载(前端|后端)$/ })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '直接下载前端' }))
+    fireEvent.click(screen.getByRole('button', { name: '直接下载后端' }))
+    await act(async () => { await Promise.resolve() })
+    expect(writes).toHaveLength(0)
+  })
+  it('数值比较 1.3.10 高于 1.3.9，并只为确有更高版本的组件提供下载', async () => {
+    setVersions('1.3.10', '1.3.9', '1.3.9', '1.3.10', '1.3.10')
+    mount(false, true, '1.3.10')
+    expect(await screen.findByText('发现可选更新 1.3.10')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '下载前端' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '直接下载前端' }))
+    fireEvent.click(screen.getByRole('button', { name: '下载后端' }))
+    await waitFor(() => expect(writes).toHaveLength(1))
+    expect(JSON.parse(writes[0]!.init.body as string)).toEqual({ component: 'backend' })
+  })
+  it('相同组件版本不下载，不根据整体发布版本误判组件升级', async () => {
+    setVersions('1.3.10', '1.4.0', '1.3.10', '1.3.9', '1.5.0')
+    mount(false, true, '1.3.10')
+    await screen.findByText('线上版本说明')
+    expect(screen.queryByText(/发现可选更新/)).toBeNull()
+    expect(screen.queryByRole('button', { name: /^下载(前端|后端)$/ })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '直接下载前端' }))
+    await act(async () => { await Promise.resolve() })
+    expect(writes).toHaveLength(0)
+  })
+  it('在线包不是更高版本时，仍保留用户已导入校验的离线包安装', async () => {
+    setVersions('1.3.1', '1.3.1', '1.3.0', '1.3.0', '1.3.0')
+    state.job = { id: 'offline-old', component: 'backend', version: '1.3.0', status: 'ready', message: '离线包已校验' }
+    mount(false, false, '1.3.1')
+    fireEvent.click(await screen.findByRole('button', { name: '安装后端' }))
+    fireEvent.click(await screen.findByRole('button', { name: '确认安装' }))
+    await waitFor(() => expect(writes).toHaveLength(1))
+    expect(writes[0]!.path).toBe('/api/system/updates/install')
+  })
+  it.each([
+    ['1.3.1', '1.3.1-rc.1'],
+    ['1.3.1-rc.10', '1.3.1-rc.9'],
+    ['1.3.1+build.2', '1.3.1+build.3'],
+  ])('当前 %s 不把远端 %s 作为更高版本', async (installed, remote) => {
+    setVersions(installed, installed, remote, remote, remote)
+    mount(false, false, installed)
+    await screen.findByText('线上版本说明')
+    expect(screen.queryByText(/发现可选更新/)).toBeNull()
+    expect(screen.queryByRole('button', { name: /^下载(前端|后端)$/ })).toBeNull()
   })
 })
 

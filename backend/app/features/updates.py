@@ -11,6 +11,24 @@ from backend.app.features.auth import require_authenticated_session
 from updater.manifest import MAX_ARCHIVE_BYTES, PackageError
 from updater.service import UpdateError, UpdateService
 
+_INSTALL_BLOCK_MESSAGES = {
+    "unsupported_runtime": "当前运行方式不支持模块化更新，请使用完整安装包。",
+    "not_supervised": (
+        "当前服务未通过启动器运行，请使用完整安装目录中的 SunYu_ERP.exe 启动后重试。"
+    ),
+    "client_unavailable": (
+        "无法确认此连接的来源，请在运行服务的电脑上直接访问 127.0.0.1，"
+        "并检查本机代理设置。"
+    ),
+    "non_loopback_peer": (
+        "此连接未被识别为本机连接，请在运行服务的电脑上使用 127.0.0.1 直接访问，"
+        "并检查代理是否接管本机请求。"
+    ),
+    "non_loopback_host": (
+        "当前访问地址不是本机地址，请在服务电脑上使用 127.0.0.1 或 localhost 访问后重试。"
+    ),
+}
+
 
 def _loopback(host: str | None) -> bool:
     if not host:
@@ -21,15 +39,23 @@ def _loopback(host: str | None) -> bool:
         return False
 
 
-def can_install(request: Request, service: UpdateService | None) -> bool:
+def install_block_reason(request: Request, service: UpdateService | None) -> str | None:
     # 只使用 ASGI transport 提供的 peer；生产入口必须 proxy_headers=False。
-    return bool(
-        service
-        and os.environ.get("SUNYU_SUPERVISED") == "1"
-        and request.client
-        and _loopback(request.client.host)
-        and (request.url.hostname == "localhost" or _loopback(request.url.hostname))
-    )
+    if not service:
+        return "unsupported_runtime"
+    if os.environ.get("SUNYU_SUPERVISED") != "1":
+        return "not_supervised"
+    if not request.client:
+        return "client_unavailable"
+    if not _loopback(request.client.host):
+        return "non_loopback_peer"
+    if request.url.hostname != "localhost" and not _loopback(request.url.hostname):
+        return "non_loopback_host"
+    return None
+
+
+def can_install(request: Request, service: UpdateService | None) -> bool:
+    return install_block_reason(request, service) is None
 
 
 def _origin(value: str) -> tuple[str, str | None, int]:
@@ -68,29 +94,35 @@ def create_updates_router(get_session_secret: Callable) -> APIRouter:
     def service_for(request: Request) -> UpdateService:
         service = request.app.state.update_service
         if service is None:
-            raise HTTPException(409, "当前运行方式不支持模块化更新，请使用完整安装包。")
+            raise HTTPException(409, _INSTALL_BLOCK_MESSAGES["unsupported_runtime"])
         return service
 
     def local_service(request: Request) -> UpdateService:
         service = service_for(request)
         require_same_origin(request)
-        if not can_install(request, service):
-            raise HTTPException(403, "请在运行本程序的电脑上登录后操作更新。")
+        reason = install_block_reason(request, service)
+        if reason is not None:
+            raise HTTPException(403, _INSTALL_BLOCK_MESSAGES[reason])
         return service
 
     def snapshot(request: Request):
         service = request.app.state.update_service
+        reason = install_block_reason(request, service)
         if service is None:
             return {
                 "supported": False,
                 "can_install": False,
+                "install_block_reason": reason,
                 "current": {"backend": None, "frontend": None},
                 "frontend_version": None,
                 "latest": None,
                 "preferences": {"auto_check": True, "ignored_version": None},
                 "job": None,
             }
-        return service.status(can_install(request, service))
+        return {
+            **service.status(reason is None),
+            "install_block_reason": reason,
+        }
 
     def execute(operation):
         try:

@@ -87,8 +87,10 @@ def test_complete_package_keeps_business_and_bootstrap_external_without_private_
         "releases/backend/1.3.0/backend/app/__init__.py",
         "releases/backend/1.3.0/backend/app/main.py",
         "releases/backend/1.3.0/backend/migrations/001_foundation.sql",
+        "releases/backend/1.3.0/.update-manifest.json",
         "releases/frontend/1.3.0/index.html", "releases/frontend/1.3.0/assets/app.js",
         "releases/frontend/1.3.0/templates/import.xlsx",
+        "releases/frontend/1.3.0/.update-manifest.json",
     }
     stage = output / "SunYu_ERP"
     assert {p.relative_to(stage).as_posix() for p in stage.rglob("*") if p.is_file()} == expected
@@ -150,6 +152,28 @@ def test_build_refuses_to_overwrite_an_existing_installation(builder, build_tree
         build(builder, build_tree, output)
     assert original.read_text(encoding="utf-8") == "user active versions"
     assert list(output.iterdir()) == [installed]
+
+
+@pytest.mark.parametrize("component", ["frontend", "backend"])
+def test_full_package_components_can_be_selected_by_import_after_covering_old_installation(
+    builder, build_tree, tmp_path, component,
+):
+    from updater.manifest import PackageError, stage_package, verify_staged
+
+    output = tmp_path / "publish"
+    installed = build(builder, build_tree, output)
+    # 完整包覆盖保留旧选择；用户随后主动导入同一正式组件包。
+    selection = {"format": 1, "backend": "1.2.0", "frontend": "1.2.0",
+                 "api_version": 1, "runtime_version": 1}
+    (installed / "installation.json").write_text(json.dumps(selection), encoding="utf-8")
+    archive = (output / f"SunYu_ERP-{component}-1.3.0.zip").read_bytes()
+    manifest = stage_package(installed, archive, reuse_verified=True)
+    assert verify_staged(installed, component, "1.3.0") == manifest
+    assert json.loads((installed / "installation.json").read_text()) == selection
+    target = installed / "releases" / component / "1.3.0"
+    (target / next(iter(manifest["files"]))).write_bytes(b"modified after covering")
+    with pytest.raises(PackageError, match="modified"):
+        stage_package(installed, archive, reuse_verified=True)
 
 
 @pytest.mark.parametrize("version", ["../1.3.0", "1.3.0/other", "v1.3.0", "1.3"])
