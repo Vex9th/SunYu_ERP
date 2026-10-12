@@ -787,8 +787,24 @@ ProjectRepository / ProcurementRepository / WorkforceRepository
 
 ## 9. 契约变更规则
 
-1. 后端实现必须与本文一致，并以生成的 OpenAPI 做自动契约测试。
+1. 后端实现必须与本文一致。Go 后端通过 `server/testdata/legacy-routes.json` 核对旧版路由，并使用 HTTP 及数据库回归测试核对业务行为。
 2. 已实现接口只能向后兼容扩展；需要破坏性修改时新增版本路径，不静默改字段。
 3. 新状态、新字段和新错误码先更新本文和前端类型，再实现业务代码。
-4. OpenAPI 与本文冲突时，在同一变更内修正，禁止把兼容分支永久留在前端。
+4. 路由、回归测试与本文冲突时，在同一变更内修正，禁止把兼容分支永久留在前端。
 5. 本文不承诺尚未标记“已实现”的接口已经可调用；Mock 只用于页面预览。
+
+## 2.0 原生更新接口
+
+业务接口沿用上述契约。更新操作改为持久化异步任务：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/system/updates` | 当前组件、最新版本、安装限制、偏好与任务；可用 `request_id` 查询原请求 |
+| POST | `/api/system/updates/check` | 检查官方版本，不安装 |
+| POST | `/api/system/updates/update` | 一键检查、下载、校验并安装 |
+| POST | `/api/system/updates/import` | multipart `file` 上传官方 ZIP，校验后直接安装 |
+| PATCH | `/api/system/updates/preferences` | `auto_check` 和可为空的 `ignored_version` |
+
+所有接口要求登录。写操作验证同源；安装、导入和修改偏好还要求由正式启动器管理服务、连接源和访问地址均为本机。检查、更新、导入要求唯一 UUID 头 `X-Update-Request-ID`，受理返回 `202`。响应丢失后按同一请求标识查询，不另起安装。
+
+任务状态为 `checking`、`downloading`、`verifying`、`backing_up`、`installing`、`restarting`、`cleaning`、`success`、`failed` 或 `manual_recovery`。页面显示阶段和具体 `error`；重连期间保持未确认状态。只有确认持久化任务结果后，才报告成功或允许新的安装。旧 `/download`、`/install` 两步操作在 2.0 移除。

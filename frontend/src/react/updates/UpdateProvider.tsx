@@ -2,8 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState, ty
 import { ApiError, requestJson } from '../../api'
 import { errorText } from '../shared'
 import { useRefreshBlockReason } from '../unsavedChanges'
-import { isRunningJob, type UpdateComponent, type UpdateState } from './types'
-import { isNewerVersion } from './version'
+import { isRunningJob, type UpdateState } from './types'
 
 const endpoint = '/api/system/updates'
 const checkInterval = 6 * 60 * 60 * 1000
@@ -20,8 +19,7 @@ interface UpdatesContextValue {
   dismiss: (version: string) => void
   read: () => Promise<void>
   check: () => Promise<void>
-  download: (component: UpdateComponent) => Promise<void>
-  install: (component: UpdateComponent) => Promise<void>
+  update: () => Promise<void>
   importPackage: (file: File) => Promise<void>
   preferences: (patch: Partial<UpdateState['preferences']>) => Promise<void>
   refreshPage: () => void
@@ -46,10 +44,12 @@ export function UpdatesProvider({ children, pageVersion = __APP_VERSION__ }: { c
   const reading = useRef(false)
   const generation = useRef(0)
   const confirmsUncertainRequest = useRef<((next: UpdateState) => boolean) | null>(null)
+  const pendingRequestID = useRef<string | null>(null)
   const getRefreshBlockReason = useRefreshBlockReason()
   const accept = useCallback((next: UpdateState) => {
     if (confirmsUncertainRequest.current?.(next)) {
       confirmsUncertainRequest.current = null
+      pendingRequestID.current = null
       setUncertain(false)
       setActionError(null)
       setRefreshError(null)
@@ -63,7 +63,7 @@ export function UpdatesProvider({ children, pageVersion = __APP_VERSION__ }: { c
     reading.current = true
     const epoch = generation.current
     try {
-      const next = await requestJson<UpdateState>(endpoint, { timeoutMs: 8000 })
+      const next = await requestJson<UpdateState>(pendingRequestID.current ? `${endpoint}?request_id=${encodeURIComponent(pendingRequestID.current)}` : endpoint, { timeoutMs: 8000 })
       if (mounted.current && epoch === generation.current) accept(next)
     } catch (cause) {
       if (mounted.current && epoch === generation.current) setConnectionError(errorText(cause))
@@ -76,12 +76,12 @@ export function UpdatesProvider({ children, pageVersion = __APP_VERSION__ }: { c
     if (actionBusy.current || confirmsUncertainRequest.current || !current.current?.supported) return
     if (path !== '/check' && !current.current.can_install) return
     if (isRunningJob(current.current.job) || current.current.job?.status === 'manual_recovery') return
-    if (path === '/check' && current.current.job?.status === 'ready') return
-    const component = (path === '/install' || path === '/download') ? (body as { component: UpdateComponent }).component : null
-    if (path === '/download' && component && !isNewerVersion(current.current.latest?.components[component]?.version, current.current.current[component])) return
+    if (path === '/update' || path === '/import') {
+      const reason = getRefreshBlockReason()
+      if (reason) { setActionError(reason.replace('再刷新使用新版本', '再开始更新')); return }
+    }
     actionBusy.current = true
-    const previousJob = current.current.job
-    const version = path === '/install' ? previousJob?.version : component ? current.current.latest?.components[component]?.version : null
+    const requestID = crypto.randomUUID()
     confirmsUncertainRequest.current = null
     generation.current++
     setBusy(true)
@@ -90,28 +90,18 @@ export function UpdatesProvider({ children, pageVersion = __APP_VERSION__ }: { c
       try { sessionStorage.setItem('sunyu-update-checked-at', String(Date.now())) } catch { /* 存储不可用时仍允许手动检查。 */ }
     }
     try {
-      const next = await requestJson<UpdateState>(`${endpoint}${path}`, { method, body, timeoutMs: path === '/import' ? 120000 : 15000 })
+      const next = await requestJson<UpdateState>(`${endpoint}${path}`, { method, body, headers: { 'X-Update-Request-ID': requestID }, timeoutMs: path === '/import' ? 120000 : 15000 })
       if (mounted.current) accept(next)
     } catch (cause) {
       if (mounted.current) {
         const resultUnknown = !(cause instanceof ApiError) || cause.status === 0 || cause.status >= 500 || [408, 425, 429].includes(cause.status)
         setActionError(resultUnknown ? `提交结果尚未确认，正在查询后台任务；请勿重复提交。${errorText(cause)}` : errorText(cause))
         if (resultUnknown) {
+          pendingRequestID.current = path === '/preferences' ? null : requestID
           confirmsUncertainRequest.current = path === '/preferences'
             ? next => Object.entries(body as Partial<UpdateState['preferences']>).every(([key, value]) => next.preferences[key as keyof UpdateState['preferences']] === value)
-            : next => {
-              const job = next.job
-              // GET 恢复不证明本次提交已受理；旧任务、其他组件和版本不能解除保护。
-              if (!job || job.id === previousJob?.id) return false
-              if (path === '/install') return Boolean(component && version && job.component === component && job.version === version
-                && ['installing', 'success', 'failed', 'manual_recovery'].includes(job.status)
-                && (job.status !== 'success' || next.current[component] === version))
-              if (path === '/download') return job.component === component && job.version === version && ['downloading', 'ready', 'failed'].includes(job.status)
-              if (path === '/check') return job.component === null && job.version === null && ['checking', 'success', 'failed'].includes(job.status)
-              // 离线包的组件身份只能在服务端校验后得到；检查任务不能确认为导入结果。
-              return path === '/import' && ((job.status === 'ready' && Boolean(job.component && job.version))
-                || (['downloading', 'failed'].includes(job.status) && job.component === null && job.version === null))
-            }
+            // 只有服务端持久化的同一请求能确认受理，旧任务和其他窗口不能解除保护。
+            : next => (next.requested_job ?? next.job)?.request_id === requestID
           setUncertain(true)
           setConnectionError(errorText(cause))
         }
@@ -120,7 +110,7 @@ export function UpdatesProvider({ children, pageVersion = __APP_VERSION__ }: { c
       actionBusy.current = false
       if (mounted.current) { setBusy(false); void read() }
     }
-  }, [accept, read])
+  }, [accept, read, getRefreshBlockReason])
   const check = useCallback(async () => {
     await action('/check')
   }, [action])
@@ -137,7 +127,7 @@ export function UpdatesProvider({ children, pageVersion = __APP_VERSION__ }: { c
   }, [state, loading, busy, uncertain, connectionError, read, pollRevision])
   const lastAutoCheck = useRef(0)
   useEffect(() => {
-    if (!state?.supported || !state.preferences.auto_check || busy || uncertain || connectionError || isRunningJob(state.job) || state.job?.status === 'manual_recovery' || state.job?.status === 'ready') return
+    if (!state?.supported || !state.preferences.auto_check || busy || uncertain || connectionError || isRunningJob(state.job) || state.job?.status === 'manual_recovery') return
     let stored = 0
     try { stored = Number(sessionStorage.getItem('sunyu-update-checked-at')) || 0 } catch { /* 无存储时使用当前登录会话的检查间隔。 */ }
     if (Date.now() - Math.max(stored, lastAutoCheck.current) < checkInterval) return
@@ -148,8 +138,7 @@ export function UpdatesProvider({ children, pageVersion = __APP_VERSION__ }: { c
   return <UpdatesContext.Provider value={{
     state, loading, busy, uncertain, connectionError, actionError, refreshError, pageVersion, dismissed,
     dismiss: setDismissed, read, check,
-    download: component => action('/download', { component }),
-    install: component => action('/install', { component }),
+    update: () => action('/update'),
     importPackage: file => { const body = new FormData(); body.set('file', file, file.name); return action('/import', body) },
     preferences: patch => action('/preferences', patch, 'PATCH'),
     refreshPage: () => {

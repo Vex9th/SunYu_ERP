@@ -1,0 +1,606 @@
+[
+  {
+    "method": "POST",
+    "path": "/api/auth/setup"
+  },
+  {
+    "method": "POST",
+    "path": "/api/auth/login"
+  },
+  {
+    "method": "POST",
+    "path": "/api/auth/logout"
+  },
+  {
+    "method": "GET",
+    "path": "/api/auth/session"
+  },
+  {
+    "method": "GET",
+    "path": "/api/system/updates"
+  },
+  {
+    "method": "POST",
+    "path": "/api/system/updates/check"
+  },
+  {
+    "method": "POST",
+    "path": "/api/system/updates/download"
+  },
+  {
+    "method": "POST",
+    "path": "/api/system/updates/install"
+  },
+  {
+    "method": "POST",
+    "path": "/api/system/updates/import"
+  },
+  {
+    "method": "PATCH",
+    "path": "/api/system/updates/preferences"
+  },
+  {
+    "method": "GET",
+    "path": "/api/companies"
+  },
+  {
+    "method": "POST",
+    "path": "/api/companies"
+  },
+  {
+    "method": "GET",
+    "path": "/api/companies/{company_id}"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/companies/{company_id}"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/companies/{company_id}"
+  },
+  {
+    "method": "GET",
+    "path": "/api/companies/{company_id}/ledger"
+  },
+  {
+    "method": "POST",
+    "path": "/api/companies/{company_id}/contacts"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/companies/{company_id}/contacts/{contact_id}"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/companies/{company_id}/contacts/{contact_id}"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/archive"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/dashboard"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/close"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/restore"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/documents"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/documents"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/document-version-options"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/documents/{document_id}"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/documents/{document_id}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/documents/{document_id}/versions"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/documents/{document_id}/versions/{version_id}/download"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/document-versions/{version_id}/download"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/documents/{document_id}/archive"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/quotes"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/quotes"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/quotes/{quote_id}"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/quotes/{quote_id}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/quotes/{quote_id}/transition"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/contracts"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/contracts"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/contracts/{contract_id}"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/contracts/{contract_id}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/contracts/{contract_id}/transition"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/payments"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/payment-terms/{milestone}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/receipts"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/receipts/{receipt_id}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/receipts/{receipt_id}/void"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/stages"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/stages/{stage_code}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/stages/{stage_code}/transition"
+  },
+  {
+    "method": "GET",
+    "path": "/api/procurement/import-template.xlsx"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/procurement-lists"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/procurement-lists"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/procurement-lists/{list_id}"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/procurement-lists/{list_id}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/procurement-lists/{list_id}/lines"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/procurement-lists/{list_id}/lines/{line_id}"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/projects/{project_code}/procurement-lists/{list_id}/lines/{line_id}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/procurement-lists/{list_id}/confirm"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/procurement-lists/{list_id}/copy-as-draft"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/purchase-order-number-preview"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/purchase-orders"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/purchase-orders"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/purchase-orders/{order_id}"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/purchase-orders/{order_id}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/purchase-orders/{order_id}/confirm"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/purchase-orders/{order_id}/goods-receipts"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/procurement-options"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/procurement-overview"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/procurement-imports/preview"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/procurement-imports/{import_id}/confirm"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/purchase-orders/{order_id}/cancel"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/purchase-orders/{order_id}/supplier-payments"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/supplier-payments/{payment_id}/reverse"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/purchase-orders/{order_id}/supplier-invoices"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/supplier-invoices/{invoice_id}/reverse"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/goods-receipts/{receipt_id}/reverse"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/procurement-lists/{list_id}/quote-exports"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/quote-exports"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/quote-exports/{export_id}/download"
+  },
+  {
+    "method": "GET",
+    "path": "/api/inventory/items"
+  },
+  {
+    "method": "POST",
+    "path": "/api/inventory/items"
+  },
+  {
+    "method": "GET",
+    "path": "/api/inventory/items/{item_id}"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/inventory/items/{item_id}"
+  },
+  {
+    "method": "GET",
+    "path": "/api/inventory/items/{item_id}/movements"
+  },
+  {
+    "method": "POST",
+    "path": "/api/inventory/adjustments"
+  },
+  {
+    "method": "POST",
+    "path": "/api/inventory/adjustments/{adjustment_id}/reverse"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/inventory-issues"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/inventory-issues/{issue_id}/reverse"
+  },
+  {
+    "method": "GET",
+    "path": "/api/workers"
+  },
+  {
+    "method": "POST",
+    "path": "/api/workers"
+  },
+  {
+    "method": "GET",
+    "path": "/api/workers/{worker_id}"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/workers/{worker_id}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/workers/{worker_id}/deactivate"
+  },
+  {
+    "method": "POST",
+    "path": "/api/workers/{worker_id}/reactivate"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/crew-assignments"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/crew-assignments"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/crew-assignments/{assignment_id}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/crew-assignments/{assignment_id}/transition"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/labor-entries"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/labor-entries"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/labor-entries/{entry_id}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/labor-entries/{entry_id}/void"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/labor-entries/batch"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/site-daily-reports"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/site-daily-reports/{work_date}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/site-daily-reports/{work_date}/confirm"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/site-daily-reports/{work_date}/reopen"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/material-advances"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/material-advances"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/material-advances/{advance_id}"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/material-advances/{advance_id}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/material-advances/{advance_id}/reimbursements"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/material-advances/{advance_id}/reimbursements/{reimbursement_id}/void"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/material-advances/{advance_id}/void"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/drawing-signoffs"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/drawing-signoffs/{discipline}"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/commissioning-sessions"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/commissioning-sessions"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/commissioning-sessions/{session_id}"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/engineering-changes"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/engineering-changes"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/engineering-changes/{change_id}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/engineering-changes/{change_id}/transition"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/acceptances"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/acceptances"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/acceptances/{acceptance_id}/reschedule"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/acceptances/{acceptance_id}/cancel"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/acceptances/{acceptance_id}/complete"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/warranty"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/warranty"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/invoices"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/invoices"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/invoices/{invoice_id}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/invoices/{invoice_id}/void"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/after-sales"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/after-sales"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/projects/{project_code}/after-sales/{case_id}"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/{project_code}/after-sales/{case_id}/transition"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/{project_code}/delivery-summary"
+  },
+  {
+    "method": "GET",
+    "path": "/api/dashboard"
+  },
+  {
+    "method": "GET",
+    "path": "/api/system/overview"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/system/backup-settings"
+  },
+  {
+    "method": "POST",
+    "path": "/api/system/backups"
+  },
+  {
+    "method": "POST",
+    "path": "/api/system/backup-tasks"
+  },
+  {
+    "method": "GET",
+    "path": "/api/system/backup-tasks/{task_id}"
+  },
+  {
+    "method": "GET",
+    "path": "/api/health"
+  }
+]

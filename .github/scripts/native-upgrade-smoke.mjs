@@ -1,0 +1,199 @@
+/** Windows 隔离目录中验证旧正式包迁移、前端热切换、应用重启和清理。 */
+import { spawn, execFileSync } from 'node:child_process'
+import { createWriteStream } from 'node:fs'
+import { mkdir, readFile, writeFile, readdir, stat, unlink } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import assert from 'node:assert/strict'
+import net from 'node:net'
+import path from 'node:path'
+import { Client, seed, verify } from './release-smoke.mjs'
+
+const [legacyArg, fixturesArg, outputArg, version] = process.argv.slice(2)
+if (!legacyArg || !fixturesArg || !outputArg || !/^\d+\.\d+\.\d+$/.test(version ?? '') || process.platform !== 'win32') throw new Error('Usage (Windows): node native-upgrade-smoke.mjs <old-1.3.1.zip> <fixtures> <new-output> <candidate-version>')
+const [legacyZip, fixtures, output] = [legacyArg, fixturesArg, outputArg].map(value => path.resolve(value))
+const [major, minor, patch] = version.split('.').map(Number)
+const firstFrontend = `${major}.${minor}.${patch + 1}`
+const secondFrontend = `${major}.${minor}.${patch + 2}`
+const applicationVersion = `${major}.${minor}.${patch + 3}`
+const failureVersion = `${major}.${minor}.${patch + 4}`
+await mkdir(output)
+const root = path.join(output, 'installation')
+await mkdir(root)
+execFileSync('tar.exe', ['-xf', legacyZip, '-C', root])
+const listener = net.createServer()
+await new Promise(resolve => listener.listen(0, '127.0.0.1', resolve))
+const port = listener.address().port
+await new Promise(resolve => listener.close(resolve))
+const base = `http://127.0.0.1:${port}`
+const configPath = path.join(root, 'config.json')
+await writeFile(configPath, JSON.stringify({ host: '127.0.0.1', port, data_dir: 'customer/DATA', backup_enabled: false, session_secret: randomUUID() }), { flag: 'wx' })
+const checks = []
+let first, config, business, frontendPID
+const check = name => { checks.push(name); console.log(`PASS ${name}`) }
+const digest = buffer => createHash('sha256').update(buffer).digest('hex')
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
+async function eventually(fn, label, seconds = 90) {
+  const until = Date.now() + seconds * 1000
+  let last
+  do { try { return await fn() } catch (error) { if (error.terminal) throw error; last = error }; await delay(250) } while (Date.now() < until)
+  throw new Error(`${label}: ${last?.message}`)
+}
+function launch(exe, args, logName) {
+  const log = createWriteStream(path.join(output, logName), { flags: 'wx' })
+  const child = spawn(exe, args, { cwd: root, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+  child.stdout.pipe(log, { end: false }); child.stderr.pipe(log, { end: false })
+  child.on('error', error => log.write(String(error)))
+  child.once('close', () => log.end())
+  return child
+}
+async function health(version) {
+  return eventually(async () => {
+    const response = await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(1500) })
+    assert.equal(response.status, 200)
+    const body = await response.json()
+    assert.equal(body.status, 'ok'); assert.equal(body.backend_version, version)
+    assert.ok(Number.isInteger(body.pid) && body.pid > 0)
+    return body
+  }, `Health ${version}`)
+}
+async function noFile(relative) {
+  try { await stat(path.join(root, relative)); assert.fail(`Unexpected retained file ${relative}`) } catch (error) { if (error.code !== 'ENOENT') throw error }
+}
+async function catalog(version) {
+  await mkdir(path.join(root, '.updates'), { recursive: true })
+  await writeFile(path.join(root, '.updates/catalog-v2.json'), await readFile(path.join(fixtures, version, 'update-manifest-v2.json')))
+}
+async function job(requestID, expected = 'success', previousID) {
+  return eventually(async () => {
+    const file = requestID ? `.updates/requests/${requestID}.json` : '.updates/job.json'
+    const state = JSON.parse(await readFile(path.join(root, file), 'utf8'))
+    if (previousID) assert.notEqual(state.id, previousID, 'Waiting for the new helper transaction')
+    if (['success', 'failed', 'manual_recovery'].includes(state.status) && state.status !== expected) throw Object.assign(new Error(JSON.stringify(state)), { terminal: true })
+    assert.equal(state.status, expected, JSON.stringify(state))
+    return state
+  }, 'Update completion', 150)
+}
+async function assets(version) {
+  const response = await fetch(base, { signal: AbortSignal.timeout(3000) })
+  assert.equal(response.status, 200)
+  const html = await response.text()
+  const asset = html.match(/(?:src|href)="(\/__frontend\/[^/]+\/assets\/[^\"]+)"/)
+  assert.ok(asset, 'Versioned frontend resource missing')
+  assert.ok(asset[1].startsWith(`/__frontend/${version}/`), asset[1])
+  assert.equal((await fetch(base + asset[1])).status, 200)
+  return asset[1]
+}
+async function preserved(client) {
+  assert.deepEqual(await readFile(configPath), config, 'Config bytes changed')
+  assert.equal(await readFile(path.join(root, 'customer/DATA/customer-attachment.txt'), 'utf8'), '测试附件保留')
+  assert.equal(await readFile(path.join(root, 'runtime/customer-note.txt'), 'utf8'), '客户未知文件保留')
+  await verify(client, business)
+}
+async function importPackage(client, version, component, expected = 'success') {
+  await catalog(version)
+  const archive = path.join(fixtures, version, `SunYu_ERP-${component}-${version}.zip`)
+  const requestID = randomUUID()
+  const form = new FormData()
+  form.set('file', new Blob([await readFile(archive)], { type: 'application/zip' }), path.basename(archive))
+  const response = await fetch(`${base}/api/system/updates/import`, { method: 'POST', headers: { Cookie: client.cookie, Origin: base, 'X-Update-Request-ID': requestID }, body: form, signal: AbortSignal.timeout(30000) })
+  const responseText = await response.text()
+  assert.equal(response.status, 202, responseText)
+  await job(requestID, expected)
+  return requestID
+}
+async function migrate(target, expected, logName) {
+  let previousID
+  try { previousID = JSON.parse(await readFile(path.join(root, '.updates/job.json'), 'utf8')).id } catch (error) { if (error.code !== 'ENOENT') throw error }
+  await catalog(target)
+  const helper = launch(path.join(fixtures, version, 'SunYu_ERP_Upgrade.exe'), ['--root', root, '--package', path.join(fixtures, target, `SunYu_ERP-application-${target}.zip`), '--no-pause'], logName)
+  const result = await job(undefined, expected, previousID)
+  await eventually(() => { assert.equal(helper.exitCode, expected === 'success' ? 0 : 1); return true }, 'Upgrade helper exit', 30)
+  return result
+}
+try {
+  first = launch(path.join(root, 'SunYu_ERP.exe'), ['--headless'], 'legacy-launcher.log')
+  await health('1.3.1')
+  const client = new Client(base)
+  business = await seed(client)
+  await verify(client, business)
+  config = await readFile(configPath)
+  await writeFile(path.join(output, 'business-state.json'), JSON.stringify(business), { flag: 'wx' })
+  await writeFile(path.join(root, 'customer/DATA/customer-attachment.txt'), '测试附件保留', { flag: 'wx' })
+  await writeFile(path.join(root, 'runtime/customer-note.txt'), '客户未知文件保留', { flag: 'wx' })
+  await writeFile(path.join(root, '.upgrade-smoke-fixture'), 'isolated native upgrade smoke', { flag: 'wx' })
+  check('real 1.3.1 business data seeded and verified')
+  const legacyFailure = await migrate(failureVersion, 'failed', 'legacy-failed-upgrade.log')
+  assert.match(legacyFailure.message, /已恢复/)
+  assert.equal(await readFile(path.join(root, '.upgrade-smoke-failure-ran'), 'utf8'), 'yes')
+  await health('1.3.1')
+  await preserved(client)
+  await unlink(path.join(root, '.upgrade-smoke-failure-ran'))
+  check('failed Python-to-Go migration restores real Python service and original business data')
+  await migrate(version, 'success', 'legacy-upgrade.log')
+  await eventually(() => { assert.equal(first.exitCode, 0); return true }, 'Legacy launcher exit', 20)
+  frontendPID = (await health(version)).pid
+  // Use the cookie issued by Python before logging in again.
+  await client.request(`/api/projects/RELEASE-SMOKE/purchase-orders/${business.order_id}`)
+  check('Python session retained by Go')
+  await preserved(client)
+  const firstAsset = await assets(version)
+  await noFile('runtime/SunYuRuntime.exe')
+  await noFile('releases/backend/1.3.1/backend/app/main.py')
+  await noFile('installation.json')
+  check('1.3.1 migrated; DATA/config/business preserved; owned Python files cleaned; unknown file retained')
+
+  const firstID = await importPackage(client, firstFrontend, 'frontend')
+  assert.equal((await health(version)).pid, frontendPID)
+  const secondAsset = await assets(firstFrontend)
+  assert.equal((await fetch(base + firstAsset)).status, 200)
+  await preserved(client)
+  check('first frontend hot update; PID unchanged; previous assets accessible')
+  // Reusing a completed request must neither apply twice nor retain another upload.
+  await catalog(firstFrontend)
+  const replayForm = new FormData()
+  replayForm.set('file', new Blob([await readFile(path.join(fixtures, firstFrontend, `SunYu_ERP-frontend-${firstFrontend}.zip`))]), 'replay.zip')
+  const replay = await fetch(`${base}/api/system/updates/import`, { method: 'POST', headers: { Cookie: client.cookie, Origin: base, 'X-Update-Request-ID': firstID }, body: replayForm })
+  assert.equal(replay.status, 202, await replay.text())
+  assert.deepEqual(await readdir(path.join(root, '.updates/imports')), [])
+  check('completed import replay is idempotent and leaves no uploaded ZIP')
+  await importPackage(client, secondFrontend, 'frontend')
+  assert.equal((await health(version)).pid, frontendPID)
+  await assets(secondFrontend)
+  assert.equal((await fetch(base + secondAsset)).status, 200)
+  await noFile(`app/web/${version}/index.html`)
+  await preserved(client)
+  check('second frontend update retains one previous version and removes oldest')
+
+  const oldLauncher = digest(await readFile(path.join(root, 'SunYu_ERP.exe')))
+  await importPackage(client, applicationVersion, 'application')
+  assert.notEqual((await health(applicationVersion)).pid, frontendPID)
+  await assets(applicationVersion)
+  const installed = JSON.parse(await readFile(path.join(root, 'app/manifest.json'), 'utf8'))
+  assert.equal(installed.launcher_version, applicationVersion)
+  for (const [relative, hash] of Object.entries(installed.files)) assert.equal(digest(await readFile(path.join(root, relative))), hash, relative)
+  assert.notEqual(digest(await readFile(path.join(root, 'SunYu_ERP.exe'))), oldLauncher)
+  await preserved(client)
+  const backups = await readdir(path.join(root, '.updates/rollback'), { withFileTypes: true })
+  assert.equal(backups.filter(entry => entry.isDirectory()).length, 1)
+  assert.deepEqual(await readdir(path.join(root, '.updates/imports')), [])
+  check('application update replaced launcher/service and restarted backend; one rollback snapshot; all data intact')
+  const previousManifest = await readFile(path.join(root, 'app/manifest.json'))
+  const failureID = await importPackage(client, failureVersion, 'application', 'failed')
+  const failure = await job(failureID, 'failed')
+  assert.match(failure.message, /已恢复/)
+  assert.equal(await readFile(path.join(root, '.upgrade-smoke-failure-ran'), 'utf8'), 'yes', 'Failure service did not run')
+  await health(applicationVersion)
+  await assets(applicationVersion)
+  assert.deepEqual(await readFile(path.join(root, 'app/manifest.json')), previousManifest)
+  await preserved(client)
+  check('real failed startup after SQLite write automatically restores program, database, config and attachments')
+  await writeFile(path.join(output, 'native-upgrade-result.json'), JSON.stringify({ status: 'passed', version, network_catalog: 'controlled offline catalog fixture; live GitHub check not tested', checks }, null, 2), { flag: 'wx' })
+} finally {
+  await mkdir(path.join(root, '.updates'), { recursive: true })
+  await writeFile(path.join(root, '.updates/shutdown'), 'isolated upgrade smoke cleanup')
+  await eventually(async () => {
+    let online = false
+    try { online = (await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(500) })).ok } catch { }
+    assert.equal(online, false, 'Owned smoke service remains running')
+  }, 'Graceful cleanup', 30)
+}
