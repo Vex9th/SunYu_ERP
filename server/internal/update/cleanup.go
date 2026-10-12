@@ -59,9 +59,10 @@ func (e *Engine) cleanupWork(keep string, finishCurrent bool) error {
 		if err != nil {
 			return err
 		}
+		selfInWork := filepath.Dir(self) == dir
 		complete := true
 		for _, child := range children {
-			if child.Name() == "work.json" {
+			if child.Name() == "work.json" || selfInWork && child.Name() == "request.json" {
 				continue
 			}
 			p := filepath.Join(dir, child.Name())
@@ -111,4 +112,21 @@ func (e *Engine) pruneRequests() {
 		_ = os.Remove(old[0].path)
 		old = old[1:]
 	}
+}
+
+func (e *Engine) ensureWork(id string) (string, error) {
+	dir, err := safePath(e.Root, ".updates/work/"+id)
+	if err != nil {
+		return "", err
+	}
+	var marker map[string]string
+	if err = readJSON(filepath.Join(dir, "work.json"), &marker); err == nil {
+		if !regexpJobID(id) || marker["application"] != Application || marker["id"] != id {
+			return "", errors.New("更新目录归属无效")
+		}
+		return dir, nil
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	return e.createWork(id)
 }

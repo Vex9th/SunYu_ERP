@@ -22,14 +22,14 @@ for (let increment = 1; increment <= 4; increment++) {
   await mkdir(bin)
   execFileSync(process.execPath, [path.join(repository, 'frontend/node_modules/vite/bin/vite.js'), 'build', '--outDir', web], { cwd: path.join(repository, 'frontend'), env: { ...process.env, SUNYU_VERSION: fixtureVersion }, stdio: 'inherit' })
   // Frontend-only versions keep the original binary identities. The third
-  // fixture has newly compiled identities and must restart both native parts.
+  // fixture changes the launcher, service and independent updater identities.
   const nativeVersion = increment >= 3 ? fixtureVersion : version
   const launcherVersion = increment === 4 ? `${major}.${minor}.${patch + 3}` : nativeVersion
-  for (const [name, command, gui] of [['SunYu_ERP.exe', 'launcher', true], ['SunYuService.exe', 'service', true], ['SunYu_ERP_Upgrade.exe', 'upgrade', false]]) {
+  for (const [name, command, gui] of [['SunYu_ERP.exe', 'launcher', true], ['SunYuService.exe', 'service', true], ['update.exe', 'updater', false]]) {
     if (increment < 3) {
-      const relative = name === 'SunYu_ERP_Upgrade.exe' ? name : path.join('SunYu_ERP', name === 'SunYuService.exe' ? path.join('app', name) : name)
+      const relative = path.join('SunYu_ERP', name === 'SunYuService.exe' ? path.join('app', name) : name)
       await cp(path.join(candidate, relative), path.join(bin, name), { force: false, errorOnExist: true })
-    } else if (increment === 4) {
+    } else if (increment === 4 && command !== 'updater') {
       if (command !== 'service') {
         await cp(path.join(output, `fixture-build-${launcherVersion}`, 'bin', name), path.join(bin, name), { force: false, errorOnExist: true })
       } else {

@@ -1,10 +1,9 @@
-// SunYu_ERP_Upgrade is the one-time bridge from the Python distribution to the native layout.
+// update.exe owns downloads, installation and recovery independently of the service.
 package main
 
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,26 +11,18 @@ import (
 	"os"
 	"path/filepath"
 	"sunyu.local/erp/internal/update"
-	"time"
 )
 
 var version = "2.0.0-dev"
 
 func main() {
-	if len(os.Args) == 4 && os.Args[1] == "--apply-update" {
-		if err := update.RunHelper(os.Args[2], os.Args[3]); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		return
-	}
 	err := run()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "升级失败：", err)
 	}
 	noPause := flag.Lookup("no-pause")
 	printVersion := flag.Lookup("version")
-	if noPause != nil && printVersion != nil && noPause.Value.String() != "true" && printVersion.Value.String() != "true" {
+	if noPause != nil && printVersion != nil && noPause.Value.String() != "true" && printVersion.Value.String() != "true" && !errors.Is(err, update.ErrBusy) && (flag.Lookup("worker").Value.String() == "true" || flag.Lookup("recover").Value.String() == "true" || err != nil) {
 		pauseStandaloneConsole()
 	}
 	if err != nil {
@@ -46,19 +37,26 @@ func run() error {
 	root := flag.String("root", filepath.Dir(exe), "原程序安装目录（包含 config.json 和 DATA）")
 	archive := flag.String("package", "", "已下载的官方完整更新包（可选）")
 	printVersion := flag.Bool("version", false, "显示版本")
-	flag.Bool("no-pause", false, "完成后直接退出（用于命令行自动验证）")
+	noPause := flag.Bool("no-pause", false, "完成后直接退出（用于命令行自动验证）")
+	worker := flag.Bool("worker", false, "内部更新工作进程")
+	recover := flag.Bool("recover", false, "内部恢复工作进程")
+	job := flag.String("job", "", "内部更新任务")
 	flag.Parse()
 	if *printVersion {
 		fmt.Println(version)
 		return nil
 	}
-	e, err := update.New(*root)
+	if *worker || *recover {
+		return update.RunWorker(*root, *job, *recover)
+	}
+	e, err := update.NewController(*root)
 	if err != nil {
 		return err
 	}
 	defer e.Close()
+	e.Visible = !*noPause
 	if id, pending := update.Pending(e.Root); pending {
-		return update.RunHelper(e.Root, id)
+		return e.Recover(id)
 	}
 	b := make([]byte, 16)
 	if _, err = rand.Read(b); err != nil {
@@ -80,27 +78,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	last := ""
-	for {
-		state := e.Status()
-		b, _ := json.Marshal(state["job"])
-		var j update.Job
-		if err = json.Unmarshal(b, &j); err != nil {
-			return err
-		}
-		if j.Message != last {
-			fmt.Println(j.Message)
-			last = j.Message
-		}
-		switch j.Status {
-		case "success":
-			fmt.Println("升级完成。请使用原目录的 SunYu_ERP.exe 启动。")
-			return nil
-		case "failed", "manual_recovery":
-			return fmt.Errorf("%s：%s", j.Message, j.Error)
-		}
-		time.Sleep(500 * time.Millisecond)
+	if err = e.WaitHandoff(id); err != nil {
+		return err
 	}
+	fmt.Println("独立更新进程已启动，可在网页设置中查看进度。")
+	return nil
 }
 
 // Bind temporary uploads to opened directories so cleanup cannot follow a replaced path.

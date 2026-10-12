@@ -13,9 +13,10 @@ import (
 func applicationFixture(t *testing.T, root, version string) Manifest {
 	m := testManifest(version, "application")
 	m.BackendVersion, m.LauncherVersion = version, version
+	m.Files["update.exe"] = digest("updater" + version)
 	m.Files["SunYu_ERP.exe"] = digest("launcher" + version)
 	m.Files["app/SunYuService.exe"] = digest("service" + version)
-	installFixture(t, root, m, map[string]string{"SunYu_ERP.exe": "launcher" + version, "app/SunYuService.exe": "service" + version, "app/web/" + version + "/index.html": "new"})
+	installFixture(t, root, m, map[string]string{"update.exe": "updater" + version, "SunYu_ERP.exe": "launcher" + version, "app/SunYuService.exe": "service" + version, "app/web/" + version + "/index.html": "new"})
 	return m
 }
 func TestTransactionRollbackRestoresExactDataConfigAndProgram(t *testing.T) {
@@ -494,5 +495,116 @@ func TestRestoreRejectsIncompleteTransactionMetadataBeforeChanges(t *testing.T) 
 	b, _ := os.ReadFile(filepath.Join(root, "Data/db"))
 	if string(b) != "keep" {
 		t.Fatal("data changed")
+	}
+}
+
+func TestProgressStorageFailureDoesNotAlterTransactionRecoveryState(t *testing.T) {
+	for _, phase := range []string{"installing", "cleaning"} {
+		t.Run(phase, func(t *testing.T) {
+			e := testEngine(t, t.TempDir())
+			j := Job{ID: "ed41cab3882b4496484d7791", RequestID: "6057b208-09d0-4994-bd1e-53de0f9e5f91", Status: phase, Phase: phase}
+			if err := os.Mkdir(filepath.Join(e.Root, ".updates/job.json"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.progress(&j, phase, "stage progress", 50); err == nil {
+				t.Fatal("progress storage error ignored")
+			}
+			if j.Status != phase || j.Phase != phase || j.PersistenceError != "" {
+				t.Fatal("UI storage failure poisoned transaction stage", j)
+			}
+			visible, err := e.Request(j.RequestID)
+			if err != nil || visible.Status != "failed" || visible.PersistenceError == "" {
+				t.Fatal("UI storage failure not visible", visible, err)
+			}
+		})
+	}
+}
+func TestVerifiedRecoveryWithFailedDisplayStatusNeverRollsBackData(t *testing.T) {
+	e := testEngine(t, t.TempDir())
+	old := applicationFixture(t, e.Root, "2.0.0")
+	id := "6c7970876523890c32972939"
+	work, err := e.createWork(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage := filepath.Join(work, "stage")
+	next := applicationFixture(t, stage, "2.0.1")
+	data := filepath.Join(e.Root, "Data")
+	if err = os.Mkdir(data, 0700); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(data, "record"), []byte("old"), 0600)
+	tx := Transaction{Job: Job{ID: id, RequestID: "b1d9c8e1-e189-4c21-b7dc-1374310c4dbf", Status: "installing"}, Manifest: next, Old: old, Stage: stage, State: "prepared"}
+	if err = e.backup(&tx); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.replaceProgram(&tx); err != nil {
+		t.Fatal(err)
+	}
+	tx.State, tx.Job.Status = "verified", "failed"
+	if err = e.saveTransaction(&tx); err != nil {
+		t.Fatal(err)
+	}
+	if _, pending := Pending(e.Root); !pending {
+		t.Fatal("unfinished verified transaction skipped recovery")
+	}
+	if err = os.WriteFile(filepath.Join(data, "record"), []byte("new business write"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	release, err := lifecycle.Acquire(e.Root, "launcher.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if err = RunHelper(e.Root, id); err != nil {
+		t.Fatal("verified recovery refused display failure", err)
+	}
+	got, _ := os.ReadFile(filepath.Join(data, "record"))
+	if string(got) != "new business write" {
+		t.Fatal("verified recovery restored old DATA", string(got))
+	}
+	var durable Transaction
+	if err = readJSON(filepath.Join(e.Root, ".updates/transaction-v2.json"), &durable); err != nil || durable.State != "completed" {
+		t.Fatal(durable.State, err)
+	}
+}
+func TestReplacingRecoveryAcceptsFailedDisplayStatusAndRestoresData(t *testing.T) {
+	e := testEngine(t, t.TempDir())
+	old := applicationFixture(t, e.Root, "2.0.0")
+	id := "9f7bf9ae7a8f67a1e60a5e1c"
+	work, err := e.createWork(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage := filepath.Join(work, "stage")
+	next := applicationFixture(t, stage, "2.0.1")
+	data := filepath.Join(e.Root, "Data")
+	os.Mkdir(data, 0700)
+	os.WriteFile(filepath.Join(data, "record"), []byte("old"), 0600)
+	tx := Transaction{Job: Job{ID: id, RequestID: "9dad5b4e-6a72-4c28-9ec5-530e1633f7f6", Status: "installing"}, Manifest: next, Old: old, Stage: stage, State: "prepared"}
+	if err = e.backup(&tx); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.replaceProgram(&tx); err != nil {
+		t.Fatal(err)
+	}
+	tx.State, tx.Job.Status = "replacing", "failed"
+	if err = e.saveTransaction(&tx); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(data, "record"), []byte("partial migration"), 0600)
+	_ = e.mark("maintenance")
+	// Fixture launcher bytes are deliberately not executable: after restoring the
+	// snapshot the recovery reports manual recovery, but must not reject the state.
+	if err = RunHelper(e.Root, id); err == nil {
+		t.Fatal("fixture launcher unexpectedly ran")
+	}
+	got, _ := os.ReadFile(filepath.Join(data, "record"))
+	if string(got) != "old" {
+		t.Fatal("interrupted replacing transaction did not restore DATA", string(got))
+	}
+	var durable Transaction
+	if err = readJSON(filepath.Join(e.Root, ".updates/transaction-v2.json"), &durable); err != nil || durable.RestorePhase != "complete" {
+		t.Fatal(durable.RestorePhase, err)
 	}
 }

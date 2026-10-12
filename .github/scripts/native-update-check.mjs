@@ -1,6 +1,6 @@
 /** 对已完成 native-smoke 的隔离安装执行真实官方更新检查；绝不触发安装。 */
 import { spawn } from 'node:child_process'
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, writeFile, realpath } from 'node:fs/promises'
 import { createWriteStream } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
@@ -9,7 +9,7 @@ import { Client } from './release-smoke.mjs'
 
 const [rootArg, phase = 'prepublish'] = process.argv.slice(2)
 if (!rootArg || !['prepublish', 'postpublish'].includes(phase)) throw new Error('Usage: node native-update-check.mjs <native-smoke-installation> [prepublish|postpublish]')
-const root = path.resolve(rootArg)
+const root = await realpath(path.resolve(rootArg))
 const proof = JSON.parse(await readFile(path.join(root, 'native-smoke-result.json'), 'utf8'))
 assert.equal(proof.status, 'passed')
 const configBytes = await readFile(path.join(root, 'config.json'))
@@ -32,7 +32,11 @@ async function eventually(fn, seconds) {
 }
 let report
 try {
-  await eventually(async () => { assert.equal(child.exitCode, null); assert.equal((await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(1500) })).status, 200) }, 45)
+  await eventually(async () => {
+    assert.equal(child.exitCode, null)
+    const response = await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(1500) })
+    assert.equal(response.status, 200)
+  }, 45)
   const client = new Client(base)
   await client.post('/api/auth/login', { password: state.password }, 204)
   const requestID = randomUUID()
@@ -50,7 +54,14 @@ try {
   assert.deepEqual(await readFile(path.join(root, 'app/manifest.json')), manifest)
   assert.deepEqual(await readFile(path.join(root, 'config.json')), configBytes)
   assert.equal(status.current.backend, proof.version)
-  report = { status: 'passed', phase, installed: proof.version, official_catalog_format: catalog.format, official_version: catalog.version, official_backend: catalog.backend_version, official_frontend: catalog.frontend_version, program_unchanged: true, installation_requested: false }
+  // The public API exposes component offers, not Engine.update_available.
+  const offeredComponents = status.latest?.components ?? {}
+  if (catalog.format === 1) assert.deepEqual(offeredComponents, {}, 'Legacy catalog offered an incompatible component package')
+  else {
+    assert.deepEqual(Object.keys(offeredComponents).sort(), Object.keys(catalog.packages).sort(), 'Public API omitted a catalog component')
+    for (const [component, metadata] of Object.entries(offeredComponents)) assert.equal(metadata.version, status.current[component], `Unexpected ${component} version offered after installing the current release`)
+  }
+  report = { status: 'passed', phase, installed: proof.version, official_catalog_format: catalog.format, official_version: catalog.version, official_backend: catalog.backend_version, official_frontend: catalog.frontend_version, newer_components_offered: false, program_unchanged: true, installation_requested: false }
   console.log(JSON.stringify(report))
 } catch (error) {
   report = { status: 'failed', phase, error: error.message }

@@ -38,7 +38,7 @@ func Build(o Options) (Result, error) {
 	}
 	m := update.Manifest{Format: 2, Application: update.Application, Version: o.Version, BackendVersion: o.BackendVersion, FrontendVersion: o.Version, LauncherVersion: o.LauncherVersion, APIVersion: 1, Component: "application", Files: map[string]string{}}
 	// Validate version/path syntax before constructing any destination paths.
-	for _, p := range []string{"SunYu_ERP.exe", "app/SunYuService.exe", "app/web/" + o.Version + "/index.html"} {
+	for _, p := range []string{"SunYu_ERP.exe", "app/SunYuService.exe", "update.exe", "app/web/" + o.Version + "/index.html"} {
 		m.Files[p] = strings.Repeat("0", 64)
 	}
 	if err := m.Validate(); err != nil {
@@ -83,7 +83,7 @@ func Build(o Options) (Result, error) {
 		return Result{}, err
 	}
 	defer web.Close()
-	for _, name := range []string{"SunYu_ERP.exe", "SunYuService.exe", "SunYu_ERP_Upgrade.exe"} {
+	for _, name := range []string{"SunYu_ERP.exe", "SunYuService.exe", "update.exe"} {
 		f, err := openRegular(bin, name)
 		if err != nil {
 			return Result{}, err
@@ -98,7 +98,7 @@ func Build(o Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	m.Files = map[string]string{"SunYu_ERP.exe": strings.Repeat("0", 64), "app/SunYuService.exe": strings.Repeat("0", 64)}
+	m.Files = map[string]string{"SunYu_ERP.exe": strings.Repeat("0", 64), "app/SunYuService.exe": strings.Repeat("0", 64), "update.exe": strings.Repeat("0", 64)}
 	for _, name := range webFiles {
 		m.Files["app/web/"+o.Version+"/"+name] = strings.Repeat("0", 64)
 	}
@@ -120,7 +120,7 @@ func Build(o Options) (Result, error) {
 	if err = os.MkdirAll(installation, 0755); err != nil {
 		return Result{}, err
 	}
-	for _, name := range []string{"SunYu_ERP.exe", "SunYuService.exe"} {
+	for _, name := range []string{"SunYu_ERP.exe", "SunYuService.exe", "update.exe"} {
 		target := name
 		if name == "SunYuService.exe" {
 			target = "app/" + name
@@ -151,7 +151,7 @@ func Build(o Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	for _, name := range []string{"SunYu_ERP.exe", "app/SunYuService.exe"} {
+	for _, name := range []string{"SunYu_ERP.exe", "app/SunYuService.exe", "update.exe"} {
 		f, e := os.Open(filepath.Join(installation, filepath.FromSlash(name)))
 		if e != nil {
 			return Result{}, e
@@ -167,17 +167,19 @@ func Build(o Options) (Result, error) {
 	if err = writeJSON(filepath.Join(installation, "app", "manifest.json"), installed); err != nil {
 		return Result{}, err
 	}
-	if _, err = copySnapshot(bin, "SunYu_ERP_Upgrade.exe", filepath.Join(stage, "SunYu_ERP_Upgrade.exe"), 0755); err != nil {
-		return Result{}, err
-	}
-	upgrade, err := os.Open(filepath.Join(stage, "SunYu_ERP_Upgrade.exe"))
+	// The standalone first-migration download must be byte-for-byte identical to
+	// the installed updater, even if the supplied build directory changes later.
+	installationRoot, err := os.OpenRoot(installation)
 	if err != nil {
 		return Result{}, err
 	}
-	err = validateAMD64(upgrade)
-	_ = upgrade.Close()
+	updaterHash, err := copySnapshot(installationRoot, "update.exe", filepath.Join(stage, "update.exe"), 0755)
+	_ = installationRoot.Close()
 	if err != nil {
 		return Result{}, err
+	}
+	if updaterHash != m.Files["update.exe"] {
+		return Result{}, errors.New("独立更新器与程序内更新器不一致")
 	}
 	applicationName := "SunYu_ERP-application-" + o.Version + ".zip"
 	frontendName := "SunYu_ERP-frontend-" + o.Version + ".zip"
@@ -212,7 +214,7 @@ func Build(o Options) (Result, error) {
 	if err = writeLegacyCatalog(filepath.Join(stage, "update-manifest.json"), o.Version); err != nil {
 		return Result{}, err
 	}
-	names := []string{"SunYu_ERP-windows-x64.zip", applicationName, frontendName, "SunYu_ERP_Upgrade.exe", "update-manifest-v2.json", "update-manifest.json"}
+	names := []string{"SunYu_ERP-windows-x64.zip", applicationName, frontendName, "update.exe", "update-manifest-v2.json", "update-manifest.json"}
 	sort.Strings(names)
 	result := Result{Output: o.Output, Artifacts: []Artifact{}}
 	var sums strings.Builder

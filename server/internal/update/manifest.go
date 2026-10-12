@@ -74,7 +74,7 @@ func validPath(p string) bool {
 	return true
 }
 func managedPath(p string) bool {
-	return p == "SunYu_ERP.exe" || p == "app/SunYuService.exe" || strings.HasPrefix(p, "app/web/")
+	return p == "update.exe" || p == "SunYu_ERP.exe" || p == "app/SunYuService.exe" || strings.HasPrefix(p, "app/web/")
 }
 func (m Manifest) Validate() error {
 	if m.Format != 2 || m.Application != Application || m.APIVersion != 1 {
@@ -109,7 +109,7 @@ func (m Manifest) Validate() error {
 		return errors.New("更新包缺少前端首页")
 	}
 	if m.Component == "application" {
-		for _, p := range []string{"SunYu_ERP.exe", "app/SunYuService.exe"} {
+		for _, p := range []string{"SunYu_ERP.exe", "app/SunYuService.exe", "update.exe"} {
 			if _, ok := m.Files[p]; !ok {
 				return fmt.Errorf("完整更新包缺少 %s", p)
 			}
@@ -119,7 +119,7 @@ func (m Manifest) Validate() error {
 }
 func ReadManifest(root string) (Manifest, error) {
 	var m Manifest
-	b, e := os.ReadFile(filepath.Join(root, "app", "manifest.json"))
+	b, e := readStateFile(filepath.Join(root, "app", "manifest.json"), 8<<20)
 	if e != nil {
 		return m, e
 	}
@@ -197,7 +197,7 @@ func atomicBytes(p string, b []byte, mode os.FileMode) error {
 	if e != nil {
 		return e
 	}
-	return os.Rename(f.Name(), p)
+	return replaceStateFile(f.Name(), p)
 }
 func copyFile(src, dst string) error {
 	in, e := os.Open(src)
@@ -340,7 +340,7 @@ func VerifyInstallation(root string) error {
 	if err != nil {
 		return fmt.Errorf("程序安装清单缺失或损坏，请保留 DATA 和 config.json 后恢复完整程序：%w", err)
 	}
-	for _, required := range []string{"SunYu_ERP.exe", "app/SunYuService.exe"} {
+	for _, required := range []string{"SunYu_ERP.exe", "app/SunYuService.exe", "update.exe"} {
 		if _, ok := m.Files[required]; !ok {
 			return fmt.Errorf("安装清单缺少程序文件：%s", required)
 		}

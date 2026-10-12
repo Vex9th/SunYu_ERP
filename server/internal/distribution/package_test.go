@@ -51,7 +51,7 @@ func fixture(t *testing.T) Options {
 	if err := os.MkdirAll(filepath.Join(o.WebDir, "assets"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"SunYu_ERP.exe", "SunYuService.exe", "SunYu_ERP_Upgrade.exe"} {
+	for _, name := range []string{"SunYu_ERP.exe", "SunYuService.exe", "update.exe"} {
 		if err := os.WriteFile(filepath.Join(o.BinDir, name), fixturePE(pe.IMAGE_FILE_MACHINE_AMD64), 0700); err != nil {
 			t.Fatal(err)
 		}
@@ -94,8 +94,13 @@ func TestBuildGeneratesVerifiedNativeRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.Version != o.Version || m.Component != "" || len(m.Files) != 5 {
+	if m.Version != o.Version || m.Component != "" || len(m.Files) != 6 {
 		t.Fatalf("wrong installed manifest: %#v", m)
+	}
+	for _, p := range []string{"SunYu_ERP.exe", "app/SunYuService.exe", "update.exe", "app/web/2.0.1/index.html", "app/web/2.0.1/assets/main.js", "app/web/2.0.1/assets/main.css"} {
+		if _, ok := m.Files[p]; !ok {
+			t.Fatalf("installed manifest missing %s", p)
+		}
 	}
 	for p, h := range m.Files {
 		if fileHash(t, filepath.Join(installation, filepath.FromSlash(p))) != h {
@@ -116,6 +121,9 @@ func TestBuildGeneratesVerifiedNativeRelease(t *testing.T) {
 		if extracted.Component != component {
 			t.Fatal(extracted.Component)
 		}
+		if component == "application" && extracted.Files["update.exe"] != m.Files["update.exe"] {
+			t.Fatal("application package does not include the installed updater")
+		}
 		for p := range extracted.Files {
 			if component == "frontend" && !strings.HasPrefix(p, "app/web/2.0.1/") {
 				t.Fatalf("unexpected frontend payload: %s", p)
@@ -127,12 +135,19 @@ func TestBuildGeneratesVerifiedNativeRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer full.Close()
-	if len(full.File) != 6 {
+	if len(full.File) != 7 {
 		t.Fatalf("full archive members %d", len(full.File))
 	}
+	fullMembers := map[string]bool{}
 	for _, f := range full.File {
+		fullMembers[f.Name] = true
 		if !strings.HasPrefix(f.Name, "SunYu_ERP/") || f.FileInfo().IsDir() {
 			t.Fatalf("wrong full archive entry %s", f.Name)
+		}
+	}
+	for p := range m.Files {
+		if !fullMembers["SunYu_ERP/"+p] {
+			t.Fatalf("full archive missing %s", p)
 		}
 	}
 	var catalog update.Catalog
@@ -154,7 +169,7 @@ func TestBuildGeneratesVerifiedNativeRelease(t *testing.T) {
 	if err = json.Unmarshal(b, &legacy); err != nil {
 		t.Fatal(err)
 	}
-	if len(legacy) != 4 || legacy["format"] != float64(1) || legacy["version"] != o.Version || !strings.Contains(legacy["notes"].(string), "SunYu_ERP_Upgrade.exe") {
+	if len(legacy) != 4 || legacy["format"] != float64(1) || legacy["version"] != o.Version || !strings.Contains(legacy["notes"].(string), "/update.exe") || strings.Contains(legacy["notes"].(string), "SunYu_ERP_Upgrade.exe") {
 		t.Fatalf("wrong legacy catalog: %#v", legacy)
 	}
 	components := legacy["components"].(map[string]any)
@@ -179,13 +194,16 @@ func TestBuildGeneratesVerifiedNativeRelease(t *testing.T) {
 			t.Fatalf("wrong artifact %v", a)
 		}
 	}
-	if fileHash(t, filepath.Join(o.Output, "SunYu_ERP_Upgrade.exe")) != fileHash(t, filepath.Join(o.BinDir, "SunYu_ERP_Upgrade.exe")) {
-		t.Fatal("upgrade helper changed")
+	if fileHash(t, filepath.Join(o.Output, "update.exe")) != m.Files["update.exe"] || fileHash(t, filepath.Join(o.Output, "update.exe")) != fileHash(t, filepath.Join(o.BinDir, "update.exe")) {
+		t.Fatal("standalone updater differs from the installed updater")
+	}
+	if _, err := os.Stat(filepath.Join(o.Output, "SunYu_ERP_Upgrade.exe")); !os.IsNotExist(err) {
+		t.Fatalf("obsolete standalone upgrade helper was published: %v", err)
 	}
 }
 
 func TestBuildRejectsBadInputsWithoutPublishing(t *testing.T) {
-	for _, name := range []string{"wrong-machine", "not-pe", "old-frontend-base", "missing-asset", "case-alias", "invalid-version", "symlink-web", "output-inside-web"} {
+	for _, name := range []string{"wrong-machine", "not-pe", "missing-updater", "wrong-updater-machine", "not-updater-pe", "old-frontend-base", "missing-asset", "case-alias", "invalid-version", "symlink-web", "output-inside-web"} {
 		t.Run(name, func(t *testing.T) {
 			o := fixture(t)
 			switch name {
@@ -193,6 +211,12 @@ func TestBuildRejectsBadInputsWithoutPublishing(t *testing.T) {
 				_ = os.WriteFile(filepath.Join(o.BinDir, "SunYuService.exe"), fixturePE(pe.IMAGE_FILE_MACHINE_ARM64), 0700)
 			case "not-pe":
 				_ = os.WriteFile(filepath.Join(o.BinDir, "SunYu_ERP.exe"), []byte("not a native executable"), 0700)
+			case "missing-updater":
+				_ = os.Remove(filepath.Join(o.BinDir, "update.exe"))
+			case "wrong-updater-machine":
+				_ = os.WriteFile(filepath.Join(o.BinDir, "update.exe"), fixturePE(pe.IMAGE_FILE_MACHINE_ARM64), 0700)
+			case "not-updater-pe":
+				_ = os.WriteFile(filepath.Join(o.BinDir, "update.exe"), []byte("not a native executable"), 0700)
 			case "old-frontend-base":
 				_ = os.WriteFile(filepath.Join(o.WebDir, "index.html"), []byte(`<script src="/assets/main.js"></script>`), 0600)
 			case "missing-asset":

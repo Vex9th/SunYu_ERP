@@ -1,7 +1,7 @@
 /** Windows 隔离目录中验证旧正式包迁移、前端热切换、应用重启和清理。 */
 import { spawn, execFileSync } from 'node:child_process'
 import { createWriteStream } from 'node:fs'
-import { mkdir, readFile, writeFile, readdir, stat, lstat, realpath, unlink } from 'node:fs/promises'
+import { cp, mkdir, readFile, writeFile, readdir, stat, lstat, realpath, unlink } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import assert from 'node:assert/strict'
 import net from 'node:net'
@@ -17,8 +17,9 @@ const secondFrontend = `${major}.${minor}.${patch + 2}`
 const applicationVersion = `${major}.${minor}.${patch + 3}`
 const failureVersion = `${major}.${minor}.${patch + 4}`
 await mkdir(output)
-const root = path.join(output, 'installation')
-await mkdir(root)
+const installation = path.join(output, 'installation')
+await mkdir(installation)
+const root = await realpath(installation)
 execFileSync('tar.exe', ['-xf', legacyZip, '-C', root])
 const listener = net.createServer()
 await new Promise(resolve => listener.listen(0, '127.0.0.1', resolve))
@@ -42,8 +43,13 @@ if (dataMode !== 'relative') {
 }
 const accessedData = path.isAbsolute(configuredData) ? configuredData : path.join(root, configuredData)
 await writeFile(configPath, JSON.stringify({ host: '127.0.0.1', port, data_dir: configuredData, backup_enabled: false, session_secret: randomUUID() }), { flag: 'wx' })
+// First-time 1.3.1 migration uses the same updater users download into their
+// old directory; it remains installed after both failure and success.
+const migrationUpdater = await readFile(path.join(fixtures, version, 'update.exe'))
+await writeFile(path.join(root, 'update.exe'), migrationUpdater, { flag: 'wx' })
 const checks = []
-let first, config, business, frontendPID
+let first, config, business, frontendPID, servicePID
+const updateProcesses = new Map()
 const check = name => { checks.push(name); console.log(`PASS ${name}`) }
 const digest = buffer => createHash('sha256').update(buffer).digest('hex')
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -68,6 +74,7 @@ async function health(version) {
     const body = await response.json()
     assert.equal(body.status, 'ok'); assert.equal(body.backend_version, version)
     assert.ok(Number.isInteger(body.pid) && body.pid > 0)
+    servicePID = body.pid
     return body
   }, `Health ${version}`)
 }
@@ -78,11 +85,36 @@ async function catalog(version) {
   await mkdir(path.join(root, '.updates'), { recursive: true })
   await writeFile(path.join(root, '.updates/catalog-v2.json'), await readFile(path.join(fixtures, version, 'update-manifest-v2.json')))
 }
+function verifyUpdateOwner(state) {
+  if (!state.owner_pid && !state.owner_exe && !['success', 'failed', 'manual_recovery'].includes(state.status)) return
+  assert.ok(Number.isInteger(state.owner_pid) && state.owner_pid > 0, `Missing updater owner PID: ${JSON.stringify(state)}`)
+  assert.notEqual(state.owner_pid, servicePID, 'Business service executed the update job')
+  assert.match(state.id, /^[a-f0-9]{24}$/)
+  const expected = path.join(root, '.updates/work', state.id, 'update.exe')
+  assert.equal(path.resolve(state.owner_exe).toLowerCase(), expected.toLowerCase(), 'Update job was not owned by its independent updater work copy')
+  const previous = updateProcesses.get(state.id)
+  if (previous?.observed) {
+    previous.component = state.component ?? previous.component
+    previous.version = state.version ?? previous.version
+    return
+  }
+  const raw = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-CimInstance Win32_Process -Filter 'ProcessId = ${state.owner_pid}' | Select-Object ProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress`], { encoding: 'utf8', timeout: 15000, windowsHide: true }).trim()
+  const process = raw ? JSON.parse(raw) : null
+  const proof = { id: state.id, owner_pid: state.owner_pid, owner_exe: state.owner_exe, observed: !!process, component: state.component, version: state.version }
+  if (process) {
+    assert.equal(process.ProcessId, state.owner_pid)
+    assert.equal(path.resolve(process.ExecutablePath).toLowerCase(), expected.toLowerCase())
+    assert.match(process.CommandLine, /--(?:worker|recover)\b/)
+    proof.command_line = process.CommandLine
+  }
+  updateProcesses.set(state.id, proof)
+}
 async function job(requestID, expected = 'success', previousID) {
   return eventually(async () => {
     const file = requestID ? `.updates/requests/${requestID}.json` : '.updates/job.json'
     const state = JSON.parse(await readFile(path.join(root, file), 'utf8'))
     if (previousID) assert.notEqual(state.id, previousID, 'Waiting for the new helper transaction')
+    verifyUpdateOwner(state)
     if (['success', 'failed', 'manual_recovery'].includes(state.status) && state.status !== expected) throw Object.assign(new Error(JSON.stringify(state)), { terminal: true })
     assert.equal(state.status, expected, JSON.stringify(state))
     return state
@@ -127,12 +159,34 @@ async function migrate(target, expected, logName) {
   let previousID
   try { previousID = JSON.parse(await readFile(path.join(root, '.updates/job.json'), 'utf8')).id } catch (error) { if (error.code !== 'ENOENT') throw error }
   await catalog(target)
-  const helper = launch(path.join(fixtures, version, 'SunYu_ERP_Upgrade.exe'), ['--root', root, '--package', path.join(fixtures, target, `SunYu_ERP-application-${target}.zip`), '--no-pause'], logName)
+  const helper = launch(path.join(root, 'update.exe'), ['--root', root, '--package', path.join(fixtures, target, `SunYu_ERP-application-${target}.zip`), '--no-pause'], logName)
+  // The root entry exits after a successful handoff to release its own image
+  // lock. Only the worker's durable job determines installation success.
+  await eventually(() => { assert.equal(helper.exitCode, 0); return true }, 'Independent updater handoff', 30)
   const result = await job(undefined, expected, previousID)
-  await eventually(() => { assert.equal(helper.exitCode, expected === 'success' ? 0 : 1); return true }, 'Upgrade helper exit', 30)
   return result
 }
+async function verifyFailedHandoff() {
+  const failedRoot = path.join(output, 'handoff-failure')
+  await cp(path.join(fixtures, version, 'SunYu_ERP'), failedRoot, { recursive: true, force: false, errorOnExist: true })
+  // A separately owned fixture with a matching manifest but invalid PE image
+  // makes Windows reject the work-copy launch. Never alter the real candidate.
+  const invalidPE = Buffer.from('isolated invalid Windows updater image')
+  await writeFile(path.join(failedRoot, 'update.exe'), invalidPE)
+  const manifestPath = path.join(failedRoot, 'app/manifest.json')
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+  manifest.files['update.exe'] = digest(invalidPE)
+  await writeFile(manifestPath, JSON.stringify(manifest))
+  const entry = launch(path.join(fixtures, version, 'update.exe'), ['--root', failedRoot, '--package', path.join(fixtures, applicationVersion, `SunYu_ERP-application-${applicationVersion}.zip`), '--no-pause'], 'failed-handoff.log')
+  await eventually(() => { assert.equal(entry.exitCode, 1, 'Failed worker launch was reported as successful handoff'); return true }, 'Failed updater handoff', 30)
+  const failedJob = JSON.parse(await readFile(path.join(failedRoot, '.updates/job.json'), 'utf8'))
+  assert.equal(failedJob.status, 'failed')
+  assert.ok(failedJob.error, 'Worker launch failure cause was lost')
+  assert.deepEqual(await readFile(path.join(failedRoot, 'update.exe')), invalidPE)
+  check('Windows worker launch failure returns nonzero from the root entry and remains visible in the job')
+}
 try {
+  await verifyFailedHandoff()
   first = launch(path.join(root, 'SunYu_ERP.exe'), ['--headless'], 'legacy-launcher.log')
   await health('1.3.1')
   const client = new Client(base)
@@ -151,8 +205,9 @@ try {
   assert.equal(await readFile(path.join(root, '.upgrade-smoke-failure-ran'), 'utf8'), 'yes')
   await health('1.3.1')
   await preserved(client)
+  assert.deepEqual(await readFile(path.join(root, 'update.exe')), migrationUpdater, 'Failed first migration removed or changed the standalone update entry point')
   await unlink(path.join(root, '.upgrade-smoke-failure-ran'))
-  check('failed Python-to-Go migration restores real Python service and original business data')
+  check('failed Python-to-Go migration restores real Python service, business data and the reusable update.exe entry point')
   await migrate(version, 'success', 'legacy-upgrade.log')
   await eventually(() => { assert.equal(first.exitCode, 0); return true }, 'Legacy launcher exit', 20)
   frontendPID = (await health(version)).pid
@@ -164,6 +219,8 @@ try {
   await noFile('runtime/SunYuRuntime.exe')
   await noFile('releases/backend/1.3.1/backend/app/main.py')
   await noFile('installation.json')
+  await noFile('SunYu_ERP_Upgrade.exe')
+  assert.deepEqual(await readFile(path.join(root, 'update.exe')), migrationUpdater)
   check('1.3.1 migrated; DATA/config/business preserved; owned Python files cleaned; unknown file retained')
 
   const firstID = await importPackage(client, firstFrontend, 'frontend')
@@ -171,6 +228,7 @@ try {
   const secondAsset = await assets(firstFrontend)
   assert.equal((await fetch(base + firstAsset)).status, 200)
   await preserved(client)
+  assert.deepEqual(await readFile(path.join(root, 'update.exe')), migrationUpdater, 'Frontend update changed the updater')
   check('first frontend hot update; PID unchanged; previous assets accessible')
   // Reusing a completed request must neither apply twice nor retain another upload.
   await catalog(firstFrontend)
@@ -186,9 +244,11 @@ try {
   assert.equal((await fetch(base + secondAsset)).status, 200)
   await noFile(`app/web/${version}/index.html`)
   await preserved(client)
+  assert.deepEqual(await readFile(path.join(root, 'update.exe')), migrationUpdater, 'Frontend update changed the updater')
   check('second frontend update retains one previous version and removes oldest')
 
   const oldLauncher = digest(await readFile(path.join(root, 'SunYu_ERP.exe')))
+  const oldUpdater = digest(await readFile(path.join(root, 'update.exe')))
   await importPackage(client, applicationVersion, 'application')
   assert.notEqual((await health(applicationVersion)).pid, frontendPID)
   await assets(applicationVersion)
@@ -196,12 +256,16 @@ try {
   assert.equal(installed.launcher_version, applicationVersion)
   for (const [relative, hash] of Object.entries(installed.files)) assert.equal(digest(await readFile(path.join(root, relative))), hash, relative)
   assert.notEqual(digest(await readFile(path.join(root, 'SunYu_ERP.exe'))), oldLauncher)
+  const newUpdater = digest(await readFile(path.join(root, 'update.exe')))
+  assert.notEqual(newUpdater, oldUpdater, 'Application update did not replace update.exe')
+  assert.equal(newUpdater, installed.files['update.exe'], 'Installed updater is not manifest-managed')
   await preserved(client)
   const backups = await readdir(path.join(root, '.updates/rollback'), { withFileTypes: true })
   assert.equal(backups.filter(entry => entry.isDirectory()).length, 1)
   assert.deepEqual(await readdir(path.join(root, '.updates/imports')), [])
-  check('application update replaced launcher/service and restarted backend; one rollback snapshot; all data intact')
+  check('application update replaced launcher/service/update.exe and restarted backend; one rollback snapshot; all data intact')
   const previousManifest = await readFile(path.join(root, 'app/manifest.json'))
+  assert.notEqual(digest(await readFile(path.join(fixtures, failureVersion, 'update.exe'))), newUpdater, 'Failure fixture must install a different updater to prove its rollback')
   const failureID = await importPackage(client, failureVersion, 'application', 'failed')
   const failure = await job(failureID, 'failed')
   assert.match(failure.message, /已恢复/)
@@ -209,10 +273,14 @@ try {
   await health(applicationVersion)
   await assets(applicationVersion)
   assert.deepEqual(await readFile(path.join(root, 'app/manifest.json')), previousManifest)
+  assert.equal(digest(await readFile(path.join(root, 'update.exe'))), newUpdater, 'Failed application update did not restore update.exe')
+  for (const [relative, hash] of Object.entries(installed.files)) assert.equal(digest(await readFile(path.join(root, relative))), hash, `Rollback ${relative}`)
   await preserved(client)
-  check('real failed startup after SQLite write automatically restores program, database, config and attachments')
+  check('real failed startup after SQLite write automatically restores program, update.exe, database, config and attachments')
+  assert.ok([...updateProcesses.values()].some(proof => proof.observed), 'No independent updater process was observed while executing an actual update')
+  check('independent updater owns every installation job; Windows process inspection confirms the real worker executable')
   if (dataMode !== 'relative') check(`${dataMode} Data root preserves physical directory, alias and config through migration and rollback`)
-  await writeFile(path.join(output, 'native-upgrade-result.json'), JSON.stringify({ status: 'passed', version, data_mode: dataMode, network_catalog: 'controlled offline catalog fixture; live GitHub check not tested', checks }, null, 2), { flag: 'wx' })
+  await writeFile(path.join(output, 'native-upgrade-result.json'), JSON.stringify({ status: 'passed', version, data_mode: dataMode, network_catalog: 'controlled offline catalog fixture; live GitHub check not tested', update_processes: [...updateProcesses.values()], checks }, null, 2), { flag: 'wx' })
 } finally {
   await mkdir(path.join(root, '.updates'), { recursive: true })
   await writeFile(path.join(root, '.updates/shutdown'), 'isolated upgrade smoke cleanup')

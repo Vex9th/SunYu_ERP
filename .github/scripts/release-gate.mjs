@@ -13,10 +13,11 @@ export function classifyRelease(tag, commit, tagCommit, release) {
   }
   if (!tagCommit) throw new Error('Existing release has no matching fetched tag')
   const version = tag.slice(1)
-  const required = ['SunYu_ERP-windows-x64.zip', `SunYu_ERP-application-${version}.zip`, `SunYu_ERP-frontend-${version}.zip`, 'SunYu_ERP_Upgrade.exe', 'update-manifest-v2.json', 'update-manifest.json', 'SHA256SUMS.txt']
+  const required = ['SunYu_ERP-windows-x64.zip', `SunYu_ERP-application-${version}.zip`, `SunYu_ERP-frontend-${version}.zip`, 'update.exe', 'update-manifest-v2.json', 'update-manifest.json', 'SHA256SUMS.txt']
   const names = new Set(release.assets.filter(asset => asset.state === 'uploaded' && asset.size > 0).map(asset => asset.name))
   const missing = required.filter(name => !names.has(name))
   if (missing.length) throw new Error(`Published release has incomplete assets: ${missing.join(', ')}; inspect it before retrying`)
+  if (names.has('SunYu_ERP_Upgrade.exe')) throw new Error('Published release retains the obsolete SunYu_ERP_Upgrade.exe asset; inspect it before retrying')
   return 'published'
 }
 function readRelease(repository, tag) {

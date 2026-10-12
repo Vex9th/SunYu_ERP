@@ -88,12 +88,12 @@ func run() error {
 	}
 	app := api.Application(db, settings, root, version)
 	if manifestPresent {
-		engine, engineErr := update.New(root)
-		if engineErr != nil {
-			return engineErr
+		controller, controllerErr := update.NewController(root)
+		if controllerErr != nil {
+			return controllerErr
 		}
-		defer engine.Close()
-		app.Updates = engine
+		defer controller.Close()
+		app.Updates = controller
 		app.Supervised = os.Getenv("SUNYU_SUPERVISED") == "1"
 	}
 	if err = app.System.Start(); err != nil {

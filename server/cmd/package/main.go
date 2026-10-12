@@ -19,7 +19,7 @@ func run(args []string, out, diagnostics io.Writer) error {
 	flags.StringVar(&options.Version, "version", "", "发布版本，前端需使用相同 SUNYU_VERSION 构建")
 	flags.StringVar(&options.BackendVersion, "backend-version", "", "后端版本，默认等于 version")
 	flags.StringVar(&options.LauncherVersion, "launcher-version", "", "启动器版本，默认等于 version")
-	flags.StringVar(&options.BinDir, "bin-dir", "", "包含三个 Windows AMD64 EXE 的目录")
+	flags.StringVar(&options.BinDir, "bin-dir", "", "包含 SunYu_ERP.exe、SunYuService.exe、update.exe 三个 Windows AMD64 程序的目录")
 	flags.StringVar(&options.WebDir, "web-dir", "", "已经构建的前端资源目录")
 	flags.StringVar(&options.Output, "output", "", "不存在或为空的发布输出目录")
 	flags.StringVar(&options.Notes, "notes", "", "写入正式更新清单的发布说明")

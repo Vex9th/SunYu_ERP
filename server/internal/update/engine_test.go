@@ -80,7 +80,14 @@ func awaitJob(t *testing.T, e *Engine) Job {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("job did not finish")
+	e.mu.Lock()
+	running := e.running
+	e.mu.Unlock()
+	var last Job
+	jobErr := readJSON(filepath.Join(e.Root, ".updates", "job.json"), &last)
+	var archived Job
+	requestErr := readJSON(filepath.Join(e.Root, ".updates", "requests", last.RequestID+".json"), &archived)
+	t.Fatalf("job did not finish: worker_running=%v job=%+v job_read_error=%v request=%+v request_read_error=%v status=%+v", running, last, jobErr, archived, requestErr, e.Status())
 	return Job{}
 }
 func installFixture(t *testing.T, root string, m Manifest, data map[string]string) {
@@ -230,5 +237,91 @@ func TestLegacyCatalogCanBeCheckedWithoutOfferingDowngrade(t *testing.T) {
 	}
 	if e.Status()["update_available"] != false {
 		t.Fatal("legacy catalog offered downgrade")
+	}
+}
+
+func TestTerminalStatePersistenceFailureRemainsVisibleAcrossRestart(t *testing.T) {
+	for _, target := range []string{"job", "requests", "both"} {
+		t.Run(target, func(t *testing.T) {
+			e := testEngine(t, t.TempDir())
+			id := "f747e752-6010-4773-a1c8-c698416824ae"
+			if err := e.start(id, "checking", func(j *Job) error {
+				if target != "requests" {
+					p := filepath.Join(e.Root, ".updates", "job.json")
+					if err := os.Remove(p); err != nil {
+						return err
+					}
+					if err := os.Mkdir(p, 0700); err != nil {
+						return err
+					}
+				}
+				if target != "job" {
+					p := filepath.Join(e.Root, ".updates", "requests")
+					if err := os.Rename(p, p+"-saved"); err != nil {
+						return err
+					}
+					if err := os.WriteFile(p, []byte("external blocker"), 0600); err != nil {
+						return err
+					}
+				}
+				return errors.New("original operation failure")
+			}); err != nil {
+				t.Fatal(err)
+			}
+			e.Close()
+			engines := []*Engine{e}
+			if target != "both" {
+				engines = append(engines, testEngine(t, e.Root))
+			}
+			for _, engine := range engines {
+				j, err := engine.Request(id)
+				if err != nil || j.Status != "failed" || !strings.Contains(j.Error, "状态") || !strings.Contains(j.Error, "original operation failure") {
+					t.Fatalf("terminal persistence failure hidden: %+v %v", j, err)
+				}
+				b, _ := json.Marshal(engine.Status()["job"])
+				var visible Job
+				if err := json.Unmarshal(b, &visible); err != nil || visible.Status != "failed" || !strings.Contains(visible.Error, "状态") {
+					t.Fatalf("status persistence failure hidden: %+v %v", visible, err)
+				}
+			}
+		})
+	}
+}
+
+func TestInstallWithoutNewVersionReportsNoInstall(t *testing.T) {
+	for _, version := range []string{"2.0.0", "1.9.0", "legacy-1.3.1"} {
+		t.Run(version, func(t *testing.T) {
+			e := testEngine(t, t.TempDir())
+			applicationFixture(t, e.Root, "2.0.0")
+			before, err := os.ReadFile(filepath.Join(e.Root, "app/manifest.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := Catalog{Format: 2, Application: Application, Version: version, BackendVersion: version, FrontendVersion: version, LauncherVersion: version, APIVersion: 1, Packages: map[string]Archive{"application": {URL: "https://github.com/Vex9th/SunYu_ERP/releases/download/v" + version + "/package.zip", SHA256: digest("unused")}}}
+			body, _ := json.Marshal(c)
+			if version == "legacy-1.3.1" {
+				body = []byte(`{"format":1,"version":"1.3.1","components":{"backend":{"version":"1.3.1"},"frontend":{"version":"1.3.1"}}}`)
+			}
+			e.Client = &http.Client{Transport: responseTransport(func(r *http.Request) (*http.Response, error) {
+				if !strings.HasSuffix(r.URL.Path, ".json") {
+					t.Error("no-update path attempted a package download", r.URL)
+				}
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(string(body))), Header: http.Header{}}, nil
+			})}
+			if err = e.Install("68fa7797-a78f-49b3-8ac4-619ce46c2b6e"); err != nil {
+				t.Fatal(err)
+			}
+			j := awaitJob(t, e)
+			if j.Status != "success" || j.Message != "当前没有可安装的新版本" || j.Progress != 100 {
+				t.Fatalf("no-op reported installation: %+v", j)
+			}
+			after, err := os.ReadFile(filepath.Join(e.Root, "app/manifest.json"))
+			if err != nil || string(after) != string(before) {
+				t.Fatal("no-op modified installed manifest", err)
+			}
+			if _, err = os.Stat(filepath.Join(e.Root, ".updates/transaction-v2.json")); !os.IsNotExist(err) {
+				t.Fatal("no-op prepared an install transaction", err)
+			}
+		})
 	}
 }

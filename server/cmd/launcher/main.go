@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sunyu.local/erp/internal/update"
 	"time"
 )
 
@@ -29,13 +28,6 @@ var version = "2.0.0-dev"
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
 		fmt.Println(version)
-		return
-	}
-	if len(os.Args) == 4 && os.Args[1] == "--apply-update" {
-		if err := update.RunHelper(os.Args[2], os.Args[3]); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
 		return
 	}
 	options, err := parseOptions(os.Args[1:])

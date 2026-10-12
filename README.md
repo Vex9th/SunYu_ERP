@@ -14,7 +14,11 @@
 ```text
 SunYu_ERP/
 ├── SunYu_ERP.exe          # 日常启动入口、托盘和服务管理
-├── app/                  # 当前服务、升级组件、前端资源与校验清单
+├── update.exe            # 独立更新器，负责下载安装与旧版迁移
+├── app/
+│   ├── SunYuService.exe  # 业务服务
+│   ├── web/             # 前端资源
+│   └── manifest.json    # 程序文件校验清单
 ├── Data/                 # 首次运行创建；数据库和项目文件
 ├── config.json           # 首次运行创建；本机配置
 └── .updates/             # 更新状态与最近一次恢复备份
@@ -24,23 +28,25 @@ SunYu_ERP/
 
 ## 从 1.3.1 升级到 2.0
 
-这是一次运行环境迁移，旧版更新器无法替换自身及 Python 运行库。使用本版本的独立升级助手完成一次迁移：
+这是一次运行环境迁移，使用独立的 `update.exe` 完成。它也是新版本日常使用的更新器：
 
 1. 保存工作，从托盘退出旧程序；另行备份原 `Data/`（或自定义数据目录）和 `config.json`。
-2. 下载官方 `SunYu_ERP_Upgrade.exe`，放入**原程序目录**，与原 `SunYu_ERP.exe`、`config.json` 同级。
-3. 双击升级助手。它显示执行阶段，自动下载、核验、备份和升级；失败时保留错误信息。成功后用原目录的 `SunYu_ERP.exe` 启动。
+2. 下载官方 `update.exe`，放入**原程序目录**，与原 `SunYu_ERP.exe`、`config.json` 同级。
+3. 双击 `update.exe`。它显示执行阶段，自动下载、核验、备份和升级；失败时保留错误信息。成功后用原目录的 `SunYu_ERP.exe` 启动。
 
-迁移完成后，临时放在根目录的 `SunYu_ERP_Upgrade.exe` 可以删除；之后使用页面的一键更新，所需更新组件已随程序放在 `app/` 中。
+迁移完成后保留根目录的 `update.exe`。之后点击页面“一键更新”即可自动调用它，也可以直接双击运行。
 
 上述步骤针对带 `installation.json` 的 1.3.1 目录包。更早的单文件版本请先按 1.3.1 发布说明升级到目录包，再执行本次迁移。
 
-不要先覆盖旧目录的程序文件，也不要删除 `installation.json` 或原数据来“重置”安装。升级助手需要原有安装信息完成校验与恢复。现有 SQLite 迁移编号、密码、采购含税金额、付款、发票和公司往来账的业务计算规则保持兼容；升级不主动重算历史金额。
+不要先覆盖旧目录的程序文件，也不要删除 `installation.json` 或原数据来“重置”安装。更新器需要原有安装信息完成校验与恢复。现有 SQLite 迁移编号、密码、采购含税金额、付款、发票和公司往来账的业务计算规则保持兼容；升级不主动重算历史金额。
 
-官方 1.3.0、1.3.1 中可以识别的旧程序文件会按清单和哈希清理。用户自行放入或修改过的文件会保留，避免按目录名误删资料。迁移失败且自动恢复未完成时，保留 `.updates/`，再次运行升级助手处理恢复。
+官方 1.3.0、1.3.1 中可以识别的旧程序文件会按清单和哈希清理。用户自行放入或修改过的文件会保留，避免按目录名误删资料。迁移失败且自动恢复未完成时，保留 `.updates/`，再次运行 `update.exe` 处理恢复。
 
 ## 一键更新
 
 在运行服务的本机登录，进入“系统设置 → 版本与更新”，点击 **一键更新**。程序自动检查、下载、校验、备份并安装，不再要求分别下载和安装前后端。
+
+主程序负责检查更新、发起操作和显示进度；独立 `update.exe` 负责下载、校验、备份、替换、重启和清理。更新器从受管临时副本运行，因此能够同时更新自己。临时程序按归属清理，不在安装根目录堆积版本。
 
 - 自动检查只提醒，可以关闭、忽略版本或稍后处理；不会强制安装或刷新。
 - 前端独立更新时服务继续运行。保存当前页面的工作后，点击“刷新使用新版本”。
@@ -109,12 +115,12 @@ New-Item -ItemType Directory -Path dist/native-bin -Force | Out-Null
 Push-Location server
 go build -trimpath -ldflags="-s -w -H=windowsgui -X main.version=$env:SUNYU_VERSION" -o ../dist/native-bin/SunYu_ERP.exe ./cmd/launcher
 go build -trimpath -ldflags="-s -w -H=windowsgui -X main.version=$env:SUNYU_VERSION" -o ../dist/native-bin/SunYuService.exe ./cmd/service
-go build -trimpath -ldflags="-s -w -X main.version=$env:SUNYU_VERSION" -o ../dist/native-bin/SunYu_ERP_Upgrade.exe ./cmd/upgrade
+go build -trimpath -ldflags="-s -w -X main.version=$env:SUNYU_VERSION" -o ../dist/native-bin/update.exe ./cmd/updater
 go run ./cmd/package --version $env:SUNYU_VERSION --bin-dir ../dist/native-bin --web-dir ../frontend/dist --output ../dist/native --notes (Get-Content ../RELEASE_NOTES.md -Raw -Encoding utf8)
 Pop-Location
 node .github/scripts/native-smoke.mjs dist/native/SunYu_ERP tmp/native-smoke $env:SUNYU_VERSION
 ```
 
-每批使用新的输出目录，打包器拒绝覆盖已有产物。发布附件包括完整 ZIP、应用更新 ZIP、前端更新 ZIP、升级助手、两代更新目录和 `SHA256SUMS.txt`。旧版 `update-manifest.json` 仅提供迁移说明，不会把 Go 包交给 Python 组件更新器；新程序使用 `update-manifest-v2.json`。
+每批使用新的输出目录，打包器拒绝覆盖已有产物。发布附件包括完整 ZIP、应用更新 ZIP、前端更新 ZIP、`update.exe`、两代更新目录和 `SHA256SUMS.txt`。旧版 `update-manifest.json` 仅提供迁移说明，不会把 Go 包交给 Python 组件更新器；新程序使用 `update-manifest-v2.json`。
 
 [MIT License](LICENSE)

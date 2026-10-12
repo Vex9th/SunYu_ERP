@@ -97,8 +97,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Launcher build failed' }
           go build -trimpath -ldflags="$flags" -o ../dist/native-bin/SunYuService.exe ./cmd/service
           if ($LASTEXITCODE -ne 0) { throw 'Service build failed' }
-          go build -trimpath -ldflags="-s -w -X main.version=$env:SUNYU_VERSION" -o ../dist/native-bin/SunYu_ERP_Upgrade.exe ./cmd/upgrade
-          if ($LASTEXITCODE -ne 0) { throw 'Upgrade helper build failed' }
+          go build -trimpath -ldflags="-s -w -X main.version=$env:SUNYU_VERSION" -o ../dist/native-bin/update.exe ./cmd/updater
+          if ($LASTEXITCODE -ne 0) { throw 'Independent updater build failed' }
       - name: Assemble verified native packages
         working-directory: server
         run: go run ./cmd/package --version "$env:SUNYU_VERSION" --bin-dir ../dist/native-bin --web-dir ../frontend/dist --output ../dist/native --notes (Get-Content ../RELEASE_NOTES.md -Raw -Encoding utf8)
@@ -127,7 +127,7 @@ jobs:
           name: SunYu_ERP-windows-x64
           path: |
             dist/native/*.zip
-            dist/native/SunYu_ERP_Upgrade.exe
+            dist/native/update.exe
             dist/native/update-manifest*.json
             dist/native/SHA256SUMS.txt
             ${{ runner.temp }}/SunYu ERP 中文 Native Smoke/native-smoke-result.json

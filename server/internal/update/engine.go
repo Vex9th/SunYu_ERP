@@ -27,31 +27,38 @@ var ErrBusy = errors.New("正在处理另一个更新任务，请等待完成")
 var requestPattern = regexp.MustCompile(`^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`)
 
 type Job struct {
-	ID        string `json:"id"`
-	RequestID string `json:"request_id"`
-	Status    string `json:"status"`
-	Phase     string `json:"phase"`
-	Message   string `json:"message"`
-	Error     string `json:"error,omitempty"`
-	Version   string `json:"version,omitempty"`
-	Component string `json:"component,omitempty"`
-	Progress  int    `json:"progress"`
-	StartedAt string `json:"started_at"`
-	UpdatedAt string `json:"updated_at"`
+	ID               string `json:"id"`
+	RequestID        string `json:"request_id"`
+	Status           string `json:"status"`
+	Phase            string `json:"phase"`
+	Message          string `json:"message"`
+	Error            string `json:"error,omitempty"`
+	PersistenceError string `json:"persistence_error,omitempty"`
+	Version          string `json:"version,omitempty"`
+	Component        string `json:"component,omitempty"`
+	WorkerStartedAt  string `json:"worker_started_at,omitempty"`
+	OwnerPID         int    `json:"owner_pid,omitempty"`
+	OwnerExe         string `json:"owner_exe,omitempty"`
+	Progress         int    `json:"progress"`
+	StartedAt        string `json:"started_at"`
+	UpdatedAt        string `json:"updated_at"`
 }
 type Engine struct {
-	Root       string
-	CatalogURL string
-	Client     *http.Client
-	mu         sync.Mutex
-	running    bool
-	closed     bool
-	ctx        context.Context
-	cancel     context.CancelFunc
-	workers    sync.WaitGroup
+	Root          string
+	CatalogURL    string
+	Client        *http.Client
+	mu            sync.Mutex
+	running       bool
+	closed        bool
+	ctx           context.Context
+	cancel        context.CancelFunc
+	workers       sync.WaitGroup
+	stateMu       sync.RWMutex
+	stateFailures map[string]Job
 }
 
-func New(root string) (*Engine, error) {
+func New(root string) (*Engine, error) { return newEngine(root, true) }
+func newEngine(root string, recover bool) (*Engine, error) {
 	root, e := filepath.Abs(root)
 	if e != nil {
 		return nil, e
@@ -80,12 +87,14 @@ func New(root string) (*Engine, error) {
 		}
 		return trustedRedirect(r.URL)
 	}}}
-	engine.recoverInterruptedJob()
+	if recover {
+		engine.recoverInterruptedJob()
+	}
 	return engine, nil
 }
 func terminal(s string) bool { return s == "success" || s == "failed" || s == "manual_recovery" }
 func readJSON(p string, v any) error {
-	b, e := os.ReadFile(p)
+	b, e := readStateFile(p, 16<<20)
 	if e != nil {
 		return e
 	}
@@ -97,7 +106,7 @@ func readJSON(p string, v any) error {
 func (e *Engine) Status() map[string]any {
 	var j *Job
 	var c *Catalog
-	_ = readJSON(filepath.Join(e.Root, ".updates", "job.json"), &j)
+	j = e.currentJob()
 	_ = readJSON(filepath.Join(e.Root, ".updates", "catalog-v2.json"), &c)
 	m, err := ReadManifest(e.Root)
 	var installed any
@@ -107,16 +116,27 @@ func (e *Engine) Status() map[string]any {
 	return map[string]any{"installed": installed, "latest": c, "job": j, "update_available": c != nil && available(m, *c), "restart_required": c != nil && available(m, *c) && (m.BackendVersion != c.BackendVersion || m.LauncherVersion != c.LauncherVersion)}
 }
 func (e *Engine) saveJob(j *Job) error {
+	if j.PersistenceError != "" {
+		j.Error = strings.TrimSpace(strings.TrimSuffix(j.Error, j.PersistenceError))
+		j.PersistenceError = ""
+	}
 	j.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	if err := writeJSON(filepath.Join(e.Root, ".updates", "job.json"), j); err != nil {
-		return err
-	}
+	jobPath := filepath.Join(e.Root, ".updates", "job.json")
+	jobErr := writeJSON(jobPath, j)
+	var requestErr error
 	if requestPattern.MatchString(j.RequestID) {
-		return writeJSON(filepath.Join(e.Root, ".updates", "requests", strings.ToLower(j.RequestID)+".json"), j)
+		requestErr = writeJSON(e.requestPath(j.RequestID), j)
 	}
+	if err := errors.Join(jobErr, requestErr); err != nil {
+		return e.recordStateFailure(j, fmt.Errorf("写入更新状态失败：%w", err))
+	}
+	e.forgetStateFailure(*j)
 	return nil
 }
 func (e *Engine) progress(j *Job, phase, message string, p int) error {
+	if j.OwnerPID == os.Getpid() {
+		fmt.Println(message)
+	}
 	j.Status, j.Phase, j.Message, j.Progress = phase, phase, message, p
 	return e.saveJob(j)
 }
@@ -133,9 +153,11 @@ func (e *Engine) startPrepared(id, phase string, prepare func(*Job) error, fn fu
 	if e.closed {
 		return errors.New("更新服务正在退出")
 	}
-	var previous Job
-	if readJSON(filepath.Join(e.Root, ".updates", "requests", id+".json"), &previous) == nil {
+	if _, err := e.Request(id); err == nil {
 		return nil
+	}
+	if current := e.currentJob(); current != nil && !terminal(current.Status) && processMatches(current.OwnerExe, current.OwnerPID) {
+		return ErrBusy
 	}
 	if e.running {
 		return ErrBusy
@@ -176,15 +198,26 @@ func (e *Engine) startPrepared(id, phase string, prepare func(*Job) error, fn fu
 		defer e.workers.Done()
 		defer func() { release(); e.mu.Lock(); e.running = false; e.mu.Unlock() }()
 		err := fn(&j)
+		if errors.Is(err, errHandedOff) {
+			return
+		}
+		if j.Status == "manual_recovery" || (terminal(j.Status) && (err == nil || j.OwnerPID != 0)) {
+			_ = e.saveJob(&j)
+			return
+		}
 		if err != nil {
 			j.Status, j.Phase, j.Error, j.Message = "failed", "failed", err.Error(), "更新失败，原有业务数据已保留"
-			_ = e.saveJob(&j)
+			if saveErr := e.saveJob(&j); saveErr != nil {
+				return
+			}
 		} else if j.Status != "restarting" {
 			j.Status, j.Phase, j.Progress = "success", "success", 100
 			if !strings.Contains(j.Message, "暂") && !strings.Contains(j.Message, "检查完成") {
 				j.Message = "操作完成"
 			}
-			_ = e.saveJob(&j)
+			if saveErr := e.saveJob(&j); saveErr != nil {
+				return
+			}
 		}
 	}()
 	return nil
@@ -199,138 +232,142 @@ func (e *Engine) Check(id string) error {
 	})
 }
 func (e *Engine) Install(id string) error {
-	return e.start(id, "checking", func(j *Job) error {
-		c, err := e.fetchCatalog()
-		if err != nil {
-			return err
-		}
-		m, err := ReadManifest(e.Root)
-		if err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		if m.Format != 2 && c.Format != 2 {
-			return errors.New("当前正式发布尚未提供原生程序更新包，请等待正式发布后再运行迁移工具")
-		}
-		if !available(m, c) {
-			return nil
-		}
-		component := "application"
-		if m.BackendVersion == c.BackendVersion && m.LauncherVersion == c.LauncherVersion {
-			component = "frontend"
-		}
-		archive, ok := c.Packages[component]
-		if !ok {
-			return fmt.Errorf("正式版本尚未提供 %s 更新包", component)
-		}
-		j.Version, j.Component = c.Version, component
-		if err = e.progress(j, "downloading", "正在下载更新包", 10); err != nil {
-			return err
-		}
-		work, err := e.createWork(j.ID)
-		if err != nil {
-			return err
-		}
-		p := filepath.Join(work, "download.zip")
-		if err = e.download(archive.URL, p, MaxArchiveBytes); err != nil {
-			return err
-		}
-		h, err := hashFile(p)
-		if err != nil {
-			return err
-		}
-		if h != archive.SHA256 {
-			return errors.New("下载更新包 SHA256 不匹配")
-		}
-		return e.installArchive(j, p, c, component)
-	})
+	return e.start(id, "checking", e.installJob)
+}
+func (e *Engine) installJob(j *Job) error {
+	c, err := e.fetchCatalog()
+	if err != nil {
+		return err
+	}
+	m, err := ReadManifest(e.Root)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if m.Format != 2 && c.Format != 2 {
+		return errors.New("当前正式发布尚未提供原生程序更新包，请等待正式发布后再运行迁移工具")
+	}
+	if !available(m, c) {
+		j.Status, j.Phase, j.Progress, j.Message = "success", "success", 100, "当前没有可安装的新版本"
+		return nil
+	}
+	component := "application"
+	if m.BackendVersion == c.BackendVersion && m.LauncherVersion == c.LauncherVersion {
+		component = "frontend"
+	}
+	archive, ok := c.Packages[component]
+	if !ok {
+		return fmt.Errorf("正式版本尚未提供 %s 更新包", component)
+	}
+	j.Version, j.Component = c.Version, component
+	if err = e.progress(j, "downloading", "正在下载更新包", 10); err != nil {
+		return err
+	}
+	work, err := e.ensureWork(j.ID)
+	if err != nil {
+		return err
+	}
+	p := filepath.Join(work, "download.zip")
+	if err = e.download(archive.URL, p, MaxArchiveBytes); err != nil {
+		return err
+	}
+	h, err := hashFile(p)
+	if err != nil {
+		return err
+	}
+	if h != archive.SHA256 {
+		return errors.New("下载更新包 SHA256 不匹配")
+	}
+	return e.installArchive(j, p, c, component)
 }
 func (e *Engine) Import(p, id string) error {
 	var owned string
-	return e.startPrepared(id, "verifying", func(j *Job) error {
-		rel, err := filepath.Rel(e.Root, p)
+	return e.startPrepared(id, "verifying", func(j *Job) error { var err error; owned, err = e.prepareImport(p, j); return err }, func(j *Job) error { return e.importJob(j, owned) })
+}
+func (e *Engine) prepareImport(p string, j *Job) (string, error) {
+	rel, err := filepath.Rel(e.Root, p)
+	if err != nil {
+		return "", err
+	}
+	rel = filepath.ToSlash(rel)
+	if !validPath(rel) || !strings.HasPrefix(rel, ".updates/imports/") {
+		return "", errors.New("导入文件必须位于当前安装的受管上传目录")
+	}
+	bound, err := os.OpenRoot(e.Root)
+	if err != nil {
+		return "", err
+	}
+	defer bound.Close()
+	parts := strings.Split(rel, "/")
+	for i := range parts {
+		info, err := bound.Lstat(strings.Join(parts[:i+1], "/"))
 		if err != nil {
-			return err
+			return "", err
 		}
-		rel = filepath.ToSlash(rel)
-		if !validPath(rel) || !strings.HasPrefix(rel, ".updates/imports/") {
-			return errors.New("导入文件必须位于当前安装的受管上传目录")
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", errors.New("导入文件路径包含链接")
 		}
-		bound, err := os.OpenRoot(e.Root)
+	}
+	source, err := bound.Open(rel)
+	if err != nil {
+		return "", err
+	}
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || info.Size() > MaxArchiveBytes {
+		return "", errors.New("导入文件类型或大小无效")
+	}
+	dir, err := e.ensureWork(j.ID)
+	if err != nil {
+		return "", err
+	}
+	owned := filepath.Join(dir, "download.zip")
+	out, err := os.OpenFile(owned, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return "", err
+	}
+	n, err := io.Copy(out, io.LimitReader(source, MaxArchiveBytes+1))
+	if err == nil && n > MaxArchiveBytes {
+		err = errors.New("更新包超过大小限制")
+	}
+	if err == nil {
+		err = out.Sync()
+	}
+	ce := out.Close()
+	if err == nil {
+		err = ce
+	}
+	if err != nil {
+		_ = os.Remove(owned)
+	}
+	return owned, err
+}
+func (e *Engine) importJob(j *Job, owned string) error {
+	var c Catalog
+	if readJSON(filepath.Join(e.Root, ".updates", "catalog-v2.json"), &c) != nil || e.validateCatalog(c) != nil {
+		var err error
+		c, err = e.fetchCatalog()
 		if err != nil {
-			return err
+			return fmt.Errorf("无法验证离线包来源，请先联网检查一次更新以取得官方校验清单：%w", err)
 		}
-		defer bound.Close()
-		parts := strings.Split(rel, "/")
-		for i := range parts {
-			info, err := bound.Lstat(strings.Join(parts[:i+1], "/"))
-			if err != nil {
-				return err
-			}
-			if info.Mode()&os.ModeSymlink != 0 {
-				return errors.New("导入文件路径包含链接")
-			}
-		}
-		source, err := bound.Open(rel)
-		if err != nil {
-			return err
-		}
-		defer source.Close()
-		info, err := source.Stat()
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() || info.Size() > MaxArchiveBytes {
-			return errors.New("导入文件类型或大小无效")
-		}
-		dir, err := e.createWork(j.ID)
-		if err != nil {
-			return err
-		}
-		owned = filepath.Join(dir, "download.zip")
-		out, err := os.OpenFile(owned, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		if err != nil {
-			return err
-		}
-		n, err := io.Copy(out, io.LimitReader(source, MaxArchiveBytes+1))
-		if err == nil && n > MaxArchiveBytes {
-			err = errors.New("更新包超过大小限制")
-		}
-		if err == nil {
-			err = out.Sync()
-		}
-		ce := out.Close()
-		if err == nil {
-			err = ce
-		}
-		if err != nil {
-			_ = os.Remove(owned)
-		}
+	}
+	h, err := hashFile(owned)
+	if err != nil {
 		return err
-	}, func(j *Job) error {
-		var c Catalog
-		if readJSON(filepath.Join(e.Root, ".updates", "catalog-v2.json"), &c) != nil || e.validateCatalog(c) != nil {
-			var err error
-			c, err = e.fetchCatalog()
-			if err != nil {
-				return fmt.Errorf("无法验证离线包来源，请先联网检查一次更新以取得官方校验清单：%w", err)
-			}
+	}
+	component := ""
+	for name, a := range c.Packages {
+		if a.SHA256 == h {
+			component = name
+			break
 		}
-		h, err := hashFile(owned)
-		if err != nil {
-			return err
-		}
-		component := ""
-		for name, a := range c.Packages {
-			if a.SHA256 == h {
-				component = name
-				break
-			}
-		}
-		if component == "" {
-			return errors.New("离线包校验值不在已取得的官方更新清单中，请先检查更新")
-		}
-		return e.installArchive(j, owned, c, component)
-	})
+	}
+	if component == "" {
+		return errors.New("离线包校验值不在已取得的官方更新清单中，请先检查更新")
+	}
+	return e.installArchive(j, owned, c, component)
 }
 func (e *Engine) installArchive(j *Job, p string, c Catalog, component string) error {
 	j.Version, j.Component = c.Version, component
@@ -358,7 +395,7 @@ func (e *Engine) installArchive(j *Job, p string, c Catalog, component string) e
 		}
 		err = e.installFrontend(j, m, stage)
 		if err == nil {
-			_ = os.RemoveAll(filepath.Join(e.Root, ".updates", "work", j.ID))
+			_ = e.cleanupWork(j.ID, true)
 		}
 		return err
 	}
@@ -503,6 +540,9 @@ func (e *Engine) recoverInterruptedJob() {
 	if readJSON(filepath.Join(e.Root, ".updates", "job.json"), &j) != nil || terminal(j.Status) {
 		return
 	}
+	if processMatches(j.OwnerExe, j.OwnerPID) {
+		return
+	}
 	if _, pending := Pending(e.Root); pending {
 		return
 	}
@@ -520,9 +560,32 @@ func (e *Engine) Request(id string) (*Job, error) {
 	if !requestPattern.MatchString(id) {
 		return nil, errors.New("更新请求标识无效")
 	}
-	var j Job
-	err := readJSON(filepath.Join(e.Root, ".updates", "requests", strings.ToLower(id)+".json"), &j)
-	return &j, err
+	var current *Job
+	var archived Job
+	err := readJSON(e.requestPath(id), &archived)
+	if err == nil && strings.EqualFold(archived.RequestID, id) {
+		current = &archived
+	}
+	for _, path := range []string{filepath.Join(e.Root, ".updates", "job.json")} {
+		var candidate Job
+		if readJSON(path, &candidate) == nil && strings.EqualFold(candidate.RequestID, id) {
+			current = newerJob(current, &candidate)
+		}
+	}
+	var tx Transaction
+	if readJSON(filepath.Join(e.Root, ".updates", "transaction-v2.json"), &tx) == nil && strings.EqualFold(tx.Job.RequestID, id) && terminal(tx.Job.Status) {
+		current = newerJob(current, &tx.Job)
+	}
+	if candidate := e.memoryStateFailure(id); candidate != nil {
+		current = newerJob(current, candidate)
+	}
+	if current != nil {
+		return current, nil
+	}
+	if err == nil {
+		err = errors.New("更新请求状态归属不一致")
+	}
+	return nil, err
 }
 
 func (e *Engine) RequestStatus(id string) (map[string]any, error) {

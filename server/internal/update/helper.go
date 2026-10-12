@@ -31,18 +31,24 @@ func (e *Engine) launchHelper(j *Job, m Manifest, stage string) error {
 			return err
 		}
 	}
-	tx := Transaction{Job: *j, Manifest: m, Old: old, Stage: stage, State: "prepared", LegacyFiles: legacy}
-	helper := filepath.Join(e.Root, ".updates", "work", j.ID, "SunYuUpdateHelper.exe")
-	source := filepath.Join(e.Root, "SunYu_ERP.exe")
+	// In the first migration the standalone updater is already present, but is
+	// not part of the old Python manifest. Preserve only the exact validated
+	// running updater so rollback retains the same retry entry point.
 	if old.Format != 2 {
-		source, err = os.Executable()
-		if err != nil {
+		var req workerRequest
+		if err = readJSON(filepath.Join(e.Root, ".updates", "work", j.ID, "request.json"), &req); err != nil {
 			return err
 		}
+		rootHash, hashErr := hashFile(filepath.Join(e.Root, "update.exe"))
+		if hashErr != nil || rootHash != req.UpdaterHash {
+			return errors.New("迁移前 update.exe 身份已变化，已停止安装")
+		}
+		legacy["update.exe"] = rootHash
 	}
-	if err = copyFile(source, helper); err != nil {
+	if err = e.waitRootUpdater(j.ID); err != nil {
 		return err
 	}
+	tx := Transaction{Job: *j, Manifest: m, Old: old, Stage: stage, State: "prepared", LegacyFiles: legacy}
 	if err = e.progress(j, "restarting", "已校验更新，正在准备安全安装", 45); err != nil {
 		return err
 	}
@@ -50,22 +56,14 @@ func (e *Engine) launchHelper(j *Job, m Manifest, stage string) error {
 	if err = e.saveTransaction(&tx); err != nil {
 		return err
 	}
-	logFile, err := openUpdateLog(e.Root)
-	if err != nil {
-		return err
+	err = e.runHelperLocked(j.ID)
+	var completed Transaction
+	if readJSON(filepath.Join(e.Root, ".updates", "transaction-v2.json"), &completed) == nil && completed.Job.ID == j.ID {
+		*j = completed.Job
 	}
-	defer logFile.Close()
-	cmd := exec.Command(helper, "--apply-update", e.Root, j.ID)
-	cmd.Dir = e.Root
-	cmd.Stdout, cmd.Stderr = logFile, logFile
-	configureDetached(cmd)
-	if err = cmd.Start(); err != nil {
-		tx.Job.Status, tx.Job.Error = "failed", err.Error()
-		_ = e.saveTransaction(&tx)
-		return err
-	}
-	return cmd.Process.Release()
+	return err
 }
+
 func openUpdateLog(root string) (*os.File, error) {
 	dir := filepath.Join(root, ".updates", "logs")
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -144,12 +142,24 @@ func RunHelper(root, id string) error {
 		return err
 	}
 	defer release()
+	defer e.Close()
+	return e.runHelperLocked(id)
+}
+func (e *Engine) runHelperLocked(id string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	var err error
 	var tx Transaction
 	if err = readJSON(filepath.Join(e.Root, ".updates", "transaction-v2.json"), &tx); err != nil {
 		return err
 	}
-	if !regexpJobID(id) || tx.Job.ID != id || terminal(tx.Job.Status) && tx.Job.Status != "manual_recovery" && tx.State != "completed" && tx.State != "rolled_back" {
+	if !regexpJobID(id) || tx.Job.ID != id {
 		return errors.New("升级事务标识不匹配或已结束")
+	}
+	switch tx.State {
+	case "prepared", "backed_up", "replacing", "starting", "verified", "completed", "restoring", "rolled_back":
+	default:
+		return errors.New("升级事务状态无效")
 	}
 	if tx.Stage != filepath.Join(e.Root, ".updates", "work", id, "stage") {
 		return errors.New("升级暂存目录无效")
@@ -552,7 +562,11 @@ func pendingState(root string) (string, bool, error) {
 	default:
 		return "", true, errors.New("升级事务状态无效，已阻止业务服务启动")
 	}
-	pending := !terminal(tx.Job.Status) || tx.Job.Status == "manual_recovery" || maintenance == nil
+	unfinished := tx.State != "completed" && tx.State != "rolled_back"
+	if tx.State == "prepared" && tx.Job.Status == "failed" && maintenance != nil {
+		unfinished = false
+	}
+	pending := unfinished || !terminal(tx.Job.Status) || tx.Job.Status == "manual_recovery" || maintenance == nil
 	return tx.Job.ID, pending, nil
 }
 func Pending(root string) (string, bool) { id, pending, _ := pendingState(root); return id, pending }
@@ -569,6 +583,7 @@ func PrepareLaunch(root, authorizedID string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	defer e.Close()
 	if authorizedID != "" {
 		if !AuthorizeUpdateStart(e.Root, authorizedID) {
 			return false, errors.New("启动请求的升级事务无效")
@@ -586,27 +601,12 @@ func PrepareLaunch(root, authorizedID string) (bool, error) {
 	if id, pending, err := pendingState(e.Root); err != nil {
 		return false, err
 	} else if pending {
-		source, err := os.Executable()
-		if err != nil {
-			return false, err
+		cmd, startErr := e.startWorker(id, true, false)
+		if startErr != nil {
+			return false, startErr
 		}
-		helper := filepath.Join(e.Root, ".updates", "work", id, "SunYuRecovery.exe")
-		if err = copyFile(source, helper); err != nil {
-			return false, err
-		}
-		log, err := openUpdateLog(e.Root)
-		if err != nil {
-			return false, err
-		}
-		defer log.Close()
-		cmd := exec.Command(helper, "--apply-update", e.Root, id)
-		cmd.Dir = e.Root
-		cmd.Stdout, cmd.Stderr = log, log
-		configureDetached(cmd)
-		if err = cmd.Start(); err != nil {
-			return false, err
-		}
-		return true, cmd.Process.Release()
+		go func() { _ = <-cmd.done }()
+		return true, nil
 	}
 	_ = e.retryCleanup()
 	_ = e.cleanupWork("", true)

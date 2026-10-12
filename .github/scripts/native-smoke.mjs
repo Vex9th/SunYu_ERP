@@ -57,6 +57,8 @@ async function stop() {
   await exit(active, 'Graceful service exit')
 }
 try {
+  const updaterVersion = execFileSync(path.join(root, 'update.exe'), ['--version'], { cwd: root, encoding: 'utf8', windowsHide: true, timeout: 15000 }).trim()
+  assert.equal(updaterVersion, version, 'Packaged independent updater has the wrong version')
   active = start('first')
   const first = await healthy(active)
   const index = await fetch(base).then(response => response.text())
@@ -80,7 +82,7 @@ try {
   await verify(new Client(base), state)
   assert.deepEqual(await readFile(path.join(root, 'config.json')), config, 'Restart changed config bytes')
   await stop()
-  await writeFile(path.join(root, 'native-smoke-result.json'), JSON.stringify({ status: 'passed', version, checks: ['native startup', 'frontend assets', 'single instance', 'graceful shutdown', 'restart', 'config bytes unchanged', 'number', 'tax', 'payment', 'invoice', 'receipt', 'ledger', 'local update permission'] }, null, 2))
+  await writeFile(path.join(root, 'native-smoke-result.json'), JSON.stringify({ status: 'passed', version, checks: ['independent updater executable and version', 'native startup', 'frontend assets', 'single instance', 'graceful shutdown', 'restart', 'config bytes unchanged', 'number', 'tax', 'payment', 'invoice', 'receipt', 'ledger', 'local update permission'] }, null, 2))
   console.log('Native Windows packaged smoke: PASS')
 } finally {
   try { await stop() } catch (error) {

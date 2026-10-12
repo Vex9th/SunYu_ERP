@@ -40,7 +40,7 @@ func TestNativeExecutableFullAndFrontendUpdate(t *testing.T) {
 		t.Helper()
 		m := testManifest(version, "application")
 		m.BackendVersion, m.LauncherVersion = version, version
-		for target, source := range map[string]string{"SunYu_ERP.exe": "launcher-" + version, "app/SunYuService.exe": "service-" + version} {
+		for target, source := range map[string]string{"SunYu_ERP.exe": "launcher-" + version, "app/SunYuService.exe": "service-" + version, "update.exe": "updater-" + version} {
 			if err := copyFile(filepath.Join(bins, source), filepath.Join(root, target)); err != nil {
 				t.Fatal(err)
 			}
@@ -107,20 +107,9 @@ func TestNativeExecutableFullAndFrontendUpdate(t *testing.T) {
 			t.Fatal(err)
 		}
 		catalog := Catalog{Format: 2, Application: Application, Version: m.Version, BackendVersion: m.BackendVersion, FrontendVersion: m.FrontendVersion, LauncherVersion: m.LauncherVersion, APIVersion: 1, Packages: map[string]Archive{m.Component: {URL: "https://github.com/Vex9th/SunYu_ERP/releases/download/v" + m.Version + "/package.zip", SHA256: h}}}
-		body, _ := json.Marshal(catalog)
-		e.Client = &http.Client{Transport: responseTransport(func(r *http.Request) (*http.Response, error) {
-			var reader io.ReadCloser
-			if strings.HasSuffix(r.URL.Path, ".json") {
-				reader = io.NopCloser(strings.NewReader(string(body)))
-			} else {
-				file, err := os.Open(p)
-				if err != nil {
-					return nil, err
-				}
-				reader = file
-			}
-			return &http.Response{StatusCode: 200, Body: reader, Header: http.Header{}}, nil
-		})}
+		if err := writeJSON(filepath.Join(e.Root, ".updates/catalog-v2.json"), catalog); err != nil {
+			t.Fatal(err)
+		}
 	}
 	wait := func() {
 		t.Helper()
@@ -139,8 +128,21 @@ func TestNativeExecutableFullAndFrontendUpdate(t *testing.T) {
 		b, _ := os.ReadFile(filepath.Join(e.Root, ".updates/logs/update.log"))
 		t.Fatalf("native update timeout: %s", b)
 	}
+	dispatch := func(path, id string) error {
+		c, err := NewController(e.Root)
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+		upload := filepath.Join(e.Root, ".updates/imports", id+".zip")
+		if err = copyFile(path, upload); err != nil {
+			return err
+		}
+		defer os.Remove(upload)
+		return c.Import(upload, id)
+	}
 	setCatalog(next, archive)
-	if err = e.Install("9f74f971-4f58-46c7-adf2-639cd3d9ec9c"); err != nil {
+	if err = dispatch(archive, "9f74f971-4f58-46c7-adf2-639cd3d9ec9c"); err != nil {
 		t.Fatal(err)
 	}
 	wait()
@@ -191,7 +193,7 @@ func TestNativeExecutableFullAndFrontendUpdate(t *testing.T) {
 	}
 	before := healthPID()
 	setCatalog(frontend, frontArchive)
-	if err = e.Install("6956e953-26a8-4a8c-a967-f4d27c149f24"); err != nil {
+	if err = dispatch(frontArchive, "6956e953-26a8-4a8c-a967-f4d27c149f24"); err != nil {
 		t.Fatal(err)
 	}
 	wait()
@@ -227,6 +229,10 @@ func main(){root:=os.Args[2];_ = os.WriteFile(filepath.Join(root,"Data","iapm.sq
 	if err := copyFile(filepath.Join(e.Root, "SunYu_ERP.exe"), filepath.Join(badStage, "SunYu_ERP.exe")); err != nil {
 		t.Fatal(err)
 	}
+	if err := copyFile(filepath.Join(e.Root, "update.exe"), filepath.Join(badStage, "update.exe")); err != nil {
+		t.Fatal(err)
+	}
+	bad.Files["update.exe"], _ = hashFile(filepath.Join(badStage, "update.exe"))
 	bad.Files["SunYu_ERP.exe"], _ = hashFile(filepath.Join(badStage, "SunYu_ERP.exe"))
 	bad.Files["app/SunYuService.exe"], _ = hashFile(badService)
 	os.MkdirAll(filepath.Join(badStage, "app/web/2.0.3"), 0700)
@@ -234,7 +240,7 @@ func main(){root:=os.Args[2];_ = os.WriteFile(filepath.Join(root,"Data","iapm.sq
 	badArchive := filepath.Join(t.TempDir(), "failed-update.zip")
 	writeNativeArchive(t, badArchive, bad, badStage)
 	setCatalog(bad, badArchive)
-	if err = e.Install("335afc01-652d-4991-8ad9-3d6bd1e90f46"); err != nil {
+	if err = dispatch(badArchive, "335afc01-652d-4991-8ad9-3d6bd1e90f46"); err != nil {
 		t.Fatal(err)
 	}
 	var failed Job
