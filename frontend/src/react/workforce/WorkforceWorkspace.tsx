@@ -1,3 +1,4 @@
+import { registerReloadGuard } from '../pendingUnload'
 import {
   useEffect,
   useMemo,
@@ -96,6 +97,9 @@ const laborFormDrafts = new WeakMap<
   object,
   Map<string, { date: string; days: Map<string, LaborFormDraft> }>
 >()
+const activeLaborDrafts = new Set<Map<string, LaborFormDraft>>()
+const releaseLaborDraftGuard = registerReloadGuard(() => activeLaborDrafts.size > 0, 'draft')
+if (import.meta.hot) import.meta.hot.dispose(releaseLaborDraftGuard)
 interface Pending {
   snapshot: WorkforceDemoViewModel | null
   editor: Editor
@@ -210,6 +214,8 @@ export default function WorkforceWorkspace({
   const [selected, setSelected] = useState<number[]>([])
   const [drafts, setDrafts] = useState<Record<number, LaborDraft>>({})
   const [batchSummary, setBatchSummary] = useState('')
+  const [laborDraftRevision, setLaborDraftRevision] = useState(0)
+  const [draftModal, draftModalHolder] = Modal.useModal()
   const [search, setSearch] = useWorkspaceValue('q', '')
   const [activeTab, setActiveTab] = useWorkspaceTab(
     'section',
@@ -377,7 +383,7 @@ export default function WorkforceWorkspace({
       draft ? draft.selected.filter((id) => eligible.has(id)) : recorded,
     )
     setBatchSummary(draft?.batchSummary ?? '')
-  }, [model, workDate])
+  }, [model, workDate, laborDraftRevision])
   useEffect(() => {
     if (!laborFormDrafts.get(repository)?.get(projectCode)?.days.size) return
     const warn = (event: BeforeUnloadEvent) => {
@@ -946,6 +952,7 @@ export default function WorkforceWorkspace({
     }
     stored.date = workDate
     stored.days.set(workDate, structuredClone(next))
+    activeLaborDrafts.add(stored.days)
     projects.set(projectCode, stored)
     setSelected(next.selected)
     setDrafts(next.drafts)
@@ -953,6 +960,23 @@ export default function WorkforceWorkspace({
   }
   function patchDraft(id: number, patch: Partial<LaborDraft>) {
     updateBatch({ drafts: { ...drafts, [id]: { ...drafts[id]!, ...patch } } })
+  }
+  function discardCurrentLaborDraft() {
+    if (mutationDisabled || !laborFormDrafts.get(repository)?.get(projectCode)?.days.has(workDate)) return
+    const targetDate = workDate
+    const version = generation.current
+    draftModal.confirm({
+      title: `放弃 ${targetDate} 的上工草稿？`,
+      content: '此日期尚未保存的选择和填写将恢复为已登记内容，其他日期的草稿继续保留。',
+      okText: '确认放弃', cancelText: '继续填写',
+      onOk: () => {
+        if (!current(projectCode, repository, version) || context.current.readonly || actionLock.current || pendingMap(repository).has(projectCode)) return
+        const days = laborFormDrafts.get(repository)?.get(projectCode)?.days
+        days?.delete(targetDate)
+        if (days?.size === 0) activeLaborDrafts.delete(days)
+        setLaborDraftRevision(value => value + 1)
+      },
+    })
   }
   const draftCost = (assignment: DemoCrewAssignmentViewModel) => {
     const draft = drafts[assignment.assignment_id]
@@ -991,10 +1015,9 @@ export default function WorkforceWorkspace({
     }
     const send = async () => {
       await repository.saveLaborEntriesBatch(projectCode, input)
-      laborFormDrafts
-        .get(repository)
-        ?.get(projectCode)
-        ?.days.delete(input.work_date)
+      const days = laborFormDrafts.get(repository)?.get(projectCode)?.days
+      days?.delete(input.work_date)
+      if (days?.size === 0) activeLaborDrafts.delete(days)
     }
     const submission: Pending = {
       snapshot: model,
@@ -1128,6 +1151,7 @@ export default function WorkforceWorkspace({
             showIcon
             title="有未保存的上工填写"
             description="已在本次会话暂存，切换页面后可以继续。请保存上工记录后再关闭浏览器。"
+            action={<Button size="small" disabled={mutationDisabled} onClick={discardCurrentLaborDraft}>放弃当前日期草稿</Button>}
           />
         )}
       <Typography.Text type="secondary">
@@ -2077,6 +2101,7 @@ export default function WorkforceWorkspace({
       style={{ width: '100%' }}
       data-testid="react-workforce-workspace"
     >
+      {draftModalHolder}
       <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
         <Typography.Text type="secondary">
           本项目{' '}

@@ -28,9 +28,16 @@ def classify_release(tag: str, commit: str, tag_commit: str | None, release: dic
         return 'draft'
     if tag_commit is None:
         raise ValueError('Existing release has no matching fetched tag')
-    if not any(asset['name'] == ASSET and asset.get('state') == 'uploaded'
-               and asset.get('size', 0) > 0 for asset in release['assets']):
-        raise ValueError('Published release has no complete Windows asset; inspect it before retrying')
+    required = {ASSET}
+    if tuple(int(part) for part in tag[1:].split('.')) >= (1, 3, 0):
+        required.update({
+            f'SunYu_ERP-frontend-{tag[1:]}.zip', f'SunYu_ERP-backend-{tag[1:]}.zip',
+            'update-manifest.json', 'SHA256SUMS.txt',
+        })
+    complete = {asset['name'] for asset in release['assets']
+                if asset.get('state') == 'uploaded' and asset.get('size', 0) > 0}
+    if missing := required - complete:
+        raise ValueError(f'Published release has incomplete assets: {sorted(missing)}; inspect it before retrying')
     return 'published'
 
 

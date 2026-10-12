@@ -31,6 +31,8 @@ import {
   useLoad,
 } from './shared'
 import styles from './Workspace.module.css'
+import { UpdatesSection } from './updates/Updates'
+import { registerReloadGuard } from './pendingUnload'
 
 type SettingsOperationKind = 'save' | 'backup'
 interface SettingsOperationResult {
@@ -49,6 +51,9 @@ type SettingsOperation =
 // 请求由页面外持有；路由卸载不会解除保存与备份之间的互斥锁。
 let settingsOperation: SettingsOperation | null = null
 let settingsDraft: BackupSettingsPayload | null = null
+const releaseSettingsDraftGuard = registerReloadGuard(() => Boolean(settingsDraft), 'draft')
+const releaseSettingsWriteGuard = registerReloadGuard(() => settingsOperation?.status === 'running', 'pending')
+if (import.meta.hot) import.meta.hot.dispose(() => { releaseSettingsDraftGuard(); releaseSettingsWriteGuard() })
 const operationListeners = new Set<() => void>()
 function subscribeOperation(listener: () => void) {
   operationListeners.add(listener)
@@ -236,6 +241,7 @@ export default function SettingsPage() {
       />
       <ErrorNotice error={overview.error} retry={overview.reload} />
       <ErrorNotice error={error} />
+      <UpdatesSection />
       {!overview.data && overview.loading && <LoadingBlock />}
       {overview.data && (
         <>

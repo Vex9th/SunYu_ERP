@@ -5,7 +5,7 @@ run-name: Windows ${{ inputs.version || '候选构建' }}
   workflow_dispatch:
     inputs:
       version:
-        description: '正式版本号，例如 v1.2.3；留空仅构建候选包'
+        description: '正式版本号，例如 v1.3.0；留空仅构建 1.3.0 候选包'
         required: false
         type: string
 
@@ -47,6 +47,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set component version
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.version }}
+        run: |
+          $version = if ($env:RELEASE_TAG) { $env:RELEASE_TAG.Substring(1) } else { '1.3.0' }
+          "SUNYU_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Setup Python x64
         uses: actions/setup-python@v6
         with:
@@ -65,6 +73,21 @@ jobs:
 
       - name: Test backend
         run: python -m pytest
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          cache: false
+
+      - name: Test and build launcher
+        working-directory: launcher
+        shell: pwsh
+        run: |
+          go test ./...
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher tests failed' }
+          go build -trimpath -ldflags="-s -w" -o ../dist/SunYu_ERP.exe .
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher build failed' }
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -92,16 +115,19 @@ jobs:
         working-directory: frontend
         run: npm run build
 
-      - name: Build single-file executable
+      - name: Build directory runtime
         run: pyinstaller --clean --noconfirm SunYu_ERP.spec
 
-      - name: Smoke-test packaged executable and persistence
+      - name: Assemble installation and component packages
+        run: python scripts/build_modular.py --version "$env:SUNYU_VERSION" --runtime-dir dist/SunYuRuntime --launcher dist/SunYu_ERP.exe --output dist/modular
+
+      - name: Smoke-test full installation and persistence
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $smokeRoot = Join-Path $env:RUNNER_TEMP 'SunYu ERP 中文 Smoke'
           New-Item -ItemType Directory -Path $smokeRoot -Force | Out-Null
-          Copy-Item 'dist\SunYu_ERP.exe' (Join-Path $smokeRoot 'SunYu_ERP.exe')
+          Copy-Item 'dist\modular\SunYu_ERP\*' $smokeRoot -Recurse
           $executable = Join-Path $smokeRoot 'SunYu_ERP.exe'
           $healthUrl = 'http://127.0.0.1:8765/api/health'
 
@@ -177,7 +203,7 @@ jobs:
             }
             $assetMatch = [regex]::Match(
               $indexResponse.Content,
-              '(?:src|href)="(?<path>/assets/[^"]+)"'
+              '(?:src|href)="(?<path>/__frontend/[^/]+/assets/[^"]+)"'
             )
             if (-not $assetMatch.Success) {
               throw 'Packaged frontend index contains no asset URL'
@@ -228,48 +254,24 @@ jobs:
             throw 'Restart did not preserve SQLite data'
           }
 
-      - name: Package release zip
+      - name: Smoke-test independent component updates and recovery
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $stage = Join-Path $env:RUNNER_TEMP 'SunYu ERP Package'
-          New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          Copy-Item 'dist\SunYu_ERP.exe' $stage
-          Copy-Item 'start.bat' $stage
-          Copy-Item 'README.md' $stage
-          Copy-Item 'LICENSE' $stage
-          Copy-Item 'config.example.json' $stage
-
-          $zipPath = Join-Path $PWD 'SunYu_ERP-windows-x64.zip'
-          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -Force
-
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
-          try {
-            $actual = @($archive.Entries | ForEach-Object { $_.FullName })
-          } finally {
-            $archive.Dispose()
-          }
-          $required = @(
-            'SunYu_ERP.exe',
-            'start.bat',
-            'README.md',
-            'LICENSE',
-            'config.example.json'
-          )
-          if (@(Compare-Object $required $actual).Count -ne 0) {
-            throw "Unexpected release zip contents: $($actual -join ', ')"
-          }
-          $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  SunYu_ERP-windows-x64.zip" | Set-Content -Encoding utf8NoBOM 'SHA256SUMS.txt'
+          $updateSmokeRoot = Join-Path $env:RUNNER_TEMP 'SunYu ERP 中文 Update Smoke'
+          python .github/scripts/modular_smoke.py --package-dir dist/modular/SunYu_ERP --output "$updateSmokeRoot"
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged component update/recovery smoke failed' }
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v7
         with:
           name: SunYu_ERP-windows-x64
           path: |
-            SunYu_ERP-windows-x64.zip
-            SHA256SUMS.txt
+            dist/modular/SunYu_ERP-windows-x64.zip
+            dist/modular/SunYu_ERP-frontend-*.zip
+            dist/modular/SunYu_ERP-backend-*.zip
+            dist/modular/update-manifest.json
+            dist/modular/SHA256SUMS.txt
           if-no-files-found: error
 
       - name: Recheck release before publishing
@@ -295,7 +297,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.version }}
-        run: gh release upload "$env:RELEASE_TAG" SunYu_ERP-windows-x64.zip SHA256SUMS.txt --clobber
+        run: |
+          $assets = Get-ChildItem 'dist/modular' -File | Where-Object { $_.Extension -eq '.zip' -or $_.Name -in @('update-manifest.json', 'SHA256SUMS.txt') }
+          gh release upload "$env:RELEASE_TAG" @($assets.FullName) --clobber
 
       - name: Publish complete release
         if: steps.publish_gate.outputs.state == 'new' || steps.publish_gate.outputs.state == 'draft'

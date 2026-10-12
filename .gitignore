@@ -2,6 +2,8 @@
 Data/
 Backups/
 config.json
+/installation.json
+/.updates/
 .env
 .env.*
 !.env.example

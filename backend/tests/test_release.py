@@ -19,6 +19,7 @@ def test_packaged_executable_includes_pinyin_runtime_dictionaries(monkeypatch) -
 
     def capture_analysis(*_args, **kwargs):
         captured.update(kwargs)
+        captured["entrypoints"] = _args[0]
         return SimpleNamespace(pure=[], scripts=[], binaries=[], datas=kwargs["datas"])
 
     monkeypatch.setattr(hooks, "collect_submodules", lambda _name: [])
@@ -26,10 +27,16 @@ def test_packaged_executable_includes_pinyin_runtime_dictionaries(monkeypatch) -
     runpy.run_path(str(root / "SunYu_ERP.spec"), init_globals={
         "SPECPATH": str(root), "Analysis": capture_analysis,
         "PYZ": lambda *_args: None, "EXE": lambda *_args, **_kwargs: None,
+        "COLLECT": lambda *_args, **_kwargs: None,
     })
     bundled = {Path(source).name for source, destination in captured["datas"]
                if destination == "pypinyin" and Path(source).is_file()}
     assert {"pinyin_dict.json", "phrases_dict.json"} <= bundled
+    assert captured["entrypoints"] == [str(root / "updater" / "runtime_entry.py")]
+    assert {"backend", "updater"} <= set(captured["excludes"])
+    assert {"sqlite3", "zoneinfo", "xml.etree.ElementTree", "fastapi", "openpyxl", "pypinyin"} <= set(captured["hiddenimports"])
+    assert not any(name.startswith(("backend", "updater")) for name in captured["hiddenimports"])
+    assert not any(destination.startswith(("backend", "frontend")) for _, destination in captured["datas"])
 
 
 def test_windows_runtime_declares_iana_timezone_database() -> None:

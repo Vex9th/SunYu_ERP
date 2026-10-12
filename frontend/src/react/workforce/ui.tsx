@@ -16,6 +16,7 @@ import {
 } from 'antd'
 import { UploadOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
+import { registerReloadGuard } from '../pendingUnload'
 import type { DocumentVersionOption } from '../../repositories/project-operating.live'
 
 export type Values = Record<string, unknown>
@@ -35,6 +36,9 @@ export const errorText = (error: unknown): string =>
   error instanceof Error ? error.message : '操作失败，请稍后重试'
 
 // 待确认请求独立于页面生命周期，返回页面后仍能收到请求完成通知。
+const activePendingMaps = new Set<Map<string, unknown>>()
+const releasePendingGuard = registerReloadGuard(() => activePendingMaps.size > 0, 'pending')
+if (import.meta.hot) import.meta.hot.dispose(releasePendingGuard)
 export function createPendingRegistry<T>() {
   const owners = new WeakMap<object, Map<string, T>>()
   const listeners = new Set<() => void>()
@@ -46,13 +50,21 @@ export function createPendingRegistry<T>() {
   class ObservableMap extends Map<string, T> {
     override set(key: string, value: T) {
       super.set(key, value)
+      activePendingMaps.add(this)
       notify()
       return this
     }
     override delete(key: string) {
       const deleted = super.delete(key)
+      if (this.size === 0) activePendingMaps.delete(this)
       if (deleted) notify()
       return deleted
+    }
+    override clear() {
+      if (!this.size) return
+      super.clear()
+      activePendingMaps.delete(this)
+      notify()
     }
   }
   return {
@@ -149,6 +161,9 @@ export function RecordSearch({
 }
 
 const editorDrafts = new WeakMap<object, Map<string, Editor>>()
+const activeDraftMaps = new Set<Map<string, Editor>>()
+const releaseEditorDraftGuard = registerReloadGuard(() => activeDraftMaps.size > 0, 'draft')
+if (import.meta.hot) import.meta.hot.dispose(releaseEditorDraftGuard)
 export const getEditorDraft = (owner: object, key: string) =>
   editorDrafts.get(owner)?.get(key)
 export function clearEditorDraft(
@@ -158,6 +173,7 @@ export function clearEditorDraft(
 ) {
   const drafts = editorDrafts.get(owner)
   if (!editorKey || drafts?.get(key)?.key === editorKey) drafts?.delete(key)
+  if (drafts?.size === 0) activeDraftMaps.delete(drafts)
 }
 function keepEditorDraft(owner: object, key: string, editor: Editor) {
   let drafts = editorDrafts.get(owner)
@@ -166,6 +182,7 @@ function keepEditorDraft(owner: object, key: string, editor: Editor) {
     editorDrafts.set(owner, drafts)
   }
   drafts.set(key, editor)
+  activeDraftMaps.add(drafts)
 }
 
 export function DateInput({

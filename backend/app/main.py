@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import asynccontextmanager
@@ -9,7 +10,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 from starlette.types import Scope
 
 from backend.app.core.config import Settings, load_settings
@@ -36,12 +37,16 @@ from backend.app.features.system import (
     BackupJobResult,
     BackupPruner,
     BackupScheduler,
+    BackupWorkers,
     SettingsStore,
     create_system_router,
     recover_interrupted_backups,
     run_backup_job,
 )
+from backend.app.features.updates import create_updates_router
 from backend.app.features.workforce import create_workforce_router
+from updater.service import UpdateService
+from updater.storage import component_path, read_installation
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_CONFIG_PATH = _PROJECT_ROOT / "config.json"
@@ -59,6 +64,46 @@ class FrontendStaticFiles(StaticFiles):
             if response.status_code != 404 or not _is_frontend_navigation(path, scope):
                 return response
         return await super().get_response("index.html", scope)
+
+
+class ModularFrontend:
+    def __init__(self, root: Path):
+        self.root = root
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "/")
+        if path.startswith("/__frontend/"):
+            parts = path.removeprefix("/__frontend/").split("/", 1)
+            try:
+                directory = component_path(self.root, "frontend", parts[0])
+            except ValueError:
+                await Response(status_code=404)(scope, receive, send)
+                return
+            if len(parts) != 2 or not directory.is_dir():
+                await Response(status_code=404)(scope, receive, send)
+                return
+            static = StaticFiles(directory=directory)
+            try:
+                response = await static.get_response(parts[1], scope)
+            except StarletteHTTPException:
+                response = Response(status_code=404)
+            if parts[1].endswith(".html"):
+                response.headers["Cache-Control"] = "no-store"
+            await response(scope, receive, send)
+            return
+        if path not in {"/", "/index.html"} and not _is_frontend_navigation(
+            path, scope
+        ):
+            await Response(status_code=404)(scope, receive, send)
+            return
+        directory = component_path(
+            self.root, "frontend", read_installation(self.root)["frontend"]
+        )
+        response = await StaticFiles(directory=directory).get_response(
+            "index.html", scope
+        )
+        response.headers["Cache-Control"] = "no-store"
+        await response(scope, receive, send)
 
 
 def _is_frontend_navigation(_path: str, scope: Scope) -> bool:
@@ -90,6 +135,7 @@ def create_app(
     config_path: str | Path | None = None,
     migrations_dir: str | Path | None = None,
     frontend_dist: str | Path | None = None,
+    update_root: str | Path | None = None,
     backup_creator: BackupCreator = create_backup,
     backup_pruner: BackupPruner = prune_backups,
     scheduler_factory: Callable[..., BackupScheduler] = BackupScheduler,
@@ -100,9 +146,25 @@ def create_app(
     selected_migrations_dir = (
         _MIGRATIONS_DIR if migrations_dir is None else Path(migrations_dir)
     )
+    selected_update_root = Path(update_root) if update_root is not None else None
+    backup_workers = (
+        BackupWorkers(lambda: (selected_update_root / ".updates/maintenance").exists())
+        if selected_update_root is not None
+        else None
+    )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> Iterator[None]:
+        application.state.update_service = (
+            UpdateService(selected_update_root)
+            if selected_update_root is not None
+            else None
+        )
+        application.state.backend_version = (
+            read_installation(selected_update_root)["backend"]
+            if selected_update_root is not None
+            else None
+        )
         settings = load_settings(selected_config_path)
         settings.data_dir.mkdir(parents=True, exist_ok=True)
         files.cleanup_stale_staged_versions(settings.data_dir)
@@ -130,6 +192,11 @@ def create_app(
             scheduled_settings: Settings,
             now: datetime,
         ) -> BackupJobResult:
+            if (
+                selected_update_root is not None
+                and (selected_update_root / ".updates/maintenance").exists()
+            ):
+                raise RuntimeError("维护期间暂停自动备份。")
             return run_backup_job(
                 scheduled_connection,
                 scheduled_settings,
@@ -144,6 +211,31 @@ def create_app(
             runner=scheduled_backup_runner,
         )
         application.state.backup_scheduler = scheduler
+
+        def stop_scheduler() -> None:
+            while True:
+                try:
+                    scheduler.stop()
+                    return
+                except RuntimeError as error:
+                    if (
+                        selected_update_root is None
+                        or str(error) != "Backup scheduler did not stop"
+                        or not scheduler.is_alive
+                    ):
+                        raise
+                    # supervisor 必须等到备份线程结束后才能复制数据库及附件。
+                    # stop() 已设置停止事件；再次 join 不会开启新的备份任务。
+
+        def stop_backups() -> None:
+            if backup_workers is not None:
+                backup_workers.close_submissions()
+            try:
+                stop_scheduler()
+            finally:
+                if backup_workers is not None:
+                    backup_workers.wait()
+
         lifespan_failure: BaseException | None = None
         try:
             scheduler.start()
@@ -153,12 +245,30 @@ def create_app(
             raise
         finally:
             _cleanup_preserving_primary(
-                scheduler.stop,
+                stop_backups,
                 primary=lifespan_failure,
                 label="backup scheduler stop",
             )
 
     application = FastAPI(title="SunYu ERP", lifespan=lifespan)
+
+    @application.middleware("http")
+    async def update_maintenance(request: Request, call_next):
+        if (
+            selected_update_root is not None
+            and (selected_update_root / ".updates/maintenance").exists()
+            and request.url.path.startswith("/api/")
+            and not (
+                request.method == "GET"
+                and request.url.path in {"/api/health", "/api/system/updates"}
+            )
+        ):
+            return JSONResponse(
+                {"detail": "系统正在更新，请稍后重试。"},
+                status_code=503,
+                headers={"Retry-After": "3"},
+            )
+        return await call_next(request)
 
     def get_settings(request: Request) -> Settings:
         store: SettingsStore = request.app.state.settings
@@ -203,6 +313,7 @@ def create_app(
             )
 
     application.include_router(create_auth_router(get_connection, get_session_secret))
+    application.include_router(create_updates_router(get_session_secret))
     application.include_router(create_companies_router(get_connection, get_settings))
     application.include_router(create_projects_router(get_connection, get_settings))
     application.include_router(create_documents_router(get_connection, get_settings))
@@ -229,14 +340,22 @@ def create_app(
             get_scheduler_snapshot,
             backup_creator=backup_creator,
             backup_pruner=backup_pruner,
+            backup_workers=backup_workers,
         )
     )
 
     @application.get("/api/health")
-    def get_health() -> dict[str, str]:
-        return {"status": "ok"}
+    def get_health() -> dict[str, object]:
+        result: dict[str, object] = {"status": "ok"}
+        if selected_update_root is not None:
+            result.update(
+                backend_version=application.state.backend_version, pid=os.getpid()
+            )
+        return result
 
-    if frontend_dist is not None:
+    if selected_update_root is not None:
+        application.mount("/", ModularFrontend(selected_update_root), name="frontend")
+    elif frontend_dist is not None:
         application.mount(
             "/",
             FrontendStaticFiles(directory=Path(frontend_dist), html=True),

@@ -28,6 +28,21 @@ def test_existing_complete_release_is_a_successful_noop(gate):
     assert gate.classify_release('v1.2.2', SHA, SHA, published_release()) == 'published'
 
 
+def test_modular_release_requires_catalog_components_and_checksums(gate):
+    with pytest.raises(ValueError, match='asset'):
+        gate.classify_release('v1.3.0', SHA, SHA, published_release())
+    release = {'draft': False, 'assets': [
+        {'name': name, 'size': 123, 'state': 'uploaded'} for name in (
+            'SunYu_ERP-windows-x64.zip', 'SunYu_ERP-frontend-1.3.0.zip',
+            'SunYu_ERP-backend-1.3.0.zip', 'update-manifest.json', 'SHA256SUMS.txt',
+        )
+    ]}
+    assert gate.classify_release('v1.3.0', SHA, SHA, release) == 'published'
+    release['assets'][1]['size'] = 0
+    with pytest.raises(ValueError, match='asset'):
+        gate.classify_release('v1.3.0', SHA, SHA, release)
+
+
 def test_new_version_and_candidate_can_build(gate):
     assert gate.classify_release('v1.2.3', SHA, None, None) == 'new'
     assert gate.classify_release('', SHA, None, None) == 'candidate'

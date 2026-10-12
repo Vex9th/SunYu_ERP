@@ -48,6 +48,7 @@ import { errorText, LoadingBlock } from './shared'
 import styles from './Workspace.module.css'
 import { WorkspaceNavigationProvider } from './navigationState'
 import { UnsavedChangesProvider } from './unsavedChanges'
+import { UpdateNotice, UpdatesProvider } from './updates/Updates'
 
 const HomePage = lazy(() => import('./HomePage'))
 const ProjectsPage = lazy(() => import('./ProjectsPage'))
@@ -193,7 +194,7 @@ export function Application() {
         onSubmit={authenticate}
       />
     )
-  return <Shell busy={busy} logout={logout} />
+  return <UpdatesProvider><Shell busy={busy} logout={logout} /></UpdatesProvider>
 }
 
 function Shell({
@@ -291,6 +292,7 @@ function Shell({
           </div>
         </header>
         <main className={styles.content} id="main-content">
+          <UpdateNotice />
           <WorkspaceNavigationProvider>
             <ScreenBoundary
               key={location.pathname.replace(/(\/documents)\/\d+$/, '$1')}

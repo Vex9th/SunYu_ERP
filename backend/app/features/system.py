@@ -31,6 +31,46 @@ Clock = Callable[[], datetime]
 Waiter = Callable[[Event, float], bool]
 
 
+class BackupWorkers:
+    """跟踪手动备份实际线程；关闭入口后等待，不依赖数据库任务状态。"""
+
+    def __init__(self, maintenance: Callable[[], bool]) -> None:
+        self._maintenance = maintenance
+        self._lock = Lock()
+        self._closing = False
+        self._threads: set[Thread] = set()
+
+    def _require_accepting(self) -> None:
+        if self._closing or self._maintenance():
+            raise RuntimeError("Backup submissions are paused")
+
+    def require_accepting(self) -> None:
+        with self._lock:
+            self._require_accepting()
+
+    def start(self, worker: Thread) -> None:
+        with self._lock:
+            self._require_accepting()
+            self._threads = {thread for thread in self._threads if thread.is_alive()}
+            self._threads.add(worker)
+            try:
+                worker.start()
+            except BaseException:
+                self._threads.discard(worker)
+                raise
+
+    def close_submissions(self) -> None:
+        with self._lock:
+            self._closing = True
+
+    def wait(self) -> None:
+        with self._lock:
+            threads = tuple(self._threads)
+        # 不持任务提交锁或数据库连接等待，worker 可完成状态回写和资源释放。
+        for worker in threads:
+            worker.join()
+
+
 class SettingsStore:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -341,6 +381,7 @@ def create_system_router(
     *,
     backup_creator: BackupCreator = create_backup,
     backup_pruner: BackupPruner = prune_backups,
+    backup_workers: BackupWorkers | None = None,
     clock: Clock | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/system", tags=["system"])
@@ -351,6 +392,13 @@ def create_system_router(
     now = clock or _utc_now
     live_tasks: set[str] = set()
     unrecorded_success: dict[str, dict[str, object]] = {}
+
+    def require_backup_accepting() -> None:
+        if backup_workers is not None:
+            try:
+                backup_workers.require_accepting()
+            except RuntimeError:
+                raise HTTPException(status_code=503, detail="维护期间暂停备份。") from None
 
     def reconcile_task(connection: sqlite3.Connection, task_id: str) -> dict[str, object] | None:
         completed = unrecorded_success.get(task_id)
@@ -422,6 +470,7 @@ def create_system_router(
         connection: sqlite3.Connection = connection_dependency,
         settings: Settings = settings_dependency,
     ) -> dict[str, str]:
+        require_backup_accepting()
         if settings.backup_dir is None:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -469,6 +518,7 @@ def create_system_router(
         if settings.backup_dir is None:
             raise HTTPException(status_code=409, detail="Backup directory is not configured")
         with _TASK_SUBMISSION_LOCK:
+            require_backup_accepting()
             active = connection.execute(
                 "SELECT id FROM backup_tasks WHERE status='running' "
                 "ORDER BY started_at DESC LIMIT 1"
@@ -567,7 +617,10 @@ def create_system_router(
 
         worker = Thread(target=execute, name=f"backup-{task_id[:8]}", daemon=True)
         try:
-            worker.start()
+            if backup_workers is None:
+                worker.start()
+            else:
+                backup_workers.start(worker)
         except RuntimeError:
             with _TASK_SUBMISSION_LOCK:
                 live_tasks.discard(task_id)
