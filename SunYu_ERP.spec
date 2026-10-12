@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
 project_root = Path(SPECPATH)
@@ -12,6 +12,7 @@ analysis = Analysis(
     datas=[
         (str(project_root / "backend" / "migrations"), "backend/migrations"),
         (str(project_root / "frontend" / "dist"), "frontend/dist"),
+        *collect_data_files("pypinyin", includes=["*.json"]),
     ],
     hiddenimports=collect_submodules("uvicorn"),
     hookspath=[],

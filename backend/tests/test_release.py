@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import runpy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -9,6 +10,26 @@ from typing import Any
 import pytest
 
 import release
+
+
+def test_packaged_executable_includes_pinyin_runtime_dictionaries(monkeypatch) -> None:
+    from PyInstaller.utils import hooks
+
+    captured = {}
+
+    def capture_analysis(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(pure=[], scripts=[], binaries=[], datas=kwargs["datas"])
+
+    monkeypatch.setattr(hooks, "collect_submodules", lambda _name: [])
+    root = Path(__file__).resolve().parents[2]
+    runpy.run_path(str(root / "SunYu_ERP.spec"), init_globals={
+        "SPECPATH": str(root), "Analysis": capture_analysis,
+        "PYZ": lambda *_args: None, "EXE": lambda *_args, **_kwargs: None,
+    })
+    bundled = {Path(source).name for source, destination in captured["datas"]
+               if destination == "pypinyin" and Path(source).is_file()}
+    assert {"pinyin_dict.json", "phrases_dict.json"} <= bundled
 
 
 def test_windows_runtime_declares_iana_timezone_database() -> None:

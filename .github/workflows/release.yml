@@ -194,6 +194,8 @@ jobs:
             if (-not (Test-Path (Join-Path $smokeRoot 'Data\iapm.sqlite'))) {
               throw 'First start did not create Data\iapm.sqlite beside the executable'
             }
+            python .github/scripts/release_smoke.py seed (Join-Path $smokeRoot 'business-smoke.json')
+            if ($LASTEXITCODE -ne 0) { throw 'Packaged business smoke failed' }
           } finally {
             Stop-SunYuProcess $first
           }
@@ -211,6 +213,8 @@ jobs:
             if ($second.HasExited) {
               throw 'Restarted SunYu_ERP.exe exited immediately after health check'
             }
+            python .github/scripts/release_smoke.py verify (Join-Path $smokeRoot 'business-smoke.json')
+            if ($LASTEXITCODE -ne 0) { throw 'Packaged business state did not survive restart' }
           } finally {
             Stop-SunYuProcess $second
           }
