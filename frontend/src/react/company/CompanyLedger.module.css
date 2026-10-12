@@ -35,8 +35,8 @@
 .field {
   display: grid;
   gap: 5px;
-  color: var(--sunyu-text-secondary);
-  font-size: 13px;
+  color: #596779;
+  font-size: 12px;
 }
 .projectFilter {
   width: 210px;
@@ -60,8 +60,8 @@
   font-size: 18px;
 }
 .summary dt {
-  color: var(--sunyu-text-secondary);
-  font-size: 13px;
+  color: #596779;
+  font-size: 12px;
 }
 .summary dd {
   margin: 6px 0 0;
@@ -75,8 +75,8 @@
 }
 .note {
   margin: 0;
-  color: var(--sunyu-text-secondary);
-  font-size: 13px;
+  color: #6c7789;
+  font-size: 12px;
   line-height: 1.6;
 }
 .amount {
@@ -95,7 +95,7 @@
   justify-content: center;
   gap: 12px;
   min-height: 200px;
-  color: var(--sunyu-text-secondary);
+  color: #596779;
 }
 .contractTable {
   padding: 8px 0;

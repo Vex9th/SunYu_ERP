@@ -48,7 +48,6 @@ import { errorText, LoadingBlock } from './shared'
 import styles from './Workspace.module.css'
 import { WorkspaceNavigationProvider } from './navigationState'
 import { UnsavedChangesProvider } from './unsavedChanges'
-import { UpdateNotice, UpdatesProvider } from './updates/Updates'
 
 const HomePage = lazy(() => import('./HomePage'))
 const ProjectsPage = lazy(() => import('./ProjectsPage'))
@@ -194,7 +193,7 @@ export function Application() {
         onSubmit={authenticate}
       />
     )
-  return <UpdatesProvider><Shell busy={busy} logout={logout} /></UpdatesProvider>
+  return <Shell busy={busy} logout={logout} />
 }
 
 function Shell({
@@ -292,7 +291,6 @@ function Shell({
           </div>
         </header>
         <main className={styles.content} id="main-content">
-          <UpdateNotice />
           <WorkspaceNavigationProvider>
             <ScreenBoundary
               key={location.pathname.replace(/(\/documents)\/\d+$/, '$1')}
@@ -356,16 +354,12 @@ export default function RootApp() {
           colorWarning: '#c18129',
           colorError: '#c34343',
           colorText: '#26354b',
-          colorTextSecondary: '#526177',
-          colorTextTertiary: '#596579',
-          colorTextPlaceholder: '#657187',
+          colorTextSecondary: '#596579',
           colorBgLayout: '#f4f6f9',
           colorBorder: '#e1e6ee',
           colorBorderSecondary: '#edf0f4',
-          fontFamily: 'var(--sunyu-font-family)',
-          fontSize: 15,
-          fontSizeSM: 13,
-          lineHeight: 1.6,
+          fontFamily: '"PingFang SC", "Microsoft YaHei", sans-serif',
+          fontSize: 14,
           borderRadius: 6,
           controlHeight: 34,
           wireframe: false,
@@ -374,9 +368,6 @@ export default function RootApp() {
           Table: {
             headerBg: '#f8f9fc',
             headerColor: '#526177',
-            cellFontSize: 15,
-            cellFontSizeMD: 15,
-            cellFontSizeSM: 15,
             cellPaddingBlock: 11,
           },
           Menu: {

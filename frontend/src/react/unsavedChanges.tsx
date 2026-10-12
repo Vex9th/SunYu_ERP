@@ -1,20 +1,9 @@
 import { createContext, useContext, useEffect, useRef, type ReactNode } from 'react'
 import { App } from 'antd'
 import { useBlocker } from 'react-router-dom'
-import { reloadBlockReason } from './pendingUnload'
-import { listPendingCreates } from './companyWrites'
 
 type Check = () => boolean
 const UnsavedChangesContext = createContext<Set<Check> | null>(null)
-
-export function useRefreshBlockReason() {
-  const checks = useContext(UnsavedChangesContext)
-  return () => {
-    if (listPendingCreates().length) return '业务请求仍在执行或结果尚未确认，请返回公司与联系人核对后再刷新。'
-    return reloadBlockReason() ?? ([...(checks ?? [])].some(check => check())
-      ? '请先保存或处理未保存的修改，再刷新使用新版本。' : null)
-  }
-}
 
 /** 一个路由阻拦器统一管理当前页面的多个编辑器，覆盖链接、页签和浏览器后退。 */
 export function UnsavedChangesProvider({ children }: { children: ReactNode }) {

@@ -5,7 +5,7 @@ run-name: Windows ${{ inputs.version || '候选构建' }}
   workflow_dispatch:
     inputs:
       version:
-        description: '正式版本号，例如 v2.0.0；留空仅构建候选包'
+        description: '正式版本号，例如 v1.2.3；留空仅构建候选包'
         required: false
         type: string
 
@@ -23,133 +23,255 @@ jobs:
     outputs:
       build_needed: ${{ steps.gate.outputs.build_needed }}
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '22'
       - name: Check version and existing release
         id: gate
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.version }}
-        run: node .github/scripts/release-gate.mjs
+        run: python .github/scripts/release_gate.py
 
   release:
     needs: prepare
     if: needs.prepare.outputs.build_needed == 'true'
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 35
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: Set release version
-        shell: pwsh
-        env:
-          RELEASE_TAG: ${{ inputs.version }}
-        run: |
-          $version = if ($env:RELEASE_TAG) { $env:RELEASE_TAG.Substring(1) } else { '2.0.0' }
-          "SUNYU_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - uses: actions/setup-go@v6
+
+      - name: Setup Python x64
+        uses: actions/setup-python@v6
         with:
-          go-version-file: server/go.mod
-          cache-dependency-path: server/go.sum
-      - uses: actions/setup-node@v6
+          python-version-file: .python-version
+          architecture: x64
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install backend dependencies
+        run: python -m pip install --requirement requirements-dev.txt
+
+      - name: Lint backend
+        run: python -m ruff check . .github/scripts
+
+      - name: Test backend
+        run: python -m pytest
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - name: Verify native backend and updater
-        working-directory: server
-        run: |
-          go test ./...
-          if ($LASTEXITCODE -ne 0) { throw 'Native Go tests failed' }
-          go vet ./...
-          if ($LASTEXITCODE -ne 0) { throw 'Go vet failed' }
-      - name: Verify release protection
-        run: node --test .github/scripts/release-gate.test.mjs .github/scripts/windows-zip.test.mjs
+
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
+
       - name: Test frontend
         working-directory: frontend
-        run: npm test -- --maxWorkers=1
+        # Windows 上并行挂载多个完整 jsdom 工作区会争抢资源，串行执行文件。
+        run: |
+          node -e "const os = require('node:os'); console.log({ node: process.version, platform: process.platform, workers: 1, cpus: os.availableParallelism(), memoryGiB: Math.round(os.totalmem() / 1024 ** 3) })"
+          npm test -- --maxWorkers=1
+
       - name: Type-check frontend
         working-directory: frontend
         run: npm run typecheck
+
       - name: Build frontend
         working-directory: frontend
         run: npm run build
-      - name: Build native Windows executables
-        working-directory: server
-        env:
-          CGO_ENABLED: '0'
-          GOOS: windows
-          GOARCH: amd64
+
+      - name: Build single-file executable
+        run: pyinstaller --clean --noconfirm SunYu_ERP.spec
+
+      - name: Smoke-test packaged executable and persistence
+        shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path ../dist/native-bin -Force | Out-Null
-          $flags = "-s -w -H=windowsgui -X main.version=$env:SUNYU_VERSION"
-          go build -trimpath -ldflags="$flags" -o ../dist/native-bin/SunYu_ERP.exe ./cmd/launcher
-          if ($LASTEXITCODE -ne 0) { throw 'Launcher build failed' }
-          go build -trimpath -ldflags="$flags" -o ../dist/native-bin/SunYuService.exe ./cmd/service
-          if ($LASTEXITCODE -ne 0) { throw 'Service build failed' }
-          go build -trimpath -ldflags="-s -w -X main.version=$env:SUNYU_VERSION" -o ../dist/native-bin/update.exe ./cmd/updater
-          if ($LASTEXITCODE -ne 0) { throw 'Independent updater build failed' }
-      - name: Assemble verified native packages
-        working-directory: server
-        run: go run ./cmd/package --version "$env:SUNYU_VERSION" --bin-dir ../dist/native-bin --web-dir ../frontend/dist --output ../dist/native --notes (Get-Content ../RELEASE_NOTES.md -Raw -Encoding utf8)
-      - name: Verify packaged startup, single instance and data persistence
-        run: node .github/scripts/native-smoke.mjs dist/native/SunYu_ERP "$env:RUNNER_TEMP/SunYu ERP 中文 Native Smoke" "$env:SUNYU_VERSION"
-      - name: Build isolated frontend and application upgrade fixtures
-        run: node .github/scripts/build-upgrade-fixtures.mjs dist/native dist/upgrade-fixtures "$env:SUNYU_VERSION"
-      - name: Download and verify legacy migration baseline
-        env:
-          GH_TOKEN: ${{ github.token }}
+          $ErrorActionPreference = 'Stop'
+          $smokeRoot = Join-Path $env:RUNNER_TEMP 'SunYu ERP 中文 Smoke'
+          New-Item -ItemType Directory -Path $smokeRoot -Force | Out-Null
+          Copy-Item 'dist\SunYu_ERP.exe' (Join-Path $smokeRoot 'SunYu_ERP.exe')
+          $executable = Join-Path $smokeRoot 'SunYu_ERP.exe'
+          $healthUrl = 'http://127.0.0.1:8765/api/health'
+
+          function Start-SunYuProcess([string] $suffix) {
+            return Start-Process -FilePath $executable `
+              -WorkingDirectory $smokeRoot `
+              -RedirectStandardOutput (Join-Path $smokeRoot "stdout-$suffix.log") `
+              -RedirectStandardError (Join-Path $smokeRoot "stderr-$suffix.log") `
+              -PassThru
+          }
+
+          function Wait-SunYuHealth([System.Diagnostics.Process] $process) {
+            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+              if ($process.HasExited) {
+                Get-Content (Join-Path $smokeRoot 'stderr-*.log') -ErrorAction SilentlyContinue
+                throw "SunYu_ERP.exe exited before becoming healthy: $($process.ExitCode)"
+              }
+              try {
+                $health = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 2
+                if ($health.status -eq 'ok') {
+                  return
+                }
+              } catch {
+                Start-Sleep -Seconds 1
+              }
+            }
+            throw 'SunYu_ERP.exe did not become healthy within 60 seconds'
+          }
+
+          function Stop-SunYuProcess([System.Diagnostics.Process] $process) {
+            $process.Refresh()
+            if ($process.HasExited) {
+              return
+            }
+
+            & taskkill.exe /PID $process.Id /T /F | Out-Null
+            $taskkillExitCode = $LASTEXITCODE
+            $process.Refresh()
+            if ($taskkillExitCode -ne 0 -and -not $process.HasExited) {
+              throw "Failed to terminate SunYu_ERP.exe process tree: $taskkillExitCode"
+            }
+            Wait-Process -Id $process.Id -Timeout 15 -ErrorAction SilentlyContinue
+            $process.Refresh()
+            if (-not $process.HasExited) {
+              throw 'SunYu_ERP.exe process tree did not stop within 15 seconds'
+            }
+          }
+
+          function Wait-SunYuStopped {
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              $client = [System.Net.Sockets.TcpClient]::new()
+              try {
+                $client.Connect('127.0.0.1', 8765)
+                if (-not $client.Connected) {
+                  return
+                }
+              } catch [System.Net.Sockets.SocketException] {
+                return
+              } finally {
+                $client.Dispose()
+              }
+              Start-Sleep -Milliseconds 500
+            }
+            throw 'Port 8765 remained reachable after process-tree termination'
+          }
+
+          $first = Start-SunYuProcess 'first'
+          try {
+            Wait-SunYuHealth $first
+            $indexResponse = Invoke-WebRequest -Uri 'http://127.0.0.1:8765/' -UseBasicParsing
+            if ($indexResponse.StatusCode -ne 200 -or $indexResponse.Content -notmatch '<div id="app">') {
+              throw 'Packaged frontend index was not served'
+            }
+            $assetMatch = [regex]::Match(
+              $indexResponse.Content,
+              '(?:src|href)="(?<path>/assets/[^"]+)"'
+            )
+            if (-not $assetMatch.Success) {
+              throw 'Packaged frontend index contains no asset URL'
+            }
+            $asset = Invoke-WebRequest `
+              -Uri ("http://127.0.0.1:8765" + $assetMatch.Groups['path'].Value) `
+              -UseBasicParsing
+            if ($asset.StatusCode -ne 200 -or $asset.Content.Length -le 0) {
+              throw 'Packaged frontend asset was not served'
+            }
+            if (-not (Test-Path (Join-Path $smokeRoot 'config.json'))) {
+              throw 'First start did not create config.json beside the executable'
+            }
+            if (-not (Test-Path (Join-Path $smokeRoot 'Data\iapm.sqlite'))) {
+              throw 'First start did not create Data\iapm.sqlite beside the executable'
+            }
+            python .github/scripts/release_smoke.py seed (Join-Path $smokeRoot 'business-smoke.json')
+            if ($LASTEXITCODE -ne 0) { throw 'Packaged business smoke failed' }
+          } finally {
+            Stop-SunYuProcess $first
+          }
+          Wait-SunYuStopped
+
+          $configPath = Join-Path $smokeRoot 'config.json'
+          $databasePath = Join-Path $smokeRoot 'Data\iapm.sqlite'
+          $configBeforeRestart = Get-Content $configPath -Raw
+          python -c 'import sqlite3, sys; connection = sqlite3.connect(sys.argv[1]); connection.execute("INSERT OR REPLACE INTO system_settings (key, value_json, updated_at) VALUES (?, ?, ?)", ("release_smoke", "persisted", "now")); connection.commit(); connection.close()' $databasePath
+
+          $second = Start-SunYuProcess 'second'
+          try {
+            Wait-SunYuHealth $second
+            $second.Refresh()
+            if ($second.HasExited) {
+              throw 'Restarted SunYu_ERP.exe exited immediately after health check'
+            }
+            python .github/scripts/release_smoke.py verify (Join-Path $smokeRoot 'business-smoke.json')
+            if ($LASTEXITCODE -ne 0) { throw 'Packaged business state did not survive restart' }
+          } finally {
+            Stop-SunYuProcess $second
+          }
+          Wait-SunYuStopped
+
+          if ((Get-Content $configPath -Raw) -ne $configBeforeRestart) {
+            throw 'Restart unexpectedly rewrote config.json'
+          }
+          $marker = python -c 'import sqlite3, sys; connection = sqlite3.connect(sys.argv[1]); print(connection.execute("SELECT value_json FROM system_settings WHERE key = ?", ("release_smoke",)).fetchone()[0]); connection.close()' $databasePath
+          if ($marker.Trim() -ne 'persisted') {
+            throw 'Restart did not preserve SQLite data'
+          }
+
+      - name: Package release zip
+        shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path dist/legacy-baseline | Out-Null
-          gh release download v1.3.1 --repo "$env:GITHUB_REPOSITORY" --pattern SunYu_ERP-windows-x64.zip --dir dist/legacy-baseline
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot download legacy migration baseline' }
-          $hash = (Get-FileHash dist/legacy-baseline/SunYu_ERP-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
-          if ($hash -ne 'b2568323d110a6102777fbb589b8af69f6c7192471c7504f1defc8357ab62591') { throw 'Legacy migration baseline hash changed' }
-      - name: Verify legacy migration, hot updates, application replacement and failed migration recovery
-        run: node .github/scripts/native-upgrade-smoke.mjs dist/legacy-baseline/SunYu_ERP-windows-x64.zip dist/upgrade-fixtures "$env:RUNNER_TEMP/SunYu ERP 中文 Upgrade Smoke" "$env:SUNYU_VERSION"
-      - name: Verify external data junction upgrade and recovery compatibility
-        run: node .github/scripts/native-upgrade-smoke.mjs dist/legacy-baseline/SunYu_ERP-windows-x64.zip dist/upgrade-fixtures "$env:RUNNER_TEMP/SunYu ERP 中文 Junction Smoke" "$env:SUNYU_VERSION" junction
-      - name: Verify short data directory name upgrade and recovery compatibility
-        run: node .github/scripts/native-upgrade-smoke.mjs dist/legacy-baseline/SunYu_ERP-windows-x64.zip dist/upgrade-fixtures "$env:RUNNER_TEMP/SunYu ERP 中文 Short Name Smoke" "$env:SUNYU_VERSION" short-leaf
-      - name: Upload candidate and validation artifact
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'SunYu ERP Package'
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item 'dist\SunYu_ERP.exe' $stage
+          Copy-Item 'start.bat' $stage
+          Copy-Item 'README.md' $stage
+          Copy-Item 'LICENSE' $stage
+          Copy-Item 'config.example.json' $stage
+
+          $zipPath = Join-Path $PWD 'SunYu_ERP-windows-x64.zip'
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -Force
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            $actual = @($archive.Entries | ForEach-Object { $_.FullName })
+          } finally {
+            $archive.Dispose()
+          }
+          $required = @(
+            'SunYu_ERP.exe',
+            'start.bat',
+            'README.md',
+            'LICENSE',
+            'config.example.json'
+          )
+          if (@(Compare-Object $required $actual).Count -ne 0) {
+            throw "Unexpected release zip contents: $($actual -join ', ')"
+          }
+          $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  SunYu_ERP-windows-x64.zip" | Set-Content -Encoding utf8NoBOM 'SHA256SUMS.txt'
+
+      - name: Upload release artifact
         uses: actions/upload-artifact@v7
         with:
           name: SunYu_ERP-windows-x64
           path: |
-            dist/native/*.zip
-            dist/native/update.exe
-            dist/native/update-manifest*.json
-            dist/native/SHA256SUMS.txt
-            ${{ runner.temp }}/SunYu ERP 中文 Native Smoke/native-smoke-result.json
-            ${{ runner.temp }}/SunYu ERP 中文 Upgrade Smoke/native-upgrade-result.json
-            ${{ runner.temp }}/SunYu ERP 中文 Junction Smoke/native-upgrade-result.json
-            ${{ runner.temp }}/SunYu ERP 中文 Short Name Smoke/native-upgrade-result.json
+            SunYu_ERP-windows-x64.zip
+            SHA256SUMS.txt
           if-no-files-found: error
-      - name: Upload failed verification diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: SunYu_ERP-native-validation-logs
-          path: |
-            ${{ runner.temp }}/SunYu ERP 中文 Native Smoke/*.log
-            ${{ runner.temp }}/SunYu ERP 中文 Native Smoke/.updates/logs/*.log
-            ${{ runner.temp }}/SunYu ERP 中文 Upgrade Smoke/*.log
-            ${{ runner.temp }}/SunYu ERP 中文 Upgrade Smoke/installation/.updates/logs/*.log
-            ${{ runner.temp }}/SunYu ERP 中文 Junction Smoke/*.log
-            ${{ runner.temp }}/SunYu ERP 中文 Junction Smoke/installation/.updates/logs/*.log
-            ${{ runner.temp }}/SunYu ERP 中文 Short Name Smoke/*.log
-            ${{ runner.temp }}/SunYu ERP 中文 Short Name Smoke/installation/.updates/logs/*.log
-          if-no-files-found: ignore
+
       - name: Recheck release before publishing
         if: inputs.version != ''
         id: publish_gate
@@ -159,21 +281,22 @@ jobs:
         run: |
           git fetch --tags origin
           if ($LASTEXITCODE -ne 0) { throw 'Cannot refresh release tags' }
-          node .github/scripts/release-gate.mjs
+          python .github/scripts/release_gate.py
+
       - name: Create release draft
         if: steps.publish_gate.outputs.state == 'new'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.version }}
         run: gh release create "$env:RELEASE_TAG" --draft --target "$env:GITHUB_SHA" --notes-file RELEASE_NOTES.md --title "$env:RELEASE_TAG"
+
       - name: Upload verified assets to draft
         if: steps.publish_gate.outputs.state == 'new' || steps.publish_gate.outputs.state == 'draft'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.version }}
-        run: |
-          $assets = Get-ChildItem 'dist/native' -File | Where-Object { $_.Extension -in @('.zip', '.exe') -or $_.Name -in @('update-manifest.json', 'update-manifest-v2.json', 'SHA256SUMS.txt') }
-          gh release upload "$env:RELEASE_TAG" @($assets.FullName) --clobber
+        run: gh release upload "$env:RELEASE_TAG" SunYu_ERP-windows-x64.zip SHA256SUMS.txt --clobber
+
       - name: Publish complete release
         if: steps.publish_gate.outputs.state == 'new' || steps.publish_gate.outputs.state == 'draft'
         env:

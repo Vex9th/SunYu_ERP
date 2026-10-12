@@ -1,5 +1,5 @@
 export interface RequestOptions {
-  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+  method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
   headers?: HeadersInit
   body?: unknown
   signal?: AbortSignal

@@ -21,7 +21,6 @@ import {
 import { ReloadOutlined } from '@ant-design/icons'
 import { ApiError } from '../api'
 import styles from './Workspace.module.css'
-import { registerReloadGuard } from './pendingUnload'
 export { useWorkspaceTab, useWorkspaceValue } from './navigationState'
 
 export const errorText = (error: unknown) =>
@@ -254,9 +253,6 @@ const editorDrafts = new Map<
   string,
   { values: EditorValues; revision?: number }
 >()
-const releaseDraftGuard = registerReloadGuard(() => editorDrafts.size > 0, 'draft')
-const releaseEditorGuard = registerReloadGuard(() => [...pendingEditors.values()].some(request => !request.completed && !request.definitive), 'pending')
-if (import.meta.hot) import.meta.hot.dispose(() => { releaseDraftGuard(); releaseEditorGuard() })
 const editorListeners = new Set<() => void>()
 function notifyEditors() {
   editorListeners.forEach((listener) => listener())
