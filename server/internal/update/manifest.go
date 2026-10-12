@@ -15,6 +15,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"sunyu.local/erp/internal/pathidentity"
 )
 
 const Application = "SunYu_ERP"
@@ -149,7 +151,7 @@ func safePath(root, rel string) (string, error) {
 	for _, part := range strings.Split(rel, "/") {
 		current = filepath.Join(current, part)
 		i, e := os.Lstat(current)
-		if e == nil && i.Mode()&os.ModeSymlink != 0 {
+		if e == nil && pathidentity.IsLink(i) {
 			return "", fmt.Errorf("拒绝符号链接：%s", rel)
 		}
 		if e != nil && !os.IsNotExist(e) {

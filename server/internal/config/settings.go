@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"unicode/utf8"
+
+	"sunyu.local/erp/internal/pathidentity"
 )
 
 type Settings struct {
@@ -207,7 +209,7 @@ func resolvePath(path string) (string, error) {
 }
 
 func resolveMissingPath(path string, links int) (string, error) {
-	resolved, err := filepath.EvalSymlinks(path)
+	resolved, err := pathidentity.ResolveExisting(path)
 	if err == nil {
 		return resolved, nil
 	}
@@ -215,7 +217,7 @@ func resolveMissingPath(path string, links int) (string, error) {
 		return "", err
 	}
 	info, statErr := os.Lstat(path)
-	if statErr == nil && info.Mode()&os.ModeSymlink != 0 {
+	if statErr == nil && pathidentity.IsLink(info) {
 		if links >= 64 {
 			return "", fmt.Errorf("too many symbolic links: %s", path)
 		}

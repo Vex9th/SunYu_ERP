@@ -10,11 +10,64 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"sunyu.local/erp/internal/lifecycle"
 )
 
 type responseTransport func(*http.Request) (*http.Response, error)
 
 func (f responseTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func testEngine(t *testing.T, root string) *Engine {
+	t.Helper()
+	e, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(e.Close)
+	return e
+}
+
+func TestEngineFixtureWaitsForWorkerFinalizationBeforeRemovingData(t *testing.T) {
+	root := t.TempDir()
+	var e *Engine
+	id := "687afbf8-a5ae-42c2-ad7f-bdd7349bbf51"
+	// Registered before the engine's cleanup, so this checks its completed teardown.
+	t.Cleanup(func() {
+		e.mu.Lock()
+		closed, running := e.closed, e.running
+		e.mu.Unlock()
+		if !closed || running {
+			e.Close()
+			t.Error("test engine did not finish its background worker before directory cleanup")
+		}
+		j, err := e.Request(id)
+		if err != nil || j.Status != "failed" || !strings.Contains(j.Error, "worker finalized") {
+			t.Errorf("final request state was not persisted: %+v %v", j, err)
+		}
+		release, err := lifecycle.Acquire(e.Root, "installer.lock")
+		if err != nil {
+			t.Error("engine cleanup did not release the installer lock", err)
+		} else {
+			release()
+		}
+	})
+	e = testEngine(t, root)
+	if err := e.start(id, "checking", func(j *Job) error {
+		// Expose a terminal snapshot while the worker still has finalization work.
+		j.Status = "success"
+		if err := e.saveJob(j); err != nil {
+			return err
+		}
+		<-e.ctx.Done()
+		return errors.New("worker finalized after cancellation")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if j := awaitJob(t, e); j.Status != "success" {
+		t.Fatal(j)
+	}
+}
 func awaitJob(t *testing.T, e *Engine) Job {
 	t.Helper()
 	for end := time.Now().Add(5 * time.Second); time.Now().Before(end); {
@@ -49,7 +102,7 @@ func TestFrontendInstallPreservesDataAndOnePreviousVersion(t *testing.T) {
 	next := testManifest("2.0.1", "frontend")
 	stage := t.TempDir()
 	installFixture(t, stage, next, map[string]string{"app/web/2.0.1/index.html": "new"})
-	e, _ := New(root)
+	e := testEngine(t, root)
 	j := Job{ID: "test", RequestID: "request", Status: "installing"}
 	if err := e.installFrontend(&j, next, stage); err != nil {
 		t.Fatal(err)
@@ -68,9 +121,16 @@ func TestFrontendInstallPreservesDataAndOnePreviousVersion(t *testing.T) {
 	}
 }
 func TestCheckRequestIsIdempotentAndBusyDoesNotQueue(t *testing.T) {
-	e, _ := New(t.TempDir())
+	e := testEngine(t, t.TempDir())
 	gate := make(chan struct{})
-	e.Client = &http.Client{Transport: responseTransport(func(r *http.Request) (*http.Response, error) { <-gate; return nil, errors.New("network unavailable") })}
+	e.Client = &http.Client{Transport: responseTransport(func(r *http.Request) (*http.Response, error) {
+		select {
+		case <-gate:
+			return nil, errors.New("network unavailable")
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+	})}
 	id := "28f4417c-e8a9-4bd0-a4d4-773ba6e279fa"
 	if err := e.Check(id); err != nil {
 		t.Fatal(err)
@@ -95,7 +155,7 @@ func TestCheckRequestIsIdempotentAndBusyDoesNotQueue(t *testing.T) {
 	}
 }
 func TestCatalogRejectsUnsafeOriginsAndDowngrades(t *testing.T) {
-	e, _ := New(t.TempDir())
+	e := testEngine(t, t.TempDir())
 	m := testManifest("3.0.0", "frontend")
 	installFixture(t, e.Root, m, map[string]string{"app/web/3.0.0/index.html": "new"})
 	c := Catalog{Format: 2, Application: Application, APIVersion: 1, Version: "2.0.1", BackendVersion: "2.0.0", FrontendVersion: "2.0.1", LauncherVersion: "2.0.0", Packages: map[string]Archive{"frontend": {URL: "https://evil.invalid/x.zip", SHA256: digest("x")}}}
@@ -108,7 +168,7 @@ func TestCatalogRejectsUnsafeOriginsAndDowngrades(t *testing.T) {
 	}
 }
 func TestImportRejectsSelfDeclaredHashWithoutOfficialDigest(t *testing.T) {
-	e, _ := New(t.TempDir())
+	e := testEngine(t, t.TempDir())
 	m := testManifest("2.0.1", "frontend")
 	p := testArchive(t, m, map[string]string{"app/web/2.0.1/index.html": "new"})
 	owned := filepath.Join(e.Root, ".updates/imports/test.zip")
@@ -131,7 +191,7 @@ func TestImportRejectsSelfDeclaredHashWithoutOfficialDigest(t *testing.T) {
 	}
 }
 func TestHealthVerificationStopsWhenNewLauncherExits(t *testing.T) {
-	e, _ := New(t.TempDir())
+	e := testEngine(t, t.TempDir())
 	start := time.Now()
 	if err := e.waitHealthyOwned("2.0.1", 30*time.Second, 2147483647); err == nil {
 		t.Fatal("nonexistent launcher accepted")
@@ -151,7 +211,7 @@ func TestSemanticVersionPrereleaseAndUnboundedNumbers(t *testing.T) {
 	}
 }
 func TestLegacyCatalogCanBeCheckedWithoutOfferingDowngrade(t *testing.T) {
-	e, _ := New(t.TempDir())
+	e := testEngine(t, t.TempDir())
 	m := testManifest("2.0.0", "frontend")
 	installFixture(t, e.Root, m, map[string]string{"app/web/2.0.0/index.html": "new"})
 	e.Client = &http.Client{Transport: responseTransport(func(r *http.Request) (*http.Response, error) {

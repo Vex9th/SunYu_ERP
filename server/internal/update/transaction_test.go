@@ -67,7 +67,9 @@ func TestBackupRefusesDataSymlinkAndUnsafeOverlap(t *testing.T) {
 			root := t.TempDir()
 			applicationFixture(t, root, "2.0.0")
 			data := filepath.Join(root, "Data")
-			os.MkdirAll(data, 0700)
+			if err := os.MkdirAll(data, 0700); err != nil {
+				t.Fatal(err)
+			}
 			switch kind {
 			case "symlink":
 				if err := os.Symlink(t.TempDir(), filepath.Join(data, "linked")); err != nil {
@@ -80,13 +82,40 @@ func TestBackupRefusesDataSymlinkAndUnsafeOverlap(t *testing.T) {
 			case "app":
 				data = filepath.Join(root, "app")
 			}
-			os.WriteFile(filepath.Join(root, "config.json"), []byte(`{"data_dir":`+quoteJSON(data)+`}`), 0600)
-			e, _ := New(root)
+			if err := os.WriteFile(filepath.Join(root, "config.json"), []byte(`{"data_dir":`+quoteJSON(data)+`}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			e := testEngine(t, root)
 			tx := Transaction{Job: Job{ID: "bad"}, Stage: t.TempDir()}
 			if err := e.backup(&tx); err == nil {
-				t.Fatal("unsafe data backup accepted")
+				normalized, normalizeErr := filepath.EvalSymlinks(data)
+				t.Fatalf("unsafe data backup accepted: original root=%q canonical root=%q configured data=%q resolved data=%q resolve error=%v backup data=%q", root, e.Root, data, normalized, normalizeErr, tx.DataDir)
 			}
 		})
+	}
+}
+
+func TestPathComparisonPreservesExternalDataConfiguration(t *testing.T) {
+	e := testEngine(t, t.TempDir())
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := filepath.Join(parent, "customer", "not-created")
+	configuration := []byte(`{"data_dir":` + quoteJSON(data) + `, "original_spacing": 1}`)
+	if err := os.WriteFile(filepath.Join(e.Root, "config.json"), configuration, 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := installationPaths(e.Root)
+	if err != nil || got != data {
+		t.Fatalf("valid external Data changed or rejected: %q %v", got, err)
+	}
+	after, err := os.ReadFile(filepath.Join(e.Root, "config.json"))
+	if err != nil || string(after) != string(configuration) {
+		t.Fatal("config bytes changed")
+	}
+	if _, err := os.Stat(filepath.Join(parent, "customer")); !os.IsNotExist(err) {
+		t.Fatal("path validation created Data directories")
 	}
 }
 func TestRestoreRejectsDamagedBackupBeforeDeletingData(t *testing.T) {
@@ -304,62 +333,119 @@ func TestReleaseMaintenanceRequiresDurableVerification(t *testing.T) {
 		t.Fatal("maintenance removed before durable commit")
 	}
 }
-func TestRestoreResumesEveryDataSwapInterruption(t *testing.T) {
-	for _, point := range []string{"partial_stage", "after_quarantine", "after_data_swap", "after_program"} {
+func TestRestoreResumesEveryDataContentsInterruption(t *testing.T) {
+	for _, point := range []string{"before_delete", "after_delete", "partial_copy", "after_data", "after_program"} {
 		t.Run(point, func(t *testing.T) {
-			root := t.TempDir()
-			old := applicationFixture(t, root, "2.0.0")
-			os.Mkdir(filepath.Join(root, "Data"), 0700)
-			os.WriteFile(filepath.Join(root, "Data/iapm.sqlite"), []byte("original"), 0600)
-			e, _ := New(root)
-			tx := Transaction{Job: Job{ID: "resume"}, Manifest: old, Old: old, Stage: t.TempDir()}
+			e := testEngine(t, t.TempDir())
+			old := applicationFixture(t, e.Root, "2.0.0")
+			data := filepath.Join(e.Root, "Data")
+			if err := os.Mkdir(data, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(data, "iapm.sqlite"), []byte("original"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			identity, err := os.Stat(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tx := Transaction{Job: Job{ID: "resume"}, Manifest: old, Old: old}
 			if err := e.backup(&tx); err != nil {
 				t.Fatal(err)
 			}
-			tx.State = "restoring"
-			tx.RestorePhase = "prepare"
-			stage := tx.DataDir + ".sunyu-restore-" + tx.Job.ID
-			failed := tx.DataDir + ".sunyu-failed-" + tx.Job.ID
-			if point == "partial_stage" {
-				os.Mkdir(stage, 0700)
-				os.WriteFile(filepath.Join(stage, "iapm.sqlite"), []byte("partial"), 0600)
-			} else {
-				if err := copyTree(filepath.Join(tx.Backup, "data"), stage, tx.DataFiles, tx.DataDirs); err != nil {
+			tx.State, tx.RestorePhase = "restoring", "data"
+			if err := os.WriteFile(filepath.Join(data, "iapm.sqlite"), []byte("migrated"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if point != "before_delete" {
+				if err := os.Remove(filepath.Join(data, "iapm.sqlite")); err != nil {
 					t.Fatal(err)
 				}
-				tx.RestorePhase = "swap"
-				os.WriteFile(filepath.Join(tx.DataDir, "iapm.sqlite"), []byte("migrated"), 0600)
-				if err := os.Rename(tx.DataDir, failed); err != nil {
+			}
+			if point == "partial_copy" {
+				if err := os.WriteFile(filepath.Join(data, "iapm.sqlite"), []byte("partial"), 0600); err != nil {
 					t.Fatal(err)
 				}
-				if point != "after_quarantine" {
-					if err := os.Rename(stage, tx.DataDir); err != nil {
-						t.Fatal(err)
-					}
+			}
+			if point == "after_data" || point == "after_program" {
+				if err := copyTree(filepath.Join(tx.Backup, "data"), data, tx.DataFiles, tx.DataDirs); err != nil {
+					t.Fatal(err)
 				}
-				if point == "after_program" {
-					tx.RestorePhase = "program"
-				}
+			}
+			if point == "after_program" {
+				tx.RestorePhase = "program"
 			}
 			if err := e.saveTransaction(&tx); err != nil {
 				t.Fatal(err)
 			}
-			if err := e.restore(&tx); err != nil {
+			// Reopen both the engine and durable transaction to model process loss.
+			restarted := testEngine(t, e.Root)
+			var recovered Transaction
+			if err := readJSON(filepath.Join(e.Root, ".updates", "transaction-v2.json"), &recovered); err != nil {
 				t.Fatal(err)
 			}
-			b, _ := os.ReadFile(filepath.Join(tx.DataDir, "iapm.sqlite"))
-			if string(b) != "original" {
-				t.Fatal(string(b))
+			if err := restarted.restore(&recovered); err != nil {
+				t.Fatal(err)
 			}
-			if _, err := os.Stat(failed); !os.IsNotExist(err) {
-				t.Fatal("owned failed data was not collected")
+			b, err := os.ReadFile(filepath.Join(data, "iapm.sqlite"))
+			if err != nil || string(b) != "original" {
+				t.Fatal("restored data incorrect", string(b), err)
 			}
-			if err := e.restore(&tx); err != nil {
+			after, err := os.Stat(data)
+			if err != nil || !os.SameFile(identity, after) {
+				t.Fatal("Data root object was replaced")
+			}
+			if err := restarted.restore(&recovered); err != nil {
 				t.Fatal("finished restore is not idempotent", err)
 			}
 		})
 	}
 }
+
+func TestRestorePreservesMissingOrReplacedDataRootForManualRecovery(t *testing.T) {
+	for _, scenario := range []string{"missing", "replaced", "created_after_backup"} {
+		t.Run(scenario, func(t *testing.T) {
+			e := testEngine(t, t.TempDir())
+			m := applicationFixture(t, e.Root, "2.0.0")
+			data := filepath.Join(e.Root, "Data")
+			if scenario != "created_after_backup" {
+				if err := os.Mkdir(data, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(data, "original"), []byte("keep"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tx := Transaction{Job: Job{ID: "identity"}, Manifest: m, Old: m}
+			if err := e.backup(&tx); err != nil {
+				t.Fatal(err)
+			}
+			if scenario != "created_after_backup" {
+				if err := os.Rename(data, data+"-moved"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario != "missing" {
+				if err := os.Mkdir(data, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(data, "unknown"), []byte("keep"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := e.restore(&tx); err == nil {
+				t.Fatal("unverifiable Data root accepted for automatic recovery")
+			}
+			if scenario != "missing" {
+				b, err := os.ReadFile(filepath.Join(data, "unknown"))
+				if err != nil || string(b) != "keep" {
+					t.Fatal("unknown Data root was modified")
+				}
+			}
+		})
+	}
+}
+
 func TestBackupResumesOwnedInterruptedPartialCopy(t *testing.T) {
 	root := t.TempDir()
 	m := applicationFixture(t, root, "2.0.0")

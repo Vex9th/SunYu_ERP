@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"sunyu.local/erp/internal/lifecycle"
+	"sunyu.local/erp/internal/pathidentity"
 )
 
 const DefaultCatalogURL = "https://github.com/Vex9th/SunYu_ERP/releases/latest/download/update-manifest-v2.json"
@@ -58,11 +59,11 @@ func New(root string) (*Engine, error) {
 	if e = os.MkdirAll(root, 0700); e != nil {
 		return nil, e
 	}
-	root, e = filepath.EvalSymlinks(root)
+	root, e = pathidentity.ResolveExisting(root)
 	if e != nil {
 		return nil, e
 	}
-	for _, p := range []string{"app", ".updates", "Data", "config.json"} {
+	for _, p := range []string{"app", ".updates", "config.json"} {
 		if _, e = safePath(root, p); e != nil {
 			return nil, e
 		}

@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strings"
 	"sunyu.local/erp/internal/config"
+	"sunyu.local/erp/internal/pathidentity"
 	"sync"
 	"time"
 )
@@ -486,7 +487,7 @@ func backupResolvedPath(name string) (string, error) {
 	if e != nil {
 		return "", e
 	}
-	resolved, e := filepath.EvalSymlinks(name)
+	resolved, e := pathidentity.ResolveExisting(name)
 	if e == nil {
 		return resolved, nil
 	}

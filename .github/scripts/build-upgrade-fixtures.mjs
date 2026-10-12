@@ -36,7 +36,23 @@ for (let increment = 1; increment <= 4; increment++) {
         // This synthetic executable refuses to write anything without an exact
         // marker created only by native-upgrade-smoke in its brand-new directory.
         const badSource = path.join(work, 'failure-service.go')
-        await writeFile(badSource, `package main\nimport ("os"; "path/filepath")\nfunc main() { if len(os.Args)!=3 || os.Args[1]!="--root" { os.Exit(43) }; root:=os.Args[2]; marker,err:=os.ReadFile(filepath.Join(root,".upgrade-smoke-fixture")); if err!=nil || string(marker)!="isolated native upgrade smoke" { os.Exit(43) }; if err=os.WriteFile(filepath.Join(root,"customer","DATA","iapm.sqlite"),[]byte("simulated interrupted database migration"),0600); err!=nil { os.Exit(44) }; _=os.WriteFile(filepath.Join(root,".upgrade-smoke-failure-ran"),[]byte("yes"),0600); os.Exit(42) }\n`, { flag: 'wx' })
+        await writeFile(badSource, `package main
+import ("encoding/json"; "os"; "path/filepath")
+func main() {
+  if len(os.Args)!=3 || os.Args[1]!="--root" { os.Exit(43) }
+  root:=os.Args[2]
+  marker,err:=os.ReadFile(filepath.Join(root,".upgrade-smoke-fixture"))
+  if err!=nil || string(marker)!="isolated native upgrade smoke" { os.Exit(43) }
+  configuration,err:=os.ReadFile(filepath.Join(root,"config.json"))
+  var settings struct { DataDir string \`json:"data_dir"\` }
+  if err!=nil || json.Unmarshal(configuration,&settings)!=nil || settings.DataDir=="" { os.Exit(44) }
+  data:=settings.DataDir
+  if !filepath.IsAbs(data) { data=filepath.Join(root,data) }
+  if err=os.WriteFile(filepath.Join(data,"iapm.sqlite"),[]byte("simulated interrupted database migration"),0600); err!=nil { os.Exit(44) }
+  _=os.WriteFile(filepath.Join(root,".upgrade-smoke-failure-ran"),[]byte("yes"),0600)
+  os.Exit(42)
+}
+`, { flag: 'wx' })
         execFileSync('go', ['build', '-trimpath', '-o', path.join(bin, name), badSource], { cwd: server, env: { ...process.env, CGO_ENABLED: '0', GOOS: 'windows', GOARCH: 'amd64' }, stdio: 'inherit' })
       }
     } else {

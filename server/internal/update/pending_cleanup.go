@@ -29,7 +29,7 @@ func (e *Engine) retryCleanup() error {
 	} else if err != nil {
 		return err
 	}
-	data, backup, err := installationPaths(e.Root)
+	boundary, err := readDataBoundary(e.Root)
 	if err != nil {
 		return err
 	}
@@ -42,14 +42,14 @@ func (e *Engine) retryCleanup() error {
 		if !validPath(name) || !hashPattern.MatchString(h) {
 			return errors.New("待清理路径或校验值无效")
 		}
-		full, err := safePath(e.Root, name)
+		_, err := safePath(e.Root, name)
 		if err != nil {
 			if first == nil {
 				first = err
 			}
 			continue
 		}
-		if inside(data, full) || backup != "" && inside(backup, full) || name == "config.json" {
+		if boundary.protects(name) || name == "config.json" {
 			return errors.New("待清理路径与用户数据重叠")
 		}
 		if _, keep := active.Files[name]; keep {

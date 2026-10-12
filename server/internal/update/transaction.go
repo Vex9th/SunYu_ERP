@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+
+	"sunyu.local/erp/internal/pathidentity"
 )
 
 type Transaction struct {
@@ -19,6 +21,7 @@ type Transaction struct {
 	State         string            `json:"state"`
 	Backup        string            `json:"backup"`
 	DataDir       string            `json:"data_dir"`
+	DataIdentity  string            `json:"data_identity"`
 	DataExisted   bool              `json:"data_existed"`
 	ConfigExisted bool              `json:"config_existed"`
 	DataFiles     map[string]string `json:"data_files"`
@@ -37,6 +40,26 @@ func inside(parent, child string) bool {
 	rel, err := filepath.Rel(parent, child)
 	return err == nil && (rel == "." || rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
+
+// Compare existing directory identities in one spelling, including Windows 8.3
+// aliases. Missing descendants are appended without creating or rewriting Data.
+func comparisonPath(path string) (string, error) {
+	var suffix []string
+	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
+		resolved, err := pathidentity.ResolveExisting(current)
+		if err == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return resolved, nil
+		}
+		if !os.IsNotExist(err) || filepath.Dir(current) == current {
+			return "", err
+		}
+		suffix = append(suffix, filepath.Base(current))
+	}
+}
+
 func installationPaths(root string) (string, string, error) {
 	var raw map[string]json.RawMessage
 	b, err := os.ReadFile(filepath.Join(root, "config.json"))
@@ -72,18 +95,62 @@ func installationPaths(root string) (string, string, error) {
 		return "", "", err
 	}
 	for _, p := range []string{data, backup} {
-		if p == "" {
-			continue
-		}
-		if inside(p, root) || inside(filepath.Join(root, ".updates"), p) || inside(p, filepath.Join(root, ".updates")) || inside(filepath.Join(root, "app"), p) || inside(p, filepath.Join(root, "app")) {
-			return "", "", errors.New("数据或业务备份目录与程序、更新工作目录重叠，无法安全升级")
-		}
-		if _, err := noLinks(p); err != nil {
-			return "", "", err
+		if p != "" {
+			if _, err := checkedDataPath(root, p); err != nil {
+				return "", "", err
+			}
 		}
 	}
 	return data, backup, nil
 }
+
+func checkedDataPath(root, path string) (string, error) {
+	physicalRoot, err := comparisonPath(root)
+	if err != nil {
+		return "", err
+	}
+	physical, err := comparisonPath(path)
+	if err != nil {
+		return "", err
+	}
+	// The configured root may itself be a link, as supported by the previous
+	// release. Work only on its frozen physical target; never follow links inside.
+	if _, err := noLinks(physical); err != nil {
+		return "", err
+	}
+	if inside(physical, physicalRoot) || inside(filepath.Join(physicalRoot, ".updates"), physical) || inside(physical, filepath.Join(physicalRoot, ".updates")) || inside(filepath.Join(physicalRoot, "app"), physical) || inside(physical, filepath.Join(physicalRoot, "app")) {
+		return "", errors.New("数据或业务备份目录与程序、更新工作目录重叠，无法安全升级")
+	}
+	return physical, nil
+}
+
+type dataBoundary struct{ root, data, backup string }
+
+func readDataBoundary(root string) (dataBoundary, error) {
+	data, backup, err := installationPaths(root)
+	if err != nil {
+		return dataBoundary{}, err
+	}
+	physicalRoot, err := comparisonPath(root)
+	if err != nil {
+		return dataBoundary{}, err
+	}
+	for _, p := range []*string{&data, &backup} {
+		if *p != "" {
+			*p, err = comparisonPath(*p)
+			if err != nil {
+				return dataBoundary{}, err
+			}
+		}
+	}
+	return dataBoundary{physicalRoot, data, backup}, nil
+}
+
+func (b dataBoundary) protects(relative string) bool {
+	path := filepath.Join(b.root, filepath.FromSlash(relative))
+	return b.data != "" && inside(b.data, path) || b.backup != "" && inside(b.backup, path)
+}
+
 func noLinks(p string) (string, error) {
 	p, err := filepath.Abs(p)
 	if err != nil {
@@ -92,7 +159,7 @@ func noLinks(p string) (string, error) {
 	current := p
 	for {
 		i, err := os.Lstat(current)
-		if err == nil && i.Mode()&os.ModeSymlink != 0 {
+		if err == nil && pathidentity.IsLink(i) {
 			return "", fmt.Errorf("拒绝链接目录：%s", current)
 		}
 		if err != nil && !os.IsNotExist(err) {
@@ -192,6 +259,10 @@ func (e *Engine) backup(tx *Transaction) error {
 	if err != nil {
 		return err
 	}
+	data, err = checkedDataPath(e.Root, data)
+	if err != nil {
+		return err
+	}
 	tx.DataDir = data
 	tx.Backup = filepath.Join(e.Root, ".updates", "rollback", tx.Job.ID)
 	if _, err = safePath(e.Root, ".updates/rollback/"+tx.Job.ID); err != nil {
@@ -235,8 +306,15 @@ func (e *Engine) backup(tx *Transaction) error {
 		return err
 	}
 	tx.DataFiles, tx.DataDirs = map[string]string{}, []string{}
-	if _, err = os.Stat(data); err == nil {
+	if info, statErr := os.Stat(data); statErr == nil {
+		if !info.IsDir() {
+			return errors.New("数据目录不是普通目录")
+		}
 		tx.DataExisted = true
+		tx.DataIdentity, err = pathidentity.Identity(data)
+		if err != nil {
+			return err
+		}
 		tx.DataFiles, tx.DataDirs, err = treeInventory(data)
 		if err != nil {
 			return err
@@ -244,8 +322,11 @@ func (e *Engine) backup(tx *Transaction) error {
 		if err = copyTree(data, filepath.Join(partial, "data"), tx.DataFiles, tx.DataDirs); err != nil {
 			return err
 		}
-	} else if !os.IsNotExist(err) {
-		return err
+		if current, identityErr := pathidentity.Identity(data); identityErr != nil || current != tx.DataIdentity {
+			return errors.New("备份期间数据根目录身份改变，已停止升级")
+		}
+	} else if !os.IsNotExist(statErr) {
+		return statErr
 	}
 	configPath := filepath.Join(e.Root, "config.json")
 	if _, err = os.Stat(configPath); err == nil {
@@ -368,7 +449,7 @@ func (e *Engine) restore(tx *Transaction) error {
 		return errors.New("事务备份位置无效")
 	}
 	var saved Transaction
-	if readJSON(filepath.Join(tx.Backup, "backup.json"), &saved) != nil || saved.Job.ID != tx.Job.ID || saved.Backup != tx.Backup || saved.DataDir != tx.DataDir || saved.DataExisted != tx.DataExisted || saved.ConfigExisted != tx.ConfigExisted || saved.ConfigHash != tx.ConfigHash || len(saved.ProgramFiles) == 0 || !reflect.DeepEqual(saved.ProgramFiles, tx.ProgramFiles) || !reflect.DeepEqual(saved.DataFiles, tx.DataFiles) || !reflect.DeepEqual(saved.DataDirs, tx.DataDirs) || !reflect.DeepEqual(saved.Manifest, tx.Manifest) {
+	if readJSON(filepath.Join(tx.Backup, "backup.json"), &saved) != nil || saved.Job.ID != tx.Job.ID || saved.Backup != tx.Backup || saved.DataDir != tx.DataDir || saved.DataIdentity != tx.DataIdentity || saved.DataExisted != tx.DataExisted || saved.ConfigExisted != tx.ConfigExisted || saved.ConfigHash != tx.ConfigHash || len(saved.ProgramFiles) == 0 || !reflect.DeepEqual(saved.ProgramFiles, tx.ProgramFiles) || !reflect.DeepEqual(saved.DataFiles, tx.DataFiles) || !reflect.DeepEqual(saved.DataDirs, tx.DataDirs) || !reflect.DeepEqual(saved.Manifest, tx.Manifest) {
 		return errors.New("升级事务恢复元数据缺失或与原始备份不一致，已停止恢复")
 	}
 	var configValues map[string]json.RawMessage
@@ -386,7 +467,10 @@ func (e *Engine) restore(tx *Transaction) error {
 	if !filepath.IsAbs(originalData) {
 		originalData = filepath.Join(e.Root, originalData)
 	}
-	originalData = filepath.Clean(originalData)
+	originalData, err := checkedDataPath(e.Root, originalData)
+	if err != nil {
+		return err
+	}
 	if originalData != tx.DataDir {
 		return errors.New("恢复数据位置与原始配置不一致")
 	}
@@ -412,70 +496,55 @@ func (e *Engine) restore(tx *Transaction) error {
 		}
 	}
 
-	// Recovery checkpoints make each directory swap resumable after power loss.
 	if _, err := noLinks(tx.DataDir); err != nil {
 		return err
 	}
-	staged := tx.DataDir + ".sunyu-restore-" + tx.Job.ID
-	quarantine := tx.DataDir + ".sunyu-failed-" + tx.Job.ID
-	exists := func(p string) bool { _, err := os.Lstat(p); return err == nil }
-	for _, p := range []string{staged, quarantine} {
-		if _, err := noLinks(p); err != nil {
-			return err
+	if tx.DataExisted {
+		identity, err := pathidentity.Identity(tx.DataDir)
+		if err != nil || tx.DataIdentity == "" || identity != tx.DataIdentity {
+			return errors.New("原数据根目录不存在或已被替换，请保留备份并人工恢复")
 		}
+	} else if _, err := os.Lstat(tx.DataDir); !os.IsNotExist(err) {
+		return errors.New("原备份没有数据根目录，但当前位置已有其它内容，请保留现场并人工恢复")
 	}
 	if tx.RestorePhase == "complete" {
-		return os.RemoveAll(quarantine)
+		return nil
 	}
 	if tx.RestorePhase == "" {
-		if exists(staged) || exists(quarantine) {
-			return errors.New("恢复路径已被其它内容占用，请保留现场")
-		}
-		tx.State, tx.RestorePhase = "restoring", "prepare"
+		tx.State, tx.RestorePhase = "restoring", "data"
 		if err := e.saveTransaction(tx); err != nil {
 			return err
 		}
 	}
-	if tx.RestorePhase == "prepare" {
+	if tx.RestorePhase == "data" {
+		// Preserve the root object, including its Windows short alias and ACL.
+		// A crash leaves this checkpoint active; retry rebuilds the contents from
+		// the immutable verified snapshot before any business process can restart.
 		if tx.DataExisted {
-			if exists(staged) {
-				if err := verifyTree(staged, tx.DataFiles, tx.DataDirs); err != nil {
-					if err = os.RemoveAll(staged); err != nil {
-						return err
-					}
-				}
+			bound, err := os.OpenRoot(tx.DataDir)
+			if err != nil {
+				return err
 			}
-			if !exists(staged) {
-				if err := copyTree(filepath.Join(tx.Backup, "data"), staged, tx.DataFiles, tx.DataDirs); err != nil {
+			defer bound.Close()
+			directory, err := bound.Open(".")
+			if err != nil {
+				return err
+			}
+			entries, err := directory.ReadDir(-1)
+			directory.Close()
+			if err != nil {
+				return err
+			}
+			for _, entry := range entries {
+				if err := bound.RemoveAll(entry.Name()); err != nil {
 					return err
 				}
 			}
-		}
-		tx.RestorePhase = "swap"
-		if err := e.saveTransaction(tx); err != nil {
-			return err
-		}
-	}
-	if tx.RestorePhase == "swap" {
-		// If the stage has gone and the restored data is present, the rename completed before the checkpoint was saved.
-		alreadyRestored := tx.DataExisted && !exists(staged) && exists(tx.DataDir)
-		if alreadyRestored {
-			if err := verifyTree(tx.DataDir, tx.DataFiles, tx.DataDirs); err != nil {
-				return errors.New("恢复交换状态不一致，原备份仍保留")
+			if err := copyTree(filepath.Join(tx.Backup, "data"), tx.DataDir, tx.DataFiles, tx.DataDirs); err != nil {
+				return err
 			}
-		} else {
-			if !exists(quarantine) && exists(tx.DataDir) {
-				if err := os.Rename(tx.DataDir, quarantine); err != nil {
-					return err
-				}
-			}
-			if exists(tx.DataDir) {
-				return errors.New("恢复目标同时存在，不能覆盖未知数据")
-			}
-			if tx.DataExisted {
-				if err := os.Rename(staged, tx.DataDir); err != nil {
-					return err
-				}
+			if identity, err := pathidentity.Identity(tx.DataDir); err != nil || identity != tx.DataIdentity {
+				return errors.New("恢复期间数据根目录身份改变，请保留备份并人工恢复")
 			}
 		}
 		tx.RestorePhase = "program"
@@ -524,5 +593,5 @@ func (e *Engine) restore(tx *Transaction) error {
 	if err := e.saveTransaction(tx); err != nil {
 		return err
 	}
-	return os.RemoveAll(quarantine)
+	return nil
 }

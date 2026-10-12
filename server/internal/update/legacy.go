@@ -34,7 +34,7 @@ func legacyInventory(root string) (map[string]string, error) {
 	if installation.Format != 1 || installation.APIVersion != 1 || installation.RuntimeVersion != 1 || !versionPattern.MatchString(installation.Backend) || !versionPattern.MatchString(installation.Frontend) {
 		return nil, errors.New("旧版安装协议不受支持")
 	}
-	data, backup, err := installationPaths(root)
+	boundary, err := readDataBoundary(root)
 	if err != nil {
 		return nil, err
 	}
@@ -47,7 +47,7 @@ func legacyInventory(root string) (map[string]string, error) {
 		if err != nil {
 			return err
 		}
-		if inside(data, p) || backup != "" && inside(backup, p) {
+		if boundary.protects(rel) {
 			return nil
 		}
 		info, err := os.Lstat(p)
@@ -149,6 +149,10 @@ func legacyInventory(root string) (map[string]string, error) {
 // directory shape, matching data root and a complete verified inventory before collecting them.
 func (e *Engine) legacyBackupFiles(dataDir string) (map[string]string, error) {
 	out := map[string]string{}
+	physicalData, err := comparisonPath(dataDir)
+	if err != nil {
+		return nil, err
+	}
 	base, err := safePath(e.Root, ".updates/backups")
 	if err != nil {
 		return nil, err
@@ -185,7 +189,14 @@ func (e *Engine) legacyBackupFiles(dataDir string) (map[string]string, error) {
 			DataDir string            `json:"data_dir"`
 			Files   map[string]string `json:"files"`
 		}
-		if readJSON(filepath.Join(dir, "backup.json"), &metadata) != nil || filepath.Clean(metadata.DataDir) != filepath.Clean(dataDir) || len(metadata.Files) == 0 {
+		if readJSON(filepath.Join(dir, "backup.json"), &metadata) != nil || len(metadata.Files) == 0 {
+			continue
+		}
+		if !filepath.IsAbs(metadata.DataDir) {
+			continue
+		}
+		physicalSnapshotData, err := comparisonPath(metadata.DataDir)
+		if err != nil || !inside(physicalData, physicalSnapshotData) || !inside(physicalSnapshotData, physicalData) {
 			continue
 		}
 		actual, _, err := treeInventory(dir)

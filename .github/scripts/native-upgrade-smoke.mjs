@@ -1,15 +1,15 @@
 /** Windows 隔离目录中验证旧正式包迁移、前端热切换、应用重启和清理。 */
 import { spawn, execFileSync } from 'node:child_process'
 import { createWriteStream } from 'node:fs'
-import { mkdir, readFile, writeFile, readdir, stat, unlink } from 'node:fs/promises'
+import { mkdir, readFile, writeFile, readdir, stat, lstat, realpath, unlink } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import assert from 'node:assert/strict'
 import net from 'node:net'
 import path from 'node:path'
 import { Client, seed, verify } from './release-smoke.mjs'
 
-const [legacyArg, fixturesArg, outputArg, version] = process.argv.slice(2)
-if (!legacyArg || !fixturesArg || !outputArg || !/^\d+\.\d+\.\d+$/.test(version ?? '') || process.platform !== 'win32') throw new Error('Usage (Windows): node native-upgrade-smoke.mjs <old-1.3.1.zip> <fixtures> <new-output> <candidate-version>')
+const [legacyArg, fixturesArg, outputArg, version, dataMode = 'relative'] = process.argv.slice(2)
+if (!legacyArg || !fixturesArg || !outputArg || !/^\d+\.\d+\.\d+$/.test(version ?? '') || !['relative', 'junction', 'short-leaf'].includes(dataMode) || process.platform !== 'win32') throw new Error('Usage (Windows): node native-upgrade-smoke.mjs <old-1.3.1.zip> <fixtures> <new-output> <candidate-version> [relative|junction|short-leaf]')
 const [legacyZip, fixtures, output] = [legacyArg, fixturesArg, outputArg].map(value => path.resolve(value))
 const [major, minor, patch] = version.split('.').map(Number)
 const firstFrontend = `${major}.${minor}.${patch + 1}`
@@ -26,7 +26,22 @@ const port = listener.address().port
 await new Promise(resolve => listener.close(resolve))
 const base = `http://127.0.0.1:${port}`
 const configPath = path.join(root, 'config.json')
-await writeFile(configPath, JSON.stringify({ host: '127.0.0.1', port, data_dir: 'customer/DATA', backup_enabled: false, session_secret: randomUUID() }), { flag: 'wx' })
+let configuredData = 'customer/DATA'
+let physicalData = path.join(root, 'customer/DATA')
+if (dataMode !== 'relative') {
+  physicalData = path.join(output, 'external-customer-data')
+  await mkdir(physicalData)
+  if (dataMode === 'junction') {
+    await mkdir(path.join(root, 'customer'))
+    execFileSync('cmd.exe', ['/c', 'mklink', '/J', path.join(root, configuredData), physicalData])
+  } else {
+    // Assign a short name only to this owned fixture; never change volume settings.
+    execFileSync('fsutil.exe', ['file', 'setshortname', physicalData, 'CUSTOM~1'])
+    configuredData = path.join(output, 'CUSTOM~1')
+  }
+}
+const accessedData = path.isAbsolute(configuredData) ? configuredData : path.join(root, configuredData)
+await writeFile(configPath, JSON.stringify({ host: '127.0.0.1', port, data_dir: configuredData, backup_enabled: false, session_secret: randomUUID() }), { flag: 'wx' })
 const checks = []
 let first, config, business, frontendPID
 const check = name => { checks.push(name); console.log(`PASS ${name}`) }
@@ -85,7 +100,14 @@ async function assets(version) {
 }
 async function preserved(client) {
   assert.deepEqual(await readFile(configPath), config, 'Config bytes changed')
-  assert.equal(await readFile(path.join(root, 'customer/DATA/customer-attachment.txt'), 'utf8'), '测试附件保留')
+  assert.equal(await readFile(path.join(physicalData, 'customer-attachment.txt'), 'utf8'), '测试附件保留')
+  assert.equal((await realpath(accessedData)).toLowerCase(), (await realpath(physicalData)).toLowerCase(), 'Data alias no longer targets the original physical directory')
+  if (dataMode === 'junction') assert.equal((await lstat(accessedData)).isSymbolicLink(), true, 'Data junction was replaced by an ordinary directory')
+  if (dataMode === 'short-leaf') {
+    const entries = await readdir(path.dirname(physicalData))
+    assert.ok(entries.includes(path.basename(physicalData)), 'Physical long directory name was removed')
+    assert.ok(!entries.some(name => name.toUpperCase() === 'CUSTOM~1'), 'Rollback created the short alias as a physical directory name')
+  }
   assert.equal(await readFile(path.join(root, 'runtime/customer-note.txt'), 'utf8'), '客户未知文件保留')
   await verify(client, business)
 }
@@ -117,10 +139,12 @@ try {
   business = await seed(client)
   await verify(client, business)
   config = await readFile(configPath)
+  assert.equal(JSON.parse(config).data_dir, configuredData, 'Legacy setup changed the configured Data alias before the upgrade test')
   await writeFile(path.join(output, 'business-state.json'), JSON.stringify(business), { flag: 'wx' })
-  await writeFile(path.join(root, 'customer/DATA/customer-attachment.txt'), '测试附件保留', { flag: 'wx' })
+  await writeFile(path.join(physicalData, 'customer-attachment.txt'), '测试附件保留', { flag: 'wx' })
   await writeFile(path.join(root, 'runtime/customer-note.txt'), '客户未知文件保留', { flag: 'wx' })
   await writeFile(path.join(root, '.upgrade-smoke-fixture'), 'isolated native upgrade smoke', { flag: 'wx' })
+  await preserved(client)
   check('real 1.3.1 business data seeded and verified')
   const legacyFailure = await migrate(failureVersion, 'failed', 'legacy-failed-upgrade.log')
   assert.match(legacyFailure.message, /已恢复/)
@@ -187,7 +211,8 @@ try {
   assert.deepEqual(await readFile(path.join(root, 'app/manifest.json')), previousManifest)
   await preserved(client)
   check('real failed startup after SQLite write automatically restores program, database, config and attachments')
-  await writeFile(path.join(output, 'native-upgrade-result.json'), JSON.stringify({ status: 'passed', version, network_catalog: 'controlled offline catalog fixture; live GitHub check not tested', checks }, null, 2), { flag: 'wx' })
+  if (dataMode !== 'relative') check(`${dataMode} Data root preserves physical directory, alias and config through migration and rollback`)
+  await writeFile(path.join(output, 'native-upgrade-result.json'), JSON.stringify({ status: 'passed', version, data_mode: dataMode, network_catalog: 'controlled offline catalog fixture; live GitHub check not tested', checks }, null, 2), { flag: 'wx' })
 } finally {
   await mkdir(path.join(root, '.updates'), { recursive: true })
   await writeFile(path.join(root, '.updates/shutdown'), 'isolated upgrade smoke cleanup')

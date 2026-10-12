@@ -117,6 +117,10 @@ jobs:
           if ($hash -ne 'b2568323d110a6102777fbb589b8af69f6c7192471c7504f1defc8357ab62591') { throw 'Legacy migration baseline hash changed' }
       - name: Verify legacy migration, hot updates, application replacement and failed migration recovery
         run: node .github/scripts/native-upgrade-smoke.mjs dist/legacy-baseline/SunYu_ERP-windows-x64.zip dist/upgrade-fixtures "$env:RUNNER_TEMP/SunYu ERP 中文 Upgrade Smoke" "$env:SUNYU_VERSION"
+      - name: Verify external data junction upgrade and recovery compatibility
+        run: node .github/scripts/native-upgrade-smoke.mjs dist/legacy-baseline/SunYu_ERP-windows-x64.zip dist/upgrade-fixtures "$env:RUNNER_TEMP/SunYu ERP 中文 Junction Smoke" "$env:SUNYU_VERSION" junction
+      - name: Verify short data directory name upgrade and recovery compatibility
+        run: node .github/scripts/native-upgrade-smoke.mjs dist/legacy-baseline/SunYu_ERP-windows-x64.zip dist/upgrade-fixtures "$env:RUNNER_TEMP/SunYu ERP 中文 Short Name Smoke" "$env:SUNYU_VERSION" short-leaf
       - name: Upload candidate and validation artifact
         uses: actions/upload-artifact@v7
         with:
@@ -128,6 +132,8 @@ jobs:
             dist/native/SHA256SUMS.txt
             ${{ runner.temp }}/SunYu ERP 中文 Native Smoke/native-smoke-result.json
             ${{ runner.temp }}/SunYu ERP 中文 Upgrade Smoke/native-upgrade-result.json
+            ${{ runner.temp }}/SunYu ERP 中文 Junction Smoke/native-upgrade-result.json
+            ${{ runner.temp }}/SunYu ERP 中文 Short Name Smoke/native-upgrade-result.json
           if-no-files-found: error
       - name: Upload failed verification diagnostics
         if: failure()
@@ -139,6 +145,10 @@ jobs:
             ${{ runner.temp }}/SunYu ERP 中文 Native Smoke/.updates/logs/*.log
             ${{ runner.temp }}/SunYu ERP 中文 Upgrade Smoke/*.log
             ${{ runner.temp }}/SunYu ERP 中文 Upgrade Smoke/installation/.updates/logs/*.log
+            ${{ runner.temp }}/SunYu ERP 中文 Junction Smoke/*.log
+            ${{ runner.temp }}/SunYu ERP 中文 Junction Smoke/installation/.updates/logs/*.log
+            ${{ runner.temp }}/SunYu ERP 中文 Short Name Smoke/*.log
+            ${{ runner.temp }}/SunYu ERP 中文 Short Name Smoke/installation/.updates/logs/*.log
           if-no-files-found: ignore
       - name: Recheck release before publishing
         if: inputs.version != ''
