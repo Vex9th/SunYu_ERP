@@ -7,6 +7,7 @@ import assert from 'node:assert/strict'
 import net from 'node:net'
 import path from 'node:path'
 import { Client, seed, verify } from './release-smoke.mjs'
+import { extractWindowsZip } from './windows-zip.mjs'
 
 const [legacyArg, fixturesArg, outputArg, version, dataMode = 'relative'] = process.argv.slice(2)
 if (!legacyArg || !fixturesArg || !outputArg || !/^\d+\.\d+\.\d+$/.test(version ?? '') || !['relative', 'junction', 'short-leaf'].includes(dataMode) || process.platform !== 'win32') throw new Error('Usage (Windows): node native-upgrade-smoke.mjs <old-1.3.1.zip> <fixtures> <new-output> <candidate-version> [relative|junction|short-leaf]')
@@ -20,7 +21,7 @@ await mkdir(output)
 const installation = path.join(output, 'installation')
 await mkdir(installation)
 const root = await realpath(installation)
-execFileSync('tar.exe', ['-xf', legacyZip, '-C', root])
+extractWindowsZip(legacyZip, root)
 const listener = net.createServer()
 await new Promise(resolve => listener.listen(0, '127.0.0.1', resolve))
 const port = listener.address().port

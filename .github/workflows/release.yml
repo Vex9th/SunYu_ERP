@@ -71,7 +71,7 @@ jobs:
           go vet ./...
           if ($LASTEXITCODE -ne 0) { throw 'Go vet failed' }
       - name: Verify release protection
-        run: node --test .github/scripts/release-gate.test.mjs
+        run: node --test .github/scripts/release-gate.test.mjs .github/scripts/windows-zip.test.mjs
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
