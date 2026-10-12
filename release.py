@@ -8,6 +8,8 @@ import uvicorn
 from fastapi import FastAPI
 
 from backend.app.core.config import load_settings
+from backend.app.core.update_runtime import ServiceAlreadyRunning, UpdateRuntime
+from backend.app.features.updates import UpdateManager
 from backend.app.main import create_app
 
 
@@ -60,6 +62,10 @@ def resolve_runtime_paths(
 
 def create_release_app(paths: RuntimePaths) -> FastAPI:
     return create_app(
+        update_manager=UpdateManager(
+            paths.writable_root,
+            enabled=sys.platform == "win32" and bool(getattr(sys, "frozen", False)),
+        ),
         config_path=paths.config_path,
         migrations_dir=paths.migrations_dir,
         frontend_dist=paths.frontend_dist,
@@ -69,7 +75,24 @@ def create_release_app(paths: RuntimePaths) -> FastAPI:
 def run_server(paths: RuntimePaths) -> None:
     application = create_release_app(paths)
     settings = load_settings(paths.config_path)
-    uvicorn.run(application, host=settings.host, port=settings.port)
+    server = uvicorn.Server(uvicorn.Config(
+        application, host=settings.host, port=settings.port, proxy_headers=False,
+    ))
+    manager = application.state.updates
+    runtime = UpdateRuntime(manager, port=settings.port,
+                            shutdown=lambda: setattr(server, "should_exit", True))
+    try:
+        if manager.enabled:
+            runtime.start()
+        server.run()
+    except ServiceAlreadyRunning:
+        host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(settings.host, settings.host)
+        if ":" in host:
+            host = f"[{host}]"
+        print(f"服务已在运行，请访问 http://{host}:{settings.port}；此次不会重复启动。")
+    finally:
+        if manager.enabled:
+            runtime.close()
 
 
 def main() -> None:

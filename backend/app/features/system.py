@@ -25,7 +25,7 @@ _CLEANUP_WARNING = "Backup created but cleanup failed"
 
 BackupCreator = Callable[..., Path]
 BackupPruner = Callable[..., list[Path]]
-BackupRunner = Callable[[sqlite3.Connection, Settings, datetime], "BackupJobResult"]
+BackupRunner = Callable[[sqlite3.Connection, Settings, datetime], "BackupJobResult | None"]
 ConnectionFactory = Callable[[str | Path], sqlite3.Connection]
 Clock = Callable[[], datetime]
 Waiter = Callable[[Event, float], bool]
@@ -167,7 +167,7 @@ class BackupScheduler:
             else:
                 failure_category = "backup"
                 result = self._runner(connection, settings, now)
-                ran_backup = True
+                ran_backup = result is not None
         except BaseException as failure:  # noqa: BLE001 - daemon safety boundary
             primary_failure = failure
         finally:

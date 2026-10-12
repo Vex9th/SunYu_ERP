@@ -31,6 +31,7 @@ import {
   useLoad,
 } from './shared'
 import styles from './Workspace.module.css'
+import UpdatePanel from './UpdatePanel'
 
 type SettingsOperationKind = 'save' | 'backup'
 interface SettingsOperationResult {
@@ -125,6 +126,7 @@ export default function SettingsPage() {
   const dirty = useRef(Boolean(settingsDraft))
   const [formDirty, setFormDirty] = useState(Boolean(settingsDraft))
   const [error, setError] = useState<string | null>(null)
+  const [updating, setUpdating] = useState(false)
   const { message } = App.useApp()
   useEffect(() => {
     const pendingTask = sessionStorage.getItem('sunyu-backup-task')
@@ -186,7 +188,7 @@ export default function SettingsPage() {
   }
 
   function save(values: BackupSettingsPayload) {
-    if (settingsOperation) return
+    if (settingsOperation || updating) return
     const input: BackupSettingsPayload = {
       enabled: values.enabled,
       directory: values.directory?.trim() || null,
@@ -207,7 +209,7 @@ export default function SettingsPage() {
   }
   function backup() {
     const pendingTask = sessionStorage.getItem('sunyu-backup-task')
-    if (settingsOperation || (!pendingTask && (dirty.current || !overview.data?.backup.directory)))
+    if (settingsOperation || updating || (!pendingTask && (dirty.current || !overview.data?.backup.directory)))
       return
     setError(null)
     void runOperation('backup', async () => {
@@ -267,7 +269,7 @@ export default function SettingsPage() {
               layout="vertical"
               onFinish={(values) => void save(values)}
               style={{ maxWidth: 650 }}
-              disabled={saving || backingUp}
+              disabled={saving || backingUp || updating}
             >
               <Form.Item
                 name="enabled"
@@ -347,7 +349,7 @@ export default function SettingsPage() {
                   保存设置
                 </Button>
                 {formDirty && (
-                  <Button onClick={restoreSaved}>恢复已保存设置</Button>
+                  <Button disabled={saving || backingUp} onClick={restoreSaved}>恢复已保存设置</Button>
                 )}
               </Space>
               {formDirty && (
@@ -366,6 +368,7 @@ export default function SettingsPage() {
                 disabled={
                   saving ||
                   backingUp ||
+                  updating ||
                   (!pendingTaskId && (formDirty || !overview.data.backup.directory))
                 }
                 onClick={() => void backup()}
@@ -453,6 +456,15 @@ export default function SettingsPage() {
           />
         </>
       )}
+      <UpdatePanel
+        onInstallBusyChange={setUpdating}
+        installBlockedReason={
+          saving ? '正在保存备份设置，请保存完成后再更新。'
+            : backingUp || pendingTaskId ? '备份任务尚未确认完成，请先等待或继续查询备份结果。'
+              : formDirty ? '备份设置有未保存的修改，请先保存或恢复后再更新。'
+                : !overview.data ? '请先读取备份设置，确认没有未完成的保存或备份任务。' : null
+        }
+      />
     </div>
   )
 }

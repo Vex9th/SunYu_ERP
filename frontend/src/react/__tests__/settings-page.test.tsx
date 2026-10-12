@@ -24,6 +24,7 @@ import type {
   SystemOverview,
 } from '../../types'
 import SettingsPage from '../SettingsPage'
+import type { UpdateStatus } from '../UpdatePanel'
 
 vi.mock('../../api', async (original) => ({
   ...(await original<typeof import('../../api')>()),
@@ -82,6 +83,7 @@ function mockApi(data: SystemOverview, backup?: Promise<BackupCreated>) {
     if (path === '/api/system/overview') return data
     if (path === '/api/system/backup-tasks' && backup) return { task_id: 'test-task' }
     if (path === '/api/system/backup-tasks/test-task' && backup) return backup.then((result) => ({ status: 'success', phase: 'finished', warning: result.warning }))
+    if (path === '/api/system/updates') return unsupportedUpdate
     throw new Error(`未预期的请求：${path}`)
   }) as typeof requestJson)
 }
@@ -106,6 +108,95 @@ const completed: BackupCreated = {
   path: '/test-backups/complete.zip',
   created_at: '2026-10-06T08:00:00Z',
 }
+const unsupportedUpdate: UpdateStatus = {
+  job_id: '', phase: 'idle', message: '', progress: 0,
+  current_version: '1.2.4', latest_version: '', update_available: false,
+  busy: false, error: '', checked_at: '', can_install: false,
+  disabled_reason: '测试环境不安装更新', supported: false,
+}
+
+it('设置页显示可选更新，备份草稿未保存时禁止安装', async () => {
+  const update = {
+    job_id: 'checked', phase: 'available', message: '发现新版本', progress: 0,
+    current_version: '1.2.4', latest_version: '1.2.5', update_available: true,
+    busy: false, error: '', checked_at: '2026-10-13T09:00:00Z',
+    can_install: true, disabled_reason: '', supported: true,
+  }
+  vi.mocked(requestJson).mockImplementation((async (path) => {
+    if (path === '/api/system/overview') return overview()
+    if (path === '/api/system/updates' || path === '/api/system/updates/check') return update
+    throw new Error(`未预期的请求：${path}`)
+  }) as typeof requestJson)
+  renderSettings()
+  const directory = await screen.findByLabelText('备份目录')
+  const install = await screen.findByRole('button', { name: '一键更新' })
+  expect((install as HTMLButtonElement).disabled).toBe(false)
+  fireEvent.change(directory, { target: { value: '/draft-for-update' } })
+  expect((install as HTMLButtonElement).disabled).toBe(true)
+  expect(screen.getByText('备份设置有未保存的修改，请先保存或恢复后再更新。')).toBeTruthy()
+  fireEvent.click(install)
+  expect(requests('/api/system/updates/install')).toHaveLength(0)
+})
+
+it('安装请求发出即禁用保存和备份，明确失败后恢复原操作', async () => {
+  const pending = deferred<UpdateStatus>()
+  const available: UpdateStatus = {
+    ...unsupportedUpdate, job_id: 'check-1', phase: 'available', latest_version: '1.2.5',
+    update_available: true, supported: true, can_install: true, disabled_reason: '',
+  }
+  vi.mocked(requestJson).mockImplementation((async (path) => {
+    if (path === '/api/system/overview') return overview()
+    if (path === '/api/system/updates' || path === '/api/system/updates/check') return available
+    if (path === '/api/system/updates/install') return pending.promise
+    throw new Error(`未预期的请求：${path}`)
+  }) as typeof requestJson)
+  renderSettings()
+  await screen.findByLabelText('备份目录')
+  const install = await screen.findByRole('button', { name: '一键更新' })
+  await waitFor(() => expect((install as HTMLButtonElement).disabled).toBe(false))
+  fireEvent.click(install)
+  fireEvent.click(screen.getByRole('button', { name: '开始更新' }))
+  await waitFor(() => expect(requests('/api/system/updates/install')).toHaveLength(1))
+  const save = screen.getByRole('button', { name: '保存设置' }) as HTMLButtonElement
+  const backup = screen.getByRole('button', { name: /立即备份/ }) as HTMLButtonElement
+  expect(save.disabled).toBe(true)
+  expect(backup.disabled).toBe(true)
+  fireEvent.click(backup)
+  expect(requests('/api/system/backup-tasks')).toHaveLength(0)
+  await act(async () => pending.resolve({ ...available, job_id: 'apply-1', phase: 'failed', error: '下载失败，服务保持运行' }))
+  await waitFor(() => expect(save.disabled).toBe(false))
+  expect(backup.disabled).toBe(false)
+})
+
+it('已有草稿遇到中断更新时仍可恢复本地设置，保存和备份保持禁用', async () => {
+  let interrupted = false
+  vi.mocked(requestJson).mockImplementation((async (path) => {
+    if (path === '/api/system/overview') return overview()
+    if (path === '/api/system/updates') return interrupted
+      ? { ...unsupportedUpdate, supported: true, can_install: true, disabled_reason: '', phase: 'failed', recovery_required: true }
+      : unsupportedUpdate
+    throw new Error(`未预期的请求：${path}`)
+  }) as typeof requestJson)
+  renderSettings()
+  fireEvent.change(await screen.findByLabelText('备份目录'), { target: { value: '/unsaved-draft' } })
+  fireEvent.click(screen.getByRole('link', { name: '打开其他业务' }))
+  interrupted = true
+  fireEvent.click(screen.getByRole('link', { name: '返回系统设置' }))
+  const restore = await screen.findByRole('button', { name: '恢复已保存设置' })
+  const resume = await screen.findByRole('button', { name: '继续恢复更新' })
+  const save = screen.getByRole('button', { name: '保存设置' }) as HTMLButtonElement
+  const backup = screen.getByRole('button', { name: /立即备份/ }) as HTMLButtonElement
+  await waitFor(() => expect(save.disabled).toBe(true))
+  expect(backup.disabled).toBe(true)
+  expect((resume as HTMLButtonElement).disabled).toBe(true)
+  expect((restore as HTMLButtonElement).disabled).toBe(false)
+  fireEvent.click(restore)
+  await waitFor(() => expect((resume as HTMLButtonElement).disabled).toBe(false))
+  expect(save.disabled).toBe(true)
+  expect(backup.disabled).toBe(true)
+  expect(requests('/api/system/backup-settings')).toHaveLength(0)
+  expect(requests('/api/system/backup-tasks')).toHaveLength(0)
+})
 
 describe('系统备份设置保护', () => {
   it('未配置已保存目录时禁用手动备份，不发送请求', async () => {
@@ -215,6 +306,7 @@ describe('系统备份设置保护', () => {
     vi.mocked(requestJson).mockImplementation((async (path) => {
       if (path === '/api/system/overview') return data
       if (path === '/api/system/backup-settings') return pending.promise
+      if (path === '/api/system/updates') return unsupportedUpdate
       throw new Error(`未预期的请求：${path}`)
     }) as typeof requestJson)
     renderSettings()
@@ -272,6 +364,7 @@ it('轮询暂时超时继续等待后台任务，不把网络错误显示为备�
       if (polls === 1) throw new Error('Request timed out')
       return { status: 'success', phase: 'finished' }
     }
+    if (path === '/api/system/updates') return unsupportedUpdate
     throw new Error(`未预期的请求：${path}`)
   }) as typeof requestJson)
   renderSettings()
@@ -291,6 +384,7 @@ it('恢复的任务编号确定不存在时停止轮询并解除设置锁，结�
     if (path === '/api/system/overview') return overview()
     if (path === '/api/system/backup-tasks/restored-task')
       throw new ApiError('Backup task not found', 404)
+    if (path === '/api/system/updates') return unsupportedUpdate
     throw new Error(`未预期的请求：${path}`)
   }) as typeof requestJson)
   renderSettings()
@@ -306,6 +400,7 @@ it('连续五次无法读取状态后停止自动查询，保留编号供用户�
     if (path === '/api/system/overview') return overview()
     if (path === '/api/system/backup-tasks/offline-task')
       throw new ApiError('请求超时', 0, 'REQUEST_TIMEOUT')
+    if (path === '/api/system/updates') return unsupportedUpdate
     throw new Error(`未预期的请求：${path}`)
   }) as typeof requestJson)
   renderSettings()
@@ -316,6 +411,7 @@ it('连续五次无法读取状态后停止自动查询，保留编号供用户�
   vi.mocked(requestJson).mockImplementation((async (path) => {
     if (path === '/api/system/overview') return overview()
     if (path === '/api/system/backup-tasks/offline-task') return { status: 'success', phase: 'finished' }
+    if (path === '/api/system/updates') return unsupportedUpdate
     throw new Error(`未预期的请求：${path}`)
   }) as typeof requestJson)
   fireEvent.click(screen.getByRole('button', { name: /继续查询/ }))
@@ -333,6 +429,7 @@ it('离页期间达到查询上限后，首次返回继续核对保留任务且�
       if (!recovered) throw new ApiError('请求超时', 0, 'REQUEST_TIMEOUT')
       return { status: 'success', phase: 'finished' }
     }
+    if (path === '/api/system/updates') return unsupportedUpdate
     throw new Error(`未预期的请求：${path}`)
   }) as typeof requestJson)
   renderSettings()

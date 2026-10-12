@@ -5,7 +5,7 @@ run-name: Windows ${{ inputs.version || '候选构建' }}
   workflow_dispatch:
     inputs:
       version:
-        description: '正式版本号，例如 v1.2.3；留空仅构建候选包'
+        description: '正式版本号，须与源码版本一致；留空仅构建候选包'
         required: false
         type: string
 
@@ -38,7 +38,7 @@ jobs:
     needs: prepare
     if: needs.prepare.outputs.build_needed == 'true'
     runs-on: windows-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
     permissions:
       contents: write
     steps:
@@ -59,6 +59,36 @@ jobs:
 
       - name: Install backend dependencies
         run: python -m pip install --requirement requirements-dev.txt
+
+      - name: Resolve package version
+        env:
+          RELEASE_TAG: ${{ inputs.version }}
+        run: |
+          $version = python -c "from backend.app.version import VERSION; print(VERSION)"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read the application version' }
+          if ($env:RELEASE_TAG -and $env:RELEASE_TAG -ne "v$version") { throw 'Release tag must match backend/app/version.py' }
+          "SUNYU_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: updater/go.mod
+          cache: false
+
+      - name: Verify independent updater
+        working-directory: updater
+        run: |
+          go test ./...
+          if ($LASTEXITCODE -ne 0) { throw 'Updater tests failed' }
+          go vet ./...
+          if ($LASTEXITCODE -ne 0) { throw 'Updater vet failed' }
+
+      - name: Build independent Windows updater
+        working-directory: updater
+        env:
+          CGO_ENABLED: '0'
+          GOOS: windows
+          GOARCH: amd64
+        run: go build -trimpath -ldflags="-s -w -X main.version=$env:SUNYU_VERSION" -o ../dist/update.exe .
 
       - name: Lint backend
         run: python -m ruff check . .github/scripts
@@ -102,6 +132,7 @@ jobs:
           $smokeRoot = Join-Path $env:RUNNER_TEMP 'SunYu ERP 中文 Smoke'
           New-Item -ItemType Directory -Path $smokeRoot -Force | Out-Null
           Copy-Item 'dist\SunYu_ERP.exe' (Join-Path $smokeRoot 'SunYu_ERP.exe')
+          Copy-Item 'dist\update.exe' (Join-Path $smokeRoot 'update.exe')
           $executable = Join-Path $smokeRoot 'SunYu_ERP.exe'
           $healthUrl = 'http://127.0.0.1:8765/api/health'
 
@@ -228,48 +259,32 @@ jobs:
             throw 'Restart did not preserve SQLite data'
           }
 
-      - name: Package release zip
-        shell: pwsh
+      - name: Package singlefile application and updater
+        run: python .github/scripts/package_singlefile.py --version "$env:SUNYU_VERSION" --exe dist/SunYu_ERP.exe --updater dist/update.exe --output dist/release
+
+      - name: Download verified singlefile baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $stage = Join-Path $env:RUNNER_TEMP 'SunYu ERP Package'
-          New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          Copy-Item 'dist\SunYu_ERP.exe' $stage
-          Copy-Item 'start.bat' $stage
-          Copy-Item 'README.md' $stage
-          Copy-Item 'LICENSE' $stage
-          Copy-Item 'config.example.json' $stage
+          New-Item -ItemType Directory -Path dist/legacy-baseline | Out-Null
+          gh release download v1.2.4 --repo "$env:GITHUB_REPOSITORY" --pattern SunYu_ERP-windows-x64.zip --dir dist/legacy-baseline
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot download singlefile baseline' }
+          $hash = (Get-FileHash dist/legacy-baseline/SunYu_ERP-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne 'bab84925b30d095e1cf5ea84230a9c5d9fcb581c6578695f154ebadc681eb531') { throw 'Singlefile baseline hash changed' }
 
-          $zipPath = Join-Path $PWD 'SunYu_ERP-windows-x64.zip'
-          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -Force
-
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
-          try {
-            $actual = @($archive.Entries | ForEach-Object { $_.FullName })
-          } finally {
-            $archive.Dispose()
-          }
-          $required = @(
-            'SunYu_ERP.exe',
-            'start.bat',
-            'README.md',
-            'LICENSE',
-            'config.example.json'
-          )
-          if (@(Compare-Object $required $actual).Count -ne 0) {
-            throw "Unexpected release zip contents: $($actual -join ', ')"
-          }
-          $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  SunYu_ERP-windows-x64.zip" | Set-Content -Encoding utf8NoBOM 'SHA256SUMS.txt'
+      - name: Verify singlefile upgrade and recovery
+        run: python .github/scripts/singlefile_upgrade_smoke.py --candidate dist/release --output "$env:RUNNER_TEMP/SunYu ERP 中文 Upgrade" --version "$env:SUNYU_VERSION" --legacy dist/legacy-baseline/SunYu_ERP-windows-x64.zip
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v7
         with:
           name: SunYu_ERP-windows-x64
           path: |
-            SunYu_ERP-windows-x64.zip
-            SHA256SUMS.txt
+            dist/release/SunYu_ERP-windows-x64.zip
+            dist/release/update.exe
+            dist/release/update-manifest-singlefile.json
+            dist/release/SHA256SUMS.txt
+            ${{ runner.temp }}/SunYu ERP 中文 Upgrade/verification-result.json
           if-no-files-found: error
 
       - name: Recheck release before publishing
@@ -295,7 +310,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.version }}
-        run: gh release upload "$env:RELEASE_TAG" SunYu_ERP-windows-x64.zip SHA256SUMS.txt --clobber
+        run: gh release upload "$env:RELEASE_TAG" dist/release/SunYu_ERP-windows-x64.zip dist/release/update.exe dist/release/update-manifest-singlefile.json dist/release/SHA256SUMS.txt --clobber
 
       - name: Publish complete release
         if: steps.publish_gate.outputs.state == 'new' || steps.publish_gate.outputs.state == 'draft'

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -11,8 +12,15 @@ from fastapi.testclient import TestClient
 
 from backend.app import main as main_module
 from backend.app.core.database import connect_database
+from backend.app.version import VERSION
 
 PROJECT_MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
+
+
+def _assert_health(payload: dict[str, object]) -> None:
+    assert payload == {"status": "ok", "version": VERSION, "pid": os.getpid(),
+                       "instance_id": payload["instance_id"]}
+    assert len(payload["instance_id"]) == 32
 
 
 def _write_config(config_path: Path, **overrides: object) -> None:
@@ -59,7 +67,7 @@ def test_create_app_defers_config_and_database_writes_until_lifespan(
         response = client.get("/api/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    _assert_health(response.json())
     assert config_path.is_file()
     assert (tmp_path / "Data" / "iapm.sqlite").is_file()
 
@@ -94,7 +102,7 @@ def test_create_app_only_serves_frontend_when_dist_is_explicit(
 
     with TestClient(application) as client:
         assert client.get("/").status_code == 404
-        assert client.get("/api/health").json() == {"status": "ok"}
+        _assert_health(client.get("/api/health").json())
 
 
 def test_create_app_registers_first_business_vertical_slice_routes() -> None:
@@ -184,7 +192,7 @@ def test_create_app_serves_release_home_assets_and_keeps_api_priority(
     assert asset.status_code == 200
     assert asset.text == 'console.log("release asset")'
     assert health.status_code == 200
-    assert health.json() == {"status": "ok"}
+    _assert_health(health.json())
     assert session.status_code == 200
     assert session.json() == {
         "authenticated": False,

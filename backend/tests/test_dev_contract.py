@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 from collections.abc import Iterable
 from pathlib import Path, PureWindowsPath
@@ -25,6 +26,7 @@ def test_health_endpoint_returns_ok() -> None:
     from httpx import ASGITransport, AsyncClient
 
     from backend.app.main import app
+    from backend.app.version import VERSION
 
     async def get_health():
         async with AsyncClient(
@@ -36,7 +38,8 @@ def test_health_endpoint_returns_ok() -> None:
     response = asyncio.run(get_health())
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json() == {"status": "ok", "version": VERSION, "pid": os.getpid(),
+                               "instance_id": app.state.updates.instance_id}
 
 
 def test_dev_commands_bind_to_expected_hosts_and_ports() -> None:

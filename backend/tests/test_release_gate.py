@@ -100,3 +100,33 @@ def test_draft_discovery_checks_later_pages(gate, monkeypatch):
         return io.BytesIO(json.dumps(payload).encode())
     monkeypatch.setattr(gate, 'urlopen', request)
     assert gate.read_release('example/repo', 'v1.2.3', 'test-token') == draft
+
+
+@pytest.mark.parametrize('missing', [
+    'SunYu_ERP-windows-x64.zip', 'update.exe',
+    'update-manifest-singlefile.json', 'SHA256SUMS.txt',
+])
+def test_new_updater_release_requires_every_asset(gate, missing):
+    assets = [
+        {'name': name, 'state': 'uploaded', 'size': 123}
+        for name in ('SunYu_ERP-windows-x64.zip', 'update.exe',
+                     'update-manifest-singlefile.json', 'SHA256SUMS.txt')
+        if name != missing
+    ]
+    with pytest.raises(ValueError, match='asset'):
+        gate.classify_release('v1.2.5', SHA, SHA, {'draft': False, 'assets': assets})
+
+
+def test_complete_singlefile_updater_release_is_a_noop(gate):
+    assets = [{'name': name, 'state': 'uploaded', 'size': 123}
+              for name in ('SunYu_ERP-windows-x64.zip', 'update.exe',
+                           'update-manifest-singlefile.json', 'SHA256SUMS.txt')]
+    assert gate.classify_release('v1.2.5', SHA, SHA,
+                                 {'draft': False, 'assets': assets}) == 'published'
+
+
+def test_mismatched_source_version_stops_before_network(gate, monkeypatch):
+    monkeypatch.setenv('RELEASE_TAG', 'v999.999.999')
+    monkeypatch.setenv('GITHUB_SHA', SHA)
+    with pytest.raises(ValueError, match='source version'):
+        gate.main()

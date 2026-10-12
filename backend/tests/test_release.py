@@ -108,6 +108,9 @@ def test_create_release_app_passes_every_path_explicitly(
     monkeypatch.setattr(release, "create_app", capture_create_app)
 
     assert release.create_release_app(paths) is sentinel
+    updates = captured.pop("update_manager")
+    assert updates.root == paths.writable_root
+    assert not updates.enabled
     assert captured == {
         "config_path": paths.config_path,
         "migrations_dir": paths.migrations_dir,
@@ -136,16 +139,19 @@ def test_run_server_reads_host_and_port_without_starting_real_server(
         resource_root=tmp_path / "resources",
         writable_root=writable_root,
     )
-    application = object()
+    application = SimpleNamespace(state=SimpleNamespace(updates=SimpleNamespace(enabled=False)))
     captured: dict[str, object] = {}
 
     monkeypatch.setattr(release, "create_release_app", lambda _: application)
 
-    def capture_run(app: object, **kwargs: object) -> None:
+    def capture_config(app: object, **kwargs: object) -> object:
         captured["app"] = app
         captured.update(kwargs)
+        return object()
 
-    monkeypatch.setattr(release, "uvicorn", SimpleNamespace(run=capture_run))
+    monkeypatch.setattr(release, "uvicorn", SimpleNamespace(
+        Config=capture_config, Server=lambda _: SimpleNamespace(run=lambda: None),
+    ))
 
     release.run_server(paths)
 
@@ -153,4 +159,65 @@ def test_run_server_reads_host_and_port_without_starting_real_server(
         "app": application,
         "host": "127.0.0.1",
         "port": 9123,
+        "proxy_headers": False,
     }
+
+
+def test_duplicate_server_exits_cleanly_and_keeps_original_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    from backend.app.core.update_runtime import UpdateRuntime
+    from backend.app.features.updates import UpdateManager
+
+    paths = release.RuntimePaths(resource_root=tmp_path, writable_root=tmp_path)
+    original_manager = UpdateManager(tmp_path, enabled=True)
+    original = UpdateRuntime(original_manager, port=9123, shutdown=lambda: None)
+    duplicate_manager = UpdateManager(tmp_path, enabled=True)
+    application = SimpleNamespace(state=SimpleNamespace(updates=duplicate_manager))
+    runs = []
+    monkeypatch.setattr(release, "create_release_app", lambda _: application)
+    monkeypatch.setattr(release, "load_settings", lambda _: SimpleNamespace(
+        host="0.0.0.0", port=9123,
+    ))
+    monkeypatch.setattr(release, "uvicorn", SimpleNamespace(
+        Config=lambda *_args, **_kwargs: None,
+        Server=lambda _: SimpleNamespace(run=lambda: runs.append(True)),
+    ))
+    original.start()
+    try:
+        before = (original_manager.directory / "runtime.json").read_bytes()
+        release.run_server(paths)
+        assert runs == []
+        assert (original_manager.directory / "runtime.json").read_bytes() == before
+        assert "http://127.0.0.1:9123" in capsys.readouterr().out
+    finally:
+        original.close()
+
+
+def test_runtime_start_failure_is_not_hidden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SimpleNamespace(enabled=True)
+    monkeypatch.setattr(release, "create_release_app", lambda _: SimpleNamespace(
+        state=SimpleNamespace(updates=manager),
+    ))
+    monkeypatch.setattr(release, "load_settings", lambda _: SimpleNamespace(
+        host="127.0.0.1", port=9123,
+    ))
+    monkeypatch.setattr(release, "uvicorn", SimpleNamespace(
+        Config=lambda *_args, **_kwargs: None, Server=lambda _: None,
+    ))
+
+    class BrokenRuntime:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            raise OSError("cannot write runtime state")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(release, "UpdateRuntime", BrokenRuntime)
+    with pytest.raises(OSError, match="cannot write runtime state"):
+        release.run_server(release.RuntimePaths(tmp_path, tmp_path))

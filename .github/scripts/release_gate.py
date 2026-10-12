@@ -4,12 +4,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import runpy
 import subprocess
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 ASSET = 'SunYu_ERP-windows-x64.zip'
+UPDATER_ASSETS = {ASSET, 'update.exe', 'update-manifest-singlefile.json', 'SHA256SUMS.txt'}
 VERSION = re.compile(r'v[0-9]+\.[0-9]+\.[0-9]+')
 
 
@@ -28,8 +30,10 @@ def classify_release(tag: str, commit: str, tag_commit: str | None, release: dic
         return 'draft'
     if tag_commit is None:
         raise ValueError('Existing release has no matching fetched tag')
-    if not any(asset['name'] == ASSET and asset.get('state') == 'uploaded'
-               and asset.get('size', 0) > 0 for asset in release['assets']):
+    required = UPDATER_ASSETS if tuple(map(int, tag[1:].split('.'))) >= (1, 2, 5) else {ASSET}
+    uploaded = {asset['name'] for asset in release['assets']
+                if asset.get('state') == 'uploaded' and asset.get('size', 0) > 0}
+    if not required <= uploaded:
         raise ValueError('Published release has no complete Windows asset; inspect it before retrying')
     return 'published'
 
@@ -66,6 +70,10 @@ def main() -> None:
     commit = os.environ['GITHUB_SHA']
     # 在任何网络访问前校验版本号，后续通过环境变量和独立参数传递。
     classify_release(tag, commit, None, None)
+    source = Path(__file__).resolve().parents[2] / 'backend/app/version.py'
+    version = runpy.run_path(str(source))['VERSION']
+    if tag and tag != f'v{version}':
+        raise ValueError('Release tag does not match the source version')
     tag_commit = None
     release = None
     if tag:

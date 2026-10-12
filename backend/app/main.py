@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 from starlette.types import Scope
 
 from backend.app.core.config import Settings, load_settings
@@ -41,7 +42,9 @@ from backend.app.features.system import (
     recover_interrupted_backups,
     run_backup_job,
 )
+from backend.app.features.updates import UpdateManager, create_updates_router
 from backend.app.features.workforce import create_workforce_router
+from backend.app.version import VERSION
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_CONFIG_PATH = _PROJECT_ROOT / "config.json"
@@ -93,6 +96,7 @@ def create_app(
     backup_creator: BackupCreator = create_backup,
     backup_pruner: BackupPruner = prune_backups,
     scheduler_factory: Callable[..., BackupScheduler] = BackupScheduler,
+    update_manager: UpdateManager | None = None,
 ) -> FastAPI:
     selected_config_path = (
         _DEFAULT_CONFIG_PATH if config_path is None else Path(config_path)
@@ -100,6 +104,8 @@ def create_app(
     selected_migrations_dir = (
         _MIGRATIONS_DIR if migrations_dir is None else Path(migrations_dir)
     )
+
+    updates = update_manager or UpdateManager(selected_config_path.parent)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> Iterator[None]:
@@ -129,14 +135,17 @@ def create_app(
             scheduled_connection: sqlite3.Connection,
             scheduled_settings: Settings,
             now: datetime,
-        ) -> BackupJobResult:
-            return run_backup_job(
-                scheduled_connection,
-                scheduled_settings,
-                now,
-                creator=backup_creator,
-                pruner=backup_pruner,
-            )
+        ) -> BackupJobResult | None:
+            if updates.writes_blocked():
+                return None
+            with updates.business_write():
+                return run_backup_job(
+                    scheduled_connection,
+                    scheduled_settings,
+                    now,
+                    creator=backup_creator,
+                    pruner=backup_pruner,
+                )
 
         scheduler = scheduler_factory(
             settings_store=settings_store,
@@ -159,6 +168,21 @@ def create_app(
             )
 
     application = FastAPI(title="SunYu ERP", lifespan=lifespan)
+    application.state.updates = updates
+
+    @application.middleware("http")
+    async def update_write_guard(request: Request, call_next):
+        path = request.url.path
+        if (request.method in {"GET", "HEAD", "OPTIONS"}
+                or path in {"/api/auth/login", "/api/auth/logout"}
+                or path.startswith("/api/system/updates")):
+            return await call_next(request)
+        try:
+            with updates.business_write():
+                return await call_next(request)
+        except HTTPException as error:
+            return JSONResponse({"detail": error.detail}, status_code=error.status_code,
+                                headers=error.headers)
 
     def get_settings(request: Request) -> Settings:
         store: SettingsStore = request.app.state.settings
@@ -232,9 +256,12 @@ def create_app(
         )
     )
 
+    application.include_router(create_updates_router(get_settings, updates))
+
     @application.get("/api/health")
-    def get_health() -> dict[str, str]:
-        return {"status": "ok"}
+    def get_health() -> dict[str, object]:
+        return {"status": "ok", "version": VERSION, "pid": os.getpid(),
+                "instance_id": updates.instance_id}
 
     if frontend_dist is not None:
         application.mount(

@@ -1,0 +1,10 @@
+.content {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.message {
+  margin: 0;
+  overflow-wrap: anywhere;
+}

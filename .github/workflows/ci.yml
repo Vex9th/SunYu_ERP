@@ -15,6 +15,30 @@ permissions:
   contents: read
 
 jobs:
+  updater:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: updater/go.mod
+          cache: false
+      - name: Test independent updater
+        working-directory: updater
+        run: go test ./...
+      - name: Check updater races
+        if: runner.os == 'Linux'
+        working-directory: updater
+        run: go test -race ./...
+      - name: Vet updater
+        working-directory: updater
+        run: go vet ./...
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
