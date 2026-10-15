@@ -16,7 +16,8 @@ import WorkforceWorkspace, {
   eligibleAssignments,
 } from '../workforce/WorkforceWorkspace'
 import { MockWorkforceRepository } from '../../repositories/workforce'
-import { ApiError } from '../../api'
+import { ApiError, createRetriablePostSender } from '../../api'
+import { createHttpWorkforceWorkspaceRepository } from '../../repositories/workforce.live'
 import { formatMoney } from '../../domain/formatters'
 import { localISODate } from '../../domain/dates'
 import type { WorkforceDemoViewModel } from '../../domain/workforce'
@@ -54,7 +55,39 @@ beforeAll(() => {
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
 })
+
+function liveUiRepository(withWorker = false, withAssignment = false) {
+  const workers = withWorker
+    ? [{ id: 1, name: '已有施工员', phone: null, notes: null, status: 'active', revision: 1 }]
+    : []
+  const assignments: Record<string, unknown>[] = withAssignment ? [{
+    id: 1, worker_id: 1, worker_name: '已有施工员', revision: 1, role: '安装', status: 'active',
+    scheduled_start_on: localISODate(), scheduled_end_on: localISODate(), pay_basis: 'daily', rate_cents: 30000,
+  }] : []
+  const posts = vi.fn()
+  vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (path, init) => {
+    const url = String(path).split('?')[0]!
+    if (init?.method === 'POST') {
+      const payload = JSON.parse(String(init.body))
+      posts(url, payload, new Headers(init.headers).get('Idempotency-Key'))
+      const row = { ...payload, id: 1, revision: 1, status: url === '/api/workers' ? 'active' : 'planned' }
+      if (url === '/api/workers') workers.push(row)
+      else if (url.endsWith('/crew-assignments')) assignments.push(row)
+      else if (url.endsWith('/material-advances')) Object.assign(row, {
+        reimbursements: [], status: 'unreimbursed', total_amount_cents: 1000,
+        reimbursed_amount_cents: 0, outstanding_amount_cents: 1000,
+      })
+      else throw new Error(`Unexpected POST: ${url}`)
+      return new Response(JSON.stringify(row), { status: 201 })
+    }
+    const items = url === '/api/workers' ? workers
+      : url.endsWith('/crew-assignments') ? assignments : []
+    return new Response(JSON.stringify({ items, total: items.length, page: 1, page_size: 200 }))
+  }))
+  return { repo: createHttpWorkforceWorkspaceRepository(), posts }
+}
 
 function uiRepository() {
   const repo = new MockWorkforceRepository()
@@ -76,6 +109,79 @@ function uiRepository() {
 
 // 多步骤工作区回归包含完整表单与重挂流程，为 CI 留出渲染时间。
 describe('React 施工工作区', { timeout: 15000 }, () => {
+  it.each([false, true])('真实 HTTP 提交链可新建施工员，完整填写=%s', async (complete) => {
+    const { repo, posts } = liveUiRepository()
+    render(<WorkforceWorkspace projectCode="HTTP-CREATE" repository={repo} />)
+    fireEvent.click(await screen.findByRole('tab', { name: '施工员档案' }))
+    fireEvent.click(await screen.findByRole('button', { name: /新建施工员/ }))
+    const drawer = await screen.findByRole('dialog')
+    fireEvent.change(within(drawer).getByLabelText('姓名'), { target: { value: '新增测试工人' } })
+    if (complete) {
+      fireEvent.change(within(drawer).getByLabelText('联系电话'), { target: { value: '13800000000' } })
+      fireEvent.change(within(drawer).getByLabelText('备注'), { target: { value: '测试档案' } })
+    }
+    fireEvent.click(within(drawer).getByRole('button', { name: /保.*存/ }))
+    await waitFor(() => expect(posts).toHaveBeenCalledOnce())
+    expect(posts.mock.calls[0]).toEqual(['/api/workers', {
+      name: '新增测试工人', phone: complete ? '13800000000' : null, notes: complete ? '测试档案' : null,
+    }, expect.any(String)])
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(await screen.findByText('新增测试工人')).toBeTruthy()
+  })
+  it('真实 HTTP 提交链可添加项目工人，新建请求不携带编辑版本号', async () => {
+    const { repo, posts } = liveUiRepository(true)
+    render(<WorkforceWorkspace projectCode="HTTP-ASSIGN" repository={repo} />)
+    fireEvent.click(await screen.findByRole('tab', { name: '项目安排' }))
+    fireEvent.click(await screen.findByRole('button', { name: /添加项目工人/ }))
+    const drawer = await screen.findByRole('dialog')
+    fireEvent.change(within(drawer).getByLabelText('工种 / 工作职责'), { target: { value: '安装' } })
+    fireEvent.change(within(drawer).getByLabelText('工资标准'), { target: { value: '300' } })
+    fireEvent.click(within(drawer).getByRole('button', { name: '保存项目安排' }))
+    await waitFor(() => expect(posts).toHaveBeenCalledOnce())
+    expect(posts.mock.calls[0]).toEqual(['/api/projects/HTTP-ASSIGN/crew-assignments', {
+      worker_id: 1, role: '安装', pay_basis: 'daily', rate_cents: 30000,
+      scheduled_start_on: localISODate(), scheduled_end_on: localISODate(), notes: null,
+    }, expect.any(String)])
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+  })
+  it('发送前 JSON 校验失败不锁住表单，修改后仍可保存', async () => {
+    const { repo, posts } = liveUiRepository()
+    const sender = createRetriablePostSender()
+    const invalid: Record<string, unknown> = {}
+    invalid.self = invalid
+    vi.spyOn(repo, 'createWorker').mockImplementationOnce(() => sender.send('/api/workers', invalid))
+    render(<WorkforceWorkspace projectCode="HTTP-INVALID" repository={repo} />)
+    fireEvent.click(await screen.findByRole('tab', { name: '施工员档案' }))
+    fireEvent.click(await screen.findByRole('button', { name: /新建施工员/ }))
+    const drawer = await screen.findByRole('dialog')
+    fireEvent.change(within(drawer).getByLabelText('姓名'), { target: { value: '首次输入' } })
+    fireEvent.click(within(drawer).getByRole('button', { name: /保.*存/ }))
+    await within(drawer).findByText('POST 请求体必须是无循环引用的 JSON 兼容值')
+    expect(posts).not.toHaveBeenCalled()
+    expect((within(drawer).getByLabelText('姓名') as HTMLInputElement).disabled).toBe(false)
+    expect(screen.queryByText('上次请求结果尚未确认')).toBeNull()
+    fireEvent.change(within(drawer).getByLabelText('姓名'), { target: { value: '修正后的工人' } })
+    fireEvent.click(within(drawer).getByRole('button', { name: /保.*存/ }))
+    await waitFor(() => expect(posts).toHaveBeenCalledOnce())
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+  })
+  it('真实 HTTP 提交链可登记现场垫资，新建请求不携带编辑版本号', async () => {
+    const { repo, posts } = liveUiRepository(true, true)
+    render(<WorkforceWorkspace projectCode="HTTP-ADVANCE" repository={repo} />)
+    fireEvent.click(await screen.findByRole('tab', { name: '垫资与报销' }))
+    fireEvent.click(await screen.findByRole('button', { name: /登记现场垫资/ }))
+    const drawer = await screen.findByRole('dialog')
+    for (const [label, value] of [['商家名称', '测试五金店'], ['材料名称', '胶带'], ['数量', '1'], ['单位', '卷'], ['单价（元）', '10']]) {
+      fireEvent.change(within(drawer).getByLabelText(label!), { target: { value } })
+    }
+    fireEvent.click(within(drawer).getByRole('button', { name: '登记现场垫资' }))
+    await waitFor(() => expect(posts).toHaveBeenCalledOnce())
+    const [path, payload] = posts.mock.calls[0]!
+    expect(path).toBe('/api/projects/HTTP-ADVANCE/material-advances')
+    expect(payload).not.toHaveProperty('expected_revision')
+    expect(payload).toMatchObject({ worker_id: 1, vendor_name: '测试五金店', items: [{ name: '胶带', unit_price_cents: 1000, line_amount_cents: 1000 }] })
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+  })
   it('同一工人优先使用有效的进行中安排，不包含停用和不在日期范围内的安排', async () => {
     const repo = new MockWorkforceRepository()
     const model = (await repo.getWorkforcePreview('SY-2026-001')).data
@@ -268,12 +374,16 @@ describe('React 施工工作区', { timeout: 15000 }, () => {
         .hasAttribute('disabled'),
     ).toBe(true)
   })
-  it('网络失败锁定原始人员提交，重试复用完全相同的输入', async () => {
+  it.each([
+    ['网络失败', new ApiError('请求超时', 0)],
+    ['响应正文读取失败', new TypeError('读取响应失败')],
+    ['响应正文解析失败', new SyntaxError('响应不是 JSON')],
+  ])('%s 锁定原始人员提交，重试复用完全相同的输入', async (_reason, failure) => {
     const repo = uiRepository()
     const original = repo.createWorker.bind(repo)
     const create = vi
       .spyOn(repo, 'createWorker')
-      .mockRejectedValueOnce(new ApiError('请求超时', 0))
+      .mockRejectedValueOnce(failure)
       .mockImplementation(original)
     render(<WorkforceWorkspace projectCode="SY-2026-001" repository={repo} />)
     await screen.findByRole('tab', { name: '施工员档案' })

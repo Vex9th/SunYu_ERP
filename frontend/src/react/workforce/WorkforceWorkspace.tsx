@@ -27,7 +27,7 @@ import {
 } from 'antd'
 import { DeleteOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
-import { ApiError } from '../../api'
+import { ApiError, InvalidJsonBodyError } from '../../api'
 import { useWorkspaceTab, useWorkspaceValue } from '../shared'
 import { localISODate } from '../../domain/dates'
 import {
@@ -423,6 +423,7 @@ export default function WorkforceWorkspace({
       if (
         submission &&
         (failure instanceof InputError ||
+          failure instanceof InvalidJsonBodyError ||
           (failure instanceof Error && failure.name === 'Error') ||
           (failure instanceof ApiError &&
             failure.status >= 400 &&
@@ -547,12 +548,14 @@ export default function WorkforceWorkspace({
       ],
       async (values) => {
         const input = {
-          expected_revision: values.revision as number | null | undefined,
           name: textValue(values, 'name'),
           phone: optionalText(values, 'phone'),
           notes: optionalText(values, 'notes'),
         }
-        if (worker) await repository.updateWorker(worker.worker_id, input)
+        if (worker) await repository.updateWorker(worker.worker_id, {
+          ...input,
+          expected_revision: values.revision as number | null | undefined,
+        })
         else await repository.createWorker(input)
       },
     )
@@ -592,7 +595,6 @@ export default function WorkforceWorkspace({
       ],
       async (values) => {
         const input = {
-          expected_revision: values.revision as number | null | undefined,
           worker_id: numberValue(values, 'worker_id'),
           role: textValue(values, 'role'),
           scheduled_start_on: textValue(values, 'scheduled_start_on'),
@@ -607,7 +609,7 @@ export default function WorkforceWorkspace({
           await repository.updateCrewAssignment(
             projectCode,
             assignment.assignment_id,
-            input,
+            { ...input, expected_revision: values.revision as number | null | undefined },
           )
         else await repository.assignWorker(projectCode, input)
       },
@@ -803,7 +805,6 @@ export default function WorkforceWorkspace({
         )
           throw new InputError('垫付人员在该日期没有有效项目安排')
         const input = {
-          expected_revision: values.revision as number | null | undefined,
           worker_id: workerId,
           spent_on: spentOn,
           vendor_name: textValue(values, 'vendor_name'),
@@ -834,7 +835,7 @@ export default function WorkforceWorkspace({
           await repository.updateMaterialAdvance(
             projectCode,
             advance.advance_id,
-            input,
+            { ...input, expected_revision: values.revision as number | null | undefined },
           )
         else await repository.saveMaterialAdvance(projectCode, input)
       },

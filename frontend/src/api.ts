@@ -82,6 +82,14 @@ export class ApiError extends Error {
   }
 }
 
+// 仅表示请求发送前的本地校验失败，不能与网络或响应读取的 TypeError 混用。
+export class InvalidJsonBodyError extends TypeError {
+  constructor() {
+    super('POST 请求体必须是无循环引用的 JSON 兼容值')
+    this.name = 'InvalidJsonBodyError'
+  }
+}
+
 async function sendRequest<T>(
   path: string,
   options: RequestOptions,
@@ -455,7 +463,7 @@ function jsonDataPropertyValue(descriptor: PropertyDescriptor | undefined): unkn
 }
 
 function invalidJsonBody(): never {
-  throw new TypeError('POST 请求体必须是无循环引用的 JSON 兼容值')
+  throw new InvalidJsonBodyError()
 }
 
 export async function requestBlob(
