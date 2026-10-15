@@ -40,6 +40,7 @@ func terminateOwned(path string, pid int) error {
 }
 func processAlive(pid int) bool { return pid > 0 && syscall.Kill(pid, 0) == nil }
 func configureDetached(cmd *exec.Cmd, visible bool) {
+	cmd.Env = append(cmd.Environ(), "PYINSTALLER_RESET_ENVIRONMENT=1")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 }
 func listenerPID(host string, port int) (int, error) {

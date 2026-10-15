@@ -99,6 +99,8 @@ func processAlive(pid int) bool {
 	return e == nil && state == uint32(windows.WAIT_TIMEOUT)
 }
 func configureDetached(cmd *exec.Cmd, visible bool) {
+	// 独立进程可能跨越旧单文件程序退出，必须让 PyInstaller 重新解包运行库。
+	cmd.Env = append(cmd.Environ(), "PYINSTALLER_RESET_ENVIRONMENT=1")
 	flags := uint32(windows.CREATE_NEW_PROCESS_GROUP)
 	if visible {
 		flags |= windows.CREATE_NEW_CONSOLE
