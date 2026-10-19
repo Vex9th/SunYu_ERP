@@ -73,3 +73,8 @@
   .metrics { gap: 8px; }
   .listPicker { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+.orderPricing { display: grid; grid-template-columns: 0.8fr 1fr 1fr; gap: 0 16px; }
+.priceHint { grid-column: 1 / -1; margin: -8px 0 16px; color: var(--text-secondary, #64748b); font-size: 12px; }
+.priceHint strong { color: var(--text-primary, #172b4d); font-weight: 500; }
+@media (max-width: 640px) { .orderPricing { grid-template-columns: 1fr; } }

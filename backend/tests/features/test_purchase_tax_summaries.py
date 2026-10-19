@@ -154,3 +154,22 @@ def test_summaries_add_each_rounded_line_tax_without_retaxing_order_total(
     assert dashboard_response.status_code == 200, dashboard_response.text
     assert ledger_response.json()["supplier"]["summary"]["ordered_amount_cents"] == 4
     assert dashboard_response.json()["costs"]["procurement_committed_cents"] == 4
+
+
+def test_gross_quote_drives_ledger_and_dashboard_without_unit_round_trip(harness):
+    with closing(connect_database(harness.database_path)) as connection:
+        supplier = _company(connection, "原含税报价供应商")
+        project = _project(connection, supplier, "GROSS-COST")
+        order = _order(connection, project, supplier, "GROSS-39", "confirmed", [(66372, 39000)])
+        _set_order_tax(connection, order, 1300, 336504)
+        connection.execute("UPDATE purchase_order_lines SET gross_unit_cost_cents = 75000 WHERE purchase_order_id = ?", (order,))
+        _supplier_fact(connection, "supplier_payments", order, 2925000)
+        _supplier_fact(connection, "supplier_invoices", order, 2925000)
+    with harness.client() as client:
+        ledger = client.get(f"/api/companies/{supplier}/ledger")
+        dashboard = client.get("/api/projects/GROSS-COST/dashboard")
+    assert ledger.status_code == dashboard.status_code == 200
+    summary = ledger.json()["supplier"]["summary"]
+    assert summary["ordered_amount_cents"] == 2925000
+    assert summary["unpaid_amount_cents"] == summary["uninvoiced_amount_cents"] == 0
+    assert dashboard.json()["costs"]["procurement_committed_cents"] == 2925000

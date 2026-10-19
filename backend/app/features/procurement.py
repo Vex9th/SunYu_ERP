@@ -889,8 +889,8 @@ def create_procurement_router(
                             INSERT INTO purchase_order_lines
                                 (purchase_order_id, procurement_line_id,
                                  quantity_milli, received_quantity_milli,
-                                 unit_cost_cents, tax_amount_cents, overage_reason, created_at)
-                            VALUES (?, ?, ?, 0, ?, ?, ?, ?)
+                                 unit_cost_cents, tax_amount_cents, gross_unit_cost_cents, overage_reason, created_at)
+                            VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)
                             """,
                             (
                                 order_id,
@@ -898,6 +898,7 @@ def create_procurement_router(
                                 line["quantity_milli"],
                                 line["unit_cost_cents"],
                                 line.get("tax_amount_cents", 0),
+                                line.get("gross_unit_cost_cents"),
                                 line["overage_reason"],
                                 timestamp,
                             ),
@@ -1275,7 +1276,7 @@ def create_procurement_router(
         committed_lines = connection.execute(
             """
             SELECT order_lines.unit_cost_cents, order_lines.quantity_milli,
-                   order_lines.tax_amount_cents
+                   order_lines.tax_amount_cents, order_lines.gross_unit_cost_cents
             FROM purchase_order_lines AS order_lines
             JOIN purchase_orders AS orders ON orders.id = order_lines.purchase_order_id
             WHERE orders.project_id = ?
@@ -1286,7 +1287,7 @@ def create_procurement_router(
         committed = sum(
             gross_line_value(
                 int(line["unit_cost_cents"]), int(line["quantity_milli"]),
-                int(line["tax_amount_cents"]),
+                int(line["tax_amount_cents"]), line["gross_unit_cost_cents"],
             )
             for line in committed_lines
         )
@@ -1416,7 +1417,9 @@ def _normalize_order(
     lines: list[dict[str, object]] = []
     seen_lines: set[int] = set()
     for raw_line in raw_lines:
-        if not isinstance(raw_line, dict) or set(raw_line) != _ORDER_LINE_FIELDS:
+        if (not isinstance(raw_line, dict)
+                or not _ORDER_LINE_FIELDS <= set(raw_line)
+                or set(raw_line) - _ORDER_LINE_FIELDS - {"gross_unit_cost_cents"}):
             raise _invalid_payload("Invalid purchase order payload")
         procurement_line_id = _positive_integer(
             raw_line["procurement_line_id"], "Invalid purchase order payload"
@@ -1428,14 +1431,19 @@ def _normalize_order(
         unit_cost_cents = _money(
             raw_line["unit_cost_cents"], "Invalid purchase order payload"
         )
-        amounts = calculate_line_amounts(unit_cost_cents, quantity_milli, tax_rate)
+        gross_unit_cost_cents = raw_line.get("gross_unit_cost_cents")
+        amounts = calculate_line_amounts(
+            unit_cost_cents, quantity_milli, tax_rate, gross_unit_cost_cents
+        )
         lines.append(
             {
                 "procurement_line_id": procurement_line_id,
                 "quantity_milli": quantity_milli,
                 "unit_cost_cents": unit_cost_cents,
                 **({"tax_amount_cents": amounts["tax_amount_cents"]}
-                   if "tax_rate_bps" in payload else {}),
+                   if "tax_rate_bps" in payload or gross_unit_cost_cents is not None else {}),
+                **({"gross_unit_cost_cents": gross_unit_cost_cents}
+                   if gross_unit_cost_cents is not None else {}),
                 "overage_reason": _optional_text(
                     raw_line["overage_reason"], "Invalid purchase order payload"
                 ),
@@ -1446,6 +1454,7 @@ def _normalize_order(
             int(line["unit_cost_cents"]),
             int(line["quantity_milli"]),
             int(line.get("tax_amount_cents", 0)),
+            line.get("gross_unit_cost_cents"),
         )
         for line in lines
     )
@@ -1492,12 +1501,12 @@ def _receipt_line_value(
     line: sqlite3.Row,
     quantity_milli: int,
 ) -> int:
-    if order["tax_rate_bps"] is None:
+    if order["tax_rate_bps"] is None and line["gross_unit_cost_cents"] is None:
         # 未设置税率的旧单继续沿用原来的逐次入库舍入规则。
         return line_value(int(line["unit_cost_cents"]), quantity_milli)
     gross = gross_line_value(
         int(line["unit_cost_cents"]), int(line["quantity_milli"]),
-        int(line["tax_amount_cents"]),
+        int(line["tax_amount_cents"]), line["gross_unit_cost_cents"],
     )
     received_value = int(connection.execute(
         """
@@ -1739,7 +1748,7 @@ def _line_facts(connection: sqlite3.Connection, line_id: int) -> dict[str, int]:
     amounts = connection.execute(
         """
         SELECT order_lines.unit_cost_cents, order_lines.quantity_milli,
-               order_lines.tax_amount_cents
+               order_lines.tax_amount_cents, order_lines.gross_unit_cost_cents
         FROM purchase_order_lines AS order_lines
         JOIN purchase_orders AS orders ON orders.id = order_lines.purchase_order_id
         WHERE order_lines.procurement_line_id = ?
@@ -1752,7 +1761,7 @@ def _line_facts(connection: sqlite3.Connection, line_id: int) -> dict[str, int]:
         "ordered_amount_cents": sum(
             gross_line_value(
                 int(line["unit_cost_cents"]), int(line["quantity_milli"]),
-                int(line["tax_amount_cents"]),
+                int(line["tax_amount_cents"]), line["gross_unit_cost_cents"],
             )
             for line in amounts
         ),
@@ -1777,7 +1786,10 @@ def _order_response(
         (row["id"],),
     ).fetchall()
     net_amount = sum(
-        line_value(int(line["unit_cost_cents"]), int(line["quantity_milli"]))
+        gross_line_value(
+            int(line["unit_cost_cents"]), int(line["quantity_milli"]),
+            int(line["tax_amount_cents"]), line["gross_unit_cost_cents"],
+        ) - int(line["tax_amount_cents"])
         for line in lines
     )
     tax_amount = sum(int(line["tax_amount_cents"]) for line in lines)
@@ -1855,13 +1867,15 @@ def _order_response(
                     int(line["received_quantity_milli"])
                 ),
                 "unit_cost_cents": line["unit_cost_cents"],
-                "net_amount_cents": line_value(
-                    int(line["unit_cost_cents"]), int(line["quantity_milli"])
-                ),
+                "gross_unit_cost_cents": line["gross_unit_cost_cents"],
+                "net_amount_cents": gross_line_value(
+                    int(line["unit_cost_cents"]), int(line["quantity_milli"]),
+                    int(line["tax_amount_cents"]), line["gross_unit_cost_cents"],
+                ) - int(line["tax_amount_cents"]),
                 "tax_amount_cents": line["tax_amount_cents"],
                 "line_amount_cents": gross_line_value(
                     int(line["unit_cost_cents"]), int(line["quantity_milli"]),
-                    int(line["tax_amount_cents"]),
+                    int(line["tax_amount_cents"]), line["gross_unit_cost_cents"],
                 ),
                 "overage_reason": line["overage_reason"],
             }

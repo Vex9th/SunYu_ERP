@@ -10,6 +10,11 @@ beforeAll(() => {
 afterEach(cleanup)
 
 describe('采购税额整数计算', () => {
+  it('含税报价按原报价乘数量，反算未税金额不产生再次加税的尾差', () => {
+    expect(calculatePurchaseTax([{ quantity: '39', cost: '663.72', gross_cost: '750.00', price_basis: 'gross' }], 1300)).toEqual({ net: 2588496, tax: 336504, gross: 2925000 })
+    expect(calculatePurchaseTax([{ quantity: '3', cost: '0.04', gross_cost: '0.05', price_basis: 'gross' }], 1300)).toEqual({ net: 13, tax: 2, gross: 15 })
+  })
+
   it('单价未税，100 元加 13% 后应付 113 元', () => {
     expect(calculatePurchaseTax([{ quantity: '1', cost: '100' }], 1300)).toEqual({ net: 10000, tax: 1300, gross: 11300 })
   })
@@ -51,7 +56,7 @@ describe('手动采购税率', () => {
   ])('初始未填写完整时展示中性说明：$lines', async ({ lines }) => {
     render(<Harness onFinish={vi.fn()} lines={lines} />)
     const preview = screen.getByRole('region', { name: '采购金额预览' })
-    expect(await within(preview).findByText('填写采购数量和未税单价后显示金额')).toBeTruthy()
+    expect(await within(preview).findByText('填写采购数量和任一单价后显示金额')).toBeTruthy()
     expect(within(preview).queryByText(/数量必须|金额必须/)).toBeNull()
   })
   it('未填完整但已有非法输入时仍提示具体错误', async () => {

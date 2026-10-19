@@ -104,6 +104,8 @@ export interface PurchaseOrderLineInput {
   procurement_line_id: number
   quantity: DecimalString
   unit_cost_cents: MoneyCents
+  /** 有值时按原含税报价计价；省略或 null 时沿用未税单价计价。 */
+  gross_unit_cost_cents?: MoneyCents | null
   overage_reason: string | null
 }
 

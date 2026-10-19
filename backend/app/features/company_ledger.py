@@ -61,7 +61,7 @@ def _supplier_ledger(
     lines = connection.execute(
         """
         SELECT lines.purchase_order_id, lines.unit_cost_cents, lines.quantity_milli,
-               lines.tax_amount_cents
+               lines.tax_amount_cents, lines.gross_unit_cost_cents
         FROM purchase_order_lines AS lines
         JOIN purchase_orders AS orders ON orders.id = lines.purchase_order_id
         WHERE orders.supplier_company_id = ?
@@ -73,7 +73,7 @@ def _supplier_ledger(
         orders[int(line["purchase_order_id"])]["ordered_amount_cents"] += gross_line_value(
             int(line["unit_cost_cents"]),
             int(line["quantity_milli"]),
-            int(line["tax_amount_cents"]),
+            int(line["tax_amount_cents"]), line["gross_unit_cost_cents"],
         )
 
     # 金额事实独立读取，避免订单行、付款和发票互相联表放大。

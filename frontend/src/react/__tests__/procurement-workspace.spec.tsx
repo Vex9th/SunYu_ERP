@@ -24,6 +24,42 @@ function material(id: number, name: string, quantity: string): ProcurementLineDt
 }
 function LocationProbe() { return <output aria-label="当前地址">{useLocation().search}</output> }
 describe('React 采购工作区', () => {
+  it('含税单价可填写，修改税率保留手填的一侧，提交原含税报价', async () => {
+    const repo = repository()
+    const list = (await repo.getProcurementList('SY-GROSS', 1)).data
+    repo.getProcurementList = async () => ({ source: 'live', data: { ...list, status: 'confirmed', lines: [material(1, '含税报价物料', '39.000')] } })
+    Object.assign(repo, { previewPurchaseOrderNumber: async () => ({ order_no: 'PO_GROSS_001' }) })
+    repo.createPurchaseOrder = vi.fn().mockResolvedValue({ source: 'live', data: { id: 27 } })
+    repo.discardCreatePurchaseOrder = () => true
+    render(<ProcurementWorkspace projectCode="SY-GROSS" repository={repo} />)
+    fireEvent.click(await screen.findByRole('button', { name: '建立采购单' }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.mouseDown(within(dialog).getByLabelText('供应商'))
+    fireEvent.click(await screen.findByText('供应商甲'))
+    const net = within(dialog).getByLabelText('未税成本单价（元）') as HTMLInputElement
+    const gross = within(dialog).getByLabelText('含税成本单价（元）') as HTMLInputElement
+    fireEvent.click(within(dialog).getByRole('button', { name: '13%' }))
+    fireEvent.change(gross, { target: { value: '750' } })
+    fireEvent.blur(gross)
+    await waitFor(() => expect(net.value).toBe('663.72'))
+    expect(gross.value).toBe('750.00')
+    expect(await within(dialog).findByText('¥29,250.00')).toBeTruthy()
+    fireEvent.click(within(dialog).getByRole('button', { name: '6%' }))
+    await waitFor(() => expect(net.value).toBe('707.55'))
+    expect(gross.value).toBe('750.00')
+    fireEvent.change(net, { target: { value: '100' } })
+    fireEvent.blur(net)
+    await waitFor(() => expect(gross.value).toBe('106.00'))
+    expect(net.value).toBe('100.00')
+    fireEvent.click(within(dialog).getByRole('button', { name: '13%' }))
+    await waitFor(() => expect(gross.value).toBe('113.00'))
+    fireEvent.change(gross, { target: { value: '' } })
+    await waitFor(() => expect(net.value).toBe(''))
+    fireEvent.change(gross, { target: { value: '750' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: /^保\s*存$/ }))
+    await waitFor(() => expect(repo.createPurchaseOrder).toHaveBeenCalledWith('SY-GROSS', expect.objectContaining({ tax_rate_bps: 1300, lines: [{ procurement_line_id: 1, quantity: '39.000', unit_cost_cents: 66372, gross_unit_cost_cents: 75000, overage_reason: null }] }), []))
+  })
+
   it('新采购单预览自动编号但提交空号，让后台分配唯一号码', async () => {
     const repo = repository()
     const list = (await repo.getProcurementList('SY-AUTO', 1)).data
@@ -45,6 +81,25 @@ describe('React 采购工作区', () => {
     expect(await within(dialog).findByText('¥113.00')).toBeTruthy()
     fireEvent.click(within(dialog).getByRole('button', { name: /^保\s*存$/ }))
     await waitFor(() => expect(repo.createPurchaseOrder).toHaveBeenCalledWith('SY-AUTO', expect.objectContaining({ order_no: '', supplier_company_id: 1, ordered_on: '2026-10-11', tax_rate_bps: 1300, lines: [{ procurement_line_id: 1, quantity: '2.000', unit_cost_cents: 5000, overage_reason: null }] }), []))
+  })
+
+  it('重新编辑含税报价草稿保留计价依据和原金额', async () => {
+    const repo = repository()
+    const record: PurchaseOrderRecordDto = { id: 28, project_code: 'SY-GROSS-EDIT', order_no: 'GROSS-028', supplier_company_id: 1, supplier_company_name: '供应商甲', status: 'draft', ordered_on: '2026-10-19', expected_delivery_on: null, notes: null, document_version_ids: [], revision: 2, tax_rate_bps: 1300, ordered_amount_cents: 2925000, created_at: '', updated_at: '', lines: [{ id: 281, purchase_order_id: 28, procurement_line_id: 7, quantity: '39.000', unit_cost_cents: 66372, gross_unit_cost_cents: 75000, line_amount_cents: 2925000, overage_reason: null, received_quantity: '0.000' }] }
+    repo.listPurchaseOrders = async () => ({ source: 'live', data: { items: [record], total: 1, page: 1, page_size: 20 } })
+    repo.getPurchaseOrder = async () => ({ source: 'live', data: record })
+    repo.updatePurchaseOrder = vi.fn().mockResolvedValue({ source: 'live', data: record })
+    render(<ProcurementWorkspace projectCode="SY-GROSS-EDIT" repository={repo} />)
+    fireEvent.click(await screen.findByRole('tab', { name: /采购单/ }))
+    fireEvent.click(await screen.findByRole('button', { name: 'GROSS-028' }))
+    fireEvent.click(await screen.findByRole('button', { name: '编辑采购单' }))
+    const dialogs = screen.getAllByRole('dialog')
+    const dialog = dialogs[dialogs.length - 1]!
+    await waitFor(() => expect((within(dialog).getByLabelText('含税成本单价（元）') as HTMLInputElement).value).toBe('750.00'))
+    expect((within(dialog).getByLabelText('未税成本单价（元）') as HTMLInputElement).value).toBe('663.72')
+    expect(within(dialog).getByText('¥29,250.00')).toBeTruthy()
+    fireEvent.click(within(dialog).getByRole('button', { name: /^保\s*存$/ }))
+    await waitFor(() => expect(repo.updatePurchaseOrder).toHaveBeenCalledWith('SY-GROSS-EDIT', 28, expect.objectContaining({ lines: [{ procurement_line_id: 7, quantity: '39.000', unit_cost_cents: 66372, gross_unit_cost_cents: 75000, overage_reason: null }], expected_revision: 2 })))
   })
 
   it.each([undefined, 0, 125])('编辑草稿回填税率 %s，保留未税单价和原单号', async (rate) => {

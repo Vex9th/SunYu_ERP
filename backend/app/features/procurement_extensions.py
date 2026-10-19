@@ -393,9 +393,6 @@ def create_procurement_extensions_router(
         expected_revision = base._positive_integer(
             payload["expected_revision"], "Invalid purchase order payload"
         )
-        normalized = base._normalize_order(
-            {field: value for field, value in payload.items() if field != "expected_revision"}
-        )
         timestamp = base._timestamp(now)
         try:
             with transaction_immediate(connection):
@@ -410,11 +407,10 @@ def create_procurement_extensions_router(
                         "Purchase order is not editable", "PURCHASE_ORDER_NOT_EDITABLE"
                     )
                 base._require_revision(order, expected_revision)
-                if "tax_rate_bps" not in payload:
-                    normalized = base._normalize_order({
-                        **{field: payload[field] for field in base._ORDER_FIELDS},
-                        "tax_rate_bps": order["tax_rate_bps"],
-                    })
+                normalized = base._normalize_order({
+                    **{field: payload[field] for field in base._ORDER_FIELDS},
+                    "tax_rate_bps": payload.get("tax_rate_bps", order["tax_rate_bps"]),
+                })
                 _validate_order_references(connection, project, normalized)
                 connection.execute(
                     """
@@ -1641,8 +1637,8 @@ def _insert_order_lines(
             """
             INSERT INTO purchase_order_lines
                 (purchase_order_id, procurement_line_id, quantity_milli,
-                 received_quantity_milli, unit_cost_cents, tax_amount_cents, overage_reason, created_at)
-            VALUES (?, ?, ?, 0, ?, ?, ?, ?)
+                 received_quantity_milli, unit_cost_cents, tax_amount_cents, gross_unit_cost_cents, overage_reason, created_at)
+            VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)
             """,
             (
                 order_id,
@@ -1650,6 +1646,7 @@ def _insert_order_lines(
                 line["quantity_milli"],
                 line["unit_cost_cents"],
                 line.get("tax_amount_cents", 0),
+                line.get("gross_unit_cost_cents"),
                 line["overage_reason"],
                 timestamp,
             ),
@@ -1835,7 +1832,7 @@ def _validate_allocation_capacity(
         ).fetchone()[0]
         line_amount = gross_line_value(
             int(order_line["unit_cost_cents"]), int(order_line["quantity_milli"]),
-            int(order_line["tax_amount_cents"]),
+            int(order_line["tax_amount_cents"]), order_line["gross_unit_cost_cents"],
         )
         if int(already_allocated) + allocation["amount_cents"] > line_amount:
             raise base._business_conflict(

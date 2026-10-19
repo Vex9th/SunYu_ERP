@@ -109,7 +109,7 @@ def test_tax_upgrade_preserves_historical_facts_and_old_idempotent_response(
             query += f' FROM "{table}"'
             snapshots[query] = [tuple(item) for item in connection.execute(query)]
 
-        assert apply_migrations(connection, migrations) == ["023_purchase_order_tax"]
+        assert apply_migrations(connection, migrations) == ["023_purchase_order_tax", "024_purchase_order_gross_price"]
         assert apply_migrations(connection, migrations) == []
         for query, rows in snapshots.items():
             assert [tuple(item) for item in connection.execute(query)] == rows
@@ -139,3 +139,34 @@ def test_tax_upgrade_preserves_historical_facts_and_old_idempotent_response(
         assert result["paid_amount_cents"] == 100
         assert result["invoiced_amount_cents"] == 200
         assert [line["line_amount_cents"] for line in result["lines"]] == [2, 333]
+
+
+def test_gross_price_upgrade_keeps_existing_taxed_order_amounts(tmp_path: Path) -> None:
+    migrations = PROJECT_ROOT / "backend" / "migrations"
+    legacy_migrations = tmp_path / "v127-migrations"
+    legacy_migrations.mkdir()
+    for path in migrations.glob("*.sql"):
+        if path.name[:3] <= "023":
+            shutil.copy2(path, legacy_migrations / path.name)
+    harness = _build_harness(tmp_path, migrations_dir=legacy_migrations)
+    with harness.connection() as connection:
+        project = connection.execute("SELECT id FROM projects WHERE project_code = ?", (harness.project_code,)).fetchone()[0]
+        order = _order(connection, project, harness.supplier_company_id, "OLD-TAXED", "confirmed", [(66372, 39000)])
+        connection.execute("UPDATE purchase_orders SET tax_rate_bps = 1300 WHERE id = ?", (order,))
+        connection.execute("UPDATE purchase_order_lines SET tax_amount_cents = 336506 WHERE purchase_order_id = ?", (order,))
+        _supplier_fact(connection, "supplier_payments", order, 2925014)
+        _supplier_fact(connection, "supplier_invoices", order, 2925014)
+        snapshots = {}
+        for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'schema_migrations'"):
+            table = row[0]
+            columns = [item[1] for item in connection.execute(f'PRAGMA table_info("{table}")')]
+            query = 'SELECT ' + ', '.join(f'"{col}"' for col in columns) + f' FROM "{table}"'
+            snapshots[query] = [tuple(item) for item in connection.execute(query)]
+        assert apply_migrations(connection, migrations) == ["024_purchase_order_gross_price"]
+        for query, rows in snapshots.items():
+            assert [tuple(item) for item in connection.execute(query)] == rows
+        assert connection.execute("SELECT gross_unit_cost_cents FROM purchase_order_lines WHERE purchase_order_id = ?", (order,)).fetchone()[0] is None
+    with harness.client() as client:
+        result = client.get(f"/api/projects/{harness.project_code}/purchase-orders/{order}").json()
+        assert result["ordered_amount_cents"] == result["paid_amount_cents"] == result["invoiced_amount_cents"] == 2925014
+        assert result["tax_amount_cents"] == 336506

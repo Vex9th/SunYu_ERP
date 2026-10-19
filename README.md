@@ -2,7 +2,7 @@
 
 面向个人使用的非标工业项目管理系统，覆盖项目资料、报价合同、采购库存、施工、收付款、成本和售后。
 
-当前版本为 **v1.2.7**：Python 单文件主程序，配套独立更新工具。
+当前版本为 **v1.2.8**：Python 单文件主程序，配套独立更新工具。采购单支持含税与未税单价双向输入，按所选税率自动关联并保留两位小数。
 
 ## 下载与使用
 
@@ -45,6 +45,6 @@ React + TypeScript（strict）+ Ant Design + Vite，Python 3.13 + FastAPI，SQLi
 
 普通 CI 检查主分支推送和 PR，同一分支的新运行会取消过期运行；标签不会重复触发测试。
 
-在 Actions 中手动运行 **Windows Release**，填写与 `backend/app/version.py` 一致的 `version`（例如 `v1.2.7`），在测试、EXE 启动、数据持久化和 Windows 升级恢复验证通过后发布。版本号留空时只上传候选构建产物。不要再单独推送标签或提前创建正式 Release。
+在 Actions 中手动运行 **Windows Release**，填写与 `backend/app/version.py` 一致的 `version`（例如 `v1.2.8`），在测试、EXE 启动、数据持久化和 Windows 升级恢复验证通过后发布。版本号留空时只上传候选构建产物。不要再单独推送标签或提前创建正式 Release。
 
 同一提交的完整版本会直接跳过；未完成的草稿可重跑续传；已有标签指向不同提交时会停止，避免覆盖旧版本。新版本附件包括完整 Windows 安装包、独立 `update.exe`、`update-manifest-singlefile.json` 和 `SHA256SUMS.txt`。完整 ZIP 仅包含两个 EXE、启动脚本、说明、许可和示例配置。

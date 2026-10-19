@@ -13,7 +13,8 @@ import { useWorkspaceTab, useWorkspaceValue } from '../shared'
 import ProcurementLists from './ProcurementLists'
 import PurchaseOrderNumberField from './PurchaseOrderNumberField'
 import PurchaseOrderTaxFields from './PurchaseOrderTaxFields'
-import { calculatePurchaseTax, taxRateToBps, taxRateToInput } from './purchaseTax'
+import PurchaseOrderPriceFields from './PurchaseOrderPriceFields'
+import { calculatePurchaseTax, purchaseUnitPrices, taxRateToBps, taxRateToInput } from './purchaseTax'
 import styles from './ProcurementWorkspace.module.css'
 
 const defaultRepository = createHttpProcurementRepository()
@@ -105,7 +106,7 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
     if (next.kind === 'line' || next.kind === 'edit-line') values = { ...values, list_id: next.list?.id, sequence_no: next.line?.sequence_no ?? Math.max(0, ...(next.list?.lines.map((line) => line.sequence_no) ?? [])) + 1, category: next.line?.category ?? '其他', ...next.line, cost: next.line ? centsToYuan(next.line.unit_cost_cents) : '', quoted_price: next.line ? centsToYuan(next.line.quoted_unit_price_cents) : '' }
     if (next.kind === 'order' && next.line) values.lines = [{ procurement_line_id: next.line.id, quantity: quantityMilli(remainingQuantity(next.line.quantity, next.line.ordered_quantity)) > 0n ? remainingQuantity(next.line.quantity, next.line.ordered_quantity) : '', cost: centsToYuan(next.line.unit_cost_cents), overage_reason: '' }]
     if (next.kind === 'order' && !next.line) values.lines = [{ quantity: '', cost: '', overage_reason: '' }]
-    if (next.kind === 'edit-order' && next.order) values = { ...values, ...next.order, tax_rate: taxRateToInput(next.order.tax_rate_bps), lines: next.order.lines.map((line) => ({ procurement_line_id: line.procurement_line_id, quantity: line.quantity, cost: centsToYuan(line.unit_cost_cents), overage_reason: line.overage_reason ?? '' })) }
+    if (next.kind === 'edit-order' && next.order) values = { ...values, ...next.order, tax_rate: taxRateToInput(next.order.tax_rate_bps), lines: next.order.lines.map((line) => ({ procurement_line_id: line.procurement_line_id, quantity: line.quantity, cost: centsToYuan(line.unit_cost_cents), gross_cost: line.gross_unit_cost_cents == null ? '' : centsToYuan(line.gross_unit_cost_cents), price_basis: line.gross_unit_cost_cents == null ? 'net' : 'gross', overage_reason: line.overage_reason ?? '' })) }
     if (next.kind === 'receipt' && next.order) values.lines = next.order.lines.map((line) => ({ purchase_order_line_id: line.id, quantity: '0' }))
     if (next.kind === 'quote') values = { ...values, list_id: next.list?.id, title: next.list ? `${next.list.name} 报价单` : '' }
     form.setFieldsValue(values); setDialog(next)
@@ -148,6 +149,7 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
     if (!data.companies.some((company) => company.id === supplier)) throw new Error('请选择有效供应商')
     const drafts = values.lines as Array<FormValues> | undefined
     if (!drafts?.length) throw new Error('请至少添加一项采购物料')
+    const taxRate = taxRateToBps(values.tax_rate)
     const seen = new Set<number>()
     const result = drafts.map((draft) => {
       const id = Number(draft.procurement_line_id)
@@ -159,9 +161,9 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
       const overage = optional(draft.overage_reason)
       const capacity = dialog?.kind === 'edit-order' ? item?.line.quantity : item ? remainingQuantity(item.line.quantity, item.line.ordered_quantity) : undefined
       if (capacity && quantityMilli(quantity) > quantityMilli(capacity) && !overage) throw new Error(`${lineLabel(id)}超出采购数量，请填写超采原因`)
-      return { procurement_line_id: id, quantity, unit_cost_cents: yuanToCents(required(draft.cost, '成本单价')), overage_reason: overage }
+      const prices = purchaseUnitPrices(draft, taxRate)
+      return { procurement_line_id: id, quantity, unit_cost_cents: prices.net, ...(draft.price_basis === 'gross' ? { gross_unit_cost_cents: prices.gross } : {}), overage_reason: overage }
     })
-    const taxRate = taxRateToBps(values.tax_rate)
     calculatePurchaseTax(drafts, taxRate)
     return { tax_rate_bps: taxRate, order_no: dialog?.kind === 'order' && values.number_mode !== 'manual' ? '' : required(values.order_no, '采购单号'), supplier_company_id: supplier, ordered_on: required(values.ordered_on, '下单日期'), expected_delivery_on: optional(values.expected_delivery_on), lines: result, notes: optional(values.notes), document_version_ids: [...((values.document_version_ids as number[] | undefined) ?? [])] }
   }
@@ -346,7 +348,7 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
           {['confirmed', 'partially_received', 'received'].includes(order.status) && <><Button disabled={locked} onClick={() => open({ kind: 'payment', order })}>登记付款</Button><Button disabled={locked} onClick={() => open({ kind: 'invoice', order })}>登记进项发票</Button></>}
           {['draft', 'confirmed'].includes(order.status) && <Button danger disabled={locked} onClick={() => open({ kind: 'cancel-order', order })}>取消采购单</Button>}
         </Space>}
-        <Table size="small" rowKey="id" dataSource={order.lines} pagination={false} scroll={{ x: 720 }} columns={[{ title: '物料', dataIndex: 'procurement_line_id', render: lineLabel }, { title: '采购数量', dataIndex: 'quantity' }, { title: '到货数量', dataIndex: 'received_quantity' }, { title: order.tax_rate_bps == null ? '成本单价' : '未税成本单价', dataIndex: 'unit_cost_cents', render: formatMoney }, { title: '税额', dataIndex: 'tax_amount_cents', render: (value: number | undefined) => order.tax_rate_bps == null ? '未设置' : formatMoney(value ?? null) }, { title: order.tax_rate_bps == null ? '金额' : '含税金额', dataIndex: 'line_amount_cents', render: formatMoney }, { title: '超采原因', dataIndex: 'overage_reason', render: (value: string | null) => value || '—' }]} />
+        <Table size="small" rowKey="id" dataSource={order.lines} pagination={false} scroll={{ x: 960 }} columns={[{ title: '物料', dataIndex: 'procurement_line_id', render: lineLabel }, { title: '采购数量', dataIndex: 'quantity' }, { title: '到货数量', dataIndex: 'received_quantity' }, { title: order.tax_rate_bps == null ? '成本单价' : '未税成本单价', dataIndex: 'unit_cost_cents', render: formatMoney }, { title: '含税成本单价', key: 'gross_unit_cost', render: (_, line) => formatMoney(line.gross_unit_cost_cents ?? purchaseUnitPrices({ cost: centsToYuan(line.unit_cost_cents) }, order.tax_rate_bps ?? null).gross) }, { title: '税额', dataIndex: 'tax_amount_cents', render: (value: number | undefined) => order.tax_rate_bps == null ? '未设置' : formatMoney(value ?? null) }, { title: order.tax_rate_bps == null ? '金额' : '含税金额', dataIndex: 'line_amount_cents', render: formatMoney }, { title: '超采原因', dataIndex: 'overage_reason', render: (value: string | null) => value || '—' }]} />
         <Tabs items={[
           { key: 'receipts', label: '到货历史', children: <Space orientation="vertical" style={{ width: '100%' }}>{!(order.goods_receipts?.length) && <Empty description="暂无到货记录" />}{order.goods_receipts?.map((receipt) => <Card key={receipt.id} size="small" title={`${receipt.received_on} · ${receipt.warehouse_name} · #${receipt.id}`} extra={<Space><Tag>{receipt.status === 'active' ? '有效' : '已冲销'}</Tag>{!readonly && receipt.status === 'active' && <Button size="small" danger disabled={locked} onClick={() => open({ kind: 'reverse-receipt', order, record: receipt })}>冲销</Button>}</Space>}>
             {receipt.reversal_reason && <Alert type="warning" title={`冲销原因：${receipt.reversal_reason}`} />}
@@ -372,8 +374,8 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
         <div className={styles.orderHeader}><Form.Item name="supplier_company_id" label="供应商" rules={[{ required: true, message: '请选择供应商' }]}><Select placeholder="请明确选择供应商" showSearch optionFilterProp="label" options={data.companies.map((company) => ({ value: company.id, label: company.name }))} /></Form.Item><TextField name="ordered_on" label="下单日期" type="date" required /><TextField name="expected_delivery_on" label="预计到货日期" type="date" /></div>
         {dialog.kind === 'order' ? <PurchaseOrderNumberField form={form} projectCode={projectCode} repository={repository} disabled={locked || actions.busy} /> : <TextField name="order_no" label="采购单号" required />}
         <Form.List name="lines">{(fields, { add, remove }) => <Space orientation="vertical" style={{ width: '100%' }}>{fields.map((field) => <Card size="small" key={field.key} title={`物料 ${field.name + 1}`} extra={dialog.kind === 'order' && <Button size="small" type="text" danger icon={<MinusCircleOutlined />} onClick={() => remove(field.name)}>删除</Button>}>
-          <Form.Item name={[field.name, 'procurement_line_id']} label="采购物料" rules={[{ required: true, message: '请选择采购物料' }]}><Select disabled={dialog.kind === 'edit-order'} showSearch optionFilterProp="label" options={dialog.kind === 'edit-order' ? dialog.order?.lines.map((line) => ({ value: line.procurement_line_id, label: lineLabel(line.procurement_line_id) })) : availableLines.map(({ list, line }) => ({ value: line.id, label: `${line.name} · ${list.name} · ${quantityMilli(remainingQuantity(line.quantity, line.ordered_quantity)) === 0n ? "已满额，可补采" : `剩余 ${remainingQuantity(line.quantity, line.ordered_quantity)} ${line.unit}`}` }))} onChange={(id) => { const item = lines.find(({ line }) => line.id === id)?.line; if (item) { form.setFieldValue(['lines', field.name, 'cost'], centsToYuan(item.unit_cost_cents)); form.setFieldValue(['lines', field.name, 'quantity'], quantityMilli(remainingQuantity(item.quantity, item.ordered_quantity)) > 0n ? remainingQuantity(item.quantity, item.ordered_quantity) : '') } }} /></Form.Item>
-          <div className={styles.formGrid}><TextField name={[field.name, 'quantity']} label="采购数量" required /><TextField name={[field.name, 'cost']} label="未税成本单价（元）" required /></div><TextField name={[field.name, 'overage_reason']} label="超采原因（超出剩余数量时必填）" />
+          <Form.Item name={[field.name, 'procurement_line_id']} label="采购物料" rules={[{ required: true, message: '请选择采购物料' }]}><Select disabled={dialog.kind === 'edit-order'} showSearch optionFilterProp="label" options={dialog.kind === 'edit-order' ? dialog.order?.lines.map((line) => ({ value: line.procurement_line_id, label: lineLabel(line.procurement_line_id) })) : availableLines.map(({ list, line }) => ({ value: line.id, label: `${line.name} · ${list.name} · ${quantityMilli(remainingQuantity(line.quantity, line.ordered_quantity)) === 0n ? "已满额，可补采" : `剩余 ${remainingQuantity(line.quantity, line.ordered_quantity)} ${line.unit}`}` }))} onChange={(id) => { const item = lines.find(({ line }) => line.id === id)?.line; if (item) { form.setFieldValue(['lines', field.name, 'price_basis'], 'net'); form.setFieldValue(['lines', field.name, 'cost'], centsToYuan(item.unit_cost_cents)); form.setFieldValue(['lines', field.name, 'quantity'], quantityMilli(remainingQuantity(item.quantity, item.ordered_quantity)) > 0n ? remainingQuantity(item.quantity, item.ordered_quantity) : '') } }} /></Form.Item>
+          <PurchaseOrderPriceFields form={form} index={field.name} /><TextField name={[field.name, 'overage_reason']} label="超采原因（超出剩余数量时必填）" />
         </Card>)}{dialog.kind === 'order' && <Button block type="dashed" icon={<PlusOutlined />} onClick={() => add({ quantity: '', cost: '' })}>添加采购物料</Button>}</Space>}</Form.List>
         <PurchaseOrderTaxFields form={form} disabled={locked || actions.busy || readonly} />
         <TextField name="notes" label="采购说明" type="textarea" />
