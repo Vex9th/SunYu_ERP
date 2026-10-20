@@ -348,3 +348,24 @@ describe('可选的一键更新', () => {
   })
 
 })
+
+describe('更新网络错误展示', () => {
+  it('旧更新器的 TLS 错误显示一次简短提示，隐藏签名链接并提供官方下载入口', async () => {
+    const error = '新版本尚未提供可验证的单文件更新包：Get "https://release-assets.githubusercontent.com/asset?sig=PRIVATE_SIGNED_QUERY": net/http: TLS handshake timeout'
+    stub(() => status({ phase: 'failed', error, message: error }))
+    panel()
+    await flush()
+    expect(screen.getAllByText('连接 GitHub 下载服务超时，请检查网络后重试。')).toHaveLength(1)
+    expect(document.body.textContent).not.toContain('PRIVATE_SIGNED_QUERY')
+    expect(document.body.textContent).not.toContain('尚未提供可验证')
+    expect(screen.getByRole('link', { name: '手动下载完整包' }).getAttribute('href')).toBe('https://github.com/Vex9th/SunYu_ERP/releases/latest')
+    expect(screen.getByRole('link', { name: '蓝奏下载（提取码 hru1）' }).getAttribute('href')).toBe('https://urldown.lanzouw.com/b019w91rof')
+    expect((screen.getByRole('button', { name: '检查更新' }) as HTMLButtonElement).disabled).toBe(false)
+  })
+  it('普通错误只显示一次并保留原因', async () => {
+    stub(() => status({ phase: 'failed', error: '文件校验失败', message: '文件校验失败' }))
+    panel()
+    await flush()
+    expect(screen.getAllByText('文件校验失败')).toHaveLength(1)
+  })
+})

@@ -67,6 +67,7 @@ func mainCode() int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+	e.mirror = newLanzouClient(e.client.Transport)
 	if err = configureTestSource(e); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1

@@ -50,3 +50,19 @@ def test_public_boundary_ignores_structured_log_directory() -> None:
     ignore_rules = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
 
     assert "/logs/" in ignore_rules.splitlines()
+
+
+def test_lanzou_retry_uses_existing_release_and_serializes_all_versions() -> None:
+    workflow = RELEASE_WORKFLOW.read_text()
+    mirror = (RELEASE_WORKFLOW.parent / "lanzou-mirror.yml").read_text()
+    caller = workflow.split("\n  mirror:", 1)[1]
+    assert "uses: ./.github/workflows/lanzou-mirror.yml" in caller
+    assert "needs.release.result == 'skipped'" in caller
+    assert "needs.prepare.outputs.build_needed == 'false'" in caller
+    assert "workflow_call:" in mirror and "workflow_dispatch:" in mirror
+    assert "group: sunyu-lanzou-publish\n" in mirror
+    assert "cancel-in-progress: false" in mirror
+    assert '"release", "download"' in mirror
+    assert "pyinstaller" not in mirror.lower()
+    assert '"isDraft"' in mirror and '"isPrerelease"' in mirror
+    assert "TestLanzouLivePublishedMirror" in mirror

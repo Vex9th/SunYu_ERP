@@ -69,5 +69,6 @@ func configureTestSource(e *Engine) error {
 		return err
 	}
 	e.client = &http.Client{Transport: fixtureTransport{m, b, testPackage}}
+	e.mirror = nil
 	return nil
 }

@@ -1,0 +1,117 @@
+name: Publish Lanzou Mirror
+run-name: 蓝奏镜像 ${{ inputs.version }}
+
+'on':
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      reauthenticate:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      LANZOU_COOKIE:
+        required: false
+      LANZOU_USERNAME:
+        required: false
+      LANZOU_PASSWORD:
+        required: false
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '已有 GitHub 正式版本，例如 v1.2.8；只同步镜像，不重新构建'
+        required: true
+        type: string
+      reauthenticate:
+        description: '忽略旧 Cookie，验证账号自动登录；需要验证码时停止'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # 所有版本及手动补传共用一把锁，防止占用同一个日期序号。
+    concurrency:
+      group: sunyu-lanzou-publish
+      cancel-in-progress: false
+    env:
+      RELEASE_TAG: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: .python-version
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: updater/go.mod
+          cache: false
+
+      - name: Download immutable official assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json, os, re, subprocess
+          from pathlib import Path
+          tag = os.environ["RELEASE_TAG"]
+          if not re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", tag):
+              raise SystemExit("Invalid release tag")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          result = subprocess.check_output(["gh", "release", "view", tag, "--repo", repo,
+                                            "--json", "tagName,isDraft,isPrerelease"])
+          release = json.loads(result)
+          if release["tagName"] != tag or release["isDraft"] or release["isPrerelease"]:
+              raise SystemExit("Only published stable releases may be mirrored")
+          destination = Path("dist/release")
+          destination.mkdir(parents=True)
+          subprocess.run(["gh", "release", "download", tag, "--repo", repo,
+                          "--pattern", "SunYu_ERP-windows-x64.zip",
+                          "--pattern", "update-manifest-singlefile.json",
+                          "--dir", str(destination)], check=True)
+          manifest = json.loads((destination / "update-manifest-singlefile.json").read_text())
+          if manifest["version"] != tag[1:]:
+              raise SystemExit("Official manifest version mismatch")
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write("SUNYU_LANZOU_EXPECTED_VERSION=" + manifest["version"] + "\n")
+              output.write("SUNYU_LANZOU_EXPECTED_SHA256=" + manifest["archive"]["sha256"] + "\n")
+          PY
+
+      - name: Upload to SunERP
+        id: upload
+        continue-on-error: true
+        env:
+          LANZOU_COOKIE: ${{ secrets.LANZOU_COOKIE }}
+          LANZOU_USERNAME: ${{ secrets.LANZOU_USERNAME }}
+          LANZOU_PASSWORD: ${{ secrets.LANZOU_PASSWORD }}
+          LANZOU_REAUTHENTICATE: ${{ inputs.reauthenticate }}
+        run: |
+          if [ "$LANZOU_REAUTHENTICATE" = true ]; then unset LANZOU_COOKIE; fi
+          python .github/scripts/publish_lanzou.py --source dist/release --output dist/lanzou
+
+      - name: Verify public mirror archive and executable hashes
+        id: verify
+        if: steps.upload.outcome == 'success'
+        continue-on-error: true
+        env:
+          SUNYU_LANZOU_LIVE_TEST: '1'
+        run: go test -C updater -run '^TestLanzouLivePublishedMirror$' -v -count=1
+
+      - name: Report mirror result
+        if: always()
+        env:
+          UPLOAD_RESULT: ${{ steps.upload.outcome }}
+          VERIFY_RESULT: ${{ steps.verify.outcome }}
+        run: |
+          if [ "$UPLOAD_RESULT" = success ] && [ "$VERIFY_RESULT" = success ]; then
+            echo "SunERP 蓝奏镜像上传、公开下载及 SHA256 校验通过：$RELEASE_TAG。" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Lanzou mirror is not verified. Retry Publish Lanzou Mirror for the same version after resolving the cause."
+            echo "蓝奏镜像尚未通过验证。GitHub 正式包保持不变。可单独重跑 Publish Lanzou Mirror 补传，无需重新构建。" >> "$GITHUB_STEP_SUMMARY"
+          fi

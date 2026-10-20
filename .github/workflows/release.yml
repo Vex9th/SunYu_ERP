@@ -318,3 +318,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.version }}
         run: gh release edit "$env:RELEASE_TAG" --draft=false --latest
+
+  mirror:
+    needs: [prepare, release]
+    if: >-
+      always() && inputs.version != '' && needs.prepare.result == 'success' &&
+      (needs.release.result == 'success' ||
+       (needs.release.result == 'skipped' && needs.prepare.outputs.build_needed == 'false'))
+    uses: ./.github/workflows/lanzou-mirror.yml
+    with:
+      version: ${{ inputs.version }}
+    secrets: inherit

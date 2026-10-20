@@ -1,6 +1,16 @@
 .content {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
+  min-width: 0;
+}
+
+.error {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.error :global(.ant-alert-content) {
   min-width: 0;
 }
 

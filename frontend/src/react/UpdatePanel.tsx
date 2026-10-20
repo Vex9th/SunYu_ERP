@@ -38,6 +38,15 @@ const phaseLabels: Record<UpdateStatus['phase'], string> = {
   restarting: '正在启动新版', success: '更新完成', failed: '更新未完成',
 }
 
+function updateMessage(value: string): string {
+  if (value.includes('TLS handshake timeout'))
+    return '连接 GitHub 下载服务超时，请检查网络后重试。'
+  // 兼容旧更新器保存的错误，避免临时下载签名撑坏页面或展示给用户。
+  return value.replace(/https?:\/\/[^\s"<>]+/g, (address) => {
+    try { return new URL(address).hostname } catch { return '官方更新地址' }
+  })
+}
+
 function readPending(): PendingInstall | null {
   try {
     const value: unknown = JSON.parse(sessionStorage.getItem(PENDING_KEY) ?? 'null')
@@ -250,7 +259,7 @@ export default function UpdatePanel({ installBlockedReason, onInstallBusyChange 
   const installLabel = status?.recovery_required ? '继续恢复更新'
     : status?.phase === 'failed' && !installPending ? '重试更新' : '一键更新'
 
-  return <Section title="软件更新" description="自动检查仅作提示。确认更新后自动下载、安装并重新启动服务。">
+  return <Section title="软件更新" description="优先从蓝奏下载，异常时回退 GitHub。检查更新仅作提示，安装需确认。">
     <div className={styles.content}>
       <Descriptions size="small" column={{ xs: 1, sm: 2 }} items={[
         { key: 'current', label: '当前版本', children: status?.current_version || '正在读取' },
@@ -258,11 +267,11 @@ export default function UpdatePanel({ installBlockedReason, onInstallBusyChange 
         { key: 'checked', label: '最近检查', children: formatChineseDateTime(status?.checked_at || null) },
         { key: 'phase', label: '更新状态', children: <Tag color={status?.phase === 'failed' ? 'error' : completed ? 'success' : status?.update_available ? 'blue' : undefined}>{status ? status.phase === 'idle' && !status.checked_at ? '尚未检查' : phaseLabels[status.phase] : '正在读取'}</Tag> },
       ]} />
-      {status?.message && <p className={styles.message} aria-live="polite">{status.message}</p>}
+      {status?.message && status.message !== status.error && <p className={styles.message} aria-live="polite">{updateMessage(status.message)}</p>}
       {status?.busy && <Progress percent={Math.max(0, Math.min(100, status.progress))} status={status.phase === 'checking' ? 'normal' : 'active'} aria-label="更新进度" />}
       {problem && <Alert type="warning" showIcon title={problem} />}
       {originalResultUnknown && <Alert type="warning" showIcon title="原任务结果已无法确认，已重新读取当前版本和任务状态；没有重新提交安装。" />}
-      {status?.error && <Alert type="error" showIcon title={status.error} />}
+      {status?.error && <Alert className={styles.error} type="error" showIcon title={updateMessage(status.error)} />}
       {blockedReason && <Alert type="info" showIcon title={blockedReason} />}
       {completed && <Alert type="success" showIcon title="更新已完成，请保存其他页面的工作后刷新使用新版。" />}
       <Space wrap>
@@ -274,6 +283,16 @@ export default function UpdatePanel({ installBlockedReason, onInstallBusyChange 
           {installLabel}
         </Button>
         {paused && <Button onClick={() => begin('resume')} loading={loading}>继续查询更新状态</Button>}
+        {status?.phase === 'failed' && !status.busy && !installPending && !status.recovery_required && (
+          <>
+            <Button href="https://urldown.lanzouw.com/b019w91rof" target="_blank" rel="noopener noreferrer">
+              蓝奏下载（提取码 hru1）
+            </Button>
+            <Button href="https://github.com/Vex9th/SunYu_ERP/releases/latest" target="_blank" rel="noopener noreferrer">
+              手动下载完整包
+            </Button>
+          </>
+        )}
         {completed && <Button disabled={Boolean(installBlockedReason)} onClick={() => {
           if (!props.current.installBlockedReason) window.location.reload()
         }}>刷新使用新版</Button>}

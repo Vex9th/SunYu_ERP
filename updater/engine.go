@@ -1,16 +1,13 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"sunyu.local/updater/internal/pathidentity"
 	"time"
 )
@@ -54,6 +51,7 @@ type Engine struct {
 	status              Status
 	client              *http.Client
 	services            services
+	mirror              updateMirror
 }
 
 func newEngine(root, id string) (*Engine, error) {
@@ -81,6 +79,8 @@ func newEngine(root, id string) (*Engine, error) {
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = platformProxy
+	transport.TLSHandshakeTimeout = 30 * time.Second
+	transport.ResponseHeaderTimeout = 30 * time.Second
 	e := &Engine{root: root, work: filepath.Join(root, ".updates/work", id), status: Status{JobID: id}, client: &http.Client{Transport: transport, Timeout: 15 * time.Minute, CheckRedirect: func(r *http.Request, via []*http.Request) error {
 		if len(via) > 5 {
 			return errors.New("下载重定向过多")
@@ -182,17 +182,9 @@ func (e *Engine) run(apply bool) (result error) {
 	if err := e.progress("checking", "正在检查官方正式版本", 0); err != nil {
 		return err
 	}
-	var release struct {
-		Tag        string `json:"tag_name"`
-		Draft      bool   `json:"draft"`
-		Prerelease bool   `json:"prerelease"`
-	}
-	if err := e.fetchJSON(latestURL, &release); err != nil {
+	latest, manifest, mirrorID, err := e.latestRelease()
+	if err != nil {
 		return err
-	}
-	latest := strings.TrimPrefix(release.Tag, "v")
-	if release.Draft || release.Prerelease || !validVersion(latest) {
-		return errors.New("正式版本信息无效")
 	}
 	e.status.LatestVersion = latest
 	e.status.CheckedAt = time.Now().UTC().Format(time.RFC3339Nano)
@@ -203,11 +195,6 @@ func (e *Engine) run(apply bool) (result error) {
 			phase = "success"
 		}
 		return e.progress(phase, "当前没有可安装的新版本", 100)
-	}
-	var manifest Manifest
-	address := "https://github.com/Vex9th/SunYu_ERP/releases/download/v" + latest + "/update-manifest-singlefile.json"
-	if err := e.fetchJSON(address, &manifest); err != nil {
-		return fmt.Errorf("新版本尚未提供可验证的单文件更新包：%w", err)
 	}
 	if err := manifest.Validate(); err != nil {
 		return err
@@ -245,8 +232,8 @@ func (e *Engine) run(apply bool) (result error) {
 		return err
 	}
 	archive := filepath.Join(e.work, "package.zip")
-	if err := e.download(manifest.Archive.URL, archive); err != nil {
-		return err
+	if err := e.downloadRelease(manifest, mirrorID, archive); err != nil {
+		return fmt.Errorf("下载更新包失败：%w", err)
 	}
 	h, err := hashFile(archive)
 	if err != nil {
@@ -260,63 +247,4 @@ func (e *Engine) run(apply bool) (result error) {
 		return err
 	}
 	return e.install(manifest, stage)
-}
-func (e *Engine) fetchJSON(address string, v any) error {
-	r, err := e.get(address)
-	if err != nil {
-		return err
-	}
-	defer r.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(r.Body, 2<<20+1))
-	if err != nil {
-		return err
-	}
-	if len(b) > 2<<20 {
-		return errors.New("官方清单过大")
-	}
-	return json.Unmarshal(b, v)
-}
-func (e *Engine) get(address string) (*http.Response, error) {
-	u, err := url.Parse(address)
-	if err != nil || !trustedURL(u) {
-		return nil, errors.New("拒绝非官方更新来源")
-	}
-	req, err := http.NewRequest("GET", address, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "SunYu-ERP-Singlefile-Updater/"+version)
-	req.Header.Set("Cache-Control", "no-cache")
-	r, err := e.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if r.StatusCode != 200 {
-		r.Body.Close()
-		return nil, fmt.Errorf("访问官方更新源失败（HTTP %d）", r.StatusCode)
-	}
-	return r, nil
-}
-func (e *Engine) download(address, target string) error {
-	r, err := e.get(address)
-	if err != nil {
-		return err
-	}
-	defer r.Body.Close()
-	f, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
-	}
-	n, err := io.Copy(f, io.LimitReader(r.Body, maxArchive+1))
-	if err == nil && n > maxArchive {
-		err = errors.New("更新包超过大小限制")
-	}
-	if err == nil {
-		err = f.Sync()
-	}
-	ce := f.Close()
-	if err == nil {
-		err = ce
-	}
-	return err
 }
