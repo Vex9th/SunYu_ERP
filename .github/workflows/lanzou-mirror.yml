@@ -3,6 +3,10 @@ run-name: 蓝奏镜像 ${{ inputs.version }}
 
 'on':
   workflow_call:
+    outputs:
+      verified:
+        description: '仅上传成功且公开下载/程序哈希验证通过时为 true'
+        value: ${{ jobs.mirror.outputs.verified }}
     inputs:
       version:
         required: true
@@ -36,6 +40,8 @@ permissions:
 jobs:
   mirror:
     runs-on: ubuntu-latest
+    outputs:
+      verified: ${{ steps.receipt.outputs.verified }}
     timeout-minutes: 15
     # 所有版本及手动补传共用一把锁，防止占用同一个日期序号。
     concurrency:
@@ -101,15 +107,34 @@ jobs:
         continue-on-error: true
         env:
           SUNYU_LANZOU_LIVE_TEST: '1'
-        run: go test -C updater -run '^TestLanzouLivePublishedMirror$' -v -count=1
+        run: |
+          mkdir -p dist/verification
+          go test -C updater -run '^TestLanzouLivePublishedMirror$' -json -count=1 > dist/verification/lanzou-live.jsonl
+
+      - name: Record verified mirror receipt
+        id: receipt
+        if: always()
+        env:
+          UPLOAD_RESULT: ${{ steps.upload.outcome }}
+          VERIFY_RESULT: ${{ steps.verify.outcome }}
+        run: python .github/scripts/release_finish.py mirror-receipt --log dist/verification/lanzou-live.jsonl --output dist/verification/mirror-verified.json
+
+      - name: Retain mirror verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: SunYu_ERP-mirror-verification-${{ inputs.version }}
+          path: dist/verification/
+          if-no-files-found: warn
 
       - name: Report mirror result
         if: always()
         env:
           UPLOAD_RESULT: ${{ steps.upload.outcome }}
           VERIFY_RESULT: ${{ steps.verify.outcome }}
+          MIRROR_VERIFIED: ${{ steps.receipt.outputs.verified }}
         run: |
-          if [ "$UPLOAD_RESULT" = success ] && [ "$VERIFY_RESULT" = success ]; then
+          if [ "$MIRROR_VERIFIED" = true ]; then
             echo "SunERP 蓝奏镜像上传、公开下载及 SHA256 校验通过：$RELEASE_TAG。" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "::warning::Lanzou mirror is not verified. Retry Publish Lanzou Mirror for the same version after resolving the cause."
