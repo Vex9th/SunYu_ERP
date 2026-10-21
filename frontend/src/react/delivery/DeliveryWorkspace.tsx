@@ -22,7 +22,7 @@ import {
 } from 'antd'
 import { PlusOutlined, ReloadOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
-import { ApiError } from '../../api'
+import { ApiError, InvalidJsonBodyError } from '../../api'
 import { useWorkspaceTab, useWorkspaceValue } from '../shared'
 import {
   localISODate,
@@ -547,10 +547,11 @@ export default function DeliveryWorkspace({
       pendingMap(repository).delete(projectCode)
     } catch (failure) {
       if (
-        failure instanceof ApiError &&
-        failure.status >= 400 &&
-        failure.status < 500 &&
-        ![408, 425, 429].includes(failure.status)
+        failure instanceof InvalidJsonBodyError ||
+        (failure instanceof ApiError &&
+          failure.status >= 400 &&
+          failure.status < 500 &&
+          ![408, 425, 429].includes(failure.status))
       )
         pendingMap(repository).delete(projectCode)
       throw failure
@@ -612,6 +613,7 @@ export default function DeliveryWorkspace({
       }
     } catch (failure) {
       if (
+        failure instanceof InvalidJsonBodyError ||
         (failure instanceof Error && failure.name === 'Error') ||
         (failure instanceof ApiError &&
           failure.status >= 400 &&
@@ -1062,7 +1064,10 @@ export default function DeliveryWorkspace({
         documentsField,
       ],
       async (values, files) => {
-        const input = { ...invoiceInput(values, files.length), expected_revision: values.revision as number | null | undefined }
+        const input = {
+          ...invoiceInput(values, files.length),
+          ...(row ? { expected_revision: row.revision } : {}),
+        }
         if (row)
           await repository.updateInvoice(projectCode, row.invoice_id, input)
         else
