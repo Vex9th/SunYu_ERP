@@ -406,6 +406,8 @@ def test_lifespan_applies_migrations_and_closes_every_owned_connection(
         "021_workforce_audit_history",
         "022_supplier_invoice_active_number",
         "023_purchase_order_tax",
+        "024_purchase_order_gross_price",
+        "025_project_categories",
     }
 
 

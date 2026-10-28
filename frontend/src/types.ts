@@ -117,11 +117,13 @@ export interface ContactUpdatePayload extends ContactPayload {
 }
 
 export type ProjectStatus = 'active' | 'archived'
+export type ProjectCategory = 'standard' | 'trade'
 export type ProjectFilter = ProjectStatus | 'all'
 
 export interface Project {
   id: number
   project_code: string
+  project_category?: ProjectCategory
   company_id: number
   name: string
   description: string | null
@@ -138,6 +140,7 @@ export interface ProjectSummary extends Project {
 
 export interface ProjectPayload {
   project_code: string
+  project_category?: ProjectCategory
   company_id: number
   name: string
   description: string | null

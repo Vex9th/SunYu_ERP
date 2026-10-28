@@ -7,6 +7,23 @@ import { installProjectDom, projectRepository, stage } from './project-fixtures'
 beforeAll(installProjectDom)
 afterEach(() => { cleanup(); vi.restoreAllMocks() })
 describe('React 项目阶段', () => {
+  it('贸易完整计划仅展示五阶段，签收沿用既有阶段状态接口', async () => {
+    const repository = projectRepository()
+    vi.mocked(repository.listProjectStages).mockResolvedValue({ source: 'live', data: [
+      'contract', 'advance_payment', 'procurement', 'acceptance', 'final_payment',
+    ].map(stage_code => ({ ...stage, stage_code })) })
+    render(<ProjectStages projectCode="TRADE" category="trade" repository={repository} />)
+    fireEvent.click(await screen.findByRole('tab', { name: '完整计划 (5)' }))
+    const rows = within(screen.getByRole('table')).getAllByRole('row')
+    expect(rows).toHaveLength(6)
+    ;['合同签订', '预付款', '采购', '签收', '尾款'].forEach((label, index) => expect(within(rows[index + 1]).getByText(label)).toBeTruthy())
+    expect(screen.queryByText('验收')).toBeNull()
+    fireEvent.click(within(rows[4]).getByRole('button', { name: /状\s*态/ }))
+    const dialog = await screen.findByRole('dialog', { name: '变更状态 · 签收' })
+    fireEvent.click(within(dialog).getByRole('button', { name: /保\s*存/ }))
+    await waitFor(() => expect(repository.transitionStage).toHaveBeenCalledWith('TRADE', 'acceptance', expect.objectContaining({ to_status: 'in_progress', expected_revision: 4 })))
+  })
+
   it('保存计划保留版本，并拒绝结束早于开始', async () => {
     const repository = projectRepository()
     render(<ProjectStages projectCode="STAGE-A" repository={repository} />)

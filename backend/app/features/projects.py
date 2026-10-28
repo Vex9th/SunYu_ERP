@@ -30,9 +30,11 @@ from backend.app.features.dashboards import build_project_operating_snapshot
 logger = logging.getLogger(__name__)
 
 _PROJECT_PAYLOAD_FIELDS = ("project_code", "company_id", "name", "description")
+_PROJECT_CATEGORIES = frozenset({"standard", "trade"})
 _PROJECT_RESPONSE_FIELDS = (
     "id",
     "project_code",
+    "project_category",
     "company_id",
     "name",
     "description",
@@ -118,6 +120,7 @@ def create_projects_router(
                     SELECT
                         projects.id,
                         projects.project_code,
+                        projects.project_category,
                         projects.company_id,
                         projects.name,
                         projects.description,
@@ -138,6 +141,7 @@ def create_projects_router(
                     SELECT
                         projects.id,
                         projects.project_code,
+                        projects.project_category,
                         projects.company_id,
                         projects.name,
                         projects.description,
@@ -174,9 +178,9 @@ def create_projects_router(
                     """
                     INSERT INTO projects
                         (project_code, project_code_key, company_id,
-                         name, description,
+                         name, description, project_category,
                          created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         payload["project_code"],
@@ -184,6 +188,7 @@ def create_projects_router(
                         payload["company_id"],
                         payload["name"],
                         payload["description"],
+                        payload["project_category"],
                         timestamp,
                         timestamp,
                     ),
@@ -362,7 +367,10 @@ def create_projects_router(
                         operating,
                     )
                     if completion_check["ready"] is not True:
-                        raise _project_completion_blocked(completion_check)
+                        raise _project_completion_blocked(
+                            completion_check,
+                            project_category=str(current["project_category"]),
+                        )
                 connection.execute(
                     """
                     UPDATE projects
@@ -492,7 +500,19 @@ async def _read_project_payload(request: Request) -> ProjectPayload:
         payload: Any = await request.json()
     except (RecursionError, UnicodeError, ValueError):
         raise _invalid_project_payload() from None
-    if not isinstance(payload, dict) or set(payload) != set(_PROJECT_PAYLOAD_FIELDS):
+    required_fields = set(_PROJECT_PAYLOAD_FIELDS)
+    if (
+        not isinstance(payload, dict)
+        or not required_fields <= set(payload)
+        or set(payload) - required_fields - {"project_category"}
+    ):
+        raise _invalid_project_payload()
+
+    project_category = payload.get("project_category", "standard")
+    if (
+        not isinstance(project_category, str)
+        or project_category not in _PROJECT_CATEGORIES
+    ):
         raise _invalid_project_payload()
 
     project_code = _normalize_project_code(
@@ -523,6 +543,7 @@ async def _read_project_payload(request: Request) -> ProjectPayload:
     )
     return {
         "project_code": project_code,
+        "project_category": project_category,
         "project_code_key": project_code_identity(project_code),
         "company_id": company_id,
         "name": name,
@@ -759,20 +780,27 @@ def _project_completion_check(
         and stage.get("status") in {"completed", "skipped"}
         for stage in stages
     )
-    latest_final_acceptance = connection.execute(
-        """
-        SELECT status FROM acceptances
-        WHERE project_id = ?
-          AND acceptance_type = 'final'
-        ORDER BY COALESCE(performed_on, scheduled_on, '') DESC, id DESC
-        LIMIT 1
-        """,
-        (project["id"],),
-    ).fetchone()
-    final_acceptance_ready = (
-        latest_final_acceptance is not None
-        and latest_final_acceptance["status"] in {"passed", "passed_with_punch"}
-    )
+    if project["project_category"] == "trade":
+        final_acceptance_ready = any(
+            stage.get("stage_code") == "acceptance"
+            and stage.get("status") in {"completed", "skipped"}
+            for stage in stages
+        )
+    else:
+        latest_final_acceptance = connection.execute(
+            """
+            SELECT status FROM acceptances
+            WHERE project_id = ?
+              AND acceptance_type = 'final'
+            ORDER BY COALESCE(performed_on, scheduled_on, '') DESC, id DESC
+            LIMIT 1
+            """,
+            (project["id"],),
+        ).fetchone()
+        final_acceptance_ready = (
+            latest_final_acceptance is not None
+            and latest_final_acceptance["status"] in {"passed", "passed_with_punch"}
+        )
     receivables_ready = outstanding_receivable == 0 and contract_outstanding == 0
     blockers: list[str] = []
     if not stages_ready:
@@ -829,13 +857,17 @@ def _project_contract_outstanding(
 
 def _project_completion_blocked(
     completion_check: dict[str, object],
+    *,
+    project_category: str,
 ) -> ApiError:
     field_errors: dict[str, object] = {}
     if completion_check["stages_ready"] is not True:
         field_errors["stages"] = "所有项目阶段必须为已完成或已跳过"
     if completion_check["final_acceptance_ready"] is not True:
         field_errors["final_acceptance"] = (
-            "必须存在结果为通过或带整改通过的最终验收"
+            "签收阶段必须为已完成或已跳过"
+            if project_category == "trade"
+            else "必须存在结果为通过或带整改通过的最终验收"
         )
     if completion_check["receivables_ready"] is not True:
         field_errors["receivables"] = "项目未收款必须为 0"
@@ -855,7 +887,7 @@ def _project_by_id(
     row = connection.execute(
         """
         SELECT
-            id, project_code, company_id, name, description, status,
+            id, project_code, project_category, company_id, name, description, status,
             archive_reason, archived_at, created_at, updated_at
         FROM projects
         WHERE id = ?
@@ -870,6 +902,7 @@ def _project_by_id(
 _PROJECT_DETAIL_FIELDS = (
     "id",
     "project_code",
+    "project_category",
     "company_id",
     "company_name",
     "name",
@@ -893,6 +926,7 @@ def _project_detail_row_by_key(
         SELECT
             projects.id,
             projects.project_code,
+            projects.project_category,
             projects.company_id,
             companies.name AS company_name,
             projects.name,

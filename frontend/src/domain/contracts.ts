@@ -1,3 +1,5 @@
+import type { ProjectCategory } from '../types'
+
 export type ISODate = string
 export type ISODateTime = string
 export type MoneyCents = number
@@ -50,6 +52,7 @@ export type ClosureType = 'cancelled' | 'completed'
 export interface ProjectDetail {
   id: number
   project_code: string
+  project_category?: ProjectCategory
   company_id: number
   company_name: string
   name: string

@@ -53,6 +53,21 @@ function mount() {
   )
 }
 describe('React 项目关闭与恢复', () => {
+  it('贸易项目按签收展示当前阶段及完工条件', async () => {
+    repository.getProjectDashboard.mockResolvedValue({
+      ...dashboard,
+      project: { ...dashboard.project, project_category: 'trade' },
+      stages: [{ ...dashboard.stages[0], stage_code: 'acceptance', status: 'in_progress' }],
+    })
+    mount()
+    expect(await screen.findByText('贸易')).toBeTruthy()
+    expect(await screen.findByRole('heading', { name: '签收' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '更多项目操作' }))
+    fireEvent.click(await screen.findByRole('menuitem', { name: /关闭项目/ }))
+    expect(screen.getByText('签收阶段：未完成')).toBeTruthy()
+    expect(screen.queryByText('最终验收：未通过')).toBeNull()
+  })
+
   it('旧版本草稿不能覆盖最新项目资料，载入最新记录后才可继续编辑', async () => {
     repository.getProjectDashboard.mockResolvedValue({
       ...dashboard,

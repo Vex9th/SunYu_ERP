@@ -5,6 +5,7 @@ import {
   Empty,
   Form,
   Input,
+  Radio,
   Select,
   Space,
   Table,
@@ -25,6 +26,7 @@ import {
   ErrorNotice,
   nullable,
   PageHeader,
+  projectCategoryLabels,
   RefreshButton,
   Section,
   StatusTag,
@@ -218,6 +220,12 @@ export default function ProjectsPage() {
               ),
             },
             {
+              title: '类别',
+              dataIndex: 'project_category',
+              width: 80,
+              render: (value: ProjectSummary['project_category']) => <Tag>{projectCategoryLabels[value ?? 'standard']}</Tag>,
+            },
+            {
               title: '状态',
               dataIndex: 'status',
               render: (value: string) => <StatusTag value={value} />,
@@ -251,6 +259,7 @@ export default function ProjectsPage() {
           title="新建项目"
           cacheKey="create-project"
           initialValues={{
+            project_category: 'standard',
             project_code: '',
             name: '',
             company_id: undefined as number | undefined,
@@ -270,6 +279,7 @@ export default function ProjectsPage() {
               name: values.name.trim(),
               company_id: values.company_id,
               description: nullable(values.description),
+              project_category: values.project_category ?? 'standard',
             })
           }}
           onSaved={(result) =>
@@ -278,6 +288,20 @@ export default function ProjectsPage() {
             )
           }
         >
+          <Form.Item name="project_category" label="项目类别" rules={[{ required: true, message: '请选择项目类别' }]}>
+            <Radio.Group options={[
+              { value: 'standard', label: '工程' },
+              { value: 'trade', label: '贸易' },
+            ]} />
+          </Form.Item>
+          <Form.Item noStyle shouldUpdate={(previous, current) => previous.project_category !== current.project_category}>
+            {({ getFieldValue }) => <div className={styles.subtle} style={{ marginTop: -12, marginBottom: 20 }}>
+              {getFieldValue('project_category') === 'trade'
+                ? '合同签订 → 预付款 → 采购 → 签收 → 尾款'
+                : '沿用工程项目的完整 18 阶段流程。'}
+              <div>类别创建后不可更改，其他业务功能相同。</div>
+            </div>}
+          </Form.Item>
           <Form.Item
             name="project_code"
             label="项目编号"

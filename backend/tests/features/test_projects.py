@@ -28,6 +28,7 @@ NOW = datetime(2026, 8, 28, 10, 30, tzinfo=timezone.utc)
 PROJECT_KEYS = {
     "id",
     "project_code",
+    "project_category",
     "company_id",
     "name",
     "description",
@@ -331,6 +332,7 @@ def test_create_normalizes_and_returns_exact_project_fields(
     assert response.json() == {
         "id": 1,
         "project_code": "P-2026-001",
+        "project_category": "standard",
         "company_id": company_id,
         "name": "自动化改造项目",
         "description": None,
@@ -848,6 +850,7 @@ def test_project_detail_update_and_revision_conflict(
     assert detail.json() == {
         "id": 1,
         "project_code": "P-2026-001",
+        "project_category": "standard",
         "company_id": first_company_id,
         "company_name": "原客户",
         "name": "自动化改造项目",
@@ -970,6 +973,7 @@ def test_close_project_is_idempotent_and_rejects_key_reuse(
     assert closed.json() == {
         "id": 1,
         "project_code": "P-2026-001",
+        "project_category": "standard",
         "company_id": company_id,
         "company_name": "示例公司",
         "name": "自动化改造项目",
@@ -2058,6 +2062,7 @@ def test_restore_archived_project_clears_closure_and_records_immutable_audit(
     assert restored.json() == {
         "id": 1,
         "project_code": "P-2026-001",
+        "project_category": "standard",
         "company_id": company_id,
         "company_name": "示例公司",
         "name": "自动化改造项目",

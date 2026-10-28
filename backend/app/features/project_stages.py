@@ -42,6 +42,16 @@ _STAGE_CATALOG = (
     ("closeout", 18),
 )
 _STAGE_CODES = frozenset(code for code, _ in _STAGE_CATALOG)
+_STAGE_CATALOGS = {
+    "standard": _STAGE_CATALOG,
+    "trade": (
+        ("contract", 1),
+        ("advance_payment", 2),
+        ("procurement", 3),
+        ("acceptance", 4),
+        ("final_payment", 5),
+    ),
+}
 _STAGE_STATUSES = frozenset(
     {"pending", "in_progress", "blocked", "completed", "skipped"}
 )
@@ -120,7 +130,9 @@ def create_project_stages_router(
                     detail="Project not found",
                     error_code="PROJECT_NOT_FOUND",
                 )
-            return _stage_list(connection, int(project["id"]))
+            return _stage_list(
+                connection, int(project["id"]), str(project["project_category"])
+            )
         except sqlite3.Error as failure:
             return _database_error(failure)
 
@@ -149,6 +161,8 @@ def create_project_stages_router(
                         error_code="PROJECT_ARCHIVED",
                     )
                 project_id = int(project["id"])
+                if not _stage_belongs_to_project(project, stage_code):
+                    return _stage_not_found()
                 cursor = connection.execute(
                     """
                     UPDATE project_stages
@@ -215,6 +229,8 @@ def create_project_stages_router(
                         error_code="PROJECT_ARCHIVED",
                     )
                 project_id = int(project["id"])
+                if not _stage_belongs_to_project(project, stage_code):
+                    return _stage_not_found()
                 current = _stage_record(connection, project_id, stage_code)
                 if current is None:
                     raise sqlite3.DatabaseError("project stage is missing")
@@ -532,7 +548,7 @@ def _project_by_key(
     project_code_key: str,
 ) -> sqlite3.Row | None:
     return connection.execute(
-        "SELECT id, status FROM projects WHERE project_code_key = ?",
+        "SELECT id, status, project_category FROM projects WHERE project_code_key = ?",
         (project_code_key,),
     ).fetchone()
 
@@ -540,6 +556,7 @@ def _project_by_key(
 def _stage_list(
     connection: sqlite3.Connection,
     project_id: int,
+    project_category: str,
 ) -> list[dict[str, object]]:
     rows = connection.execute(
         """
@@ -554,9 +571,31 @@ def _stage_list(
         (project_id,),
     ).fetchall()
     actual_catalog = tuple((row["stage_code"], row["sequence"]) for row in rows)
-    if actual_catalog != _STAGE_CATALOG:
+    if actual_catalog != _stage_catalog(project_category):
         raise sqlite3.DatabaseError("project stage catalog is incomplete")
     return [_stage_response(row) for row in rows]
+
+
+def _stage_catalog(project_category: str) -> tuple[tuple[str, int], ...]:
+    catalog = _STAGE_CATALOGS.get(project_category)
+    if catalog is None:
+        raise sqlite3.DatabaseError("project category is invalid")
+    return catalog
+
+
+def _stage_belongs_to_project(project: sqlite3.Row, stage_code: str) -> bool:
+    return any(
+        code == stage_code
+        for code, _ in _stage_catalog(str(project["project_category"]))
+    )
+
+
+def _stage_not_found() -> JSONResponse:
+    return _error_response(
+        status.HTTP_404_NOT_FOUND,
+        detail="Project stage not found",
+        error_code="STAGE_NOT_FOUND",
+    )
 
 
 def _stage_record(

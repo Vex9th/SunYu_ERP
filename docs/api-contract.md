@@ -130,7 +130,7 @@
 
 ### 3.3 项目与备份
 
-`ProjectInput`：`project_code`、`company_id`、`name` 必填，`description` 可空。
+`ProjectInput`：`project_code`、`company_id`、`name` 必填，`description` 可空。新增可选 `project_category: standard | trade`，分别表示工程和贸易；省略时默认为 `standard`。显式传入 `null`、空字符串或其他值返回 `422`。项目创建、列表、详情、更新、关闭、恢复和仪表台项目对象均返回 `project_category`；项目创建后不允许通过更新接口修改类别。
 
 | Method | Path | 请求/响应 |
 |---|---|---|
@@ -152,7 +152,7 @@
 
 ### 4.1 项目详情与阶段
 
-固定阶段代码及顺序：
+工程项目（`project_category = standard`）固定阶段代码及顺序：
 
 1. `planning` 项目规划
 2. `site_survey` 现场测绘
@@ -173,16 +173,28 @@
 17. `final_payment` 尾款
 18. `closeout` 收尾
 
+贸易项目（`project_category = trade`）仅初始化以下五个阶段，顺序为：
+
+1. `contract` 合同签订
+2. `advance_payment` 预付款
+3. `procurement` 采购
+4. `acceptance` 签收
+5. `final_payment` 尾款
+
+贸易签收复用现有 `acceptance` 阶段代码，前端按项目类别显示名称；工程项目仍显示“验收”。数据库在新建项目时按类别一次性初始化阶段。升级时所有旧项目保持 `standard` 和原有 18 阶段，阶段状态、计划、事件及历史记录不变。阶段列表按所属类别校验完整性；访问当前项目模板以外的已知阶段返回 `404 STAGE_NOT_FOUND`。
+
 | Method | Path | 请求/响应 |
 |---|---|---|
 | GET | `/api/projects/{project_code}` | 返回 `ProjectDetail` |
-| PUT | `/api/projects/{project_code}` | `company_id`、`name`、`description`、`expected_revision`；项目编号不可改 |
+| PUT | `/api/projects/{project_code}` | `company_id`、`name`、`description`、`expected_revision`；项目编号和类别不可改 |
 | POST | `/api/projects/{project_code}/close` | Header `Idempotency-Key`；`closure_type`、`reason`、`expected_revision`；返回关闭后的项目 |
 | GET | `/api/projects/{project_code}/stages` | 返回固定顺序的 `ProjectStage[]` |
 | PUT | `/api/projects/{project_code}/stages/{stage_code}` | 修改 `planned_start_on`、`planned_end_on`、`notes`、`expected_revision` |
 | POST | `/api/projects/{project_code}/stages/{stage_code}/transition` | `to_status`、`occurred_at`、`reason`、`expected_revision` |
 
 `ProjectStage` 核心字段：`stage_code`、`status`、`status_reason`、`planned_start_on`、`planned_end_on`、`started_at`、`blocked_at`、`completed_at`、`notes`、`revision`。允许流转：`pending → in_progress/skipped`、`in_progress → blocked/completed/skipped`、`blocked → in_progress/skipped`；`completed/skipped → in_progress` 仅用于纠错。进入 `blocked/skipped` 或从终态纠错都必须填写原因，所有流转保留事件历史。
+
+两类项目使用相同的手动状态流转、修订冲突及幂等规则；阶段顺序用于展示，不自动驱动合同、收款、采购或交付记录。正常完结（`closure_type = completed`）要求该项目的全部阶段为 `completed/skipped`，且项目应收与有效合同未收均为零。工程还要求最新最终验收记录为 `passed/passed_with_punch`；贸易以签收阶段为 `completed/skipped` 替代该工程验收条件，不要求额外最终验收记录。仪表台 `completion_check.final_acceptance_ready` 在工程表示最终验收通过，在贸易表示签收阶段完成或跳过；现有字段和阻塞代码保持兼容。取消归档、恢复以及其他业务功能保持原规则。
 
 ### 4.2 文件和版本归档（已实现）
 
@@ -315,11 +327,13 @@ interface ContactRecord {
 }
 
 type ProjectStatus = 'active' | 'archived'
+type ProjectCategory = 'standard' | 'trade'
 type ClosureType = 'cancelled' | 'completed'
 
 interface ProjectDetail {
   id: number
   project_code: string
+  project_category: ProjectCategory
   company_id: number
   company_name: string
   name: string

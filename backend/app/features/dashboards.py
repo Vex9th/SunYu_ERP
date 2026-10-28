@@ -21,6 +21,7 @@ _UPCOMING_DELIVERY_DAYS = 30
 _PROJECT_DETAIL_FIELDS = (
     "id",
     "project_code",
+    "project_category",
     "company_id",
     "company_name",
     "name",
@@ -172,7 +173,9 @@ def build_project_operating_snapshot(
 ) -> dict[str, object]:
     project_id = int(project["id"])
     project_code = str(project["project_code"])
-    stages = project_stages._stage_list(connection, project_id)
+    stages = project_stages._stage_list(
+        connection, project_id, str(project["project_category"])
+    )
     accepted_quote = None
     contract_rows = []
     if include_details:
@@ -247,7 +250,8 @@ def _active_projects(connection: sqlite3.Connection) -> list[sqlite3.Row]:
     return connection.execute(
         """
         SELECT
-            projects.id, projects.project_code, projects.company_id,
+            projects.id, projects.project_code, projects.project_category,
+            projects.company_id,
             companies.name AS company_name, projects.name,
             projects.description, projects.status, projects.closure_type,
             projects.archive_reason, projects.archived_at, projects.revision,

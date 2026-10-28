@@ -20,6 +20,7 @@ import {
 } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
 import { ApiError } from '../api'
+import type { ProjectCategory } from '../types'
 import styles from './Workspace.module.css'
 export { useWorkspaceTab, useWorkspaceValue } from './navigationState'
 
@@ -46,12 +47,12 @@ const businessMessages: Record<string, string> = {
   progress: '进度款',
   final: '尾款',
 }
-export const businessText = (value: string | null): string =>
+export const businessText = (value: string | null, category?: ProjectCategory): string =>
   value
     ? (businessMessages[value] ??
       value
         .split(', ')
-        .map((item) => stageLabels[item] ?? businessMessages[item] ?? item)
+        .map((item) => stageLabels[item] ? projectStageLabel(item, category) : businessMessages[item] ?? item)
         .join('、'))
     : ''
 
@@ -212,6 +213,10 @@ export const stageLabels: Record<string, string> = {
   final_payment: '尾款',
   closeout: '收尾',
 }
+
+export const projectCategoryLabels: Record<ProjectCategory, string> = { standard: '工程', trade: '贸易' }
+export const projectStageLabel = (code: string, category?: ProjectCategory): string =>
+  category === 'trade' && code === 'acceptance' ? '签收' : stageLabels[code] ?? code
 
 export function StatusTag({ value }: { value: string }) {
   const labels: Record<string, string> = {

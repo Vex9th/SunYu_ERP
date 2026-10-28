@@ -18,7 +18,7 @@ import {
   PageHeader,
   RefreshButton,
   Section,
-  stageLabels,
+  projectStageLabel,
   useLoad,
   useWorkspaceTab,
   useWorkspaceValue,
@@ -114,7 +114,7 @@ export default function HomePage() {
                     <span>
                       <strong>{businessText(todo.title)}</strong>
                       <small>
-                        {todo.project_code} · {businessText(todo.description)}
+                        {todo.project_code} · {businessText(todo.description, data.projects.find(row => row.project.project_code === todo.project_code)?.project.project_category)}
                         {todo.due_on
                           ? ` · 截止 ${formatChineseDate(todo.due_on)}`
                           : ''}
@@ -181,8 +181,7 @@ export default function HomePage() {
                       <div className={styles.rowFact}>
                         <span>当前进度</span>
                         <strong>
-                          {stageLabels[row.current_stage?.stage_code ?? ''] ??
-                            '尚未开始'}
+                          {row.current_stage ? projectStageLabel(row.current_stage.stage_code, row.project.project_category) : '尚未开始'}
                         </strong>
                         {count > 0 && <Tag color="orange">{count} 项待办</Tag>}
                       </div>

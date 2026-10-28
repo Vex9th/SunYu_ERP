@@ -41,7 +41,8 @@ import {
   RefreshButton,
   Section,
   StatusTag,
-  stageLabels,
+  projectCategoryLabels,
+  projectStageLabel,
   useLoad,
 } from './shared'
 import styles from './Workspace.module.css'
@@ -116,6 +117,7 @@ function ProjectWorkspace({ projectCode }: { projectCode: string }) {
                 <div>
                   <div className={styles.projectTitle}>
                     <h1>{data.project.name}</h1>
+                    <Tag>{projectCategoryLabels[data.project.project_category ?? 'standard']}</Tag>
                     <StatusTag value={data.project.status} />
                   </div>
                   <div className={styles.projectMeta}>
@@ -184,7 +186,7 @@ function ProjectWorkspace({ projectCode }: { projectCode: string }) {
           <Suspense fallback={<LoadingBlock />}>
             {activeTab === '' && <ProjectOverview data={data} />}
             {activeTab === 'stages' && (
-              <ProjectStages projectCode={projectCode} readonly={readonly} />
+              <ProjectStages projectCode={projectCode} category={data.project.project_category} readonly={readonly} />
             )}
             {activeTab === 'documents' && (
               <ProjectDocuments projectCode={projectCode} readonly={readonly} />
@@ -344,10 +346,9 @@ function ProjectWorkspace({ projectCode }: { projectCode: string }) {
                               : 'orange'
                           }
                         >
-                          最终验收：
-                          {data.completion_check.final_acceptance_ready
-                            ? '已通过'
-                            : '未通过'}
+                          {data.project.project_category === 'trade'
+                            ? `签收阶段：${data.completion_check.final_acceptance_ready ? '已完成 / 跳过' : '未完成'}`
+                            : `最终验收：${data.completion_check.final_acceptance_ready ? '已通过' : '未通过'}`}
                         </Tag>
                         <Tag
                           color={
@@ -366,7 +367,9 @@ function ProjectWorkspace({ projectCode }: { projectCode: string }) {
                         <Alert
                           type="warning"
                           title="暂不满足完工条件"
-                          description="项目阶段、最终验收和应收款均处理完成后，才能以完工方式关闭。"
+                          description={data.project.project_category === 'trade'
+                            ? '五个项目阶段（含签收）和应收款均处理完成后，才能以完工方式关闭。'
+                            : '项目阶段、最终验收和应收款均处理完成后，才能以完工方式关闭。'}
                           style={{ marginBottom: 18 }}
                         />
                       )}
@@ -416,7 +419,7 @@ function ProjectOverview({ data }: { data: ProjectDashboard }) {
           </span>
           <h2>
             {current
-              ? (stageLabels[current.stage_code] ?? current.stage_code)
+              ? projectStageLabel(current.stage_code, data.project.project_category)
               : '全部阶段已完成'}
           </h2>
           <p>
@@ -447,7 +450,7 @@ function ProjectOverview({ data }: { data: ProjectDashboard }) {
                 <span>
                   <strong>{businessText(todo.title)}</strong>
                   <small>
-                    {businessText(todo.description)}
+                    {businessText(todo.description, data.project.project_category)}
                     {todo.due_on
                       ? ` · 截止 ${formatChineseDate(todo.due_on)}`
                       : ''}
