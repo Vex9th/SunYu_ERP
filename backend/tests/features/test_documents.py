@@ -17,10 +17,11 @@ from starlette.datastructures import UploadFile
 from backend.app.core.config import Settings
 from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
-from backend.app.core.security import SESSION_COOKIE_NAME, create_session_token
+from backend.app.core.security import SESSION_COOKIE_NAME
 from backend.app.core.storage_paths import project_code_identity
 from backend.app.features import documents as documents_module
 from backend.app.features import files
+from backend.tests.features.test_procurement import _owner_session
 
 NOW = datetime(2026, 8, 31, 6, 30, tzinfo=timezone.utc)
 
@@ -48,7 +49,7 @@ class DocumentHarness:
         if authenticated:
             client.cookies.set(
                 SESSION_COOKIE_NAME,
-                create_session_token(self.settings.session_secret),
+                _owner_session(self.database_path, self.settings.session_secret),
             )
         return client
 

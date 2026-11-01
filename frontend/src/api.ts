@@ -1,5 +1,5 @@
 export interface RequestOptions {
-  method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
   headers?: HeadersInit
   body?: unknown
   signal?: AbortSignal
@@ -11,6 +11,28 @@ import type { ApiErrorPayload } from './domain/contracts'
 export type { ApiErrorPayload } from './domain/contracts'
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
+
+// 稳定账号 ID 隔离未确认请求；权限 revision 不改变幂等身份。
+let accountNamespace = 'anonymous'
+let accountEpoch = 0
+let knownAccessRevision: string | null = null
+export function setKnownAccessRevision(revision: number | undefined) { knownAccessRevision = revision === undefined ? null : String(revision) }
+const accountCleanup = new Set<() => void>()
+const activeRequests = new Set<AbortController>()
+const accessObservers = new Set<() => void>()
+export const getAccountNamespace = () => accountNamespace
+export function registerAccountCleanup(cleanup: () => void) { accountCleanup.add(cleanup); return () => { accountCleanup.delete(cleanup) } }
+export function subscribeAccessChanged(notify: () => void) { accessObservers.add(notify); return () => { accessObservers.delete(notify) } }
+export function setAccountNamespace(userId: number | null) {
+  const next = userId === null ? 'anonymous' : `user:${userId}`
+  if (next === accountNamespace) return
+  accountNamespace = next
+  accountEpoch += 1
+  knownAccessRevision = null
+  activeRequests.forEach(controller => controller.abort())
+  accountCleanup.forEach(cleanup => cleanup())
+}
+function accountChanged() { return new ApiError('账号已切换，请核对原账号的单据；原请求不会自动重放', 409, 'ACCOUNT_CHANGED') }
 
 export interface ProtectedSessionExpiredNotice {
   readonly message: string
@@ -37,6 +59,10 @@ export function subscribeProtectedSessionExpired(
 }
 
 const knownErrorMessages: Record<string, string> = {
+  'Permission denied': '当前账号没有执行此操作的权限',
+  'Invalid credentials': '登录名或密码不正确',
+  'Account is disabled': '账号已停用，请联系主账号',
+  'Owner bootstrap is required': '请先在服务本机创建主账号',
   'Authentication required': '登录状态已失效，请重新登录',
   'Password must be exactly six ASCII digits': '密码必须是 6 位 ASCII 数字',
   'Password is already configured': '密码已设置',
@@ -96,7 +122,9 @@ async function sendRequest<T>(
   consume: (response: Response) => Promise<T>,
 ): Promise<T> {
   const sessionObserver = protectedSessionObserver
+  const requestEpoch = accountEpoch
   const controller = new AbortController()
+  activeRequests.add(controller)
   let timedOut = false
   const timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
   const timeout = setTimeout(() => {
@@ -128,8 +156,12 @@ async function sendRequest<T>(
     try {
       response = await fetch(path, init)
     } catch {
+      if (requestEpoch !== accountEpoch) throw accountChanged()
       throw new ApiError('无法连接本地服务，请确认服务仍在运行', 0)
     }
+    if (requestEpoch !== accountEpoch) throw accountChanged()
+    const accessRevision = response.headers.get('X-Access-Revision')
+    if (accessRevision && knownAccessRevision && accessRevision !== knownAccessRevision && isProtectedApiPath(path)) { knownAccessRevision = accessRevision; accessObservers.forEach(notify => notify()) }
     if (!response.ok) {
       const error = await responseError(response)
       if (
@@ -139,15 +171,19 @@ async function sendRequest<T>(
       ) {
         sessionObserver.notify({ message: error.message, path })
       }
+      if (response.status === 403 && isProtectedApiPath(path)) accessObservers.forEach(notify => notify())
       throw error
     }
     // 超时与调用方取消必须覆盖正文读取，而不只是等待响应头。
-    return await consume(response)
+    const result = await consume(response)
+    if (requestEpoch !== accountEpoch) throw accountChanged()
+    return result
   } catch (error) {
     if (timedOut) throw new ApiError('请求超时，请重试', 0, 'REQUEST_TIMEOUT')
     if (options.signal?.aborted) throw new ApiError('请求已取消', 0, 'REQUEST_ABORTED')
     throw error
   } finally {
+    activeRequests.delete(controller)
     clearTimeout(timeout)
     options.signal?.removeEventListener('abort', abortFromCaller)
   }
@@ -158,6 +194,7 @@ function isProtectedApiPath(path: string): boolean {
   return pathname.startsWith('/api/') && ![
     '/api/auth/session',
     '/api/auth/setup',
+    '/api/auth/bootstrap',
     '/api/auth/login',
   ].includes(pathname)
 }
@@ -228,9 +265,10 @@ export function createPlannedPostRequest<T>(
   body: unknown,
   idempotencyKey = crypto.randomUUID(),
 ): PlannedPostRequest<T> {
+  const namespace = accountNamespace
   return {
     idempotencyKey,
-    send: () => requestPlannedPostJson<T>(path, body, idempotencyKey),
+    send: () => namespace === accountNamespace ? requestPlannedPostJson<T>(path, body, idempotencyKey) : Promise.reject(accountChanged()),
   }
 }
 
@@ -252,9 +290,12 @@ interface PendingPost {
 
 export function createRetriablePostSender(): RetriablePostSender {
   const pendingByPath = new Map<string, PendingPost>()
+  let namespace = accountNamespace
+  const refreshNamespace = () => { if (namespace !== accountNamespace) { pendingByPath.clear(); namespace = accountNamespace } }
 
   return {
     send<T>(path: string, body: unknown): Promise<T> {
+      refreshNamespace()
       let signature: string
       try {
         signature = stableJsonSignature(body)
@@ -298,6 +339,7 @@ export function createRetriablePostSender(): RetriablePostSender {
       return inFlight
     },
     discard(path: string, body?: unknown): boolean {
+      refreshNamespace()
       const pending = pendingByPath.get(path)
       if (!pending || pending.inFlight) return false
       if (body !== undefined && pending.signature !== stableJsonSignature(body)) return false
@@ -308,6 +350,8 @@ export function createRetriablePostSender(): RetriablePostSender {
 
 export function createRetriableMultipartPostSender(): RetriableMultipartPostSender {
   const pendingByPath = new Map<string, PendingPost>()
+  let namespace = accountNamespace
+  const refreshNamespace = () => { if (namespace !== accountNamespace) { pendingByPath.clear(); namespace = accountNamespace } }
   const fileTokens = new WeakMap<File, number>()
   let nextFileToken = 1
 
@@ -326,6 +370,7 @@ export function createRetriableMultipartPostSender(): RetriableMultipartPostSend
 
   return {
     send<T>(path: string, payload: unknown, files: readonly File[], suppliedForm?: FormData): Promise<T> {
+      refreshNamespace()
       let signature: string
       try {
         signature = signatureFor(payload, files)
@@ -371,6 +416,7 @@ export function createRetriableMultipartPostSender(): RetriableMultipartPostSend
       return inFlight
     },
     discard(path: string, payload?: unknown, files: readonly File[] = []): boolean {
+      refreshNamespace()
       const pending = pendingByPath.get(path)
       if (!pending || pending.inFlight) return false
       if (payload !== undefined && pending.signature !== signatureFor(payload, files)) return false

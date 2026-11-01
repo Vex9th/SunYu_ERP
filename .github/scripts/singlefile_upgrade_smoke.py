@@ -276,6 +276,9 @@ class Harness:
     def preserved(self) -> None:
         assert (self.root / "config.json").read_bytes() == self.config
         self.client.cookies.update(self.cookie)
+        BUSINESS["migrate_owner"](self.client, self.state)
+        BUSINESS["login"](self.client, self.state)
+        self.cookie = dict(self.client.cookies)
         assert self.client.get("/api/auth/session").json()["authenticated"]
         response = self.client.get(self.document_path)
         assert response.status_code == 200 and response.content == self.attachment

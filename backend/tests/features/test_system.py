@@ -17,6 +17,7 @@ from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
 from backend.app.features import system as system_module
 from backend.app.main import create_app
+from backend.tests.account_support import authenticate_owner
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 NOW = datetime(2026, 8, 28, 8, 30, tzinfo=timezone.utc)
@@ -62,8 +63,7 @@ def _write_config(config_path: Path, **overrides: object) -> None:
 
 
 def _login(client: TestClient) -> None:
-    assert client.post("/api/auth/setup", json={"password": "123456"}).status_code == 204
-    assert client.post("/api/auth/login", json={"password": "123456"}).status_code == 204
+    authenticate_owner(client)
 
 
 def _settings(tmp_path: Path, *, backup_enabled: bool = True) -> Settings:

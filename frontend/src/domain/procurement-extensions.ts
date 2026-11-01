@@ -1,3 +1,4 @@
+import type { ActivityTracked } from '../types'
 import type { ISODate, ISODateTime, MoneyCents, Revision } from './contracts'
 import type {
   ProcurementLineInput,
@@ -62,7 +63,7 @@ export interface SupplierPaymentInput {
   notes: string | null
 }
 
-export interface SupplierPaymentDto extends SupplierPaymentInput {
+export interface SupplierPaymentDto extends SupplierPaymentInput, ActivityTracked {
   id: number
   purchase_order_id: number
   status: 'active' | 'reversed'
@@ -81,7 +82,7 @@ export interface SupplierInvoiceInput {
   document_version_ids: number[]
 }
 
-export interface SupplierInvoiceDto extends SupplierInvoiceInput {
+export interface SupplierInvoiceDto extends SupplierInvoiceInput, ActivityTracked {
   id: number
   purchase_order_id: number
   status: 'active' | 'reversed'
@@ -111,12 +112,14 @@ export interface PurchaseOrderFacts {
 export type PurchaseOrderRecordDto = PurchaseOrderDto & Partial<PurchaseOrderFacts>
 
 export interface QuoteExportInput {
+  procurement_line_ids?: number[]
   title: string
   customer_company_id: number
   notes: string | null
 }
 
-export interface QuoteExportDto extends QuoteExportInput {
+export interface QuoteExportDto extends QuoteExportInput, ActivityTracked {
+  line_count: number
   id: number
   project_code: string
   procurement_list_id: number

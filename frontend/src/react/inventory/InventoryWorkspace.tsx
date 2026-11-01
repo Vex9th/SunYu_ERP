@@ -1,10 +1,13 @@
+import { useAccess } from '../access/AccessProvider'
+import { ActivitySummary } from '../activity/ActivitySummary'
+import { OperationHistory } from '../activity/OperationHistory'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Alert, Button, Card, Descriptions, Drawer, Empty, Form, Input, Modal, Select, Space, Table, Tag, Typography } from 'antd'
 import { MinusCircleOutlined, PlusOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import type { PagedResult } from '../../domain/contracts'
 import type { InventoryItemDto, InventoryMovementDto } from '../../domain/operations-api'
 import { localISODate } from '../../domain/dates'
-import { formatMoney } from '../../domain/formatters'
+import { formatMoney as rawFormatMoney } from '../../domain/formatters'
 import { createHttpInventoryRepository, type InventoryHttpRepository, type InventoryIssueProjectOption, type InventoryIssueWorkerOption, type InventoryListQuery } from '../../repositories/inventory.live'
 import { mutationScope, optional, quantityMilli, required, textValue } from '../procurement/model'
 import { ActionFeedback, errorText, FormModal, TextField, useBusinessActions, type FormValues } from '../procurement/ui'
@@ -17,6 +20,9 @@ const statusLabels = { all: '全部库存', in_stock: '有库存', out_of_stock:
 type Dialog = 'create' | 'edit' | 'adjust' | 'issue' | 'reverse-adjustment' | 'reverse-issue' | null
 
 export default function InventoryWorkspace({ repository = defaultRepository }: { repository?: InventoryHttpRepository }) {
+  const { can } = useAccess()
+  const formatMoney = (value: number | null | undefined) => can('sensitive.procurement_prices') ? rawFormatMoney(value ?? null) : '无权限'
+  const allowed = (kind: Exclude<Dialog, null>) => can(['create', 'edit', 'adjust', 'reverse-adjustment'].includes(kind) ? 'inventory.shared.manage' : 'inventory.manage')
   const [page, setPage] = useState(emptyPage<InventoryItemDto>)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -125,7 +131,7 @@ export default function InventoryWorkspace({ repository = defaultRepository }: {
   }, [issueProject, dialog, repository, form])
 
   function open(kind: Exclude<Dialog, null>, item?: InventoryItemDto, movement?: InventoryMovementDto) {
-    if (actions.pending) return
+    if (actions.pending || !allowed(kind)) return
     actions.setError(''); setOptionsError(''); setTargetItem(item ?? null); setTargetMovement(movement ?? null)
     form.resetFields()
     form.setFieldsValue({ ...(kind === 'edit' ? item : {}), opening_quantity: '0', occurred_on: localISODate(), issued_on: localISODate(), lines: item ? [{ inventory_item_id: item.id, quantity: '' }] : [] })
@@ -140,7 +146,7 @@ export default function InventoryWorkspace({ repository = defaultRepository }: {
     setSelected(item); setMovements(emptyPage()); setDrawer(true); void loadDetail(item)
   }
   async function submit(values: FormValues) {
-    if (actions.pending) return
+    if (actions.pending || !dialog || !allowed(dialog)) return
     try {
       if (dialog === 'create') {
         const input = inventoryInput(values)
@@ -180,7 +186,7 @@ export default function InventoryWorkspace({ repository = defaultRepository }: {
   return <section className={styles.workspace}>
     {confirmContext}
     <div className={styles.header}><div><Typography.Title level={3}>库存中心</Typography.Title><Typography.Text type="secondary">跟踪物料数量、库存价值和每一笔出入库</Typography.Text></div>
-      <Space><Button icon={<ReloadOutlined />} loading={loading} onClick={() => void refresh().catch(() => undefined)}>刷新</Button><Button type="primary" icon={<PlusOutlined />} disabled={Boolean(actions.pending) || loading} onClick={() => open('create')}>新增库存</Button></Space></div>
+      <Space><Button icon={<ReloadOutlined />} loading={loading} onClick={() => void refresh().catch(() => undefined)}>刷新</Button><Button type="primary" icon={<PlusOutlined />} disabled={Boolean(actions.pending) || loading || !allowed('create')} onClick={() => open('create')}>新增库存</Button></Space></div>
     <ActionFeedback actions={actions} />
     {error && <Alert type="error" showIcon title={error} description={page.items.length ? '当前保留上次成功读取的库存，本次筛选结果尚未更新。' : undefined} action={<Button onClick={() => void loadList().catch(() => undefined)}>重新读取</Button>} />}
     <Card styles={{ body: { padding: 16 } }}>
@@ -202,23 +208,23 @@ export default function InventoryWorkspace({ repository = defaultRepository }: {
         {status !== 'all' && <Tag closable onClose={(event) => { event.preventDefault(); applyFilters(appliedQuery, 'all') }}>状态：{statusLabels[status ?? 'all']}</Tag>}
         <Button type="link" size="small" onClick={clearFilters}>清除筛选</Button>
       </div>}
-      <Table<InventoryItemDto> size="small" rowKey="id" loading={loading} dataSource={page.items} scroll={{ x: 720 }} locale={{ emptyText: <Empty description={error ? '库存读取失败，请重新读取' : appliedQuery || status !== 'all' ? '没有符合当前条件的物料' : '尚未建立库存，先登记物料和期初数量'}>{!error && (appliedQuery || status !== 'all' ? <Button onClick={clearFilters}>清除筛选</Button> : <Button type="primary" disabled={Boolean(actions.pending)} onClick={() => open('create')}>登记第一项库存</Button>)}</Empty> }} pagination={{ current: page.page, pageSize: page.page_size, total: page.total, showSizeChanger: true, pageSizeOptions: [20, 50, 100], showTotal: (total) => `共 ${total} 项`, onChange: (number, size) => void loadList(size !== page.page_size ? 1 : number, size).catch(() => undefined) }} columns={[
+      <Table<InventoryItemDto> size="small" rowKey="id" loading={loading} dataSource={page.items} scroll={{ x: 720 }} locale={{ emptyText: <Empty description={error ? '库存读取失败，请重新读取' : appliedQuery || status !== 'all' ? '没有符合当前条件的物料' : '尚未建立库存，先登记物料和期初数量'}>{!error && (appliedQuery || status !== 'all' ? <Button onClick={clearFilters}>清除筛选</Button> : <Button type="primary" disabled={Boolean(actions.pending) || !allowed('create')} onClick={() => open('create')}>登记第一项库存</Button>)}</Empty> }} pagination={{ current: page.page, pageSize: page.page_size, total: page.total, showSizeChanger: true, pageSizeOptions: [20, 50, 100], showTotal: (total) => `共 ${total} 项`, onChange: (number, size) => void loadList(size !== page.page_size ? 1 : number, size).catch(() => undefined) }} columns={[
         { title: '物料', key: 'name', width: 280, render: (_, item) => <><Button className={styles.materialLink} type="link" onClick={() => openDetail(item)}>{item.name}</Button><div className={styles.secondary}>{[item.brand, item.model, item.specification].filter(Boolean).join(' · ') || '暂无品牌、型号和规格说明'}</div></> },
         { title: '可用数量', key: 'quantity', width: 140, align: 'right', render: (_, item) => <><strong className={styles.number}>{item.quantity} <small>{item.unit}</small></strong>{quantityMilli(item.quantity) === 0n && <div className={styles.secondary}>暂无库存</div>}</> },
         { title: '库存价值', key: 'value', width: 160, align: 'right', render: (_, item) => <><strong className={styles.number}>{formatMoney(item.inventory_value_cents)}</strong><div className={styles.secondary}>均价 {formatMoney(item.average_unit_cost_cents)} / {item.unit}</div></> },
-        { title: '操作', key: 'actions', fixed: 'right', width: 160, render: (_, item) => <Space size={4}><Button type="link" disabled={Boolean(actions.pending)} onClick={() => open('adjust', item)}>调整</Button><Button type="link" disabled={Boolean(actions.pending) || quantityMilli(item.quantity) === 0n} onClick={() => open('issue', item)}>项目领用</Button></Space> },
+        { title: '操作', key: 'actions', fixed: 'right', width: 160, render: (_, item) => <Space size={4}><Button type="link" disabled={Boolean(actions.pending) || !allowed('adjust')} onClick={() => open('adjust', item)}>调整</Button><Button type="link" disabled={Boolean(actions.pending) || quantityMilli(item.quantity) === 0n || !allowed('issue')} onClick={() => open('issue', item)}>项目领用</Button></Space> },
       ]} />
     </Card>
-    <Drawer title={selected?.name ?? '物料详情'} open={drawer} size={900} onClose={() => { setDrawer(false); context.current.detail++ }} extra={<Button disabled={detailLoading || Boolean(actions.pending)} onClick={() => selected && open('edit', selected)}>编辑资料</Button>}>
+    <Drawer title={selected?.name ?? '物料详情'} open={drawer} size={900} onClose={() => { setDrawer(false); context.current.detail++ }} extra={<Button disabled={detailLoading || Boolean(actions.pending) || !allowed('edit')} onClick={() => selected && open('edit', selected)}>编辑资料</Button>}>
       <Space orientation="vertical" style={{ width: '100%' }}>
         {detailError && <Alert type="warning" showIcon title={detailError} action={<Button onClick={() => selected && void loadDetail(selected, movements.page)}>重试</Button>} />}
-        {selected && <>
+        {selected && <><Space><ActivitySummary summary={selected.activity_summary} /><OperationHistory resourceType="inventory_item" resourceId={selected.id} /></Space>
           <div className={styles.detailSummary}>
             <div><span>现存数量</span><strong>{selected.quantity} <small>{selected.unit}</small></strong></div>
             <div><span>库存价值</span><strong>{formatMoney(selected.inventory_value_cents)}</strong></div>
             <div><span>平均单价</span><strong>{formatMoney(selected.average_unit_cost_cents)} <small>/ {selected.unit}</small></strong></div>
           </div>
-          <div className={styles.detailActions}><Typography.Text type="secondary">出入库会同步更新数量和库存价值。</Typography.Text><Space><Button disabled={detailLoading || Boolean(actions.pending)} onClick={() => open('adjust', selected)}>调整库存</Button><Button type="primary" disabled={detailLoading || Boolean(actions.pending) || quantityMilli(selected.quantity) === 0n} onClick={() => open('issue', selected)}>领用到项目</Button></Space></div>
+          <div className={styles.detailActions}><Typography.Text type="secondary">出入库会同步更新数量和库存价值。</Typography.Text><Space><Button disabled={detailLoading || Boolean(actions.pending) || !allowed('adjust')} onClick={() => open('adjust', selected)}>调整库存</Button><Button type="primary" disabled={detailLoading || Boolean(actions.pending) || quantityMilli(selected.quantity) === 0n || !allowed('issue')} onClick={() => open('issue', selected)}>领用到项目</Button></Space></div>
           <Typography.Title level={5}>物料资料</Typography.Title>
           <Descriptions size="small" column={{ xs: 1, sm: 2 }} items={[
             { key: 'brand', label: '品牌', children: selected.brand || '—' }, { key: 'model', label: '型号', children: selected.model || '—' },
@@ -229,6 +235,7 @@ export default function InventoryWorkspace({ repository = defaultRepository }: {
         <div className={styles.sectionHeading}><Typography.Title level={5}>出入库流水</Typography.Title><Typography.Text type="secondary">按原记录核对数量、金额与去向。错误登记可冲销，历史记录仍会保留。</Typography.Text></div>
         {movementError && <Alert type="warning" showIcon title={movementError} action={<Button onClick={() => selected && void loadDetail(selected, movements.page)}>重试</Button>} />}
         <Table<InventoryMovementDto> size="small" rowKey="id" dataSource={movements.items} loading={movementLoading} scroll={{ x: 790 }} locale={{ emptyText: movementError ? '流水读取失败，请重新读取' : '此物料暂无出入库流水' }} pagination={{ current: movements.page, pageSize: movements.page_size, total: movements.total, onChange: (number) => selected && void loadDetail(selected, number) }} columns={[
+            { title: '操作记录', width: 210, render: (_, movement) => <Space orientation="vertical" size={0}><ActivitySummary summary={movement.activity_summary} /><OperationHistory resourceType="inventory_movement" resourceId={movement.id} /></Space> },
           { title: '日期', dataIndex: 'occurred_on', width: 110 }, { title: '类型', key: 'type', render: (_, item) => <Tag>{movementLabel(item)}</Tag> },
           { title: '数量变化', dataIndex: 'quantity_delta', align: 'right' }, { title: '金额变化', dataIndex: 'value_delta_cents', render: formatMoney, align: 'right' },
           { title: '项目 / 说明', key: 'reason', render: (_, item) => [item.project_code, item.reason].filter(Boolean).join(' · ') || '—' },

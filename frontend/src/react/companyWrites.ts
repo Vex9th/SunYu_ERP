@@ -1,4 +1,4 @@
-import { createPlannedPostRequest } from '../api'
+import { createPlannedPostRequest, getAccountNamespace, registerAccountCleanup } from '../api'
 import type { CompanyDetail, CompanyPayload, ContactPayload, RevisionedContact } from '../types'
 
 export const companyFields = [['name', '公司名称'], ['taxpayer_id', '纳税人识别号'], ['registered_address', '注册地址'], ['registered_phone', '公司电话'], ['bank_name', '开户银行'], ['bank_account', '银行账号'], ['notes', '备注']] as const
@@ -12,7 +12,9 @@ export type PendingCreate = PendingCompanyCreate | PendingContactCreate
 const memory = new Map<string, PendingCreate>()
 const inFlight = new Map<string, Promise<CompanyDetail | RevisionedContact>>()
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-export const pendingStorageKey = (companyId?: number) => companyId === undefined ? COMPANY_PENDING_KEY : `${CONTACT_PENDING_PREFIX}${companyId}`
+const storagePrefix = () => `${getAccountNamespace()}:`
+export const pendingStorageKey = (companyId?: number) => `${storagePrefix()}${companyId === undefined ? COMPANY_PENDING_KEY : `${CONTACT_PENDING_PREFIX}${companyId}`}`
+registerAccountCleanup(() => { memory.clear(); inFlight.clear() })
 function object(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === 'object' && !Array.isArray(value) }
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]) { const actual = Object.keys(value); return actual.length === keys.length && keys.every(key => Object.prototype.hasOwnProperty.call(value, key)) }
 function validPayload(value: unknown, fields: readonly (readonly [string, string])[]): boolean {
@@ -42,12 +44,13 @@ export function readPendingCreate(companyId?: number): PendingCreate | null {
 }
 export function listPendingCreates(): PendingCreate[] {
   const ids = new Set<number>()
-  for (const pending of memory.values()) if (pending.companyId !== undefined) ids.add(pending.companyId)
+  for (const [key, pending] of memory) if (key.startsWith(storagePrefix()) && pending.companyId !== undefined) ids.add(pending.companyId)
   try {
     const keys = Array.from({ length: sessionStorage.length }, (_, index) => sessionStorage.key(index))
     for (const key of keys) {
-      if (!key?.startsWith(CONTACT_PENDING_PREFIX)) continue
-      const suffix = key.slice(CONTACT_PENDING_PREFIX.length); const id = Number(suffix)
+      const prefix = `${storagePrefix()}${CONTACT_PENDING_PREFIX}`
+      if (!key?.startsWith(prefix)) continue
+      const suffix = key.slice(prefix.length); const id = Number(suffix)
       if (!Number.isSafeInteger(id) || id <= 0 || String(id) !== suffix) { sessionStorage.removeItem(key); continue }
       ids.add(id)
     }

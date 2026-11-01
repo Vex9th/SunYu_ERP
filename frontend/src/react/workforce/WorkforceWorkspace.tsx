@@ -1,3 +1,6 @@
+import { useAccess } from '../access/AccessProvider'
+import { ActivitySummary } from '../activity/ActivitySummary'
+import { OperationHistory } from '../activity/OperationHistory'
 import {
   useEffect,
   useMemo,
@@ -31,7 +34,7 @@ import { ApiError, InvalidJsonBodyError } from '../../api'
 import { useWorkspaceTab, useWorkspaceValue } from '../shared'
 import { localISODate } from '../../domain/dates'
 import {
-  formatMoney,
+  formatMoney as rawFormatMoney,
   yuanToCents as parseYuanToCents,
 } from '../../domain/formatters'
 import type {
@@ -126,6 +129,8 @@ const reasonField: Field = {
   type: 'textarea',
   required: true,
 }
+const tabRead: Record<string, string> = { labor: 'workforce.view', 'labor-history': 'workforce.view', people: 'dispatches.view', workers: 'workforce.view', reports: 'site_reports.view', advances: 'material_advances.view' }
+const tabWrite: Record<string, string> = { labor: 'workforce.manage', 'labor-history': 'workforce.manage', people: 'dispatches.manage', workers: 'workforce.manage', reports: 'site_reports.manage', advances: 'material_advances.create' }
 const pagination = {
   defaultPageSize: 10,
   showSizeChanger: true,
@@ -138,10 +143,10 @@ const dateField = (key: string, label: string, disabled = false): Field => ({
   required: true,
   disabled,
 })
-function repositoryFor(project: string) {
+function repositoryFor(project: string, can: (permission: string) => boolean) {
   let repository = repositories.get(project)
   if (!repository) {
-    repository = createHttpWorkforceWorkspaceRepository()
+    repository = createHttpWorkforceWorkspaceRepository(can)
     repositories.set(project, repository)
   }
   return repository
@@ -193,11 +198,12 @@ export default function WorkforceWorkspace({
   readonly = false,
   repository: suppliedRepository,
 }: WorkforceWorkspaceProps) {
+  const { can, namespace, accessRevision } = useAccess()
   useSyncExternalStore(pendingRegistry.subscribe, pendingRegistry.getSnapshot)
   const priorPending = useRef(false)
   const repository = useMemo(
-    () => suppliedRepository ?? repositoryFor(projectCode),
-    [suppliedRepository, projectCode],
+    () => suppliedRepository ?? repositoryFor(`${namespace}:${accessRevision}:${projectCode}`, can),
+    [suppliedRepository, projectCode, namespace, accessRevision],
   )
   const [model, setModel] = useState<WorkforceDemoViewModel | null>(null)
   const [loading, setLoading] = useState(true)
@@ -213,9 +219,10 @@ export default function WorkforceWorkspace({
   const [search, setSearch] = useWorkspaceValue('q', '')
   const [activeTab, setActiveTab] = useWorkspaceTab(
     'section',
-    ['labor', 'labor-history', 'people', 'workers', 'reports', 'advances'],
-    readonly ? 'labor-history' : 'labor',
+    Object.keys(tabRead).filter(key => can(tabRead[key]!)),
+    Object.keys(tabRead).find(key => can(tabRead[key]!)) ?? 'labor-history',
   )
+  const formatMoney = (value: number | null | undefined) => can(activeTab === 'advances' ? 'sensitive.procurement_prices' : 'sensitive.salary_costs') ? rawFormatMoney(value ?? null) : '无权限'
   const [laborFrom, setLaborFrom] = useState('')
   const [laborTo, setLaborTo] = useState('')
   const [laborWorker, setLaborWorker] = useState<number | undefined>()
@@ -335,8 +342,9 @@ export default function WorkforceWorkspace({
       void refresh().catch(() => undefined)
     priorPending.current = Boolean(pending)
   }, [pending])
+  const salaryWriteRestricted = ['labor', 'labor-history', 'people'].includes(activeTab) && !can('sensitive.salary_costs')
   const mutationDisabled =
-    readonly || loading || !model || busy || Boolean(pending)
+    readonly || salaryWriteRestricted || (activeTab !== 'advances' && !can(tabWrite[activeTab]!)) || loading || !model || busy || Boolean(pending)
   useEffect(() => {
     if (!model) return
     const next: Record<number, LaborDraft> = {}
@@ -756,6 +764,7 @@ export default function WorkforceWorkspace({
     )
   }
   function openAdvance(advance?: DemoMaterialAdvanceViewModel) {
+    if (!can(advance ? 'material_advances.edit' : 'material_advances.create')) return
     open(
       advance ? '编辑现场垫资' : '登记现场垫资',
       advance
@@ -895,6 +904,7 @@ export default function WorkforceWorkspace({
     )
   }
   function reimburse(advance: DemoMaterialAdvanceViewModel) {
+    if (!can('material_advances.reimburse')) return
     open(
       '登记报销',
       { reimbursed_on: localISODate(), payment_method: 'bank_transfer' },
@@ -1022,6 +1032,7 @@ export default function WorkforceWorkspace({
       value?.toLowerCase().includes(search.trim().toLowerCase()),
     )
   const laborColumns: ColumnsType<DemoLaborEntryViewModel> = [
+          { title: '操作记录', width: 210, render: (_, row) => <Space orientation="vertical" size={0}><ActivitySummary summary={row.activity_summary} />{row.entry_id !== undefined && <OperationHistory resourceType="labor_entry" resourceId={row.entry_id} />}</Space> },
     {
       title: '日期',
       dataIndex: 'work_date',
@@ -1219,6 +1230,7 @@ export default function WorkforceWorkspace({
               }),
             }}
             columns={[
+          { title: '操作记录', width: 210, render: (_, row) => <Space orientation="vertical" size={0}><ActivitySummary summary={row.activity_summary} />{row.assignment_id !== undefined && <OperationHistory resourceType="crew_assignment" resourceId={row.assignment_id} />}</Space> },
               {
                 title: '施工员 / 工种',
                 render: (_, row) => (
@@ -1490,6 +1502,7 @@ export default function WorkforceWorkspace({
         )}
         scroll={{ x: 900 }}
         columns={[
+          { title: '操作记录', width: 210, render: (_, row) => <Space orientation="vertical" size={0}><ActivitySummary summary={row.activity_summary} />{row.assignment_id !== undefined && <OperationHistory resourceType="crew_assignment" resourceId={row.assignment_id} />}</Space> },
           {
             title: '施工员 / 工种',
             render: (_, row) => (
@@ -1668,6 +1681,7 @@ export default function WorkforceWorkspace({
           match(row.name, row.phone, row.notes),
         )}
         columns={[
+          { title: '操作记录', width: 210, render: (_, row) => <Space orientation="vertical" size={0}><ActivitySummary summary={row.activity_summary} />{row.worker_id !== undefined && <OperationHistory resourceType="worker" resourceId={row.worker_id} />}</Space> },
           { title: '姓名', dataIndex: 'name' },
           { title: '联系电话', dataIndex: 'phone' },
           { title: '备注', dataIndex: 'notes' },
@@ -1761,6 +1775,7 @@ export default function WorkforceWorkspace({
           match(row.work_summary, row.location, row.work_date),
         )}
         columns={[
+          { title: '操作记录', width: 210, render: (_, row) => <Space orientation="vertical" size={0}><ActivitySummary summary={row.activity_summary} />{row.report_id !== undefined && <OperationHistory resourceType="site_daily_report" resourceId={row.report_id} />}</Space> },
           {
             title: '日期',
             dataIndex: 'work_date',
@@ -1852,7 +1867,7 @@ export default function WorkforceWorkspace({
         type="primary"
         icon={<PlusOutlined />}
         disabled={
-          mutationDisabled ||
+          mutationDisabled || !can('material_advances.create') ||
           hasWarning('material_advances', 'workers', 'crew_assignments')
         }
         onClick={() => openAdvance()}
@@ -1888,6 +1903,7 @@ export default function WorkforceWorkspace({
           match(workerName(row.worker_id), row.vendor_name, row.notes),
         )}
         columns={[
+          { title: '操作记录', width: 210, render: (_, row) => <Space orientation="vertical" size={0}><ActivitySummary summary={row.activity_summary} />{row.advance_id !== undefined && <OperationHistory resourceType="material_advance" resourceId={row.advance_id} />}</Space> },
           { title: '支出日期', dataIndex: 'spent_on' },
           { title: '垫付人员', render: (_, row) => workerName(row.worker_id) },
           { title: '商家', dataIndex: 'vendor_name' },
@@ -1922,7 +1938,7 @@ export default function WorkforceWorkspace({
                 <Button
                   type="link"
                   disabled={
-                    mutationDisabled ||
+                    mutationDisabled || !can('material_advances.edit') ||
                     row.status === 'voided' ||
                     advanceTotals(row).reimbursed > 0
                   }
@@ -1933,7 +1949,7 @@ export default function WorkforceWorkspace({
                 <Button
                   type="link"
                   disabled={
-                    mutationDisabled ||
+                    mutationDisabled || !can('material_advances.reimburse') ||
                     row.status === 'voided' ||
                     advanceTotals(row).outstanding <= 0
                   }
@@ -1945,7 +1961,7 @@ export default function WorkforceWorkspace({
                   type="link"
                   danger
                   disabled={
-                    mutationDisabled ||
+                    mutationDisabled || !can('material_advances.void') ||
                     row.status === 'voided' ||
                     advanceTotals(row).reimbursed > 0
                   }
@@ -2020,6 +2036,7 @@ export default function WorkforceWorkspace({
                 pagination={false}
                 dataSource={row.reimbursements}
                 columns={[
+          { title: '操作记录', width: 210, render: (_, row) => <Space orientation="vertical" size={0}><ActivitySummary summary={row.activity_summary} />{row.reimbursement_id !== undefined && <OperationHistory resourceType="advance_reimbursement" resourceId={row.reimbursement_id} />}</Space> },
                   { title: '日期', dataIndex: 'reimbursed_on' },
                   {
                     title: '金额',
@@ -2046,7 +2063,7 @@ export default function WorkforceWorkspace({
                       <Button
                         type="link"
                         danger
-                        disabled={mutationDisabled || item.status !== 'active'}
+                        disabled={mutationDisabled || !can('material_advances.reverse') || item.status !== 'active'}
                         onClick={() =>
                           reason('作废报销记录', (reason) =>
                             repository.voidMaterialAdvanceReimbursement(
@@ -2101,6 +2118,7 @@ export default function WorkforceWorkspace({
       {readonly && (
         <Alert type="info" showIcon title="项目已归档，本页仅供查看" />
       )}
+      {salaryWriteRestricted && <Alert type="info" showIcon title="维护计薪安排和上工记录需要工资成本查看权限，请联系主账号调整授权" />}
       {model?.load_warnings?.map((warning) => (
         <Alert
           key={warning.section}
@@ -2163,13 +2181,13 @@ export default function WorkforceWorkspace({
             { key: 'workers', label: '施工员档案', children: workersContent },
             { key: 'reports', label: '施工日报', children: reportsContent },
             { key: 'advances', label: '垫资与报销', children: advancesContent },
-          ]}
+          ].filter(tab => can(tabRead[tab.key]!))}
         />
       </Card>
       <ActionDrawer
         draftOwner={repository}
         draftKey={projectCode}
-        editor={editor}
+        editor={editor ? { ...editor, fields: editor.fields.map(field => field.type === 'money' && !can(activeTab === 'advances' ? 'sensitive.procurement_prices' : 'sensitive.salary_costs') ? { ...field, visible: () => false } : field) } : null}
         busy={busy}
         error={formError}
         onClose={() => setEditor(null)}

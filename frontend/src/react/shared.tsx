@@ -1,3 +1,5 @@
+import { useAccess } from './access/AccessProvider'
+import { getAccountNamespace, registerAccountCleanup } from '../api'
 import {
   useCallback,
   useEffect,
@@ -259,6 +261,7 @@ const editorDrafts = new Map<
   { values: EditorValues; revision?: number }
 >()
 const editorListeners = new Set<() => void>()
+registerAccountCleanup(() => { pendingEditors.clear(); editorDrafts.clear(); notifyEditors() })
 function notifyEditors() {
   editorListeners.forEach((listener) => listener())
 }
@@ -271,7 +274,7 @@ function subscribeEditors(listener: () => void) {
 
 export function EntityEditor<T extends EditorValues>({
   title,
-  cacheKey,
+  cacheKey: resourceCacheKey,
   initialValues,
   recordRevision,
   onSubmit,
@@ -290,6 +293,8 @@ export function EntityEditor<T extends EditorValues>({
   children: ReactNode
   width?: number
 }) {
+  const { namespace, accessRevision } = useAccess()
+  const cacheKey = `${namespace}:${accessRevision}:${resourceCacheKey}`
   const [form] = Form.useForm<T>()
   const { message, modal } = App.useApp()
   const pending = useSyncExternalStore(
@@ -373,11 +378,13 @@ export function EntityEditor<T extends EditorValues>({
       run: () => onSubmit(payload),
       busy: false,
     }
+    const namespace = getAccountNamespace()
     const running = { ...original, busy: true, error: undefined }
     pendingEditors.set(cacheKey, running)
     notifyEditors()
     try {
       const result = await running.run()
+      if (namespace !== getAccountNamespace()) return
       pendingEditors.set(cacheKey, {
         ...running,
         busy: false,
@@ -386,6 +393,7 @@ export function EntityEditor<T extends EditorValues>({
       })
       notifyEditors()
     } catch (cause) {
+      if (namespace !== getAccountNamespace()) return
       pendingEditors.set(cacheKey, {
         ...running,
         busy: false,

@@ -19,8 +19,9 @@ from fastapi.testclient import TestClient
 from backend.app.core.config import Settings
 from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
-from backend.app.core.security import SESSION_COOKIE_NAME, create_session_token
+from backend.app.core.security import SESSION_COOKIE_NAME
 from backend.app.features import files
+from backend.tests.account_support import owner_session_token
 
 ROOT = Path(__file__).resolve().parents[3]
 NOW = datetime(2026, 2, 1, 4, 0, tzinfo=timezone.utc)
@@ -51,7 +52,7 @@ class Harness:
         if authenticated:
             client.cookies.set(
                 SESSION_COOKIE_NAME,
-                create_session_token(self.settings.session_secret),
+                owner_session_token(self.database_path, self.settings.session_secret),
             )
         return client
 
@@ -219,7 +220,7 @@ def _client_at(harness: Harness, current: datetime) -> DeliveryTestClient:
     client = DeliveryTestClient(app)
     client.cookies.set(
         SESSION_COOKIE_NAME,
-        create_session_token(harness.settings.session_secret),
+        owner_session_token(harness.database_path, harness.settings.session_secret),
     )
     return client
 
@@ -2171,7 +2172,7 @@ def test_count_and_rows_use_one_snapshot_while_second_connection_writes(
     client = DeliveryTestClient(app)
     client.cookies.set(
         SESSION_COOKIE_NAME,
-        create_session_token(harness.settings.session_secret),
+        owner_session_token(harness.database_path, harness.settings.session_secret),
     )
     with client:
         response = client.get("/api/projects/P-001/invoices?page=1&page_size=20")
@@ -2354,7 +2355,7 @@ def test_put_response_uses_pre_commit_attachment_snapshot(
     client = DeliveryTestClient(app)
     client.cookies.set(
         SESSION_COOKIE_NAME,
-        create_session_token(harness.settings.session_secret),
+        owner_session_token(harness.database_path, harness.settings.session_secret),
     )
     with client:
         response = client.put(path, json=payload)

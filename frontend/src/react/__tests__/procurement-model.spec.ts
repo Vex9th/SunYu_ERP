@@ -1,8 +1,18 @@
 import { describe, expect, it } from 'vitest'
-import { ApiError } from '../../api'
-import { MutationLedger, allocateAmount, quantityMilli, remainingQuantity } from '../procurement/model'
+import { ApiError, setAccountNamespace } from '../../api'
+import { MutationLedger, mutationLedger, allocateAmount, quantityMilli, remainingQuantity } from '../procurement/model'
 
 describe('采购写入和金额约束', () => {
+  it('切换账号清理结果未知的闭包，不再把旧请求重放给新账号', async () => {
+    setAccountNamespace(501)
+    let calls = 0
+    const pending = mutationLedger.start('account-switch-case', '保存', async () => { calls++; throw new Error('网络中断') })
+    await expect(mutationLedger.run(pending)).rejects.toThrow('网络中断')
+    setAccountNamespace(502)
+    await mutationLedger.run(pending)
+    expect(calls).toBe(1)
+    expect(mutationLedger.get('account-switch-case')).toBeNull()
+  })
   it('数量按千分位精确计算，拒绝超过三位小数', () => {
     expect(remainingQuantity('2.100', '1.999')).toBe('0.101')
     expect(() => quantityMilli('0.0001')).toThrow()

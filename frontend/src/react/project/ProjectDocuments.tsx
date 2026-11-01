@@ -1,3 +1,6 @@
+import { useAccess } from '../access/AccessProvider'
+import { ActivitySummary } from '../activity/ActivitySummary'
+import { OperationHistory } from '../activity/OperationHistory'
 import { useEffect, useRef, useState } from 'react'
 import { Alert, Button, Card, Drawer, Form, Input, Modal, Select, Space, Table, Tag, Typography, Upload } from 'antd'
 import type { UploadFile } from 'antd'
@@ -27,6 +30,7 @@ export default function ProjectDocuments({ projectCode, readonly = false, reposi
   const filters = { search, category: Object.prototype.hasOwnProperty.call(documentCategories, category) ? category : '', archived: (['active', 'archived', 'all'].includes(archive) ? archive : 'active') as DocumentArchiveFilter, page: Number.isSafeInteger(Number(pageValue)) && Number(pageValue) > 0 ? Number(pageValue) : 1, page_size: [20, 50, 100, 200].includes(Number(sizeValue)) ? Number(sizeValue) : 20 }
   const [searchDraft, setSearchDraft] = useState(search)
   useEffect(() => setSearchDraft(search), [search])
+  const { can } = useAccess()
   const load = useProjectLoad(`${projectCode}:${JSON.stringify(filters)}`, () => repository.listDocuments(projectCode, filters), repository)
   useEffect(() => { if (load.data && filters.page > 1 && load.data.items.length === 0) setPageValue(String(Math.max(1, Math.ceil(load.data.total / filters.page_size)))) }, [load.data, filters.page, filters.page_size])
   function resetFilters() { setSearch(''); setCategory(''); setArchive('active'); setPageValue('1'); setSearchDraft('') }
@@ -53,7 +57,7 @@ export default function ProjectDocuments({ projectCode, readonly = false, reposi
   }
   function preview(id: number) { navigate(documentPath(id)) }
   function save(values: DocumentForm) {
-    if (!dialog || readonly || write.locked) return
+    if (!dialog || readonly || write.locked || !can(dialog.mode === 'archive' ? 'documents.archive' : dialog.mode === 'edit' ? 'documents.edit' : 'documents.upload')) return
     const doc = dialog.document; const mode = dialog.mode
     const file = files[0]?.originFileObj
     if (['create', 'version'].includes(mode) && !file) { setFileError('请选择要上传的文件'); return }
@@ -78,14 +82,14 @@ export default function ProjectDocuments({ projectCode, readonly = false, reposi
   return <Space orientation="vertical" size={16} style={{ width: '100%' }}>{modalContext}
     {readonly && <Alert type="info" showIcon title="项目已归档，文件与历史版本仍可预览和下载" />}
     {load.error && <Alert type="error" showIcon title={load.error} action={<Button onClick={load.reload}>重新读取</Button>} />}{!dialog && write.notice}
-    <Card size="small" title="项目文件台账" extra={<Space><Button icon={<ReloadOutlined />} onClick={load.reload}>刷新</Button><Button icon={<FileTextOutlined />} disabled={disabled} onClick={() => open('minutes')}>写会议纪要</Button><Button type="primary" icon={<FileAddOutlined />} disabled={disabled} onClick={() => open('create')}>新增文件</Button></Space>}>
+    <Card size="small" title="项目文件台账" extra={<Space><Button icon={<ReloadOutlined />} onClick={load.reload}>刷新</Button><Button icon={<FileTextOutlined />} disabled={disabled || !can('documents.upload')} onClick={() => open('minutes')}>写会议纪要</Button><Button type="primary" icon={<FileAddOutlined />} disabled={disabled || !can('documents.upload')} onClick={() => open('create')}>新增文件</Button></Space>}>
       <div className="project-list-toolbar"><Input.Search aria-label="搜索文档" placeholder="标题、备注或正文关键词" enterButton="搜索" maxLength={200} allowClear value={searchDraft} onChange={event => setSearchDraft(event.target.value)} onSearch={value => { setSearch(value.trim()); setPageValue('1') }} className="project-document-search" /><Space wrap><Select aria-label="文档类别筛选" value={filters.category} style={{ width: 165 }} options={[{ value: '', label: '全部类别' }, ...Object.entries(documentCategories).map(([value, label]) => ({ value, label }))]} onChange={value => { setCategory(value); setPageValue('1') }} /><Select aria-label="文档归档筛选" value={filters.archived} style={{ width: 130 }} options={[{ value: 'active', label: '使用中' }, { value: 'archived', label: '已归档' }, { value: 'all', label: '全部状态' }]} onChange={value => { setArchive(value); setPageValue('1') }} /><Button onClick={resetFilters} disabled={!search && !filters.category && filters.archived === 'active'}>重置筛选</Button></Space></div>
       {search && <Typography.Paragraph type="secondary">搜索“{search}”{load.data ? `，找到 ${load.data.total} 份文件` : ''}</Typography.Paragraph>}
       <Table size="small" rowKey="id" loading={load.loading} dataSource={load.data?.items ?? []} scroll={{ x: 780 }} pagination={{ current: filters.page, pageSize: filters.page_size, total: load.data?.total ?? 0, showSizeChanger: true, showTotal: total => `共 ${total} 份文件`, pageSizeOptions: [20, 50, 100, 200], onChange: (page, page_size) => { setPageValue(String(page_size === filters.page_size ? page : 1)); setSizeValue(String(page_size)) } }} columns={[
-        { title: '文件标题', dataIndex: 'title', width: 300, render: (_, doc) => <Space orientation="vertical" size={0}><Button type="link" style={{ padding: 0, height: 'auto', whiteSpace: 'normal', textAlign: 'left' }} onClick={() => preview(doc.id)}>{doc.title}</Button><Typography.Text type="secondary">{doc.search_excerpt ?? doc.notes ?? ''}</Typography.Text></Space> },
+        { title: '文件标题', dataIndex: 'title', width: 300, render: (_, doc) => <Space orientation="vertical" size={0}><Button type="link" style={{ padding: 0, height: 'auto', whiteSpace: 'normal', textAlign: 'left' }} onClick={() => preview(doc.id)}>{doc.title}</Button><Typography.Text type="secondary">{doc.search_excerpt ?? doc.notes ?? ''}</Typography.Text><ActivitySummary label="上传者" actorName={doc.activity_summary?.created_by ?? null} /></Space> },
         { title: '类别 / 版本', width: 155, render: (_, doc) => <Space orientation="vertical" size={4}><span>{documentCategories[doc.category] ?? doc.category}</span><Space size={4}><Tag>V{doc.latest_version_number}</Tag>{doc.archived_at && <Tag>已归档</Tag>}</Space></Space> },
         { title: '更新时间', dataIndex: 'updated_at', width: 170, render: (value: string) => new Date(value).toLocaleString('zh-CN') },
-        { title: '操作', width: 255, fixed: 'right', render: (_, doc) => <Space wrap size={4}><Button size="small" onClick={() => preview(doc.id)}>预览 / 版本</Button>{!readonly && !doc.archived_at && <><Button size="small" disabled={disabled} onClick={() => open('edit', doc)}>编辑</Button><Button size="small" disabled={disabled} onClick={() => open(doc.category === 'planning_minutes' ? 'minutesVersion' : 'version', doc)}>追加版本</Button><Button size="small" danger disabled={disabled} onClick={() => open('archive', doc)}>归档</Button></>}</Space> },
+        { title: '操作', width: 255, fixed: 'right', render: (_, doc) => <Space wrap size={4}><OperationHistory resourceType="document" resourceId={doc.id} /><Button size="small" disabled={!can('documents.download')} onClick={() => preview(doc.id)}>预览 / 版本</Button>{!readonly && !doc.archived_at && <><Button size="small" disabled={disabled || !can('documents.edit')} onClick={() => open('edit', doc)}>编辑</Button><Button size="small" disabled={disabled || !can('documents.upload')} onClick={() => open(doc.category === 'planning_minutes' ? 'minutesVersion' : 'version', doc)}>追加版本</Button><Button size="small" danger disabled={disabled || !can('documents.archive')} onClick={() => open('archive', doc)}>归档</Button></>}</Space> },
       ]} />
     </Card>
     <Drawer forceRender title={mode ? titles[mode] : ''} open={Boolean(dialog)} onClose={close} closable={!write.busy} mask={{ closable: !write.busy }} keyboard={!write.busy} size={620} footer={<Space><Button disabled={write.busy} onClick={close}>取消</Button><Button type="primary" danger={mode === 'archive'} loading={write.busy} disabled={readonly || write.locked} onClick={() => form.submit()}>{mode === 'archive' ? '确认归档' : '保存'}</Button></Space>}>

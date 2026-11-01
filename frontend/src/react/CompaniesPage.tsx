@@ -1,3 +1,6 @@
+import { useAccess } from './access/AccessProvider'
+import { ActivitySummary } from './activity/ActivitySummary'
+import { OperationHistory } from './activity/OperationHistory'
 import { useEffect, useRef, useState } from 'react'
 import {
   Alert,
@@ -91,6 +94,7 @@ function targetFromPending(pending: PendingCreate): CompanyEditorTarget {
 }
 
 export default function CompaniesPage() {
+  const { can } = useAccess()
   const { message } = App.useApp()
   const list = useLoad(
     () => requestJson<CompanySummary[]>('/api/companies'),
@@ -101,12 +105,12 @@ export default function CompaniesPage() {
   const [detailTab, setDetailTab] = useWorkspaceTab(
     'companyTab',
     ['ledger', 'profile'],
-    'ledger',
+    can('company_ledger.view') ? 'ledger' : 'profile',
   )
   const selected = Number(selectedValue) > 0 ? Number(selectedValue) : null
   const setSelected = (value: number | null) =>
     setSelectedValue(value ? String(value) : '')
-  function openCompany(id: number, tab = 'ledger') {
+  function openCompany(id: number, tab = can('company_ledger.view') ? 'ledger' : 'profile') {
     setDetailTab(tab)
     setSelected(id)
   }
@@ -148,7 +152,7 @@ export default function CompaniesPage() {
             <Button
               type="primary"
               icon={<PlusOutlined />}
-              onClick={() => setEditor({ kind: 'company', record: null })}
+              disabled={!can('companies.create')} onClick={() => setEditor({ kind: 'company', record: null })}
             >
               新增公司
             </Button>
@@ -237,7 +241,7 @@ export default function CompaniesPage() {
                   type="link"
                   size="small"
                   onClick={() =>
-                    value
+                    (value || !can('companies.edit'))
                       ? openCompany(row.id, 'profile')
                       : setEditor({
                           kind: 'contact',
@@ -267,7 +271,7 @@ export default function CompaniesPage() {
                   <Button
                     type="text"
                     size="small"
-                    icon={<EditOutlined />}
+                    disabled={!can('companies.edit')} icon={<EditOutlined />}
                     aria-label={`编辑公司${row.name}`}
                     onClick={() => setEditor({ kind: 'company', record: row })}
                   />
@@ -296,14 +300,15 @@ export default function CompaniesPage() {
           onClose={() => setSelected(null)}
         >
           <Tabs
-            activeKey={detailTab}
+            activeKey={can('company_ledger.view') ? detailTab : 'profile'}
             onChange={setDetailTab}
             destroyOnHidden
             items={[
               {
                 key: 'ledger',
                 label: '往来账',
-                children: <CompanyLedger key={selected} companyId={selected} />,
+                disabled: !can('company_ledger.view'),
+                children: can('company_ledger.view') ? <CompanyLedger key={selected} companyId={selected} /> : null,
               },
               {
                 key: 'profile',
@@ -313,11 +318,11 @@ export default function CompaniesPage() {
                     {!companyDetail && detail.loading && <LoadingBlock />}
                     <ErrorNotice error={detail.error} retry={detail.reload} />
                     {companyDetail && (
-                      <Space orientation="vertical" size={24} style={{ width: '100%' }}>
+                      <Space orientation="vertical" size={24} style={{ width: '100%' }}><Space><ActivitySummary summary={companyDetail.activity_summary} /><OperationHistory resourceType="company" resourceId={companyDetail.id} /></Space>
                         <Descriptions
                           column={{ xs: 1, sm: 2, lg: 3 }}
                           items={companyFields
-                            .filter(([key]) => key !== 'name')
+                            .filter(([key]) => key !== 'name' && (can('sensitive.company_banking') || !['bank_name', 'bank_account'].includes(key)))
                             .map(([key, label]) => ({
                               key,
                               label,
@@ -326,7 +331,7 @@ export default function CompaniesPage() {
                         />
                         <Space wrap>
                           <Button
-                            icon={<EditOutlined />}
+                            disabled={!can('companies.edit')} icon={<EditOutlined />}
                             onClick={() =>
                               setEditor({ kind: 'company', record: companyDetail })
                             }
@@ -334,7 +339,7 @@ export default function CompaniesPage() {
                             编辑公司资料
                           </Button>
                           <Button
-                            icon={<UserAddOutlined />}
+                            disabled={!can('companies.edit')} icon={<UserAddOutlined />}
                             type="primary"
                             onClick={() =>
                               setEditor({
@@ -350,7 +355,7 @@ export default function CompaniesPage() {
                           <Button
                             type="text"
                             danger
-                            icon={<DeleteOutlined />}
+                            disabled={!can('companies.delete')} icon={<DeleteOutlined />}
                             onClick={() =>
                               setDeleting({ kind: 'company', record: companyDetail })
                             }
@@ -380,6 +385,7 @@ export default function CompaniesPage() {
                                 value ? <a href={`mailto:${value}`}>{value}</a> : '—',
                             },
                             { title: '备注', dataIndex: 'notes' },
+                            { title: '记录', render: (_, row) => <OperationHistory resourceType="contact" resourceId={row.id} /> },
                             {
                               title: '操作',
                               key: 'actions',
@@ -388,6 +394,7 @@ export default function CompaniesPage() {
                                   <Button
                                     type="link"
                                     size="small"
+                                    disabled={!can('companies.edit')}
                                     onClick={() =>
                                       setEditor({
                                         kind: 'contact',
@@ -402,6 +409,7 @@ export default function CompaniesPage() {
                                   <Button
                                     type="link"
                                     danger
+                                    disabled={!can('companies.delete')}
                                     size="small"
                                     onClick={() =>
                                       setDeleting({
@@ -472,7 +480,8 @@ function CompanyEditor({
   onClose: () => void
   onSaved: (result: CompanyDetail | RevisionedContact) => void
 }) {
-  const fields = target.kind === 'company' ? companyFields : contactFields
+  const { can } = useAccess()
+  const fields = target.kind === 'company' ? companyFields.filter(([key]) => can('sensitive.company_banking') || !['bank_name', 'bank_account'].includes(key)) : contactFields
   const companyId =
     target.kind === 'contact' ? target.companyId : target.record?.id
   const [pending, setPending] = useState<PendingCreate | null>(() =>
@@ -604,7 +613,7 @@ function CompanyEditor({
         ? await sendPendingCreate(create)
         : await requestJson<CompanyDetail | RevisionedContact>(path, {
             method: 'PUT',
-            body: { ...payload, expected_revision: revision },
+            body: { ...Object.fromEntries(Object.entries(payload).filter(([key]) => can('sensitive.company_banking') || !['bank_name', 'bank_account'].includes(key))), expected_revision: revision },
           })
       if (create) clearPendingCreate(create.companyId)
       if (mounted.current) onSaved(result)
@@ -858,7 +867,8 @@ function CompanyDeleteDialog({
   const companyId =
     target.kind === 'company' ? target.record.id : target.companyId
   const path = `/api/companies/${companyId}${target.kind === 'contact' ? `/contacts/${target.record.id}` : ''}`
-  const fields = target.kind === 'company' ? companyFields : contactFields
+  const { can } = useAccess()
+  const fields = target.kind === 'company' ? companyFields.filter(([key]) => can('sensitive.company_banking') || !['bank_name', 'bank_account'].includes(key)) : contactFields
   async function refreshLatest() {
     setRefreshRequired(true)
     try {

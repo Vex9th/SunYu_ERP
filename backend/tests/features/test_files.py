@@ -18,10 +18,11 @@ from fastapi.testclient import TestClient
 from backend.app.core.config import Settings
 from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
-from backend.app.core.security import SESSION_COOKIE_NAME, create_session_token
+from backend.app.core.security import SESSION_COOKIE_NAME
 from backend.app.core.storage_paths import project_code_identity
 from backend.app.features import business_attachments, files
 from backend.app.features.projects import create_projects_router
+from backend.tests.account_support import owner_session_token
 
 
 def _migrations_dir() -> Path:
@@ -461,7 +462,7 @@ def test_unicode_equivalent_project_cannot_become_second_storage_owner(
     with TestClient(app) as client:
         client.cookies.set(
             SESSION_COOKIE_NAME,
-            create_session_token(settings.session_secret),
+            owner_session_token(database_path, settings.session_secret),
         )
         created = client.post("/api/projects", json=payload)
         duplicate = client.post(

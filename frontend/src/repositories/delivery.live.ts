@@ -127,6 +127,7 @@ async function requestAllPages<T>(path: string): Promise<PagedResult<T>> {
 }
 
 class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
+  constructor(private readonly can: (permission: string) => boolean = () => true) {}
   readonly source = 'live' as const
   private readonly postSender = createRetriablePostSender()
   private readonly multipartPostSender = createRetriableMultipartPostSender()
@@ -188,14 +189,15 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
     const previousAfterSales = hasPreviousData ? [...this.afterSales.values()] : []
     this.activeProjectKey = null
     const project = projectPath(projectCode)
+    const emptyPage = <T>(): PagedResult<T> => ({ items: [], page: 1, page_size: 200, total: 0 })
     const results = await Promise.allSettled([
-      requestJson<DrawingSignoffDto[]>(`${project}/drawing-signoffs`),
-      requestAllPages<CommissioningDto>(`${project}/commissioning-sessions`),
-      requestAllPages<ChangeDto>(`${project}/engineering-changes`),
-      requestAllPages<AcceptanceDto>(`${project}/acceptances`),
-      requestJson<WarrantyDto | null>(`${project}/warranty`),
-      requestAllPages<InvoiceDto>(`${project}/invoices`),
-      requestAllPages<AfterSalesDto>(`${project}/after-sales`),
+      this.can('engineering_changes.view') ? requestJson<DrawingSignoffDto[]>(`${project}/drawing-signoffs`) : Promise.resolve([]),
+      this.can('engineering_changes.view') ? requestAllPages<CommissioningDto>(`${project}/commissioning-sessions`) : Promise.resolve(emptyPage<CommissioningDto>()),
+      this.can('engineering_changes.view') ? requestAllPages<ChangeDto>(`${project}/engineering-changes`) : Promise.resolve(emptyPage<ChangeDto>()),
+      this.can('acceptance.view') ? requestAllPages<AcceptanceDto>(`${project}/acceptances`) : Promise.resolve(emptyPage<AcceptanceDto>()),
+      this.can('warranty.view') ? requestJson<WarrantyDto | null>(`${project}/warranty`) : Promise.resolve(null),
+      this.can('customer_invoices.view') ? requestAllPages<InvoiceDto>(`${project}/invoices`) : Promise.resolve(emptyPage<InvoiceDto>()),
+      this.can('after_sales.view') ? requestAllPages<AfterSalesDto>(`${project}/after-sales`) : Promise.resolve(emptyPage<AfterSalesDto>()),
     ])
     if (results.every((result) => result.status === 'rejected')) {
       const firstFailure = results.find((result) => result.status === 'rejected')
@@ -499,8 +501,8 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
   }
 }
 
-export function createHttpDeliveryRepository(): DeliveryWorkspaceRepository {
-  return new HttpDeliveryRepository()
+export function createHttpDeliveryRepository(can?: (permission: string) => boolean): DeliveryWorkspaceRepository {
+  return new HttpDeliveryRepository(can)
 }
 
 function projectPath(projectCode: string): string {
@@ -530,7 +532,8 @@ function requireCached<T>(items: Map<number, T>, id: number, name: string): T {
 
 function mapSignoff(item: DrawingSignoffDto): DemoDrawingSignoffViewModel {
   return {
-    revision: item.revision,
+    signoff_id: item.id,
+    activity_summary: item.activity_summary, revision: item.revision,
     discipline: item.discipline, status: item.status, confirmed_on: item.confirmed_on,
     not_required_reason: item.not_required_reason, notes: item.notes,
     document_version_ids: item.document_version_ids,
@@ -539,7 +542,7 @@ function mapSignoff(item: DrawingSignoffDto): DemoDrawingSignoffViewModel {
 
 function mapCommissioning(item: CommissioningDto): DemoCommissioningSessionViewModel {
   return {
-    revision: item.revision,
+    activity_summary: item.activity_summary, revision: item.revision,
     session_id: item.id, started_at: item.started_at, ended_at: item.ended_at,
     status: item.status, summary: item.summary, issues: item.issues,
     next_action: item.next_action, notes: item.notes, document_version_ids: item.document_version_ids,
@@ -548,7 +551,7 @@ function mapCommissioning(item: CommissioningDto): DemoCommissioningSessionViewM
 
 function mapChange(item: ChangeDto): DemoEngineeringChangeViewModel {
   return {
-    revision: item.revision,
+    activity_summary: item.activity_summary, revision: item.revision,
     change_id: item.id, source: item.source, title: item.title, description: item.description,
     reason: item.reason, contract_delta_cents: item.contract_delta_cents,
     estimated_cost_delta_cents: item.estimated_cost_delta_cents,
@@ -559,7 +562,7 @@ function mapChange(item: ChangeDto): DemoEngineeringChangeViewModel {
 
 function mapAcceptance(item: AcceptanceDto): DemoAcceptanceViewModel {
   return {
-    revision: item.revision,
+    activity_summary: item.activity_summary, revision: item.revision,
     acceptance_id: item.id, acceptance_type: item.acceptance_type, status: item.status,
     scheduled_on: item.scheduled_on, performed_on: item.performed_on, notes: item.notes,
     document_version_ids: item.document_version_ids,
@@ -570,7 +573,8 @@ function mapAcceptance(item: AcceptanceDto): DemoAcceptanceViewModel {
 
 function mapWarranty(item: WarrantyDto): DemoWarrantyViewModel {
   return {
-    revision: item.revision,
+    warranty_id: item.id,
+    activity_summary: item.activity_summary, revision: item.revision,
     starts_on: item.starts_on, duration_months: item.duration_months,
     renewal_price_cents: item.renewal_price_cents, notes: item.notes,
     ends_on: item.ends_on, days_remaining: item.days_remaining, status: item.status,
@@ -579,7 +583,7 @@ function mapWarranty(item: WarrantyDto): DemoWarrantyViewModel {
 
 function mapInvoice(item: InvoiceDto): DemoInvoiceViewModel {
   return {
-    revision: item.revision,
+    activity_summary: item.activity_summary, revision: item.revision,
     invoice_id: item.id, invoice_type: item.invoice_type, status: item.status,
     requested_on: item.requested_on, recorded_on: item.recorded_on,
     invoice_number: item.invoice_number, amount_cents: item.amount_cents,
@@ -590,7 +594,7 @@ function mapInvoice(item: InvoiceDto): DemoInvoiceViewModel {
 
 function mapAfterSales(item: AfterSalesDto): DemoAfterSalesCaseViewModel {
   return {
-    revision: item.revision,
+    activity_summary: item.activity_summary, revision: item.revision,
     case_id: item.id, reported_on: item.reported_on, service_on: item.service_on,
     reason: item.reason, contact_name: item.contact_name ?? '', contact_phone: item.contact_phone ?? '',
     coverage_type: item.coverage_type, is_under_warranty: item.is_under_warranty,

@@ -17,6 +17,7 @@ import type {
   ProcurementLineDto,
   ProcurementLineInput,
   ProcurementLineUpdateInput,
+  ReopenProcurementLineInput,
   ProcurementListDetailDto,
   ProcurementListInput,
   ProcurementListSummaryDto,
@@ -52,7 +53,7 @@ export interface PurchaseOrderListQuery extends PaginationQuery {
 
 export interface ProcurementOptions {
   lists: Pick<ProcurementListSummaryDto, 'id' | 'name' | 'status' | 'revision'>[]
-  lines: Pick<ProcurementLineDto, 'id' | 'procurement_list_id' | 'name' | 'model' | 'quantity' | 'ordered_quantity' | 'unit' | 'unit_cost_cents'>[]
+  lines: Pick<ProcurementLineDto, 'id' | 'procurement_list_id' | 'name' | 'model' | 'quantity' | 'ordered_quantity' | 'unit' | 'unit_cost_cents' | 'confirmation_status' | 'quoted_total_cents'>[]
 }
 
 export interface ProcurementHttpRepository {
@@ -67,7 +68,11 @@ export interface ProcurementHttpRepository {
   updateProcurementList(projectCode: string, listId: number, input: ProcurementListUpdateInput): Promise<RepositoryResult<ProcurementListDetailDto>>
   createProcurementLine(projectCode: string, listId: number, input: ProcurementLineInput): Promise<RepositoryResult<ProcurementLineDto>>
   updateProcurementLine(projectCode: string, listId: number, lineId: number, input: ProcurementLineUpdateInput): Promise<RepositoryResult<ProcurementLineDto>>
-  deleteProcurementLine(projectCode: string, listId: number, lineId: number): Promise<void>
+  deleteProcurementLine(projectCode: string, listId: number, lineId: number, expectedRevision: number): Promise<void>
+  confirmProcurementLine(projectCode: string, listId: number, lineId: number, input: ConfirmRevisionInput): Promise<RepositoryResult<ProcurementLineDto>>
+  reopenProcurementLine(projectCode: string, listId: number, lineId: number, input: ReopenProcurementLineInput): Promise<RepositoryResult<ProcurementLineDto>>
+  discardConfirmProcurementLine(projectCode: string, listId: number, lineId: number, input: ConfirmRevisionInput): boolean
+  discardReopenProcurementLine(projectCode: string, listId: number, lineId: number, input: ReopenProcurementLineInput): boolean
   confirmProcurementList(projectCode: string, listId: number, input: ConfirmRevisionInput): Promise<RepositoryResult<ProcurementListDetailDto>>
   copyProcurementListAsDraft(projectCode: string, listId: number, input: ConfirmRevisionInput): Promise<RepositoryResult<ProcurementListDetailDto>>
   listPurchaseOrders(projectCode: string, query?: PurchaseOrderListQuery): Promise<RepositoryResult<PagedResult<PurchaseOrderDto>>>
@@ -154,8 +159,24 @@ class HttpProcurementRepository implements ProcurementHttpRepository {
     return live(await requestJson(procurementLinePath(projectCode, listId, lineId), { method: 'PUT', body: input }))
   }
 
-  deleteProcurementLine(projectCode: string, listId: number, lineId: number): Promise<void> {
-    return requestVoid(procurementLinePath(projectCode, listId, lineId), { method: 'DELETE' })
+  deleteProcurementLine(projectCode: string, listId: number, lineId: number, expectedRevision: number): Promise<void> {
+    return requestVoid(withQuery(procurementLinePath(projectCode, listId, lineId), { expected_revision: expectedRevision }), { method: 'DELETE' })
+  }
+
+  async confirmProcurementLine(projectCode: string, listId: number, lineId: number, input: ConfirmRevisionInput): Promise<RepositoryResult<ProcurementLineDto>> {
+    return live(await this.postSender.send(`${procurementLinePath(projectCode, listId, lineId)}/confirm`, input))
+  }
+
+  async reopenProcurementLine(projectCode: string, listId: number, lineId: number, input: ReopenProcurementLineInput): Promise<RepositoryResult<ProcurementLineDto>> {
+    return live(await this.postSender.send(`${procurementLinePath(projectCode, listId, lineId)}/reopen`, input))
+  }
+
+  discardConfirmProcurementLine(projectCode: string, listId: number, lineId: number, input: ConfirmRevisionInput): boolean {
+    return this.postSender.discard(`${procurementLinePath(projectCode, listId, lineId)}/confirm`, input)
+  }
+
+  discardReopenProcurementLine(projectCode: string, listId: number, lineId: number, input: ReopenProcurementLineInput): boolean {
+    return this.postSender.discard(`${procurementLinePath(projectCode, listId, lineId)}/reopen`, input)
   }
 
   async confirmProcurementList(projectCode: string, listId: number, input: ConfirmRevisionInput): Promise<RepositoryResult<ProcurementListDetailDto>> {

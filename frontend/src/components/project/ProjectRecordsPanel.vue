@@ -25,14 +25,14 @@ function statusLabel(status: ProjectDashboardData['project']['status']): string 
         <el-descriptions-item label="项目编号">{{ data.project.project_code }}</el-descriptions-item>
         <el-descriptions-item label="状态"><el-tag :type="data.project.status === 'active' ? 'success' : 'info'">{{ statusLabel(data.project.status) }}</el-tag></el-descriptions-item>
         <el-descriptions-item label="项目名称">{{ data.project.name }}</el-descriptions-item>
-        <el-descriptions-item label="客户">{{ data.company.name }}</el-descriptions-item>
+        <el-descriptions-item label="客户">{{ data.company?.name ?? '无权限' }}</el-descriptions-item>
         <el-descriptions-item label="项目说明" :span="2">{{ data.project.description ?? '未录入' }}</el-descriptions-item>
         <el-descriptions-item label="归档原因">{{ data.project.archive_reason ?? '未归档' }}</el-descriptions-item>
         <el-descriptions-item label="归档时间">{{ data.project.archived_at ?? '未归档' }}</el-descriptions-item>
       </el-descriptions>
     </el-card>
 
-    <el-card class="data-card" shadow="never">
+    <el-card v-if="data.company" class="data-card" shadow="never">
       <template #header><el-text tag="strong">客户开票资料</el-text></template>
       <el-descriptions :column="2" border>
         <el-descriptions-item label="公司名称" :span="2">{{ data.company.name }}</el-descriptions-item>

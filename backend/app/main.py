@@ -17,6 +17,11 @@ from backend.app.core.config import Settings, load_settings
 from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
 from backend.app.features import files
+from backend.app.features.access_policy import (
+    bind_request_connection,
+    protect_application_routes,
+)
+from backend.app.features.accounts import create_accounts_router
 from backend.app.features.auth import create_auth_router
 from backend.app.features.backups import create_backup, prune_backups
 from backend.app.features.commercial import create_commercial_router
@@ -25,6 +30,11 @@ from backend.app.features.dashboards import create_dashboards_router
 from backend.app.features.delivery import create_delivery_router
 from backend.app.features.documents import create_documents_router
 from backend.app.features.inventory import create_inventory_router
+from backend.app.features.operation_history import (
+    SystemActor,
+    bind_backup_actor,
+    create_operation_history_router,
+)
 from backend.app.features.procurement import create_procurement_router
 from backend.app.features.procurement_extensions import (
     create_procurement_extensions_router,
@@ -138,6 +148,7 @@ def create_app(
         ) -> BackupJobResult | None:
             if updates.writes_blocked():
                 return None
+            bind_backup_actor(scheduled_connection, SystemActor(), f'scheduled:{now.isoformat()}')
             with updates.business_write():
                 return run_backup_job(
                     scheduled_connection,
@@ -215,6 +226,7 @@ def create_app(
         connection = connect_database(settings.data_dir / "iapm.sqlite")
         request_failure: BaseException | None = None
         try:
+            bind_request_connection(connection, request)
             yield connection
         except BaseException as failure:
             request_failure = failure
@@ -226,26 +238,35 @@ def create_app(
                 label="database connection close",
             )
 
-    application.include_router(create_auth_router(get_connection, get_session_secret))
-    application.include_router(create_companies_router(get_connection, get_settings))
-    application.include_router(create_projects_router(get_connection, get_settings))
-    application.include_router(create_documents_router(get_connection, get_settings))
-    application.include_router(create_commercial_router(get_connection, get_settings))
-    application.include_router(
+    application.state.business_routes = []
+
+    def include_router(router):
+        protect_application_routes(router)
+        application.state.business_routes.extend(router.routes)
+        application.include_router(router)
+
+    include_router(create_auth_router(get_connection, get_session_secret))
+    include_router(create_accounts_router(get_connection, get_settings))
+    include_router(create_operation_history_router(get_connection, get_settings))
+    include_router(create_companies_router(get_connection, get_settings))
+    include_router(create_projects_router(get_connection, get_settings))
+    include_router(create_documents_router(get_connection, get_settings))
+    include_router(create_commercial_router(get_connection, get_settings))
+    include_router(
         create_project_stages_router(get_connection, get_settings)
     )
-    application.include_router(create_procurement_router(get_connection, get_settings))
-    application.include_router(
+    include_router(create_procurement_router(get_connection, get_settings))
+    include_router(
         create_procurement_extensions_router(get_connection, get_settings)
     )
-    application.include_router(create_inventory_router(get_connection, get_settings))
-    application.include_router(create_workforce_router(get_connection, get_settings))
-    application.include_router(
+    include_router(create_inventory_router(get_connection, get_settings))
+    include_router(create_workforce_router(get_connection, get_settings))
+    include_router(
         create_site_operations_router(get_connection, get_settings)
     )
-    application.include_router(create_delivery_router(get_connection, get_settings))
-    application.include_router(create_dashboards_router(get_connection, get_settings))
-    application.include_router(
+    include_router(create_delivery_router(get_connection, get_settings))
+    include_router(create_dashboards_router(get_connection, get_settings))
+    include_router(
         create_system_router(
             get_connection,
             get_settings,
@@ -256,12 +277,16 @@ def create_app(
         )
     )
 
-    application.include_router(create_updates_router(get_settings, updates))
+    include_router(create_updates_router(get_settings, updates))
 
     @application.get("/api/health")
     def get_health() -> dict[str, object]:
         return {"status": "ok", "version": VERSION, "pid": os.getpid(),
                 "instance_id": updates.instance_id}
+
+    application.state.business_routes.extend(
+        route for route in application.routes if getattr(route, "path", None) == "/api/health"
+    )
 
     if frontend_dist is not None:
         application.mount(

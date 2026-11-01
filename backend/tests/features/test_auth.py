@@ -38,8 +38,8 @@ class AuthHarness:
     session_secret: str
     clock: MutableClock
 
-    def client(self, host: str = "testclient") -> TestClient:
-        return TestClient(self.app, client=(host, 50000))
+    def client(self, host: str = "127.0.0.1") -> TestClient:
+        return TestClient(self.app, base_url="http://127.0.0.1", client=(host, 50000))
 
 
 def _migrations_dir() -> Path:
@@ -102,14 +102,14 @@ def harness(tmp_path: Path) -> AuthHarness:
     return _build_harness(tmp_path)
 
 
-def _seed_password(database_path: Path, password: str = "123456") -> str:
-    password_hash = security.hash_password(password)
+def _seed_password(database_path: Path, password: str = "TestOwner123") -> str:
+    password_hash = security.hash_account_password(password)
     connection = connect_database(database_path)
     try:
         connection.execute(
             """
-            INSERT INTO auth_secret (singleton_id, password_hash, updated_at)
-            VALUES (1, ?, '2026-08-28T00:00:00+00:00')
+            INSERT INTO accounts (id, username, username_key, password_hash, is_owner, created_at, updated_at)
+            VALUES (1, 'owner', 'owner', ?, 1, '2026-08-28T00:00:00+00:00', '2026-08-28T00:00:00+00:00')
             """,
             (password_hash,),
         )
@@ -145,41 +145,34 @@ def test_security_rejects_every_non_ascii_six_digit_password(password: Any) -> N
     "password",
     [
         "",
-        "12345",
-        "1234567",
-        "12345a",
-        " 123456",
-        "123456 ",
-        "１２３４５６",
-        "١٢٣٤٥٦",
-        123456,
+        "short",
+        "x" * 129,
+        12345678,
         True,
         None,
-        ["123456"],
-        {"nested": "123456"},
+        ["secret-value"],
+        {"nested": "secret-value"},
     ],
 )
 def test_setup_returns_422_for_invalid_password_payload(
-    harness: AuthHarness,
-    password: Any,
+    harness: AuthHarness, password: Any
 ) -> None:
     with harness.client() as client:
-        response = client.post("/api/auth/setup", json={"password": password})
-
+        response = client.post(
+            "/api/auth/bootstrap", json={"username": "owner", "password": password}
+        )
     assert response.status_code == 422
+    if isinstance(password, str) and password:
+        assert password not in response.text
 
 
 def test_validation_error_does_not_echo_password(harness: AuthHarness) -> None:
-    submitted_password = "12345a"
-
     with harness.client() as client:
         response = client.post(
-            "/api/auth/setup",
-            json={"password": submitted_password},
+            "/api/auth/bootstrap", json={"username": "owner", "password": "short"}
         )
-
     assert response.status_code == 422
-    assert submitted_password not in response.text
+    assert "short" not in response.text
 
 
 def test_password_hash_is_not_plaintext_and_verifies() -> None:
@@ -192,23 +185,28 @@ def test_password_hash_is_not_plaintext_and_verifies() -> None:
     assert security.verify_password(password_hash, "654321") is False
 
 
-def test_setup_stores_hash_once_and_returns_204(harness: AuthHarness) -> None:
+def test_setup_stores_hash_once_and_returns_owner_session(harness: AuthHarness) -> None:
     with harness.client() as client:
-        first = client.post("/api/auth/setup", json={"password": "123456"})
-        second = client.post("/api/auth/setup", json={"password": "654321"})
-
-    assert first.status_code == 204
-    assert first.content == b""
+        first = client.post(
+            "/api/auth/bootstrap",
+            json={"username": "owner", "password": "TestOwner123"},
+        )
+        second = client.post(
+            "/api/auth/bootstrap",
+            json={"username": "owner2", "password": "OtherOwner123"},
+        )
+    assert first.status_code == 200
+    assert first.json()["user"]["is_owner"] is True
     assert second.status_code == 409
     connection = connect_database(harness.database_path)
     try:
         row = connection.execute(
-            "SELECT singleton_id, password_hash, updated_at FROM auth_secret"
+            "SELECT password_hash, updated_at FROM accounts"
         ).fetchone()
-        assert row["singleton_id"] == 1
-        assert row["password_hash"] != "123456"
-        assert security.verify_password(row["password_hash"], "123456")
-        assert not security.verify_password(row["password_hash"], "654321")
+        assert security.verify_account_password(row["password_hash"], "TestOwner123")
+        assert not security.verify_account_password(
+            row["password_hash"], "OtherOwner123"
+        )
         assert row["updated_at"].endswith("+00:00")
     finally:
         connection.close()
@@ -220,24 +218,24 @@ def test_concurrent_setup_allows_only_one_insert(tmp_path: Path) -> None:
     def setup(password: str) -> int:
         with harness.client() as client:
             return client.post(
-                "/api/auth/setup",
-                json={"password": password},
+                "/api/auth/bootstrap", json={"username": "owner", "password": password}
             ).status_code
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        statuses = sorted(executor.map(setup, ["123456", "654321"]))
-
-    assert statuses == [204, 409]
+        statuses = sorted(executor.map(setup, ["TestOwner123", "OtherOwner123"]))
+    assert statuses == [200, 409]
     connection = connect_database(harness.database_path)
     try:
-        assert connection.execute("SELECT COUNT(*) FROM auth_secret").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 1
     finally:
         connection.close()
 
 
 def test_login_before_setup_returns_409(harness: AuthHarness) -> None:
     with harness.client() as client:
-        response = client.post("/api/auth/login", json={"password": "123456"})
+        response = client.post(
+            "/api/auth/login", json={"username": "owner", "password": "TestOwner123"}
+        )
 
     assert response.status_code == 409
     assert "set-cookie" not in response.headers
@@ -249,12 +247,14 @@ def test_wrong_password_returns_uniform_401_without_cookie(
     password_hash = _seed_password(harness.database_path)
 
     with harness.client() as client:
-        response = client.post("/api/auth/login", json={"password": "654321"})
+        response = client.post(
+            "/api/auth/login", json={"username": "owner", "password": "WrongPass123"}
+        )
 
     assert response.status_code == 401
     assert "set-cookie" not in response.headers
     response_text = response.text
-    assert "654321" not in response_text
+    assert "WrongPass123" not in response_text
     assert password_hash not in response_text
 
 
@@ -262,7 +262,9 @@ def test_correct_login_sets_hardened_lan_cookie(harness: AuthHarness) -> None:
     password_hash = _seed_password(harness.database_path)
 
     with harness.client() as client:
-        response = client.post("/api/auth/login", json={"password": "123456"})
+        response = client.post(
+            "/api/auth/login", json={"username": "owner", "password": "TestOwner123"}
+        )
 
     assert response.status_code == 204
     assert response.content == b""
@@ -273,7 +275,7 @@ def test_correct_login_sets_hardened_lan_cookie(harness: AuthHarness) -> None:
     assert "Path=/" in cookie
     assert f"Max-Age={security.SESSION_MAX_AGE_SECONDS}" in cookie
     assert "Secure" not in cookie
-    assert "123456" not in cookie
+    assert "TestOwner123" not in cookie
     assert password_hash not in cookie
 
 
@@ -282,27 +284,26 @@ def test_session_reports_false_without_cookie(harness: AuthHarness) -> None:
         response = client.get("/api/auth/session")
 
     assert response.status_code == 200
-    assert response.json() == {
-        "authenticated": False,
-        "password_configured": False,
-    }
+    assert response.json()["authenticated"] is False
+    assert response.json()["password_configured"] is False
 
 
 def test_session_reports_true_for_valid_login_cookie(harness: AuthHarness) -> None:
     _seed_password(harness.database_path)
 
     with harness.client() as client:
-        assert client.post(
-            "/api/auth/login",
-            json={"password": "123456"},
-        ).status_code == 204
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "owner", "password": "TestOwner123"},
+            ).status_code
+            == 204
+        )
         response = client.get("/api/auth/session")
 
     assert response.status_code == 200
-    assert response.json() == {
-        "authenticated": True,
-        "password_configured": True,
-    }
+    assert response.json()["authenticated"] is True
+    assert response.json()["password_configured"] is True
 
 
 @pytest.mark.parametrize("mutation", ["append", "replace"])
@@ -310,7 +311,13 @@ def test_session_rejects_tampered_cookie(
     harness: AuthHarness,
     mutation: str,
 ) -> None:
-    token = security.create_session_token(harness.session_secret)
+    _seed_password(harness.database_path)
+    with harness.client() as valid_client:
+        valid_client.post(
+            "/api/auth/login", json={"username": "owner", "password": "TestOwner123"}
+        )
+        assert valid_client.get("/api/auth/session").json()["authenticated"] is True
+        token = valid_client.cookies.get(security.SESSION_COOKIE_NAME)
     if mutation == "append":
         token = f"{token}tampered"
     else:
@@ -320,15 +327,24 @@ def test_session_rejects_tampered_cookie(
         client.cookies.set(security.SESSION_COOKIE_NAME, token)
         response = client.get("/api/auth/session")
 
-    assert response.json() == {
-        "authenticated": False,
-        "password_configured": False,
-    }
+    assert response.json()["authenticated"] is False
+    assert response.json()["password_configured"] is True
 
 
 def test_session_rejects_expired_cookie_without_sleep(harness: AuthHarness) -> None:
-    token = security.create_session_token(
+    _seed_password(harness.database_path)
+    with harness.client() as valid_client:
+        valid_client.post(
+            "/api/auth/login", json={"username": "owner", "password": "TestOwner123"}
+        )
+        identity = security.read_account_session_token(
+            harness.session_secret,
+            valid_client.cookies.get(security.SESSION_COOKIE_NAME),
+        )
+        assert identity is not None
+    token = security.create_account_session_token(
         harness.session_secret,
+        *identity,
         clock=lambda: time.time() - security.SESSION_MAX_AGE_SECONDS - 1,
     )
 
@@ -336,10 +352,8 @@ def test_session_rejects_expired_cookie_without_sleep(harness: AuthHarness) -> N
         client.cookies.set(security.SESSION_COOKIE_NAME, token)
         response = client.get("/api/auth/session")
 
-    assert response.json() == {
-        "authenticated": False,
-        "password_configured": False,
-    }
+    assert response.json()["authenticated"] is False
+    assert response.json()["password_configured"] is True
 
 
 @pytest.mark.parametrize(
@@ -355,6 +369,11 @@ def test_session_rejects_expired_cookie_without_sleep(harness: AuthHarness) -> N
         {"v": 1, "authenticated": True, "extra": "field"},
         [1, True],
         "authenticated",
+        {"v": 2, "uid": True, "sid": "a" * 64},
+        {"v": 2, "uid": 1.0, "sid": "a" * 64},
+        {"v": 2, "uid": 1, "sid": "a" * 63},
+        {"v": 2, "uid": 1, "sid": "z" * 64},
+        {"v": 2, "uid": 1, "sid": "a" * 64, "is_owner": True},
     ],
 )
 def test_session_rejects_signed_but_wrong_payload(
@@ -363,22 +382,23 @@ def test_session_rejects_signed_but_wrong_payload(
 ) -> None:
     serializer = security.create_session_serializer(harness.session_secret)
     token = serializer.dumps(payload)
+    assert security.read_account_session_token(harness.session_secret, token) is None
 
     with harness.client() as client:
         client.cookies.set(security.SESSION_COOKIE_NAME, token)
         response = client.get("/api/auth/session")
 
-    assert response.json() == {
-        "authenticated": False,
-        "password_configured": False,
-    }
+    assert response.json()["authenticated"] is False
+    assert response.json()["password_configured"] is False
 
 
 def test_logout_clears_cookie_and_session(harness: AuthHarness) -> None:
     _seed_password(harness.database_path)
 
     with harness.client() as client:
-        client.post("/api/auth/login", json={"password": "123456"})
+        client.post(
+            "/api/auth/login", json={"username": "owner", "password": "TestOwner123"}
+        )
         response = client.post("/api/auth/logout")
         session = client.get("/api/auth/session")
 
@@ -390,10 +410,8 @@ def test_logout_clears_cookie_and_session(harness: AuthHarness) -> None:
     assert "SameSite=lax" in cookie
     assert "Path=/" in cookie
     assert "Secure" not in cookie
-    assert session.json() == {
-        "authenticated": False,
-        "password_configured": True,
-    }
+    assert session.json()["authenticated"] is False
+    assert session.json()["password_configured"] is True
 
 
 def test_sixth_failed_login_is_rate_limited(harness: AuthHarness) -> None:
@@ -403,7 +421,7 @@ def test_sixth_failed_login_is_rate_limited(harness: AuthHarness) -> None:
         statuses = [
             client.post(
                 "/api/auth/login",
-                json={"password": "654321"},
+                json={"username": "owner", "password": "WrongPass123"},
             ).status_code
             for _ in range(6)
         ]
@@ -416,14 +434,17 @@ def test_rate_limit_window_recovers_without_sleep(harness: AuthHarness) -> None:
 
     with harness.client() as client:
         for _ in range(5):
-            assert client.post(
-                "/api/auth/login",
-                json={"password": "654321"},
-            ).status_code == 401
+            assert (
+                client.post(
+                    "/api/auth/login",
+                    json={"username": "owner", "password": "WrongPass123"},
+                ).status_code
+                == 401
+            )
         harness.clock.advance(301)
         recovered = client.post(
             "/api/auth/login",
-            json={"password": "654321"},
+            json={"username": "owner", "password": "WrongPass123"},
         )
 
     assert recovered.status_code == 401
@@ -434,18 +455,24 @@ def test_successful_login_clears_failure_history(harness: AuthHarness) -> None:
 
     with harness.client() as client:
         for _ in range(4):
-            assert client.post(
+            assert (
+                client.post(
+                    "/api/auth/login",
+                    json={"username": "owner", "password": "WrongPass123"},
+                ).status_code
+                == 401
+            )
+        assert (
+            client.post(
                 "/api/auth/login",
-                json={"password": "654321"},
-            ).status_code == 401
-        assert client.post(
-            "/api/auth/login",
-            json={"password": "123456"},
-        ).status_code == 204
+                json={"username": "owner", "password": "TestOwner123"},
+            ).status_code
+            == 204
+        )
         statuses = [
             client.post(
                 "/api/auth/login",
-                json={"password": "654321"},
+                json={"username": "owner", "password": "WrongPass123"},
             ).status_code
             for _ in range(6)
         ]
@@ -453,24 +480,42 @@ def test_successful_login_clears_failure_history(harness: AuthHarness) -> None:
     assert statuses == [401, 401, 401, 401, 401, 429]
 
 
-def test_rate_limit_is_isolated_by_request_client_host(harness: AuthHarness) -> None:
+def test_rate_limit_ignores_forwarded_host_and_covers_account_across_hosts(
+    harness: AuthHarness,
+) -> None:
     _seed_password(harness.database_path)
 
     with harness.client("192.0.2.1") as first, harness.client("192.0.2.2") as second:
         for _ in range(5):
-            assert first.post(
+            assert (
+                first.post(
+                    "/api/auth/login",
+                    json={"username": "owner", "password": "WrongPass123"},
+                    headers={"X-Forwarded-For": "192.0.2.2"},
+                ).status_code
+                == 401
+            )
+        assert (
+            first.post(
                 "/api/auth/login",
-                json={"password": "654321"},
-                headers={"X-Forwarded-For": "192.0.2.2"},
-            ).status_code == 401
-        assert first.post(
-            "/api/auth/login",
-            json={"password": "654321"},
-        ).status_code == 429
-        assert second.post(
-            "/api/auth/login",
-            json={"password": "654321"},
-        ).status_code == 401
+                json={"username": "owner", "password": "WrongPass123"},
+            ).status_code
+            == 429
+        )
+        assert (
+            second.post(
+                "/api/auth/login",
+                json={"username": "owner", "password": "WrongPass123"},
+            ).status_code
+            == 429
+        )
+        assert (
+            second.post(
+                "/api/auth/login",
+                json={"username": "unknown-other-account", "password": "WrongPass123"},
+            ).status_code
+            == 401
+        )
 
 
 def test_corrupt_hash_fails_fast_instead_of_becoming_wrong_password(
@@ -480,15 +525,17 @@ def test_corrupt_hash_fails_fast_instead_of_becoming_wrong_password(
     try:
         connection.execute(
             """
-            INSERT INTO auth_secret (singleton_id, password_hash, updated_at)
-            VALUES (1, 'not-an-argon2-hash', '2026-08-28T00:00:00+00:00')
+            INSERT INTO accounts (id, username, username_key, password_hash, is_owner, created_at, updated_at)
+            VALUES (1, 'owner', 'owner', 'not-an-argon2-hash', 1, '2026-08-28T00:00:00+00:00', '2026-08-28T00:00:00+00:00')
             """
         )
     finally:
         connection.close()
 
     with harness.client() as client, pytest.raises(InvalidHashError):
-        client.post("/api/auth/login", json={"password": "123456"})
+        client.post(
+            "/api/auth/login", json={"username": "owner", "password": "TestOwner123"}
+        )
 
 
 def test_verifier_failure_releases_attempt_reservation(
@@ -505,12 +552,17 @@ def test_verifier_failure_releases_attempt_reservation(
             raise InvalidHashError("corrupt hash")
         return True
 
-    monkeypatch.setattr(auth, "verify_password", fail_once_then_match)
+    monkeypatch.setattr(auth, "verify_account_password", fail_once_then_match)
 
     with harness.client() as client:
         with pytest.raises(InvalidHashError, match="corrupt hash"):
-            client.post("/api/auth/login", json={"password": "123456"})
-        retry = client.post("/api/auth/login", json={"password": "123456"})
+            client.post(
+                "/api/auth/login",
+                json={"username": "owner", "password": "TestOwner123"},
+            )
+        retry = client.post(
+            "/api/auth/login", json={"username": "owner", "password": "TestOwner123"}
+        )
 
     assert retry.status_code == 204
     assert verification_calls == 2
@@ -535,24 +587,24 @@ def test_concurrent_logins_reserve_only_five_verifier_slots(
                 first_five_entered.set()
         if call_number <= 5 and not release_first_five.wait(timeout=10):
             raise TimeoutError("test did not release verifier")
-        return password == "123456"
+        return password == "TestOwner123"
 
-    monkeypatch.setattr(auth, "verify_password", controlled_verify)
+    monkeypatch.setattr(auth, "verify_account_password", controlled_verify)
 
     def login(password: str) -> int:
         with harness.client("192.0.2.50") as client:
             return client.post(
                 "/api/auth/login",
-                json={"password": password},
+                json={"username": "owner", "password": password},
             ).status_code
 
     with ThreadPoolExecutor(max_workers=16) as executor:
-        first_five = [executor.submit(login, "654321") for _ in range(5)]
+        first_five = [executor.submit(login, "WrongPass123") for _ in range(5)]
         assert first_five_entered.wait(timeout=10)
-        correct_guess = executor.submit(login, "123456")
+        correct_guess = executor.submit(login, "TestOwner123")
         try:
             correct_status = correct_guess.result(timeout=10)
-            later_wrong = [executor.submit(login, "654321") for _ in range(10)]
+            later_wrong = [executor.submit(login, "WrongPass123") for _ in range(10)]
             later_statuses = [future.result(timeout=10) for future in later_wrong]
         finally:
             release_first_five.set()

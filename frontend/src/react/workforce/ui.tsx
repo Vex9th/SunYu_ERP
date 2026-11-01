@@ -1,3 +1,4 @@
+import { useAccess } from '../access/AccessProvider'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   Alert,
@@ -209,6 +210,8 @@ export function AttachmentLinks({
   ids: readonly number[]
   documents?: readonly DocumentVersionOption[]
 }) {
+  const { can } = useAccess()
+  if (!can('documents.download') && ids.length) return <Typography.Text type="secondary">无附件下载权限</Typography.Text>
   if (!ids.length)
     return (
       <span style={{ color: 'var(--ant-color-text-tertiary, #8c8c8c)' }}>

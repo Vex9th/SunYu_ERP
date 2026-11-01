@@ -308,7 +308,7 @@ async function saveProjectEdit(): Promise<void> {
       data.value = {
         ...data.value,
         project: result,
-        company: result.company_id === data.value.company.id
+        company: !data.value.company ? null : result.company_id === data.value.company.id
           ? data.value.company
           : { ...data.value.company, id: result.company_id, name: result.company_name },
       }
@@ -698,7 +698,7 @@ watch(activeTab, (tab, previousTab) => {
       <div class="project-identity">
         <el-text type="info">{{ projectCode }}</el-text>
         <h1>{{ projectPreview?.name ?? data?.project.name ?? projectCode }}</h1>
-        <p>{{ data ? `${data.company.name} · ${projectPreview?.description ?? data.project.description ?? '暂无项目说明'}` : '正在读取项目资料' }}</p>
+        <p>{{ data ? `${data.company?.name ?? data.project.company_name} · ${projectPreview?.description ?? data.project.description ?? '暂无项目说明'}` : '正在读取项目资料' }}</p>
         <el-text v-if="projectPreview?.archive_reason" type="info">完结说明：{{ projectPreview.archive_reason }}</el-text>
       </div>
       <div v-if="data" class="project-actions">
@@ -784,7 +784,7 @@ watch(activeTab, (tab, previousTab) => {
           <ProjectCommercialPanel
             :operating="operating"
             :project-code="data.project.project_code"
-            :customer-company="{ id: data.company.id, name: data.company.name }"
+            :customer-company="{ id: data.project.company_id, name: data.project.company_name }"
             :readonly="readonly"
             @changed="refreshDashboard"
           />
@@ -793,7 +793,7 @@ watch(activeTab, (tab, previousTab) => {
           <template #label><span data-testid="project-nav-procurement">采购</span></template>
           <ProcurementWorkspace
             :project-code="data.project.project_code"
-            :customer-company="{ id: data.company.id, name: data.company.name }"
+            :customer-company="{ id: data.project.company_id, name: data.project.company_name }"
             :readonly="readonly"
             @changed="refreshDashboard"
           />

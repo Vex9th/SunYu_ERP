@@ -11,6 +11,7 @@ from backend.app.core.update_runtime import UpdateRuntime
 from backend.app.features.updates import UpdateManager, atomic_json
 from backend.app.main import create_app
 from backend.app.version import VERSION
+from backend.tests.account_support import authenticate_owner
 
 
 @pytest.fixture
@@ -26,8 +27,7 @@ def setup(tmp_path):
     manager = UpdateManager(tmp_path, enabled=True, spawn=spawn)
     app = create_app(config_path=tmp_path / 'config.json', update_manager=manager)
     with TestClient(app, base_url='http://127.0.0.1:8765', client=('127.0.0.1', 51000)) as client:
-        assert client.post('/api/auth/setup', json={'password': '123456'}).status_code == 204
-        assert client.post('/api/auth/login', json={'password': '123456'}).status_code == 204
+        authenticate_owner(client)
         yield client, manager, calls, tmp_path
 
 
@@ -78,8 +78,7 @@ def test_dev_mode_cannot_spawn_updater(tmp_path):
     manager = UpdateManager(tmp_path, enabled=False)
     app = create_app(config_path=tmp_path / 'config.json', update_manager=manager)
     with TestClient(app) as client:
-        client.post('/api/auth/setup', json={'password': '123456'})
-        client.post('/api/auth/login', json={'password': '123456'})
+        authenticate_owner(client)
         assert client.get('/api/system/updates').json()['supported'] is False
         assert client.post('/api/system/updates/check').status_code == 409
     assert not (tmp_path / '.updates').exists()

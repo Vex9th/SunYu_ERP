@@ -152,9 +152,9 @@ describe('真实 P0 Repository 契约', () => {
     expect(lastRequest(fetchMock)[1].method).toBe('PUT')
 
     fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }))
-    await repository.deleteProcurementLine('SY-001', 7, 11)
+    await repository.deleteProcurementLine('SY-001', 7, 11, 3)
     expect(lastRequest(fetchMock)).toEqual([
-      '/api/projects/SY-001/procurement-lists/7/lines/11',
+      '/api/projects/SY-001/procurement-lists/7/lines/11?expected_revision=3',
       expect.objectContaining({ credentials: 'same-origin', method: 'DELETE' }),
     ])
 

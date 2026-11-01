@@ -1,3 +1,4 @@
+import { render as accessRender } from './access-fixtures'
 import type { ReactNode } from 'react'
 import { ConfigProvider } from 'antd'
 import { MemoryRouter } from 'react-router-dom'
@@ -6,7 +7,6 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import {
   cleanup,
   fireEvent,
-  render as testingRender,
   screen,
   waitFor,
   within,
@@ -21,7 +21,7 @@ import { createHttpDeliveryRepository, type DeliveryWorkspaceRepository } from '
 import { ApiError, createRetriableMultipartPostSender, createRetriablePostSender } from '../../api'
 
 function render(node: ReactNode) {
-  return testingRender(
+  return accessRender(
     <ConfigProvider theme={{ token: { motion: false } }} virtual={false}>
       {node}
     </ConfigProvider>,

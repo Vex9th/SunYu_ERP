@@ -43,6 +43,10 @@ function deferred<T>(): {
 const line = {
   id: 101,
   procurement_list_id: 11,
+  confirmation_status: 'draft' as const,
+  confirmed_at: null,
+  can_reopen: false,
+  edit_block_reason: null,
   sequence_no: 1,
   category: '电气',
   name: '伺服电机',
@@ -81,6 +85,7 @@ function listDetail(projectCode = 'SY-001', status: 'draft' | 'confirmed' = 'dra
     status,
     revision: 3,
     line_count: 1,
+    confirmed_line_count: status === 'confirmed' ? 1 : 0,
     cost_total_cents: 1031200,
     quoted_total_cents: 1271200,
     lines: [{ ...line }],
@@ -192,6 +197,10 @@ function createRepository(options: {
     createProcurementLine: vi.fn(async () => liveResult(detail.lines[0]!)),
     updateProcurementLine: vi.fn(async () => liveResult(detail.lines[0]!)),
     deleteProcurementLine: vi.fn(async () => undefined),
+    confirmProcurementLine: vi.fn(async () => liveResult(detail.lines[0]!)),
+    reopenProcurementLine: vi.fn(async () => liveResult(detail.lines[0]!)),
+    discardConfirmProcurementLine: () => true,
+    discardReopenProcurementLine: () => true,
     confirmProcurementList: vi.fn(async () => liveResult({ ...detail, status: 'confirmed' as const })),
     copyProcurementListAsDraft: vi.fn(async () => liveResult({
       ...detail, id: 12, name: `${detail.name}（修订草稿）`, status: 'draft' as const,
@@ -261,13 +270,13 @@ function createRepository(options: {
       updated_at: '2026-08-31T09:00:00+08:00',
     })),
     createQuoteExport: vi.fn(async (_projectCode, listId, input) => liveResult({
-      id: 1, project_code: projectCode, procurement_list_id: listId, ...input,
+      id: 1, project_code: projectCode, procurement_list_id: listId, line_count: 1, ...input,
       customer_company_name: '客户公司', created_at: '2026-08-31T08:00:00+08:00',
       download_url: `/api/projects/${projectCode}/quote-exports/1/download`,
     })),
     listQuoteExports: vi.fn(async () => liveResult({
       items: [{
-        id: 8, project_code: projectCode, procurement_list_id: detail.id,
+        id: 8, project_code: projectCode, procurement_list_id: detail.id, line_count: 1,
         title: '客户报价单 V2', customer_company_id: 8,
         customer_company_name: '客户公司', notes: null,
         created_at: '2026-08-31T08:00:00+08:00',
@@ -852,7 +861,7 @@ describe('采购工作台真实接口', () => {
 
     resolveDelete()
     await settle()
-    expect(repository.deleteProcurementLine).toHaveBeenCalledWith('SY-001', 11, 101)
+    expect(repository.deleteProcurementLine).toHaveBeenCalledWith('SY-001', 11, 101, line.revision)
     expect(repository.listProcurementLists).toHaveBeenLastCalledWith('SY-001', { page: 1, page_size: 100 })
     expect(wrapper.text()).not.toContain('伺服电机')
   })

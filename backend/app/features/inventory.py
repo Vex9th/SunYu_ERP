@@ -12,6 +12,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Request, status
 
+from backend.app.core.access import Principal, has_permission, project_scope_sql
 from backend.app.core.config import Settings
 from backend.app.core.database import transaction_immediate
 from backend.app.core.storage_paths import normalize_project_code, project_code_identity
@@ -78,15 +79,16 @@ def create_inventory_router(
     def require_session(
         request: Request,
         settings: Settings = settings_dependency,
-    ) -> None:
-        require_authenticated_session(request, settings.session_secret)
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> Principal:
+        return require_authenticated_session(request, settings.session_secret, connection)
 
     authentication_dependency = Depends(require_session)
 
     @router.get("/api/inventory/items")
     def list_inventory_items(
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         page, page_size = _read_pagination(request)
@@ -94,6 +96,8 @@ def create_inventory_router(
         selected_status = _read_single_query(request, "status") or "all"
         if selected_status not in {"all", "in_stock", "out_of_stock"}:
             raise _invalid_payload("Invalid inventory status")
+        if selected_status != "all" and not has_permission(_, "inventory.shared.view"):
+            raise ApiError(403, "Shared inventory permission required", "PERMISSION_DENIED")
         clauses: list[str] = []
         parameters: list[object] = []
         if query is not None:
@@ -123,7 +127,7 @@ def create_inventory_router(
             (*parameters, page_size, (page - 1) * page_size),
         ).fetchall()
         return {
-            "items": [_item_response(row) for row in rows],
+            "items": [_item_response(row, principal=_) for row in rows],
             "total": total,
             "page": page,
             "page_size": page_size,
@@ -133,7 +137,7 @@ def create_inventory_router(
     async def create_inventory_item(
         request: Request,
         idempotency_key: str = Header(alias="Idempotency-Key"),
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         key = _validate_idempotency_key(idempotency_key)
@@ -205,7 +209,7 @@ def create_inventory_router(
             row = _item_row(connection, item_id)
             if row is None:
                 raise sqlite3.DatabaseError("created inventory item is missing")
-            response = _item_response(row)
+            response = _item_response(row, principal=_)
             save_idempotent_response(
                 connection,
                 scope=_INVENTORY_ITEM_CREATE_SCOPE,
@@ -222,15 +226,16 @@ def create_inventory_router(
     @router.get("/api/inventory/items/{item_id}")
     def get_inventory_item(
         item_id: str,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         identifier = _parse_identifier(item_id)
         row = _item_row(connection, identifier)
         if row is None:
             raise _not_found("Inventory item not found")
+        scope, scope_ids = _movement_scope(_)
         movements = connection.execute(
-            """
+            f"""
             SELECT movements.*, projects.project_code,
                    issues.status AS issue_status,
                    issues.revision AS issue_revision,
@@ -246,22 +251,22 @@ def create_inventory_router(
             LEFT JOIN inventory_adjustments AS adjustments
               ON adjustments.id = movements.source_id
              AND movements.source_type = 'inventory_adjustment'
-            WHERE movements.inventory_item_id = ?
+            WHERE movements.inventory_item_id = ? AND ({scope})
             ORDER BY movements.created_at DESC, movements.id DESC
             LIMIT 20
             """,
-            (identifier,),
+            (identifier, *scope_ids),
         ).fetchall()
         return {
-            **_item_response(row),
-            "movements": [_movement_response(row) for row in movements],
+            **_item_response(row, principal=_),
+            "movements": [_movement_response(row, principal=_) for row in movements],
         }
 
     @router.put("/api/inventory/items/{item_id}")
     async def update_inventory_item(
         item_id: str,
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         identifier = _parse_identifier(item_id)
@@ -301,25 +306,26 @@ def create_inventory_router(
             updated = _item_row(connection, identifier)
             if updated is None:
                 raise sqlite3.DatabaseError("updated inventory item is missing")
-            return _item_response(updated)
+            return _item_response(updated, principal=_)
 
     @router.get("/api/inventory/items/{item_id}/movements")
     def list_inventory_movements(
         item_id: str,
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         identifier = _parse_identifier(item_id)
         if _item_row(connection, identifier) is None:
             raise _not_found("Inventory item not found")
         page, page_size = _read_pagination(request)
+        scope, scope_ids = _movement_scope(_)
         total = connection.execute(
-            "SELECT COUNT(*) FROM inventory_movements WHERE inventory_item_id = ?",
-            (identifier,),
+            f"SELECT COUNT(*) FROM inventory_movements movements WHERE inventory_item_id = ? AND ({scope})",
+            (identifier, *scope_ids),
         ).fetchone()[0]
         rows = connection.execute(
-            """
+            f"""
             SELECT movements.*, projects.project_code,
                    issues.status AS issue_status,
                    issues.revision AS issue_revision,
@@ -335,14 +341,14 @@ def create_inventory_router(
             LEFT JOIN inventory_adjustments AS adjustments
               ON adjustments.id = movements.source_id
              AND movements.source_type = 'inventory_adjustment'
-            WHERE movements.inventory_item_id = ?
+            WHERE movements.inventory_item_id = ? AND ({scope})
             ORDER BY movements.created_at DESC, movements.id DESC
             LIMIT ? OFFSET ?
             """,
-            (identifier, page_size, (page - 1) * page_size),
+            (identifier, *scope_ids, page_size, (page - 1) * page_size),
         ).fetchall()
         return {
-            "items": [_movement_response(row) for row in rows],
+            "items": [_movement_response(row, principal=_) for row in rows],
             "total": total,
             "page": page,
             "page_size": page_size,
@@ -352,7 +358,7 @@ def create_inventory_router(
     async def create_inventory_adjustment(
         request: Request,
         idempotency_key: str = Header(alias="Idempotency-Key"),
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         key = _validate_idempotency_key(idempotency_key)
@@ -473,7 +479,7 @@ def create_inventory_router(
         adjustment_id: str,
         request: Request,
         idempotency_key: str = Header(alias="Idempotency-Key"),
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         identifier = _parse_identifier(adjustment_id)
@@ -593,7 +599,7 @@ def create_inventory_router(
         project_code: str,
         request: Request,
         idempotency_key: str = Header(alias="Idempotency-Key"),
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         key = _validate_idempotency_key(idempotency_key)
@@ -691,7 +697,7 @@ def create_inventory_router(
         issue_id: str,
         request: Request,
         idempotency_key: str = Header(alias="Idempotency-Key"),
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         identifier = _parse_identifier(issue_id)
@@ -1269,11 +1275,22 @@ def _adjustment_value_delta(
     return -_round_ratio(current_value * outbound, current_quantity)
 
 
-def _item_response(row: sqlite3.Row) -> dict[str, object]:
+def _movement_scope(principal: Principal) -> tuple[str, tuple[int, ...]]:
+    scope, ids = project_scope_sql(principal, "movements.project_id")
+    if principal.is_owner:
+        return scope, ids
+    if not has_permission(principal, "inventory.view"):
+        scope, ids = "0 = 1", ()
+    if has_permission(principal, "inventory.shared.view"):
+        return f"({scope}) OR movements.project_id IS NULL", ids
+    return scope, ids
+
+
+def _item_response(row: sqlite3.Row, *, principal: Principal | None = None) -> dict[str, object]:
     quantity = int(row["quantity_milli"])
     value = int(row["inventory_value_cents"])
     average = 0 if quantity == 0 else _round_ratio(value * 1000, quantity)
-    return {
+    result = {
         "id": row["id"],
         "brand": row["brand"],
         "name": row["name"],
@@ -1288,11 +1305,14 @@ def _item_response(row: sqlite3.Row) -> dict[str, object]:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+    if not has_permission(principal, "inventory.shared.view"):
+        result.update(quantity=None, average_unit_cost_cents=None, inventory_value_cents=None, shared_balance_visible=False)
+    return result
 
 
-def _movement_response(row: sqlite3.Row) -> dict[str, object]:
+def _movement_response(row: sqlite3.Row, *, principal: Principal | None = None) -> dict[str, object]:
     columns = set(row.keys())
-    return {
+    result = {
         "id": row["id"],
         "inventory_item_id": row["inventory_item_id"],
         "project_id": row["project_id"],
@@ -1321,6 +1341,9 @@ def _movement_response(row: sqlite3.Row) -> dict[str, object]:
             else None
         ),
     }
+    if not has_permission(principal, "inventory.shared.view"):
+        result.update(quantity_after=None, value_after_cents=None, shared_balance_visible=False)
+    return result
 
 
 def _adjustment_response(

@@ -1,3 +1,5 @@
+import { useAccess } from '../access/AccessProvider'
+import { OperationHistory } from '../activity/OperationHistory'
 import { useState, type CSSProperties } from 'react'
 import { Alert, Button, Checkbox, Empty, Input, Segmented, Select, Space, Spin, Table, type TableColumnType } from 'antd'
 import { DownOutlined, RightOutlined } from '@ant-design/icons'
@@ -20,12 +22,14 @@ function amountColumnWidth(values: number[], minimum = 112) {
 }
 
 function Summary({ label, scope, items }: { label: string; scope: string; items: { label: string; value: number; outstanding?: boolean }[] }) {
+  const { can } = useAccess()
+  const permission = (text: string) => label === '供应商汇总' ? text.includes('采购') ? 'sensitive.procurement_prices' : text.includes('开票') ? 'procurement.invoices.view' : 'procurement.payments.view' : text.includes('发票') ? 'customer_invoices.view' : text.includes('到账') || text.includes('未收') ? 'customer_receipts.view' : 'contracts.view'
   return <section className={styles.summary} aria-label={label}
     style={{ '--summary-money-characters': moneyCharacters(items.map(item => item.value)) } as CSSProperties}>
     <p className={styles.note}>{scope}</p>
     <dl>{items.map(item => <div key={item.label}>
       <dt>{item.label}</dt>
-      <dd className={item.outstanding && item.value > 0 ? styles.outstanding : undefined}>{formatMoney(item.value)}</dd>
+      <dd className={item.outstanding && item.value > 0 ? styles.outstanding : undefined}>{can(permission(item.label)) ? formatMoney(item.value) : '无权限'}</dd>
     </div>)}</dl>
   </section>
 }
@@ -46,6 +50,7 @@ function ProjectFilter({ label, projects, value, onChange }: {
 }
 
 function SupplierLedger({ orders }: { orders: SupplierOrder[] }) {
+  const { can } = useAccess()
   const [project, setProject] = useState<number>()
   const [start, setStart] = useState('')
   const [end, setEnd] = useState('')
@@ -62,11 +67,12 @@ function SupplierLedger({ orders }: { orders: SupplierOrder[] }) {
     { title: '项目名称', key: 'project', width: 144, fixed: 'left', className: styles.wrappable, render: (_, row) => <><Link to={projectPath(row.project_code)}>{row.project_name}</Link><div className={styles.note}>{row.project_code}</div></> },
     { title: '采购单号', dataIndex: 'order_no', width: 200, className: styles.wrappable, render: (value: string, row) => <Link to={`${projectPath(row.project_code)}/procurement?section=orders&order=${row.order_id}`}>{value}</Link> },
     { title: '下单日期', dataIndex: 'ordered_on', width: 110 },
-    { title: '采购金额', dataIndex: 'ordered_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.ordered_amount_cents)), render: amount },
-    { title: '已付金额', dataIndex: 'paid_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.paid_amount_cents)), render: amount },
-    { title: '未付金额', dataIndex: 'unpaid_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.unpaid_amount_cents)), render: amount },
-    { title: '已开票', dataIndex: 'invoiced_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.invoiced_amount_cents)), render: amount },
-    { title: '未开票', dataIndex: 'uninvoiced_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.uninvoiced_amount_cents)), render: amount },
+    { title: '采购金额', dataIndex: 'ordered_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.ordered_amount_cents)), render: can('sensitive.procurement_prices') ? amount : () => '无权限' },
+    { title: '已付金额', dataIndex: 'paid_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.paid_amount_cents)), render: can('procurement.payments.view') ? amount : () => '无权限' },
+    { title: '未付金额', dataIndex: 'unpaid_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.unpaid_amount_cents)), render: can('procurement.payments.view') ? amount : () => '无权限' },
+    { title: '已开票', dataIndex: 'invoiced_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.invoiced_amount_cents)), render: can('procurement.invoices.view') ? amount : () => '无权限' },
+    { title: '未开票', dataIndex: 'uninvoiced_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.uninvoiced_amount_cents)), render: can('procurement.invoices.view') ? amount : () => '无权限' },
+    { title: '操作记录', key: 'history', width: 130, render: (_, row) => <OperationHistory resourceType="purchase_order" resourceId={row.order_id} /> },
   ]
   function clearFilters() { setProject(undefined); setStart(''); setEnd(''); setUnpaid(false); setUninvoiced(false); setPage(1) }
   return <div className={styles.ledger}>
@@ -101,13 +107,15 @@ function SupplierLedger({ orders }: { orders: SupplierOrder[] }) {
 }
 
 function ContractTable({ project }: { project: CustomerProject }) {
+  const { can } = useAccess()
   const columns: LedgerColumn<CustomerContract>[] = [
     { title: '合同编号 / 名称', key: 'contract', width: 214, className: styles.wrappable, render: (_, contract) => <><Link to={`${projectPath(project.project_code)}/commercial?section=contracts`}>{contract.contract_no}</Link><div className={styles.note}>{contract.title}</div></> },
     { title: '签订日期', dataIndex: 'signed_on', width: 110, render: (value: string | null) => value || '未填写' },
     { title: '状态', dataIndex: 'status', width: 90, render: (value: CustomerContract['status']) => ({ signed: '已签署', completed: '已完成', terminated: '已终止' })[value] },
-    { title: '原合同分摊', dataIndex: 'allocated_amount_cents', align: 'right', width: amountColumnWidth(project.contracts.map(row => row.allocated_amount_cents)), render: amount },
-    { title: '已收金额', dataIndex: 'received_amount_cents', align: 'right', width: amountColumnWidth(project.contracts.map(row => row.received_amount_cents)), render: amount },
-    { title: '未收金额', dataIndex: 'unreceived_amount_cents', align: 'right', width: amountColumnWidth(project.contracts.map(row => row.unreceived_amount_cents)), render: amount },
+    { title: '原合同分摊', dataIndex: 'allocated_amount_cents', align: 'right', width: amountColumnWidth(project.contracts.map(row => row.allocated_amount_cents)), render: can('contracts.view') ? amount : () => '无权限' },
+    { title: '已收金额', dataIndex: 'received_amount_cents', align: 'right', width: amountColumnWidth(project.contracts.map(row => row.received_amount_cents)), render: can('customer_receipts.view') ? amount : () => '无权限' },
+    { title: '未收金额', dataIndex: 'unreceived_amount_cents', align: 'right', width: amountColumnWidth(project.contracts.map(row => row.unreceived_amount_cents)), render: can('customer_receipts.view') ? amount : () => '无权限' },
+    { title: '操作记录', key: 'history', width: 130, render: (_, row) => <OperationHistory resourceType="contract" resourceId={row.contract_id} /> },
   ]
   return <div className={styles.contractTable}>
     <Table<CustomerContract> rowKey="allocation_id" size="small" tableLayout="fixed" dataSource={project.contracts} pagination={false} scroll={{ x: tableWidth(columns) }} columns={columns} />
@@ -115,6 +123,7 @@ function ContractTable({ project }: { project: CustomerProject }) {
 }
 
 function CustomerLedger({ projects }: { projects: CustomerProject[] }) {
+  const { can } = useAccess()
   const [project, setProject] = useState<number>()
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(10)
@@ -123,11 +132,11 @@ function CustomerLedger({ projects }: { projects: CustomerProject[] }) {
   const expandColumnWidth = 36
   const columns: LedgerColumn<CustomerProject>[] = [
     { title: '项目名称', key: 'project', width: 144, fixed: 'left', className: styles.wrappable, render: (_, row) => <><Link to={projectPath(row.project_code)}>{row.project_name}</Link><div className={styles.note}>{row.project_code} · {row.contracts.length} 份合同</div></> },
-    { title: '有效合同分摊', dataIndex: 'contracted_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.contracted_amount_cents), 125), render: amount },
-    { title: '累计合同到账', dataIndex: 'allocated_received_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.allocated_received_amount_cents), 125), render: amount },
-    { title: '合同未收', dataIndex: 'unreceived_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.unreceived_amount_cents)), render: amount },
-    { title: '未关联合同到账', dataIndex: 'unallocated_received_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.unallocated_received_amount_cents), 135), render: amount },
-    { title: '项目销项发票', dataIndex: 'invoiced_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.invoiced_amount_cents), 125), render: amount },
+    { title: '有效合同分摊', dataIndex: 'contracted_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.contracted_amount_cents), 125), render: can('contracts.view') ? amount : () => '无权限' },
+    { title: '累计合同到账', dataIndex: 'allocated_received_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.allocated_received_amount_cents), 125), render: can('customer_receipts.view') ? amount : () => '无权限' },
+    { title: '合同未收', dataIndex: 'unreceived_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.unreceived_amount_cents)), render: can('customer_receipts.view') ? amount : () => '无权限' },
+    { title: '未关联合同到账', dataIndex: 'unallocated_received_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.unallocated_received_amount_cents), 135), render: can('customer_receipts.view') ? amount : () => '无权限' },
+    { title: '项目销项发票', dataIndex: 'invoiced_amount_cents', align: 'right', width: amountColumnWidth(filtered.map(row => row.invoiced_amount_cents), 125), render: can('customer_invoices.view') ? amount : () => '无权限' },
     { title: '业务记录', key: 'actions', width: 165, render: (_, row) => <Space><Link to={`${projectPath(row.project_code)}/commercial?section=contracts`}>查看合同</Link><Link to={`${projectPath(row.project_code)}/delivery?section=invoices`}>查看发票</Link></Space> },
   ]
   return <div className={styles.ledger}>

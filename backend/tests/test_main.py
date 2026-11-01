@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from backend.app import main as main_module
 from backend.app.core.database import connect_database
 from backend.app.version import VERSION
+from backend.tests.account_support import OWNER_PASSWORD, authenticate_owner
 
 PROJECT_MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
 
@@ -33,8 +34,7 @@ def _write_config(config_path: Path, **overrides: object) -> None:
 
 
 def _login(client: TestClient) -> None:
-    assert client.post("/api/auth/setup", json={"password": "123456"}).status_code == 204
-    assert client.post("/api/auth/login", json={"password": "123456"}).status_code == 204
+    authenticate_owner(client)
 
 
 def _write_frontend_dist(frontend_dist: Path) -> None:
@@ -299,10 +299,7 @@ def test_release_app_restart_preserves_config_database_and_login(
         frontend_dist=frontend_dist,
     )
     with TestClient(first_application) as client:
-        assert client.post(
-            "/api/auth/setup",
-            json={"password": "654321"},
-        ).status_code == 204
+        authenticate_owner(client)
 
     first_config = config_path.read_text(encoding="utf-8")
     database_path = config_path.parent / "Data" / "iapm.sqlite"
@@ -316,7 +313,7 @@ def test_release_app_restart_preserves_config_database_and_login(
     with TestClient(second_application) as client:
         assert client.post(
             "/api/auth/login",
-            json={"password": "654321"},
+            json={"username": "owner", "password": OWNER_PASSWORD},
         ).status_code == 204
         assert client.get("/").status_code == 200
 
@@ -408,6 +405,9 @@ def test_lifespan_applies_migrations_and_closes_every_owned_connection(
         "023_purchase_order_tax",
         "024_purchase_order_gross_price",
         "025_project_categories",
+        "026_accounts_access",
+        "027_procurement_line_confirmation",
+        "028_operation_history",
     }
 
 
@@ -418,35 +418,47 @@ def test_authentication_flow_guards_system_routes_and_reports_setup_state(
     _write_config(config_path)
     application = main_module.create_app(config_path=config_path)
 
-    with TestClient(application) as client:
+    with TestClient(application, base_url="http://127.0.0.1", client=("127.0.0.1", 50000)) as client:
         before_setup = client.get("/api/auth/session")
         unauthenticated = client.get("/api/system/overview")
-        setup = client.post("/api/auth/setup", json={"password": "123456"})
+        bootstrap = client.post(
+            "/api/auth/bootstrap", json={"username": "owner", "password": OWNER_PASSWORD}
+        )
         after_setup = client.get("/api/auth/session")
-        login = client.post("/api/auth/login", json={"password": "123456"})
+        client.post("/api/auth/logout")
+        login = client.post(
+            "/api/auth/login", json={"username": "owner", "password": OWNER_PASSWORD}
+        )
         authenticated = client.get("/api/auth/session")
         overview = client.get("/api/system/overview")
         logout = client.post("/api/auth/logout")
         after_logout = client.get("/api/system/overview")
+        logged_out = client.get("/api/auth/session")
 
-    assert before_setup.json() == {
+    empty = {
         "authenticated": False,
         "password_configured": False,
+        "bootstrap_required": True,
+        "user": None,
+        "access_revision": 0,
+        "permissions": [],
+        "project_ids": [],
     }
+    assert before_setup.json() == empty
     assert unauthenticated.status_code == 401
-    assert setup.status_code == 204
-    assert after_setup.json() == {
-        "authenticated": False,
-        "password_configured": True,
-    }
+    assert bootstrap.status_code == 200
+    assert after_setup.json() == authenticated.json()
+    state = authenticated.json()
+    assert state["authenticated"] and state["password_configured"]
+    assert not state["bootstrap_required"]
+    assert state["user"]["username"] == "owner" and state["user"]["is_owner"]
+    assert state["project_ids"] is None and state["access_revision"] > 0
+    assert "projects.view" in state["permissions"]
     assert login.status_code == 204
-    assert authenticated.json() == {
-        "authenticated": True,
-        "password_configured": True,
-    }
     assert overview.status_code == 200
     assert logout.status_code == 204
     assert after_logout.status_code == 401
+    assert logged_out.json() == {**empty, "password_configured": True, "bootstrap_required": False}
 
 
 def test_create_app_mounts_authenticated_companies_router(tmp_path: Path) -> None:

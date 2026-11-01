@@ -11,6 +11,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
+from backend.app.core.access import Principal, has_permission
 from backend.app.core.config import Settings
 from backend.app.core.database import transaction, transaction_immediate
 from backend.app.features.api_common import (
@@ -82,14 +83,15 @@ def create_companies_router(
     def require_session(
         request: Request,
         settings: Settings = settings_dependency,
-    ) -> None:
-        require_authenticated_session(request, settings.session_secret)
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> Principal:
+        return require_authenticated_session(request, settings.session_secret, connection)
 
     authentication_dependency = Depends(require_session)
 
     @router.get("")
     def list_companies(
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> list[dict[str, object]]:
         try:
@@ -124,10 +126,14 @@ def create_companies_router(
     @router.post("", status_code=status.HTTP_201_CREATED)
     def create_company(
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         payload: NormalizedPayload = company_payload_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
+        if not has_permission(_, "sensitive.company_banking") and any(
+            payload.get(field) is not None for field in ("bank_name", "bank_account")
+        ):
+            raise HTTPException(403, "Company banking permission required")
         key = _read_optional_idempotency_key(request)
         request_hash = _request_hash(payload)
         scope = idempotency_scope(request)
@@ -182,7 +188,7 @@ def create_companies_router(
 
     @router.get("/{company_id}")
     def get_company(
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         company_id: int = company_id_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
@@ -196,7 +202,7 @@ def create_companies_router(
 
     @router.get("/{company_id}/ledger")
     def get_company_ledger(
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         company_id: int = company_id_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
@@ -204,17 +210,21 @@ def create_companies_router(
             with transaction(connection):
                 if _company_revision_row(connection, company_id) is None:
                     raise _company_not_found()
-                return company_ledger(connection, company_id)
+                return company_ledger(connection, company_id, principal=_)
         except sqlite3.Error as exc:
             raise _unexpected_database_failure("Company", exc) from None
 
     @router.put("/{company_id}")
     def replace_company(
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         company_id: int = company_id_dependency,
         payload: NormalizedUpdatePayload = company_update_payload_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
+        if not has_permission(_, "sensitive.company_banking") and (
+            {"bank_name", "bank_account"} & payload.keys()
+        ):
+            raise HTTPException(403, "Company banking permission required")
         timestamp = _timestamp(now)
         try:
             with transaction_immediate(connection):
@@ -223,6 +233,11 @@ def create_companies_router(
                     raise _company_not_found()
                 expected_revision = int(payload["expected_revision"])
                 _require_revision(current, expected_revision)
+                payload = {
+                    "bank_name": current["bank_name"],
+                    "bank_account": current["bank_account"],
+                    **payload,
+                }
                 cursor = connection.execute(
                     """
                     UPDATE companies
@@ -254,7 +269,7 @@ def create_companies_router(
 
     @router.delete("/{company_id}", status_code=status.HTTP_204_NO_CONTENT)
     def delete_company(
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         company_id: int = company_id_dependency,
         expected_revision: int = revision_payload_dependency,
         connection: sqlite3.Connection = connection_dependency,
@@ -296,7 +311,7 @@ def create_companies_router(
     )
     def create_contact(
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         company_id: int = company_id_dependency,
         payload: NormalizedPayload = contact_payload_dependency,
         connection: sqlite3.Connection = connection_dependency,
@@ -356,7 +371,7 @@ def create_companies_router(
 
     @router.put("/{company_id}/contacts/{contact_id}")
     def replace_contact(
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         company_id: int = company_id_dependency,
         contact_id: int = contact_id_dependency,
         payload: NormalizedUpdatePayload = contact_update_payload_dependency,
@@ -401,7 +416,7 @@ def create_companies_router(
         status_code=status.HTTP_204_NO_CONTENT,
     )
     def delete_contact(
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         company_id: int = company_id_dependency,
         contact_id: int = contact_id_dependency,
         expected_revision: int = revision_payload_dependency,
@@ -451,6 +466,7 @@ async def _read_company_update_payload(request: Request) -> NormalizedUpdatePayl
     return await _read_update_payload(
         request,
         fields=_COMPANY_FIELDS,
+        optional_fields=("bank_name", "bank_account"),
         detail="Invalid company payload",
     )
 
@@ -468,6 +484,7 @@ async def _read_update_payload(
     *,
     fields: tuple[str, ...],
     detail: str,
+    optional_fields: tuple[str, ...] = (),
 ) -> NormalizedUpdatePayload:
     try:
         payload: Any = await request.json()
@@ -477,9 +494,14 @@ async def _read_update_payload(
         raise _invalid_payload(detail)
     if set(payload) == set(fields):
         raise _invalid_structured_payload(detail)
-    if set(payload) != {*fields, "expected_revision"}:
+    if (
+        set(payload) - {*fields, "expected_revision"}
+        or ((set(fields) - set(optional_fields)) | {"expected_revision"}) - set(payload)
+    ):
         raise _invalid_payload(detail)
-    normalized = _normalize_payload(payload, fields=fields, detail=detail)
+    normalized = _normalize_payload(
+        payload, fields=tuple(field for field in fields if field in payload), detail=detail
+    )
     return {
         **normalized,
         "expected_revision": _positive_integer(payload["expected_revision"], detail),
@@ -648,7 +670,7 @@ def _company_revision_row(
     company_id: int,
 ) -> sqlite3.Row | None:
     return connection.execute(
-        "SELECT revision FROM companies WHERE id = ?",
+        "SELECT revision, bank_name, bank_account FROM companies WHERE id = ?",
         (company_id,),
     ).fetchone()
 

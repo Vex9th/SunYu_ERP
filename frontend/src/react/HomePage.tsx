@@ -1,3 +1,4 @@
+import { useAccess } from './access/AccessProvider'
 import { RouterButton } from './RouterButton'
 import { Alert, Button, Empty, Input, Segmented, Space, Tag } from 'antd'
 import {
@@ -27,6 +28,8 @@ import { todoDestination } from './workflowLinks'
 import styles from './Workspace.module.css'
 
 export default function HomePage() {
+  const { can, user } = useAccess()
+  const money = (value: number | null | undefined, permission: string) => can(permission) ? formatMoney(value ?? null) : '无权限'
   const dashboard = useLoad(
     () => requestJson<GlobalDashboard>('/api/dashboard'),
     [],
@@ -60,7 +63,7 @@ export default function HomePage() {
               onClick={dashboard.reload}
               loading={dashboard.loading}
             />
-            <RouterButton to="/projects?create=1" type="primary" icon={<PlusOutlined />}>
+            <RouterButton disabled={!can('projects.create')} to="/projects?create=1" type="primary" icon={<PlusOutlined />}>
               新建项目
             </RouterButton>
           </>
@@ -70,7 +73,7 @@ export default function HomePage() {
       {!data && dashboard.loading && <LoadingBlock />}
       {data && (
         <>
-          {!data.backup.healthy && (
+          {user?.is_owner && !data.backup.healthy && (
             <Alert
               type="warning"
               showIcon
@@ -88,17 +91,17 @@ export default function HomePage() {
             />
             <DataValue
               label="合同金额"
-              value={formatMoney(data.summary.contracted_amount_cents)}
+              value={money(data.summary.contracted_amount_cents, 'contracts.view')}
               note="已分配到项目的合同金额"
             />
             <DataValue
               label="已收款"
-              value={formatMoney(data.summary.received_amount_cents)}
+              value={money(data.summary.received_amount_cents, 'customer_receipts.view')}
               note="实际到账"
             />
             <DataValue
               label="待收款"
-              value={formatMoney(data.summary.outstanding_receivable_cents)}
+              value={money(data.summary.outstanding_receivable_cents, 'customer_receipts.view')}
               note={`${data.summary.overdue_receivable_count} 个节点逾期`}
             />
           </div>
@@ -188,10 +191,10 @@ export default function HomePage() {
                       <div className={styles.rowFact}>
                         <span>待收 / 合同金额</span>
                         <Link to={`${base}/commercial?section=receivables`}>
-                          {formatMoney(row.outstanding_receivable_cents)}
+                          {money(row.outstanding_receivable_cents, 'customer_receipts.view')}
                         </Link>
                         <small>
-                          合同 {formatMoney(row.contracted_amount_cents)}
+                          合同 {money(row.contracted_amount_cents, 'contracts.view')}
                         </small>
                       </div>
                       <div className={styles.rowFact}>
@@ -200,7 +203,7 @@ export default function HomePage() {
                           {formatChineseDate(row.final_delivery_on)}
                         </strong>
                         <small>
-                          利润 {formatMoney(row.actual_profit_cents)}
+                          利润 {money(row.actual_profit_cents, 'sensitive.profit_summary')}
                         </small>
                       </div>
                       <RouterButton className={styles.rowEnter} to={base} icon={<ArrowRightOutlined />} aria-label={`进入${row.project.name}`} />
@@ -226,7 +229,7 @@ export default function HomePage() {
                     清除筛选
                   </Button>
                 ) : (
-                  <RouterButton to="/projects?create=1" type="primary">新建项目</RouterButton>
+                  <RouterButton disabled={!can('projects.create')} to="/projects?create=1" type="primary">新建项目</RouterButton>
                 )}
               </Empty>
             )}

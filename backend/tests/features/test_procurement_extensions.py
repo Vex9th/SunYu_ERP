@@ -20,10 +20,11 @@ from starlette.datastructures import UploadFile
 from backend.app.core.config import Settings
 from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
-from backend.app.core.security import SESSION_COOKIE_NAME, create_session_token
+from backend.app.core.security import SESSION_COOKIE_NAME
 from backend.app.core.storage_paths import project_code_identity
 from backend.app.features import files, procurement, procurement_extensions
 from backend.app.features.api_common import ApiError
+from backend.tests.features.test_procurement import _owner_session
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 NOW = datetime(2026, 8, 31, 2, 0, tzinfo=timezone.utc)
@@ -52,7 +53,7 @@ class Harness:
         ) as client:
             client.cookies.set(
                 SESSION_COOKIE_NAME,
-                create_session_token(self.settings.session_secret),
+                _owner_session(self.database_path, self.settings.session_secret),
             )
             yield client
 
@@ -1271,6 +1272,10 @@ def test_supplier_invoice_active_number_uniqueness_migrates_existing_history(
             (PROJECT_ROOT / "backend" / "migrations" / "023_purchase_order_tax.sql")
             .read_text(encoding="utf-8")
         )
+    with harness.connection() as connection:
+        # 仅升级当前 API 所需的独立结构，保留 022 发票约束待测。
+        for name in ("024_purchase_order_gross_price.sql", "026_accounts_access.sql", "027_procurement_line_confirmation.sql", "028_operation_history.sql"):
+            connection.executescript((PROJECT_ROOT / "backend/migrations" / name).read_text(encoding="utf-8"))
     invoice_payload: dict[str, object]
     with harness.client() as client:
         order = _create_confirmed_order(client, harness)

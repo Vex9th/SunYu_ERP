@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import quote
-from uuid import UUID
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Request, status
@@ -25,10 +25,16 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.formparsers import MultiPartException
 from starlette.types import Message, Receive
 
+from backend.app.core.access import require_permission
 from backend.app.core.config import Settings
 from backend.app.core.database import transaction_immediate
 from backend.app.core.storage_paths import normalize_project_code, project_code_identity
 from backend.app.features import files
+from backend.app.features.access_policy import (
+    DOCUMENT_PERMISSIONS,
+    authorize_document,
+    can_read_document,
+)
 from backend.app.features.api_common import (
     ApiError,
     ApiErrorRoute,
@@ -38,6 +44,7 @@ from backend.app.features.api_common import (
 )
 from backend.app.features.auth import require_authenticated_session
 from backend.app.features.business_attachments import document_managed_filename
+from backend.app.features.operation_history import append_operation_event
 
 logger = logging.getLogger(__name__)
 
@@ -176,8 +183,9 @@ def create_documents_router(
     def require_session(
         request: Request,
         settings: Settings = settings_dependency,
+        connection: sqlite3.Connection = connection_dependency,
     ) -> None:
-        require_authenticated_session(request, settings.session_secret)
+        connection.principal = require_authenticated_session(request, settings.session_secret, connection)
 
     authentication_dependency = Depends(require_session)
 
@@ -196,6 +204,9 @@ def create_documents_router(
         page, page_size = _read_pagination(request)
         clauses = ["documents.project_code = ? COLLATE NOCASE"]
         parameters: list[object] = [project["project_code"]]
+        visibility, visibility_parameters = _document_visibility_filter(connection, str(project["project_code"]))
+        clauses.append(visibility)
+        parameters.extend(visibility_parameters)
         if category is not None:
             clauses.append("documents.category = ?")
             parameters.append(category)
@@ -260,8 +271,9 @@ def create_documents_router(
         connection: sqlite3.Connection = connection_dependency,
     ) -> list[dict[str, object]]:
         project = _require_project(connection, project_code)
+        visibility, parameters = _document_visibility_filter(connection, str(project["project_code"]))
         rows = connection.execute(
-            """
+            f"""
             SELECT
                 document_versions.id,
                 document_versions.version_number,
@@ -273,13 +285,14 @@ def create_documents_router(
             JOIN documents ON documents.id = document_versions.document_id
             WHERE documents.project_code = ? COLLATE NOCASE
                 AND documents.archived_at IS NULL
+                AND {visibility}
             ORDER BY
                 documents.created_at DESC,
                 documents.id DESC,
                 document_versions.version_number DESC,
                 document_versions.id DESC
             """,
-            (project["project_code"],),
+            (project["project_code"], *parameters),
         ).fetchall()
         return [
             {
@@ -331,6 +344,7 @@ def create_documents_router(
                 try:
                     with transaction_immediate(connection):
                         project = _require_project(connection, project_code)
+                        _authorize_document_category(connection, category)
                         scope = _document_scope(
                             request,
                             str(project["project_code"]),
@@ -444,6 +458,8 @@ def create_documents_router(
                     files.discard_staged_version(prepared)
                 _discard_staged_upload(staged)
         try:
+            _require_project(connection, project_code)
+            _authorize_document_category(connection, category)
             return await run_in_threadpool(process_upload)
         finally:
             await upload.close()
@@ -692,6 +708,7 @@ def create_documents_router(
         project_code: str,
         document_id: str,
         version_id: str,
+        request: Request,
         _: None = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
         settings: Settings = settings_dependency,
@@ -720,6 +737,11 @@ def create_documents_router(
             raise _not_found("Document version not found", "DOCUMENT_VERSION_NOT_FOUND")
         return _document_download_response(
             settings,
+            connection=connection,
+            request=request,
+            version_id=version_identifier,
+            project_id=int(project["id"]),
+            timestamp=_timestamp(now),
             project_code=str(project["project_code"]),
             row=row,
         )
@@ -728,6 +750,7 @@ def create_documents_router(
     def download_document_version_by_id(
         project_code: str,
         version_id: str,
+        request: Request,
         _: None = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
         settings: Settings = settings_dependency,
@@ -754,6 +777,11 @@ def create_documents_router(
             raise _not_found("Document version not found", "DOCUMENT_VERSION_NOT_FOUND")
         return _document_download_response(
             settings,
+            connection=connection,
+            request=request,
+            version_id=version_identifier,
+            project_id=int(project["id"]),
+            timestamp=_timestamp(now),
             project_code=str(project["project_code"]),
             row=row,
         )
@@ -1258,6 +1286,7 @@ def _require_project(
     ).fetchone()
     if row is None:
         raise _not_found("Project not found", "PROJECT_NOT_FOUND")
+    require_permission(connection.principal, "documents.view", project_id=int(row["id"]))
     return row
 
 
@@ -1294,7 +1323,35 @@ def _require_document_record(
     ).fetchone()
     if row is None:
         raise _not_found("Document not found", "DOCUMENT_NOT_FOUND")
+    authorize_document(connection, connection.principal, document_id)
     return row
+
+
+def _authorize_document_category(connection: sqlite3.Connection, category: str) -> None:
+    require_permission(connection.principal, "documents.view")
+    for permission in DOCUMENT_PERMISSIONS.get(category, ()):
+        require_permission(connection.principal, permission)
+
+
+def _document_visibility_filter(
+    connection: sqlite3.Connection, project_code: str,
+) -> tuple[str, list[object]]:
+    principal = connection.principal
+    require_permission(principal, "documents.view")
+    if principal.is_owner:
+        return "1 = 1", []
+    categories = sorted(category for category in _CATEGORIES
+        if category in {"invoice", "quotation"}
+        or all(permission in principal.permissions for permission in DOCUMENT_PERMISSIONS.get(category, ())))
+    candidates = connection.execute(
+        "SELECT id FROM documents WHERE project_code = ? COLLATE NOCASE "
+        "AND category IN (SELECT value FROM json_each(?))",
+        (project_code, json.dumps(categories)),
+    ).fetchall()
+    # 原件可能被多个项目或业务模块引用，统一授权后再参与分页、搜索和候选查询。
+    identifiers = [int(row["id"]) for row in candidates
+        if can_read_document(connection, principal, int(row["id"]))]
+    return "documents.id IN (SELECT value FROM json_each(?))", [json.dumps(identifiers)]
 
 
 def _require_document_detail(
@@ -1421,6 +1478,9 @@ def _document_search_rows(
 ) -> list[sqlite3.Row]:
     clauses = ["documents.project_code = ? COLLATE NOCASE"]
     parameters: list[object] = [project_code]
+    visibility, visibility_parameters = _document_visibility_filter(connection, project_code)
+    clauses.append(visibility)
+    parameters.extend(visibility_parameters)
     if category is not None:
         clauses.append("documents.category = ?")
         parameters.append(category)
@@ -1645,9 +1705,16 @@ def _open_download_file(
 def _document_download_response(
     settings: Settings,
     *,
+    connection: sqlite3.Connection,
+    request: Request,
+    version_id: int,
+    project_id: int,
+    timestamp: str,
     project_code: str,
     row: sqlite3.Row,
 ) -> StreamingResponse:
+    authorize_document(connection, connection.principal, int(row["document_id"]))
+    require_permission(connection.principal, "documents.download", project_id=project_id)
     file_handle = _open_download_file(
         settings.data_dir,
         project_code,
@@ -1656,6 +1723,21 @@ def _document_download_response(
         str(row["stored_relative_path"]),
         int(row["size_bytes"]),
     )
+    try:
+        with transaction_immediate(connection):
+            # 写入前重新验证当前身份；记录请求发送原件，不声称客户端已接收完成。
+            authorize_document(connection, connection.principal, int(row["document_id"]))
+            require_permission(connection.principal, "documents.download", project_id=project_id)
+            append_operation_event(
+                connection, principal=connection.principal,
+                request_id=getattr(request.state, "operation_request_id", None) or uuid4().hex,
+                action="documents.download", resource_type="document_version", resource_id=version_id,
+                project_ids=(project_id,), summary="请求下载文件", reason=None,
+                changes={}, occurred_at=timestamp,
+            )
+    except BaseException:
+        file_handle.close()
+        raise
     return StreamingResponse(
         _stream_file(file_handle),
         media_type=str(row["content_type"]),

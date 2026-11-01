@@ -1,3 +1,4 @@
+import type { ActivityTracked } from '../types'
 import { ApiError, createRetriablePostSender, requestJson, withQuery } from '../api'
 import type { PagedResult } from '../domain/contracts'
 import type {
@@ -214,7 +215,7 @@ interface SiteDailyReportDto extends DemoSiteDailyReportViewModel {
   updated_at: string
 }
 
-interface MaterialAdvanceSummaryDto {
+interface MaterialAdvanceSummaryDto extends ActivityTracked {
   id: number
   project_code: string
   worker_id: number
@@ -234,7 +235,7 @@ interface MaterialAdvanceSummaryDto {
   updated_at: string
 }
 
-interface MaterialAdvanceReimbursementDto {
+interface MaterialAdvanceReimbursementDto extends ActivityTracked {
   id: number
   advance_id: number
   amount_cents: number
@@ -323,6 +324,7 @@ function errorMessage(reason: unknown): string {
 }
 
 class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
+  constructor(private readonly can: (permission: string) => boolean = () => true) {}
   readonly source = 'live' as const
   private readonly api = createHttpWorkforceRepository()
   private readonly postSender = createRetriablePostSender()
@@ -380,15 +382,15 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
     this.activeProjectKey = null
     const project = projectPath(projectCode)
     const results = await Promise.allSettled([
-      requestAllPages((page, pageSize) => this.api.listWorkers({ page, page_size: pageSize, status: 'all' }).then((result) => result.data)),
-      requestAllPages((page, pageSize) => this.api.listCrewAssignments(projectCode, { page, page_size: pageSize }).then((result) => result.data)),
-      requestAllPages((page, pageSize) => this.api.listLaborEntries(projectCode, { page, page_size: pageSize }).then((result) => result.data)),
-      requestAllPages((page, pageSize) => requestJson<PagedResult<SiteDailyReportDto>>(
+      this.can('workforce.view') ? requestAllPages((page, pageSize) => this.api.listWorkers({ page, page_size: pageSize, status: 'all' }).then((result) => result.data)) : Promise.resolve(emptyPage<WorkerDto>()),
+      this.can('dispatches.view') ? requestAllPages((page, pageSize) => this.api.listCrewAssignments(projectCode, { page, page_size: pageSize }).then((result) => result.data)) : Promise.resolve(emptyPage<CrewAssignmentDto>()),
+      this.can('workforce.view') ? requestAllPages((page, pageSize) => this.api.listLaborEntries(projectCode, { page, page_size: pageSize }).then((result) => result.data)) : Promise.resolve(emptyPage<LiveLaborEntryDto>()),
+      this.can('site_reports.view') ? requestAllPages((page, pageSize) => requestJson<PagedResult<SiteDailyReportDto>>(
         withQuery(`${project}/site-daily-reports`, { page, page_size: pageSize }),
-      )),
-      requestAllPages((page, pageSize) => requestJson<PagedResult<MaterialAdvanceSummaryDto>>(
+      )) : Promise.resolve(emptyPage<SiteDailyReportDto>()),
+      this.can('material_advances.view') ? requestAllPages((page, pageSize) => requestJson<PagedResult<MaterialAdvanceSummaryDto>>(
         withQuery(`${project}/material-advances`, { page, page_size: pageSize }),
-      )),
+      )) : Promise.resolve(emptyPage<MaterialAdvanceSummaryDto>()),
     ])
     if (results.every((result) => result.status === 'rejected')) {
       const firstFailure = results.find((result) => result.status === 'rejected')
@@ -757,8 +759,8 @@ class HttpWorkforceWorkspaceRepository implements WorkforceWorkspaceRepository {
   }
 }
 
-export function createHttpWorkforceWorkspaceRepository(): WorkforceWorkspaceRepository {
-  return new HttpWorkforceWorkspaceRepository()
+export function createHttpWorkforceWorkspaceRepository(can?: (permission: string) => boolean): WorkforceWorkspaceRepository {
+  return new HttpWorkforceWorkspaceRepository(can)
 }
 
 function workerPath(workerId: number): string {
@@ -783,11 +785,13 @@ function live<T>(data: T): RepositoryResult<T> {
 
 function mapWorker(item: WorkerDto): DemoWorkerViewModel {
   return {
+    activity_summary: item.activity_summary,
     revision: item.revision, worker_id: item.id, name: item.name, phone: item.phone, notes: item.notes, status: item.status }
 }
 
 function mapAssignment(item: CrewAssignmentDto): DemoCrewAssignmentViewModel {
   return {
+    activity_summary: item.activity_summary,
     revision: item.revision,
     assignment_id: item.id,
     worker_id: item.worker_id,
@@ -803,6 +807,7 @@ function mapAssignment(item: CrewAssignmentDto): DemoCrewAssignmentViewModel {
 
 function mapLabor(item: LiveLaborEntryDto): DemoLaborEntryViewModel {
   return {
+    activity_summary: item.activity_summary,
     revision: item.revision,
     entry_id: item.id,
     pay_basis: item.pay_basis,
@@ -823,6 +828,8 @@ function mapLabor(item: LiveLaborEntryDto): DemoLaborEntryViewModel {
 
 function mapReport(item: SiteDailyReportDto): DemoSiteDailyReportViewModel {
   return {
+    report_id: item.id,
+    activity_summary: item.activity_summary,
     revision: item.revision,
     work_date: item.work_date,
     location: item.location,
@@ -839,6 +846,7 @@ function mapReport(item: SiteDailyReportDto): DemoSiteDailyReportViewModel {
 
 function mapAdvance(item: MaterialAdvanceDetailDto): DemoMaterialAdvanceViewModel {
   return {
+    activity_summary: item.activity_summary,
     revision: item.revision,
     advance_id: item.id,
     worker_id: item.worker_id,
@@ -860,6 +868,7 @@ function mapAdvance(item: MaterialAdvanceDetailDto): DemoMaterialAdvanceViewMode
     voided_at: item.voided_at,
     reimbursements: item.reimbursements.map((entry) => ({
       reimbursement_id: entry.id,
+      activity_summary: entry.activity_summary,
       revision: entry.revision,
       amount_cents: entry.amount_cents,
       reimbursed_on: entry.reimbursed_on,

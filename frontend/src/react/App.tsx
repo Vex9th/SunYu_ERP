@@ -4,6 +4,7 @@ import {
   lazy,
   Suspense,
   useEffect,
+  useCallback,
   useRef,
   useState,
   type ReactNode,
@@ -27,6 +28,7 @@ import {
   MenuOutlined,
   SettingOutlined,
   TeamOutlined,
+  SafetyOutlined,
 } from '@ant-design/icons'
 import {
   createBrowserRouter,
@@ -41,14 +43,19 @@ import {
   requestJson,
   requestVoid,
   subscribeProtectedSessionExpired,
+  subscribeAccessChanged,
+  setAccountNamespace,
+  setKnownAccessRevision,
 } from '../api'
 import type { SessionState } from '../types'
-import { AuthPage, Brand } from './AuthPage'
+import { AuthPage, Brand, type AuthCredentials } from './AuthPage'
 import { errorText, LoadingBlock } from './shared'
 import styles from './Workspace.module.css'
 import { WorkspaceNavigationProvider } from './navigationState'
 import { UnsavedChangesProvider } from './unsavedChanges'
+import { AccessProvider, useAccess } from './access/AccessProvider'
 
+const AccountsPage = lazy(() => import('./access/AccountsPage'))
 const HomePage = lazy(() => import('./HomePage'))
 const ProjectsPage = lazy(() => import('./ProjectsPage'))
 const CompaniesPage = lazy(() => import('./CompaniesPage'))
@@ -61,6 +68,7 @@ const navigation = [
   { key: '/projects', label: '项目中心', icon: <ApartmentOutlined /> },
   { key: '/companies', label: '公司与联系人', icon: <TeamOutlined /> },
   { key: '/inventory', label: '库存管理', icon: <DatabaseOutlined /> },
+  { key: '/accounts', label: '账号与权限', icon: <SafetyOutlined /> },
   { key: '/settings', label: '系统设置', icon: <SettingOutlined /> },
 ]
 
@@ -96,19 +104,17 @@ export function Application() {
   const [error, setError] = useState<string | null>(null)
   const sessionEpoch = useRef(0)
   const { message } = AntApp.useApp()
-  async function readSession() {
-    setLoading(true)
-    setError(null)
+  const readSession = useCallback(async () => {
     const epoch = ++sessionEpoch.current
     try {
       const current = await requestJson<SessionState>('/api/auth/session')
-      if (epoch === sessionEpoch.current) setSession(current)
+      if (epoch === sessionEpoch.current) { setAccountNamespace(current.authenticated ? current.user?.id ?? null : null); setKnownAccessRevision(current.access_revision); setSession(current); setError(null) }
     } catch (cause) {
       if (epoch === sessionEpoch.current) setError(errorText(cause))
     } finally {
       if (epoch === sessionEpoch.current) setLoading(false)
     }
-  }
+  }, [])
   useEffect(() => {
     void readSession()
     return () => {
@@ -119,34 +125,36 @@ export function Application() {
     if (!session?.authenticated) return
     return subscribeProtectedSessionExpired((event) => {
       sessionEpoch.current += 1
-      setSession({ authenticated: false, password_configured: true })
+      setAccountNamespace(null)
+      setSession({ authenticated: false, password_configured: true, bootstrap_required: false })
       setError(event.message)
     })
   }, [session?.authenticated])
-  async function authenticate(password: string) {
+  useEffect(() => {
+    if (!session?.authenticated) return
+    const refresh = () => { void readSession() }
+    const unsubscribe = subscribeAccessChanged(() => {
+      // 拒绝或权限版本变化时先撤下旧页面，避免会话刷新失败后仍显示受限数据。
+      setSession(null)
+      setLoading(true)
+      void readSession()
+    })
+    window.addEventListener('focus', refresh)
+    return () => { unsubscribe(); window.removeEventListener('focus', refresh) }
+  }, [session?.authenticated, readSession])
+  async function authenticate(credentials: AuthCredentials) {
     if (busyRef.current || !session) return
-    busyRef.current = true
-    setBusy(true)
-    setError(null)
+    busyRef.current = true; setBusy(true); setError(null)
     try {
-      if (!session.password_configured) {
-        await requestVoid('/api/auth/setup', {
-          method: 'POST',
-          body: { password },
-        })
-        setSession({ authenticated: false, password_configured: true })
+      if (session.bootstrap_required || !session.password_configured) {
+        const current = await requestJson<SessionState>('/api/auth/bootstrap', { method: 'POST', body: credentials })
+        setAccountNamespace(current.user?.id ?? null); setKnownAccessRevision(current.access_revision); setSession(current)
+      } else {
+        await requestVoid('/api/auth/login', { method: 'POST', body: { username: credentials.username, password: credentials.password } })
+        await readSession()
       }
-      await requestVoid('/api/auth/login', {
-        method: 'POST',
-        body: { password },
-      })
-      setSession({ authenticated: true, password_configured: true })
-    } catch (cause) {
-      setError(errorText(cause))
-    } finally {
-      busyRef.current = false
-      setBusy(false)
-    }
+    } catch (cause) { setError(errorText(cause)) }
+    finally { busyRef.current = false; setBusy(false) }
   }
   async function logout() {
     if (busyRef.current) return
@@ -155,7 +163,8 @@ export function Application() {
     try {
       await requestVoid('/api/auth/logout', { method: 'POST' })
       sessionEpoch.current += 1
-      setSession({ authenticated: false, password_configured: true })
+      setAccountNamespace(null)
+      setSession({ authenticated: false, password_configured: true, bootstrap_required: false })
       setError(null)
     } catch (cause) {
       void message.error(errorText(cause))
@@ -188,12 +197,13 @@ export function Application() {
     return (
       <AuthPage
         passwordConfigured={session.password_configured}
+        bootstrapRequired={session.bootstrap_required}
         busy={busy}
         error={error}
         onSubmit={authenticate}
       />
     )
-  return <Shell busy={busy} logout={logout} />
+  return <AccessProvider session={session} refresh={readSession}><Shell key={`${session.user?.id ?? 'anonymous'}:${session.access_revision ?? 0}`} busy={busy} logout={logout} /></AccessProvider>
 }
 
 function Shell({
@@ -203,6 +213,8 @@ function Shell({
   busy: boolean
   logout: () => Promise<void>
 }) {
+  const { user, can } = useAccess()
+  const visibleNavigation = navigation.filter(item => item.key === '/accounts' || (item.key === '/settings' ? user?.is_owner : item.key === '/companies' ? can('companies.view') : item.key === '/inventory' ? can('inventory.shared.view') || can('inventory.view') : can('projects.view'))).map(item => item.key === '/accounts' && !user?.is_owner ? { ...item, label: '我的账号' } : item)
   const location = useLocation()
   const navigate = useNavigate()
   const [mobileNav, setMobileNav] = useState(false)
@@ -213,7 +225,7 @@ function Shell({
     <Menu
       mode="inline"
       selectedKeys={[selected]}
-      items={navigation}
+      items={visibleNavigation}
       onClick={({ key }) => {
         navigate(key)
         setMobileNav(false)
@@ -271,6 +283,7 @@ function Shell({
             />
           </Space>
           <div className={styles.topbarRight}>
+            <span>{user?.display_name || user?.username}{user?.group_name ? ` · ${user.group_name}` : user?.is_owner ? ' · 主账号' : ' · 未分组'}</span>
             <span className={styles.date}>
               {new Intl.DateTimeFormat('zh-CN', {
                 timeZone: 'Asia/Shanghai',
@@ -297,11 +310,12 @@ function Shell({
             >
               <Suspense fallback={<LoadingBlock />}>
                 <Routes>
-                  <Route path="/" element={<HomePage />} />
-                  <Route path="/projects" element={<ProjectsPage />} />
-                  <Route path="/companies" element={<CompaniesPage />} />
-                  <Route path="/inventory" element={<InventoryWorkspace />} />
-                  <Route path="/settings" element={<SettingsPage />} />
+                  <Route path="/" element={can('projects.view') ? <HomePage /> : <AccountsPage />} />
+                  <Route path="/projects" element={<AccessRoute permission="projects.view"><ProjectsPage /></AccessRoute>} />
+                  <Route path="/companies" element={<AccessRoute permission="companies.view"><CompaniesPage /></AccessRoute>} />
+                  <Route path="/inventory" element={can('inventory.shared.view') || can('inventory.view') ? <InventoryWorkspace /> : <AccessDenied />} />
+                  <Route path="/accounts" element={<AccountsPage />} />
+                  <Route path="/settings" element={user?.is_owner ? <SettingsPage /> : <AccessDenied />} />
                   {[
                     '/projects/:projectCode',
                     '/projects/:projectCode/stages',
@@ -312,7 +326,7 @@ function Shell({
                     '/projects/:projectCode/workforce',
                     '/projects/:projectCode/delivery',
                   ].map((path) => (
-                    <Route key={path} path={path} element={<ProjectPage />} />
+                    <Route key={path} path={path} element={<AccessRoute permission="projects.view"><ProjectPage /></AccessRoute>} />
                   ))}
                   <Route
                     path="*"
@@ -336,6 +350,9 @@ function Shell({
     </div>
   )
 }
+
+function AccessDenied() { const { refresh } = useAccess(); return <Result status="403" title="无权查看此页面" subTitle="工作组或项目授权可能已变更，请联系主账号。" extra={<Button onClick={() => void refresh()}>刷新权限</Button>} /> }
+function AccessRoute({ permission, children }: { permission: string; children: ReactNode }) { return useAccess().can(permission) ? children : <AccessDenied /> }
 
 export default function RootApp() {
   const [router] = useState(() => createBrowserRouter([{

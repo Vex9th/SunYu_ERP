@@ -1,4 +1,4 @@
-import type { ProjectCategory } from '../types'
+import type { ProjectCategory, ActivityTracked } from '../types'
 
 export type ISODate = string
 export type ISODateTime = string
@@ -49,7 +49,7 @@ export interface ContactRecord {
 export type ProjectStatus = 'active' | 'archived'
 export type ClosureType = 'cancelled' | 'completed'
 
-export interface ProjectDetail {
+export interface ProjectDetail extends ActivityTracked {
   id: number
   project_code: string
   project_category?: ProjectCategory
@@ -73,7 +73,7 @@ export type ProjectStageStatus =
   | 'completed'
   | 'skipped'
 
-export interface ProjectStage {
+export interface ProjectStage extends ActivityTracked {
   stage_code: string
   status: ProjectStageStatus
   status_reason: string | null
@@ -96,7 +96,7 @@ export interface DashboardDocumentSummary {
   }>
 }
 
-export interface DocumentVersion {
+export interface DocumentVersion extends ActivityTracked {
   id: number
   version_number: number
   managed_filename?: string
@@ -108,7 +108,7 @@ export interface DocumentVersion {
   created_at: ISODateTime
 }
 
-export interface DocumentSummary {
+export interface DocumentSummary extends ActivityTracked {
   id: number
   project_code: string
   category: string
@@ -127,7 +127,7 @@ export interface DocumentDetail extends DocumentSummary {
 
 export type QuoteStatus = 'draft' | 'sent' | 'accepted' | 'rejected' | 'withdrawn'
 
-export interface Quote {
+export interface Quote extends ActivityTracked {
   id: number
   project_code: string
   version_number: number
@@ -151,7 +151,9 @@ export interface ContractAllocation {
   amount_cents: MoneyCents
 }
 
-export interface Contract {
+export interface Contract extends ActivityTracked {
+  restricted?: boolean
+  visibility?: 'allocation_summary' | 'full'
   id: number
   contract_no: string
   title: string
@@ -188,7 +190,7 @@ export interface PaymentTerm {
   revision: number | null
 }
 
-export interface Receipt {
+export interface Receipt extends ActivityTracked {
   id: number
   project_code: string
   contract_allocation_id: number | null
@@ -262,7 +264,7 @@ export interface ProjectCompletionCheck {
 
 export interface ProjectDashboard {
   project: ProjectDetail
-  company: CompanyRecord
+  company: CompanyRecord | null
   contacts: ContactRecord[]
   documents: DashboardDocumentSummary
   stages: ProjectStage[]

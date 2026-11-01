@@ -121,9 +121,10 @@ def create_delivery_router(
     now = clock or _utc_now
 
     def require_session(
-        request: Request, settings: Settings = settings_dependency
+        request: Request, settings: Settings = settings_dependency,
+        connection: sqlite3.Connection = connection_dependency,
     ) -> None:
-        require_authenticated_session(request, settings.session_secret)
+        require_authenticated_session(request, settings.session_secret, connection)
 
     authentication_dependency = Depends(require_session)
 

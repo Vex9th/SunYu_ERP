@@ -1,7 +1,9 @@
+import { render, ownerSession } from './access-fixtures'
+import { AccessProvider } from '../access/AccessProvider'
+import type { SessionState } from '../../types'
 import {
   cleanup,
   fireEvent,
-  render,
   screen,
   waitFor,
 } from '@testing-library/react'
@@ -39,9 +41,9 @@ beforeEach(() => {
   repository.getProjectDashboard.mockResolvedValue(dashboard)
 })
 afterEach(cleanup)
-function mount() {
+function mount(session: SessionState = ownerSession) {
   return render(
-    <ConfigProvider theme={{ token: { motion: false } }}>
+    <AccessProvider session={session} refresh={async () => undefined}><ConfigProvider theme={{ token: { motion: false } }}>
       <App>
         <MemoryRouter initialEntries={['/projects/SY-A']}>
           <Routes>
@@ -49,10 +51,19 @@ function mount() {
           </Routes>
         </MemoryRouter>
       </App>
-    </ConfigProvider>,
+    </ConfigProvider></AccessProvider>,
   )
 }
 describe('React 项目关闭与恢复', () => {
+  it('没有公司查看权时仍能查看项目，不读取被隐藏的公司信息', async () => {
+    repository.getProjectDashboard.mockResolvedValue({ ...dashboard, company: null, contacts: [], stages: [] })
+    mount({ ...ownerSession, user: { ...ownerSession.user!, id: 2, is_owner: false, group_id: 1 }, permissions: ['projects.view', 'procurement.lines.view'], project_ids: [dashboard.project.id] })
+    expect(await screen.findByRole('heading', { name: dashboard.project.name })).toBeTruthy()
+    expect(screen.queryByText(/客户开票资料/)).toBeNull()
+    expect(screen.queryByRole('link', { name: '到客户公司添加' })).toBeNull()
+    expect(screen.getByText('无权查看客户公司与联系人')).toBeTruthy()
+  })
+
   it('贸易项目按签收展示当前阶段及完工条件', async () => {
     repository.getProjectDashboard.mockResolvedValue({
       ...dashboard,

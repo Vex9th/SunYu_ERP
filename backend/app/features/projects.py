@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
+from backend.app.core.access import Principal, has_permission, project_scope_sql
 from backend.app.core.config import Settings
 from backend.app.core.database import transaction, transaction_immediate
 from backend.app.core.storage_paths import (
@@ -102,62 +103,30 @@ def create_projects_router(
     def require_session(
         request: Request,
         settings: Settings = settings_dependency,
-    ) -> None:
-        require_authenticated_session(request, settings.session_secret)
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> Principal:
+        return require_authenticated_session(request, settings.session_secret, connection)
 
     authentication_dependency = Depends(require_session)
 
     @router.get("")
     def list_projects(
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         selected_status: str = project_status_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> list[dict[str, object]]:
+        scope, scope_ids = project_scope_sql(_, "projects.id")
         try:
-            if selected_status == "all":
-                rows = connection.execute(
-                    """
-                    SELECT
-                        projects.id,
-                        projects.project_code,
-                        projects.project_category,
-                        projects.company_id,
-                        projects.name,
-                        projects.description,
-                        projects.status,
-                        projects.archive_reason,
-                        projects.archived_at,
-                        projects.created_at,
-                        projects.updated_at,
-                        companies.name AS company_name
-                    FROM projects
-                    JOIN companies ON companies.id = projects.company_id
-                    ORDER BY projects.created_at DESC, projects.id DESC
-                    """
-                ).fetchall()
-            else:
-                rows = connection.execute(
-                    """
-                    SELECT
-                        projects.id,
-                        projects.project_code,
-                        projects.project_category,
-                        projects.company_id,
-                        projects.name,
-                        projects.description,
-                        projects.status,
-                        projects.archive_reason,
-                        projects.archived_at,
-                        projects.created_at,
-                        projects.updated_at,
-                        companies.name AS company_name
-                    FROM projects
-                    JOIN companies ON companies.id = projects.company_id
-                    WHERE projects.status = ?
-                    ORDER BY projects.created_at DESC, projects.id DESC
-                    """,
-                    (selected_status,),
-                ).fetchall()
+            rows = connection.execute(
+                f"""SELECT projects.id, projects.project_code, projects.project_category,
+                        projects.company_id, projects.name, projects.description, projects.status,
+                        projects.archive_reason, projects.archived_at, projects.created_at,
+                        projects.updated_at, companies.name AS company_name
+                    FROM projects JOIN companies ON companies.id = projects.company_id
+                    WHERE ({scope}) AND (? = 'all' OR projects.status = ?)
+                    ORDER BY projects.created_at DESC, projects.id DESC""",
+                (*scope_ids, selected_status, selected_status),
+            ).fetchall()
         except sqlite3.Error as exc:
             raise _unexpected_database_failure(exc) from None
         return [
@@ -167,7 +136,7 @@ def create_projects_router(
 
     @router.post("", status_code=status.HTTP_201_CREATED)
     def create_project(
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         payload: ProjectPayload = project_payload_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
@@ -194,6 +163,9 @@ def create_projects_router(
                     ),
                 )
                 project_id = _last_insert_id(cursor)
+                if not _.is_owner and _.group_id is not None:
+                    connection.execute("INSERT INTO workgroup_projects (group_id, project_id) VALUES (?, ?)", (_.group_id, project_id))
+                    connection.execute("UPDATE workgroups SET revision = revision + 1, updated_at = ? WHERE id = ?", (timestamp, _.group_id))
                 response = _project_by_id(connection, project_id)
         except sqlite3.IntegrityError as exc:
             if _is_unique_constraint(exc):
@@ -210,7 +182,7 @@ def create_projects_router(
     @router.post("/{project_code}/archive")
     def archive_project(
         project_code: str,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
     ) -> dict[str, object]:
         del project_code
         raise ApiError(
@@ -222,7 +194,7 @@ def create_projects_router(
 
     @router.get("/{project_code}/dashboard")
     def get_project_dashboard(
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         project_code: str = structured_project_code_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
@@ -247,12 +219,18 @@ def create_projects_router(
                     connection,
                     project,
                     today=_business_date(now),
+                    principal=_,
                 )
-                completion_check = _project_completion_check(
-                    connection,
-                    project,
-                    operating,
+                completion_check = (
+                    _project_completion_check(connection, project, operating)
+                    if all(has_permission(_, key) for key in ("project_stages.view", "contracts.view", "customer_receipts.view", "acceptance.view"))
+                    else {"stages_ready": None, "final_acceptance_ready": None, "receivables_ready": None,
+                          "ready": False, "blockers": ["PERMISSION_DENIED"], "visible": False}
                 )
+                if not has_permission(_, "companies.view"):
+                    company, contacts = None, []
+                if not has_permission(_, "documents.view"):
+                    documents = {"document_count": None, "version_count": None, "categories": [], "visible": False}
         except sqlite3.Error as exc:
             raise _unexpected_structured_database_failure(exc) from None
         return {
@@ -266,7 +244,7 @@ def create_projects_router(
 
     @router.get("/{project_code}")
     def get_project_detail(
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         project_code: str = structured_project_code_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
@@ -281,7 +259,7 @@ def create_projects_router(
     @router.put("/{project_code}")
     async def update_project(
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         project_code: str = structured_project_code_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
@@ -327,7 +305,7 @@ def create_projects_router(
     @router.post("/{project_code}/close")
     async def close_project(
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         project_code: str = structured_project_code_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
@@ -408,7 +386,7 @@ def create_projects_router(
     @router.post("/{project_code}/restore")
     async def restore_project(
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         project_code: str = structured_project_code_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:

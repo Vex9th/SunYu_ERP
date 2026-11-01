@@ -16,7 +16,11 @@ from fastapi.responses import JSONResponse
 from backend.app.core.config import Settings
 from backend.app.core.database import transaction_immediate
 from backend.app.core.storage_paths import normalize_project_code, project_code_identity
-from backend.app.features.api_common import ApiError, ApiErrorRoute
+from backend.app.features.api_common import (
+    ApiError,
+    ApiErrorRoute,
+    account_idempotency_scope,
+)
 from backend.app.features.auth import require_authenticated_session
 
 logger = logging.getLogger(__name__)
@@ -63,6 +67,8 @@ _ALLOWED_TRANSITIONS = {
     "skipped": frozenset({"in_progress"}),
 }
 _STAGE_RESPONSE_FIELDS = (
+    "id",
+    "project_id",
     "stage_code",
     "status",
     "status_reason",
@@ -111,8 +117,9 @@ def create_project_stages_router(
     def require_session(
         request: Request,
         settings: Settings = settings_dependency,
+        connection: sqlite3.Connection = connection_dependency,
     ) -> None:
-        require_authenticated_session(request, settings.session_secret)
+        require_authenticated_session(request, settings.session_secret, connection)
 
     authentication_dependency = Depends(require_session)
 
@@ -487,6 +494,7 @@ def _idempotency_replay(
     key: str,
     request_hash: str,
 ) -> JSONResponse | None:
+    scope = account_idempotency_scope(connection, scope)
     previous = connection.execute(
         """
         SELECT request_sha256, response_status, response_json
@@ -525,6 +533,7 @@ def _store_idempotency_result(
     resource_id: int,
     timestamp: str,
 ) -> None:
+    scope = account_idempotency_scope(connection, scope)
     connection.execute(
         """
         INSERT INTO idempotency_requests
@@ -561,7 +570,7 @@ def _stage_list(
     rows = connection.execute(
         """
         SELECT
-            stage_code, sequence, status, status_reason, planned_start_on,
+            id, project_id, stage_code, sequence, status, status_reason, planned_start_on,
             planned_end_on, started_at, blocked_at, completed_at, notes,
             revision
         FROM project_stages
@@ -606,7 +615,7 @@ def _stage_record(
     return connection.execute(
         """
         SELECT
-            id, stage_code, status, status_reason, planned_start_on,
+            id, project_id, stage_code, status, status_reason, planned_start_on,
             planned_end_on, started_at, blocked_at, completed_at, notes,
             revision
         FROM project_stages

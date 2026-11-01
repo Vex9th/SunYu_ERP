@@ -1,3 +1,4 @@
+import type { ActivityTracked } from '../types'
 import type { DecimalString, ISODate, ISODateTime, MoneyCents } from './contracts'
 
 export type WorkerPayBasis = 'daily' | 'hourly'
@@ -19,7 +20,7 @@ export interface WorkforceLoadWarning {
   message: string
 }
 
-export interface DemoWorkerViewModel {
+export interface DemoWorkerViewModel extends ActivityTracked {
   revision?: number | null
   worker_id: number
   name: string
@@ -28,7 +29,7 @@ export interface DemoWorkerViewModel {
   status: WorkerStatus
 }
 
-export interface DemoCrewAssignmentViewModel {
+export interface DemoCrewAssignmentViewModel extends ActivityTracked {
   revision?: number | null
   assignment_id: number
   worker_id: number
@@ -41,7 +42,7 @@ export interface DemoCrewAssignmentViewModel {
   status: CrewAssignmentStatus
 }
 
-export interface DemoLaborEntryViewModel {
+export interface DemoLaborEntryViewModel extends ActivityTracked {
   pay_basis?: WorkerPayBasis
   rate_cents?: MoneyCents
   revision?: number | null
@@ -74,7 +75,8 @@ export interface LaborEntryBatchInput {
   entries: LaborEntryBatchItemInput[]
 }
 
-export interface DemoSiteDailyReportViewModel {
+export interface DemoSiteDailyReportViewModel extends ActivityTracked {
+  report_id?: number
   revision?: number | null
   work_date: ISODate
   location: string | null
@@ -88,7 +90,7 @@ export interface DemoSiteDailyReportViewModel {
   events: DemoSiteDailyReportEventViewModel[]
 }
 
-export interface DemoSiteDailyReportVersionViewModel {
+export interface DemoSiteDailyReportVersionViewModel extends ActivityTracked {
   id: number
   version_number: number
   work_date: ISODate
@@ -102,7 +104,7 @@ export interface DemoSiteDailyReportVersionViewModel {
   created_at: ISODateTime
 }
 
-export interface DemoSiteDailyReportEventViewModel {
+export interface DemoSiteDailyReportEventViewModel extends ActivityTracked {
   id: number
   from_status: SiteDailyReportStatus
   to_status: SiteDailyReportStatus
@@ -112,7 +114,7 @@ export interface DemoSiteDailyReportEventViewModel {
   report_version_id: number | null
 }
 
-export interface DemoMaterialAdvanceItemViewModel {
+export interface DemoMaterialAdvanceItemViewModel extends ActivityTracked {
   name: string
   specification: string | null
   brand: string | null
@@ -122,7 +124,7 @@ export interface DemoMaterialAdvanceItemViewModel {
   line_amount_cents: MoneyCents
 }
 
-export interface DemoReimbursementViewModel {
+export interface DemoReimbursementViewModel extends ActivityTracked {
   revision?: number | null
   reimbursement_id: number
   amount_cents: MoneyCents
@@ -134,7 +136,7 @@ export interface DemoReimbursementViewModel {
   voided_at: ISODateTime | null
 }
 
-export interface DemoMaterialAdvanceViewModel {
+export interface DemoMaterialAdvanceViewModel extends ActivityTracked {
   revision?: number | null
   advance_id: number
   worker_id: number
@@ -225,7 +227,8 @@ export type InvoiceStatus = 'planned' | 'requested' | 'recorded' | 'void'
 export type AfterSalesCoverageType = 'warranty' | 'paid' | 'goodwill'
 export type AfterSalesStatus = 'open' | 'in_progress' | 'completed' | 'cancelled'
 
-export interface DemoDrawingSignoffViewModel {
+export interface DemoDrawingSignoffViewModel extends ActivityTracked {
+  signoff_id?: number | null
   revision?: number | null
   discipline: DrawingDiscipline
   status: DrawingSignoffStatus
@@ -235,7 +238,7 @@ export interface DemoDrawingSignoffViewModel {
   document_version_ids: number[]
 }
 
-export interface DemoCommissioningSessionViewModel {
+export interface DemoCommissioningSessionViewModel extends ActivityTracked {
   revision?: number | null
   session_id: number
   started_at: ISODateTime
@@ -248,7 +251,7 @@ export interface DemoCommissioningSessionViewModel {
   document_version_ids: number[]
 }
 
-export interface DemoEngineeringChangeViewModel {
+export interface DemoEngineeringChangeViewModel extends ActivityTracked {
   revision?: number | null
   change_id: number
   source: EngineeringChangeSource
@@ -264,7 +267,7 @@ export interface DemoEngineeringChangeViewModel {
   status: EngineeringChangeStatus
 }
 
-export interface DemoAcceptanceViewModel {
+export interface DemoAcceptanceViewModel extends ActivityTracked {
   revision?: number | null
   acceptance_id: number
   acceptance_type: AcceptanceType
@@ -277,7 +280,8 @@ export interface DemoAcceptanceViewModel {
   cancelled_at: ISODate | null
 }
 
-export interface DemoWarrantyViewModel {
+export interface DemoWarrantyViewModel extends ActivityTracked {
+  warranty_id?: number
   revision?: number | null
   starts_on: ISODate
   duration_months: number
@@ -288,7 +292,7 @@ export interface DemoWarrantyViewModel {
   status: WarrantyStatus
 }
 
-export interface DemoInvoiceViewModel {
+export interface DemoInvoiceViewModel extends ActivityTracked {
   revision?: number | null
   invoice_id: number
   invoice_type: InvoiceType
@@ -303,7 +307,7 @@ export interface DemoInvoiceViewModel {
   void_reason: string | null
 }
 
-export interface DemoAfterSalesCaseViewModel {
+export interface DemoAfterSalesCaseViewModel extends ActivityTracked {
   revision?: number | null
   case_id: number
   reported_on: ISODate

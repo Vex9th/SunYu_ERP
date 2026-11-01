@@ -571,7 +571,6 @@ def test_ledger_is_read_only_and_query_count_does_not_grow_per_order(
                 connection, project, company, f"PO-{index}", "confirmed", [(100, 1000)]
             )
             _supplier_fact(connection, "supplier_payments", order, 10)
-        before = "\n".join(connection.iterdump())
 
     statements: list[str] = []
 
@@ -589,13 +588,19 @@ def test_ledger_is_read_only_and_query_count_does_not_grow_per_order(
         create_companies_router(read_only_connection, lambda: harness.settings)
     )
     harness.app = app
-    ledger = _ledger(harness, company)
+    with harness.client() as client:
+        with closing(connect_database(harness.database_path)) as connection:
+            before = "\n".join(connection.iterdump())
+        response = client.get(f"/api/companies/{company}/ledger")
+        assert response.status_code == 200, response.text
+        ledger = response.json()
     assert ledger["supplier"]["summary"]["order_count"] == 25
     assert ledger["supplier"]["summary"]["paid_amount_cents"] == 250
     assert (
-        len([sql for sql in statements if sql.lstrip().upper().startswith("SELECT")])
+        len([sql for sql in statements if sql.lstrip().upper().startswith("SELECT") and "FROM ACCOUNT_SESSIONS" not in sql.upper()])
         <= 10
     )
+    assert len([sql for sql in statements if "FROM ACCOUNT_SESSIONS" in sql.upper()]) == 1
     assert any(sql.strip().upper() == "BEGIN" for sql in statements)
     with closing(connect_database(harness.database_path)) as connection:
         assert "\n".join(connection.iterdump()) == before

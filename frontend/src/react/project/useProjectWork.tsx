@@ -1,15 +1,17 @@
+import { useAccess } from '../access/AccessProvider'
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { Alert, Button, Popconfirm, Space } from 'antd'
-import { ApiError } from '../../api'
+import { ApiError, getAccountNamespace, registerAccountCleanup } from '../../api'
 import { protectPendingWrites } from '../pendingUnload'
 
 export const errorText = (error: unknown): string => error instanceof Error ? error.message : '操作失败，请重试'
 export const nullable = (value?: string | null): string | null => value?.trim() || null
-export interface ProjectProps { projectCode: string; readonly?: boolean }
+export interface ProjectProps { projectCode: string; projectId?: number; readonly?: boolean }
 
 /** A result-unknown request keeps its original payload and idempotency key across tab switches. */
 interface PendingWrite { title: string; run: () => Promise<unknown>; discard?: () => boolean; busy: boolean; error?: string }
 const pending = new Map<string, PendingWrite>()
+registerAccountCleanup(() => { pending.clear(); publish() })
 const listeners = new Set<() => void>()
 const successListeners = new Set<(scope: string) => void>()
 function publish() { listeners.forEach((listener) => listener()) }
@@ -18,7 +20,9 @@ const releaseUnloadGuard = protectPendingWrites(() => pending.size > 0, subscrib
 if (import.meta.hot) import.meta.hot.dispose(releaseUnloadGuard)
 function unknownResult(error: unknown) { return !(error instanceof ApiError) || error.status === 0 || [408, 425, 429].includes(error.status) || error.status >= 500 }
 
-export function useProjectWrite(scope: string, onSaved: () => void) {
+export function useProjectWrite(resourceScope: string, onSaved: () => void) {
+  const { accessRevision } = useAccess()
+  const scope = `${getAccountNamespace()}:${accessRevision}:${resourceScope}`
   const context = useRef(scope)
   context.current = scope
   const mounted = useRef(true)
@@ -36,7 +40,7 @@ export function useProjectWrite(scope: string, onSaved: () => void) {
       await running.run()
       pending.delete(target); publish()
       successListeners.forEach(listener => listener(target))
-      window.dispatchEvent(new CustomEvent('project-data-changed', { detail: { projectCode: target.slice(target.indexOf(':') + 1) } }))
+      window.dispatchEvent(new CustomEvent('project-data-changed', { detail: { projectCode: resourceScope.slice(resourceScope.indexOf(':') + 1) } }))
     } catch (cause) {
       if (unknownResult(cause)) pending.set(target, { ...running, busy: false, error: errorText(cause) })
       else pending.delete(target)

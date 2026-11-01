@@ -13,8 +13,9 @@ from fastapi.testclient import TestClient
 from backend.app.core.config import Settings
 from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
-from backend.app.core.security import SESSION_COOKIE_NAME, create_session_token
+from backend.app.core.security import SESSION_COOKIE_NAME
 from backend.app.features import inventory
+from backend.tests.account_support import owner_session_token
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 NOW = datetime(2026, 8, 29, 1, 30, tzinfo=timezone.utc)
@@ -31,7 +32,7 @@ class InventoryHarness:
         with TestClient(self.app) as client:
             client.cookies.set(
                 SESSION_COOKIE_NAME,
-                create_session_token(self.settings.session_secret),
+                owner_session_token(self.database_path, self.settings.session_secret),
             )
             yield client
 

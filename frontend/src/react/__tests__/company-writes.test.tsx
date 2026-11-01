@@ -1,8 +1,8 @@
+import { render } from './access-fixtures'
 import {
   act,
   cleanup,
   fireEvent,
-  render,
   screen,
   waitFor,
   within,
@@ -20,8 +20,8 @@ import {
 import CompaniesPage from '../CompaniesPage'
 import {
   clearPendingCreate,
-  COMPANY_PENDING_KEY,
-  CONTACT_PENDING_PREFIX,
+  COMPANY_PENDING_KEY as LEGACY_COMPANY_PENDING_KEY,
+  CONTACT_PENDING_PREFIX as LEGACY_CONTACT_PENDING_PREFIX,
   listPendingCreates,
   parsePendingCreate,
   readPendingCreate,
@@ -35,6 +35,8 @@ import type {
   RevisionedContact,
 } from '../../types'
 
+const COMPANY_PENDING_KEY = `anonymous:${LEGACY_COMPANY_PENDING_KEY}`
+const CONTACT_PENDING_PREFIX = `anonymous:${LEGACY_CONTACT_PENDING_PREFIX}`
 beforeAll(installProjectDom)
 const companyPayload: CompanyPayload = {
   name: '测试公司',

@@ -1,3 +1,4 @@
+import { render as accessRender } from './access-fixtures'
 import type { ReactNode } from 'react'
 import { ConfigProvider } from 'antd'
 import { MemoryRouter, Link, Route, Routes } from 'react-router-dom'
@@ -6,7 +7,6 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import {
   cleanup,
   fireEvent,
-  render as testingRender,
   screen,
   waitFor,
   within,
@@ -23,7 +23,7 @@ import { localISODate } from '../../domain/dates'
 import type { WorkforceDemoViewModel } from '../../domain/workforce'
 
 function render(node: ReactNode) {
-  return testingRender(
+  return accessRender(
     <ConfigProvider theme={{ token: { motion: false } }}>
       {node}
     </ConfigProvider>,

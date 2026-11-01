@@ -76,6 +76,10 @@ const inventoryItem = {
 function procurementList(): ProcurementListDetailDto {
   const baseLine = {
     procurement_list_id: 11,
+    confirmation_status: 'confirmed' as const,
+    confirmed_at: '2026-10-31',
+    can_reopen: false,
+    edit_block_reason: null,
     category: '电气',
     specification: null,
     brand: '汇川',
@@ -131,6 +135,7 @@ function procurementList(): ProcurementListDetailDto {
     status: 'confirmed',
     revision: 3,
     line_count: lines.length,
+    confirmed_line_count: lines.length,
     cost_total_cents: 1325200,
     quoted_total_cents: 1650000,
     lines,

@@ -108,8 +108,9 @@ def create_procurement_router(
     def require_session(
         request: Request,
         settings: Settings = settings_dependency,
+        connection: sqlite3.Connection = connection_dependency,
     ) -> None:
-        require_authenticated_session(request, settings.session_secret)
+        require_authenticated_session(request, settings.session_secret, connection)
 
     authentication_dependency = Depends(require_session)
 
@@ -145,7 +146,8 @@ def create_procurement_router(
         ).fetchone()[0]
         rows = connection.execute(
             """
-            SELECT lists.*, COUNT(lines.id) AS line_count
+            SELECT lists.*, COUNT(lines.id) AS line_count,
+                   COALESCE(SUM(lines.confirmation_status = 'confirmed'), 0) AS confirmed_line_count
             FROM procurement_lists AS lists
             LEFT JOIN procurement_lines AS lines
                 ON lines.procurement_list_id = lists.id
@@ -354,6 +356,7 @@ def create_procurement_router(
                     ),
                 )
                 line_id = _last_insert_id(cursor)
+                _refresh_list_confirmation(connection, identifier, timestamp)
                 connection.execute(
                     """
                     UPDATE procurement_lists
@@ -419,6 +422,7 @@ def create_procurement_router(
                 if row is None:
                     raise _not_found("Procurement line not found")
                 _require_revision(row, expected_revision)
+                _require_editable_line(connection, row)
                 inventory_item_id = (
                     None
                     if _procurement_inventory_identity(row)
@@ -484,6 +488,7 @@ def create_procurement_router(
         project_code: str,
         list_id: str,
         line_id: str,
+        request: Request,
         _: None = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> Response:
@@ -493,6 +498,14 @@ def create_procurement_router(
         with transaction_immediate(connection):
             project = _active_project(connection, _normalize_project_path(project_code))
             _editable_list(connection, list_identifier, int(project["id"]))
+            row = _line_row(connection, line_identifier, list_identifier)
+            if row is None:
+                raise _not_found("Procurement line not found")
+            expected_revision = _single_query(request, "expected_revision")
+            if expected_revision is None:
+                raise _invalid_payload("expected_revision is required")
+            _require_revision(row, _parse_identifier(expected_revision))
+            _require_editable_line(connection, row)
             cursor = connection.execute(
                 """
                 DELETE FROM procurement_lines
@@ -502,6 +515,7 @@ def create_procurement_router(
             )
             if cursor.rowcount != 1:
                 raise _not_found("Procurement line not found")
+            _refresh_list_confirmation(connection, list_identifier, timestamp)
             connection.execute(
                 """
                 UPDATE procurement_lists
@@ -510,6 +524,73 @@ def create_procurement_router(
                 (timestamp, list_identifier),
             )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    async def change_line_confirmation(
+        project_code: str, list_id: str, line_id: str, request: Request,
+        idempotency_key: str, connection: sqlite3.Connection, *, confirm: bool,
+    ) -> dict[str, object]:
+        identifier, line_identifier = _parse_identifier(list_id), _parse_identifier(line_id)
+        key = _validate_idempotency_key(idempotency_key)
+        fields = _CONFIRM_FIELDS if confirm else {*_CONFIRM_FIELDS, "reason"}
+        payload = await _read_json(request, fields, "Invalid procurement confirmation payload")
+        revision = _positive_integer(payload["expected_revision"], "Invalid procurement confirmation payload")
+        normalized: dict[str, object] = {"expected_revision": revision}
+        if not confirm:
+            normalized["reason"] = _required_text(payload["reason"], "A reopen reason is required")
+        request_hash = _request_hash(normalized)
+        scope = idempotency_scope(request)
+        timestamp = _timestamp(now)
+        with transaction_immediate(connection):
+            restored = restore_idempotent_response(connection, scope=scope, key=key, request_hash=request_hash)
+            if restored is not None:
+                return restored
+            project = _active_project(connection, _normalize_project_path(project_code))
+            _editable_list(connection, identifier, int(project["id"]))
+            line = _line_row(connection, line_identifier, identifier)
+            if line is None:
+                raise _not_found("Procurement line not found")
+            _require_revision(line, revision)
+            if confirm:
+                _require_editable_line(connection, line)
+            else:
+                if line["confirmation_status"] != "confirmed":
+                    raise _business_conflict("Procurement line is not confirmed", "PROCUREMENT_LINE_NOT_CONFIRMED")
+                reason = _line_reference_reason(connection, line_identifier)
+                if reason:
+                    raise _business_conflict(reason, "PROCUREMENT_LINE_REFERENCED")
+            connection.execute(
+                """UPDATE procurement_lines SET confirmation_status = ?, confirmed_at = ?,
+                   revision = revision + 1, updated_at = ? WHERE id = ? AND revision = ?""",
+                ("confirmed" if confirm else "draft", timestamp if confirm else None,
+                 timestamp, line_identifier, revision),
+            )
+            _refresh_list_confirmation(connection, identifier, timestamp)
+            connection.execute("UPDATE procurement_lists SET revision = revision + 1, updated_at = ? WHERE id = ?", (timestamp, identifier))
+            updated = _line_row(connection, line_identifier, identifier)
+            parent = _list_row(connection, identifier, int(project["id"]))
+            response = _line_response(connection, updated, int(parent["revision"]))
+            save_idempotent_response(connection, scope=scope, key=key, request_hash=request_hash,
+                                    response=response, response_status=status.HTTP_200_OK,
+                                    resource_type="procurement_line", resource_id=line_identifier, created_at=timestamp)
+            return response
+
+    @router.post("/api/projects/{project_code}/procurement-lists/{list_id}/lines/{line_id}/confirm")
+    async def confirm_procurement_line(
+        project_code: str, list_id: str, line_id: str, request: Request,
+        idempotency_key: str = Header(alias="Idempotency-Key"),
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        return await change_line_confirmation(project_code, list_id, line_id, request, idempotency_key, connection, confirm=True)
+
+    @router.post("/api/projects/{project_code}/procurement-lists/{list_id}/lines/{line_id}/reopen")
+    async def reopen_procurement_line(
+        project_code: str, list_id: str, line_id: str, request: Request,
+        idempotency_key: str = Header(alias="Idempotency-Key"),
+        _: None = authentication_dependency,
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> dict[str, object]:
+        return await change_line_confirmation(project_code, list_id, line_id, request, idempotency_key, connection, confirm=False)
 
     @router.post("/api/projects/{project_code}/procurement-lists/{list_id}/confirm")
     async def confirm_procurement_list(
@@ -565,6 +646,14 @@ def create_procurement_router(
                     "Procurement list has no lines",
                     "PROCUREMENT_LIST_EMPTY",
                 )
+            for line in _list_line_rows(connection, identifier):
+                if line["confirmation_status"] == "draft":
+                    _require_editable_line(connection, line)
+                    connection.execute(
+                        """UPDATE procurement_lines SET confirmation_status = 'confirmed',
+                           confirmed_at = ?, revision = revision + 1, updated_at = ? WHERE id = ?""",
+                        (timestamp, timestamp, line["id"]),
+                    )
             connection.execute(
                 """
                 UPDATE procurement_lists
@@ -615,10 +704,7 @@ def create_procurement_router(
         timestamp = _timestamp(now)
         with transaction_immediate(connection):
             project = _project(connection, _normalize_project_path(project_code))
-            scope = (
-                f"POST:/api/projects/{project['project_code']}/procurement-lists/"
-                f"{identifier}/copy-as-draft"
-            )
+            scope = idempotency_scope(request)
             restored = restore_idempotent_response(
                 connection,
                 scope=scope,
@@ -1030,6 +1116,7 @@ def create_procurement_router(
                 )
             _require_revision(order, expected_revision)
             for line in _order_lines(connection, identifier):
+                _confirmed_procurement_line(connection, int(line["procurement_line_id"]), int(project["id"]))
                 previously_ordered = connection.execute(
                     """
                     SELECT COALESCE(SUM(order_lines.quantity_milli), 0)
@@ -1247,12 +1334,14 @@ def create_procurement_router(
                 "SELECT id, name, status, revision FROM procurement_lists "
                 "WHERE project_id = ? ORDER BY id", (project["id"],),
             ).fetchall()
-            rows = _project_line_quantities(connection, int(project["id"]))
+            rows = _project_line_quantities(connection, int(project["id"]), confirmed_only=True)
         return {
             "lists": [dict(row) for row in lists],
             "lines": [{
                 "id": row["id"], "procurement_list_id": row["procurement_list_id"],
                 "name": row["name"], "model": row["model"], "unit": row["unit"],
+                "confirmation_status": row["confirmation_status"],
+                "quoted_total_cents": line_value(int(row["quoted_unit_price_cents"]), int(row["quantity_milli"])),
                 "unit_cost_cents": row["unit_cost_cents"],
                 "quantity": format_quantity(int(row["quantity_milli"])),
                 "ordered_quantity": format_quantity(int(row["ordered_quantity_milli"])),
@@ -1581,6 +1670,7 @@ def _list_detail(
         "revision": row["revision"],
         "confirmed_at": row["confirmed_at"],
         "line_count": len(responses),
+        "confirmed_line_count": sum(line["confirmation_status"] == "confirmed" for line in responses),
         "cost_total_cents": sum(int(line["cost_total_cents"]) for line in responses),
         "quoted_total_cents": sum(
             int(line["quoted_total_cents"]) for line in responses
@@ -1600,6 +1690,7 @@ def _list_summary(row: sqlite3.Row, project_code: str) -> dict[str, object]:
         "status": row["status"],
         "revision": row["revision"],
         "line_count": row["line_count"],
+        "confirmed_line_count": row["confirmed_line_count"],
         "confirmed_at": row["confirmed_at"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -1612,6 +1703,9 @@ def _line_response(
     list_revision: int | None,
 ) -> dict[str, object]:
     quantities = _line_facts(connection, int(row["id"]))
+    block_reason = _line_edit_block_reason(connection, row)
+    reference_reason = _line_reference_reason(connection, int(row["id"]))
+    parent_status = connection.execute("SELECT status FROM procurement_lists WHERE id = ?", (row["procurement_list_id"],)).fetchone()[0]
     required = int(row["quantity_milli"])
     ordered = int(quantities["ordered_quantity_milli"])
     received = int(quantities["received_quantity_milli"])
@@ -1623,6 +1717,10 @@ def _line_response(
         "id": row["id"],
         "procurement_list_id": row["procurement_list_id"],
         "inventory_item_id": row["inventory_item_id"],
+        "confirmation_status": row["confirmation_status"],
+        "confirmed_at": row["confirmed_at"],
+        "can_reopen": row["confirmation_status"] == "confirmed" and parent_status != "superseded" and reference_reason is None,
+        "edit_block_reason": block_reason,
         "sequence_no": row["sequence_no"],
         "category": row["category"],
         "name": row["name"],
@@ -2097,12 +2195,59 @@ def _editable_list(
     row = _list_row(connection, list_id, project_id)
     if row is None:
         raise _not_found("Procurement list not found")
-    if row["status"] != "draft":
+    if row["status"] == "superseded":
         raise _business_conflict(
             "Procurement list is not editable",
             "PROCUREMENT_LIST_NOT_EDITABLE",
         )
     return row
+
+
+def _line_reference_reason(connection: sqlite3.Connection, line_id: int) -> str | None:
+    order = connection.execute(
+        """SELECT orders.order_no FROM procurement_line_order_references AS lines
+           JOIN purchase_orders AS orders ON orders.id = lines.purchase_order_id
+           WHERE lines.procurement_line_id = ? ORDER BY orders.id LIMIT 1""", (line_id,),
+    ).fetchone()
+    if order is not None:
+        return f"已被采购单 {order['order_no']} 引用，保留历史内容，不可撤回或修改"
+    for table in ("inventory_movements", "inventory_issue_lines"):
+        if connection.execute(f"SELECT 1 FROM {table} WHERE procurement_line_id = ? LIMIT 1", (line_id,)).fetchone():
+            return "已被库存历史记录引用，保留历史内容，不可撤回或修改"
+    return None
+
+
+def _line_edit_block_reason(connection: sqlite3.Connection, line: sqlite3.Row) -> str | None:
+    parent = connection.execute("SELECT status FROM procurement_lists WHERE id = ?", (line["procurement_list_id"],)).fetchone()
+    if parent["status"] == "superseded":
+        return "清单已被替代，仅供查阅"
+    reference = _line_reference_reason(connection, int(line["id"]))
+    if reference:
+        return reference
+    if line["confirmation_status"] == "confirmed":
+        return "此项已确认，请先撤回确认后编辑"
+    return None
+
+
+def _require_editable_line(connection: sqlite3.Connection, line: sqlite3.Row) -> None:
+    reason = _line_edit_block_reason(connection, line)
+    if reason:
+        code = "PROCUREMENT_LINE_REFERENCED" if _line_reference_reason(connection, int(line["id"])) else "PROCUREMENT_LINE_NOT_EDITABLE"
+        raise _business_conflict(reason, code)
+
+
+def _refresh_list_confirmation(connection: sqlite3.Connection, list_id: int, timestamp: str) -> None:
+    connection.execute(
+        """UPDATE procurement_lists SET
+            status = CASE WHEN EXISTS (SELECT 1 FROM procurement_lines WHERE procurement_list_id = ?)
+                AND NOT EXISTS (SELECT 1 FROM procurement_lines WHERE procurement_list_id = ? AND confirmation_status != 'confirmed')
+                THEN 'confirmed' ELSE 'draft' END,
+            confirmed_at = CASE WHEN EXISTS (SELECT 1 FROM procurement_lines WHERE procurement_list_id = ?)
+                AND NOT EXISTS (SELECT 1 FROM procurement_lines WHERE procurement_list_id = ? AND confirmation_status != 'confirmed')
+                THEN COALESCE(confirmed_at, ?) ELSE NULL END
+            WHERE id = ? AND status != 'superseded'""",
+        (list_id, list_id, list_id, list_id, timestamp, list_id),
+    )
 
 
 def _line_row(
@@ -2162,7 +2307,8 @@ def _project_line_quantities(
         FROM procurement_lines AS lines
         JOIN procurement_lists AS lists ON lists.id = lines.procurement_list_id
         LEFT JOIN ordered ON ordered.procurement_line_id = lines.id
-        WHERE lists.project_id = ? AND (? = 0 OR lists.status = 'confirmed')
+        WHERE lists.project_id = ? AND lists.status != 'superseded'
+          AND (? = 0 OR lines.confirmation_status = 'confirmed')
         ORDER BY lists.id, lines.sequence_no, lines.id
         """,
         (project_id, project_id, int(confirmed_only)),
@@ -2178,7 +2324,7 @@ def _project_line_rows(
         SELECT lines.*
         FROM procurement_lines AS lines
         JOIN procurement_lists AS lists ON lists.id = lines.procurement_list_id
-        WHERE lists.project_id = ? AND lists.status = 'confirmed'
+        WHERE lists.project_id = ? AND lists.status != 'superseded' AND lines.confirmation_status = 'confirmed'
         ORDER BY lists.id, lines.sequence_no, lines.id
         """,
         (project_id,),
@@ -2195,7 +2341,7 @@ def _confirmed_procurement_line(
         SELECT lines.*
         FROM procurement_lines AS lines
         JOIN procurement_lists AS lists ON lists.id = lines.procurement_list_id
-        WHERE lines.id = ? AND lists.project_id = ? AND lists.status = 'confirmed'
+        WHERE lines.id = ? AND lists.project_id = ? AND lists.status != 'superseded' AND lines.confirmation_status = 'confirmed'
         """,
         (line_id, project_id),
     ).fetchone()

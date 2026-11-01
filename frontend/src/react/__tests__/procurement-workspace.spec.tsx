@@ -7,6 +7,10 @@ import type { ProcurementHttpRepository } from '../../repositories/procurement.l
 import type { ProcurementImportPreviewDto, PurchaseOrderRecordDto } from '../../domain/procurement-extensions'
 import type { ProcurementLineDto } from '../../domain/operations-api'
 
+vi.mock('../access/useAccess', () => ({ useAccess: () => ({ can: () => true, namespace: 'user:1', accessRevision: 1 }) }))
+vi.mock('../activity/OperationHistory', () => ({ OperationHistory: () => <span>操作记录</span> }))
+vi.mock('../activity/ActivitySummary', () => ({ ActivitySummary: () => <span>历史未记录</span> }))
+
 beforeAll(() => {
   Object.defineProperty(window, 'matchMedia', { writable: true, value: () => ({ matches: false, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true } }) })
   globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} }
@@ -20,7 +24,7 @@ function repository() {
   return { listSupplierCompanies: () => result([{ id: 1, name: '供应商甲' }]), listProcurementLists: () => result({ items: [list], total: 1, page: 1, page_size: 20 }), getProcurementList: () => result(list), listPurchaseOrders: () => result({ items: [], total: 0, page: 1, page_size: 20 }), getProcurementOverview: () => result({ project_code: 'SY-001', line_count: 0, line_status_counts: {}, procurement_committed_cents: 0, procurement_received_cents: 0, procurement_paid_cents: 0, material_consumed_cents: 0 }), listDocumentVersionOptions: () => Promise.resolve([]), listQuoteExports: () => result({ items: [], total: 0, page: 1, page_size: 20 }), createProcurementList: vi.fn(() => result(list)), discardCreateProcurementList: () => true } as unknown as ProcurementHttpRepository
 }
 function material(id: number, name: string, quantity: string): ProcurementLineDto {
-  return { id, procurement_list_id: 1, inventory_item_id: null, sequence_no: id, category: '弱电', name, specification: null, brand: null, model: null, quantity, unit: '件', unit_cost_cents: 1234, quoted_unit_price_cents: 2000, cost_total_cents: 2468, quoted_total_cents: 4000, ordered_quantity: '0.000', ordered_amount_cents: 0, paid_amount_cents: 0, received_quantity: '0.000', invoiced_amount_cents: 0, issued_quantity: '0.000', order_status: 'not_ordered', payment_status: 'unpaid', receipt_status: 'not_received', invoice_status: 'not_invoiced', usage_status: 'unused', revision: 1, created_at: '', updated_at: '' }
+  return { confirmation_status: 'confirmed', confirmed_at: '2026-10-31', can_reopen: true, edit_block_reason: '此项已确认，请先撤回确认后编辑', id, procurement_list_id: 1, inventory_item_id: null, sequence_no: id, category: '弱电', name, specification: null, brand: null, model: null, quantity, unit: '件', unit_cost_cents: 1234, quoted_unit_price_cents: 2000, cost_total_cents: 2468, quoted_total_cents: 4000, ordered_quantity: '0.000', ordered_amount_cents: 0, paid_amount_cents: 0, received_quantity: '0.000', invoiced_amount_cents: 0, issued_quantity: '0.000', order_status: 'not_ordered', payment_status: 'unpaid', receipt_status: 'not_received', invoice_status: 'not_invoiced', usage_status: 'unused', revision: 1, created_at: '', updated_at: '' }
 }
 function LocationProbe() { return <output aria-label="当前地址">{useLocation().search}</output> }
 describe('React 采购工作区', () => {
@@ -177,7 +181,7 @@ describe('React 采购工作区', () => {
     fireEvent.click(screen.getByRole('tab', { name: '客户报价' }))
     fireEvent.click(screen.getByRole('button', { name: /生成报价单/ }))
     const quote = await screen.findByRole('dialog')
-    fireEvent.mouseDown(within(quote).getByLabelText('已确认采购清单'))
+    fireEvent.mouseDown(within(quote).getByLabelText('含已确认项的清单'))
     expect(await screen.findByText('第二页清单')).toBeTruthy()
   })
 
@@ -235,7 +239,7 @@ describe('React 采购工作区', () => {
   it('报价页签没有新建清单操作，未指定上下文时必须主动选择报价清单', async () => {
     const repo = repository()
     const list = (await repo.getProcurementList('SY-001', 1)).data
-    repo.getProcurementList = async () => ({ source: 'live', data: { ...list, status: 'confirmed' } })
+    repo.getProcurementList = async () => ({ source: 'live', data: { ...list, status: 'confirmed', lines: [material(1, '报价物料', '1.000')] } })
     repo.createQuoteExport = vi.fn()
     render(<ProcurementWorkspace projectCode="SY-001" repository={repo} customerCompany={{ id: 2, name: '客户甲' }} />)
     await screen.findByRole('button', { name: '查看清单 弱电物料' })
@@ -245,7 +249,7 @@ describe('React 采购工作区', () => {
     const dialog = await screen.findByRole('dialog')
     fireEvent.change(within(dialog).getByLabelText('报价标题'), { target: { value: '客户正式报价' } })
     fireEvent.click(within(dialog).getByRole('button', { name: /^保\s*存$/ }))
-    await within(dialog).findByText('请选择已确认采购清单')
+    await within(dialog).findByText('请选择含已确认项的清单')
     expect(repo.createQuoteExport).not.toHaveBeenCalled()
   })
 
@@ -312,8 +316,8 @@ describe('React 采购工作区', () => {
   it('已生成报价下载失败后，卸载重试只下载原报价，不再次生成', async () => {
     const repo = repository()
     const list = (await repo.getProcurementList('SY-001', 1)).data
-    repo.getProcurementList = async () => ({ source: 'live', data: { ...list, status: 'confirmed' } })
-    repo.createQuoteExport = vi.fn<ProcurementHttpRepository['createQuoteExport']>(async (_code, _id, input) => ({ source: 'live', data: { ...input, id: 42, project_code: 'SY-001', procurement_list_id: 1, customer_company_name: '客户甲', created_at: '', download_url: '' } }))
+    repo.getProcurementList = async () => ({ source: 'live', data: { ...list, status: 'confirmed', lines: [material(1, '报价物料', '1.000')] } })
+    repo.createQuoteExport = vi.fn<ProcurementHttpRepository['createQuoteExport']>(async (_code, _id, input) => ({ source: 'live', data: { ...input, line_count: 1, id: 42, project_code: 'SY-001', procurement_list_id: 1, customer_company_name: '客户甲', created_at: '', download_url: '' } }))
     repo.downloadQuoteExport = vi.fn().mockRejectedValueOnce(new Error('下载连接中断')).mockResolvedValue(new Blob(['quote']))
     URL.createObjectURL = vi.fn(() => 'blob:test-quote')
     URL.revokeObjectURL = vi.fn()
@@ -340,10 +344,10 @@ describe('React 采购工作区', () => {
   ])('报价 $stage 请求等待中 $navigation，不自动下载原页面文件', async ({ stage, navigation }) => {
     const repo = repository()
     const list = (await repo.getProcurementList('SY-001', 1)).data
-    repo.getProcurementList = async () => ({ source: 'live', data: { ...list, status: 'confirmed' } })
+    repo.getProcurementList = async () => ({ source: 'live', data: { ...list, status: 'confirmed', lines: [material(1, '报价物料', '1.000')] } })
     let finish!: () => void
     repo.createQuoteExport = vi.fn<ProcurementHttpRepository['createQuoteExport']>((_code, _id, input) => {
-      const result = { source: 'live' as const, data: { ...input, id: 42, project_code: 'SY-001', procurement_list_id: 1, customer_company_name: '客户甲', created_at: '', download_url: '' } }
+      const result = { source: 'live' as const, data: { ...input, line_count: 1, id: 42, project_code: 'SY-001', procurement_list_id: 1, customer_company_name: '客户甲', created_at: '', download_url: '' } }
       return stage === '生成' ? new Promise((resolve) => { finish = () => resolve(result) }) : Promise.resolve(result)
     })
     repo.downloadQuoteExport = vi.fn<ProcurementHttpRepository['downloadQuoteExport']>(() => stage === '下载' ? new Promise((resolve) => { finish = () => resolve(new Blob(['quote'])) }) : Promise.resolve(new Blob(['quote'])))

@@ -27,7 +27,7 @@ afterEach(async () => {
   })
 })
 describe('登录和首次设置', () => {
-  it('首次设置必须确认相同的六位数字密码', async () => {
+  it('首次设置必须确认相同的新账号密码', async () => {
     const submit = vi.fn()
     render(
       <AuthPage
@@ -37,13 +37,14 @@ describe('登录和首次设置', () => {
         onSubmit={submit}
       />,
     )
-    fireEvent.change(screen.getByLabelText('访问密码'), {
-      target: { value: '123456' },
+    fireEvent.change(screen.getByLabelText('登录名'), { target: { value: 'buyer' } })
+    fireEvent.change(screen.getByLabelText('账号密码'), {
+      target: { value: 'Test密码123456' },
     })
     fireEvent.change(screen.getByLabelText('再次输入密码'), {
-      target: { value: '654321' },
+      target: { value: 'Test密码654321' },
     })
-    fireEvent.click(screen.getByRole('button', { name: '创建密码并进入' }))
+    fireEvent.click(screen.getByRole('button', { name: '创建主账号并进入' }))
     await screen.findByText('两次输入的密码不一致')
     expect(submit).not.toHaveBeenCalled()
   })
@@ -58,10 +59,11 @@ describe('登录和首次设置', () => {
       />,
     )
     expect(screen.getByText('密码不正确')).toBeTruthy()
-    fireEvent.change(screen.getByLabelText('访问密码'), {
-      target: { value: '123456' },
+    fireEvent.change(screen.getByLabelText('登录名'), { target: { value: 'buyer' } })
+    fireEvent.change(screen.getByLabelText('账号密码'), {
+      target: { value: 'Test密码123456' },
     })
     fireEvent.click(screen.getByRole('button', { name: '进入工作台' }))
-    await waitFor(() => expect(submit).toHaveBeenCalledWith('123456'))
+    await waitFor(() => expect(submit).toHaveBeenCalledWith({ username: 'buyer', password: 'Test密码123456' }))
   })
 })

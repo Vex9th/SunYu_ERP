@@ -1,10 +1,10 @@
+import { render } from './access-fixtures'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { ConfigProvider } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import {
   cleanup,
   fireEvent,
-  render,
   screen,
   waitFor,
 } from '@testing-library/react'

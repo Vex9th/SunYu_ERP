@@ -19,11 +19,11 @@ from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
 from backend.app.core.security import (
     SESSION_COOKIE_NAME,
-    create_session_token,
 )
 from backend.app.core.storage_paths import project_code_identity
 from backend.app.features import companies as companies_module
 from backend.app.features.companies import create_companies_router
+from backend.tests.account_support import owner_session_token
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 NOW = datetime(2026, 8, 28, 9, 15, tzinfo=timezone.utc)
@@ -86,7 +86,7 @@ class CompaniesHarness:
         if authenticated:
             client.cookies.set(
                 SESSION_COOKIE_NAME,
-                create_session_token(self.settings.session_secret),
+                owner_session_token(self.database_path, self.settings.session_secret),
             )
         return client
 

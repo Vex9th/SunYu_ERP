@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Request, status
 
+from backend.app.core.access import Principal, has_permission, project_scope_sql
 from backend.app.core.config import Settings
 from backend.app.core.database import transaction_immediate
 from backend.app.core.storage_paths import normalize_project_code, project_code_identity
@@ -101,8 +102,9 @@ def create_commercial_router(
     def require_session(
         request: Request,
         settings: Settings = settings_dependency,
-    ) -> None:
-        require_authenticated_session(request, settings.session_secret)
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> Principal:
+        return require_authenticated_session(request, settings.session_secret, connection)
 
     authentication_dependency = Depends(require_session)
 
@@ -110,7 +112,7 @@ def create_commercial_router(
     def list_quotes(
         project_code: str,
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         project = _project(connection, _normalize_project_path(project_code))
@@ -147,7 +149,7 @@ def create_commercial_router(
     async def create_quote(
         project_code: str,
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
         settings: Settings = settings_dependency,
     ) -> dict[str, object]:
@@ -292,7 +294,7 @@ def create_commercial_router(
     def get_quote(
         project_code: str,
         quote_id: str,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         project = _project(connection, _normalize_project_path(project_code))
@@ -306,7 +308,7 @@ def create_commercial_router(
         project_code: str,
         quote_id: str,
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         identifier = _parse_identifier(quote_id)
@@ -376,7 +378,7 @@ def create_commercial_router(
         project_code: str,
         quote_id: str,
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         identifier = _parse_identifier(quote_id)
@@ -438,7 +440,7 @@ def create_commercial_router(
     def list_contracts(
         project_code: str,
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         project = _project(connection, _normalize_project_path(project_code))
@@ -468,7 +470,7 @@ def create_commercial_router(
             (project["id"], page_size, (page - 1) * page_size),
         ).fetchall()
         return {
-            "items": [_contract_response(connection, row) for row in rows],
+            "items": [_contract_response(connection, row, principal=_) for row in rows],
             "total": total,
             "page": page,
             "page_size": page_size,
@@ -481,7 +483,7 @@ def create_commercial_router(
     async def create_contract(
         project_code: str,
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
         settings: Settings = settings_dependency,
     ) -> dict[str, object]:
@@ -609,7 +611,7 @@ def create_commercial_router(
                 row = _contract_row(connection, contract_id, int(project["id"]))
                 if row is None:
                     raise sqlite3.DatabaseError("created contract is missing")
-                response = _contract_response(connection, row)
+                response = _contract_response(connection, row, principal=_)
                 if key is not None:
                     save_idempotent_response(
                         connection,
@@ -635,7 +637,7 @@ def create_commercial_router(
     def get_contract(
         project_code: str,
         contract_id: str,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         project = _project(connection, _normalize_project_path(project_code))
@@ -646,14 +648,14 @@ def create_commercial_router(
         )
         if row is None:
             raise _not_found("Contract not found")
-        return _contract_response(connection, row)
+        return _contract_response(connection, row, principal=_)
 
     @router.put("/api/projects/{project_code}/contracts/{contract_id}")
     async def update_contract(
         project_code: str,
         contract_id: str,
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         identifier = _parse_identifier(contract_id)
@@ -771,7 +773,7 @@ def create_commercial_router(
                 updated = _contract_row(connection, identifier, int(project["id"]))
                 if updated is None:
                     raise sqlite3.DatabaseError("updated contract is missing")
-                return _contract_response(connection, updated)
+                return _contract_response(connection, updated, principal=_)
         except sqlite3.IntegrityError as exc:
             if _is_unique_constraint(exc):
                 raise _business_conflict(
@@ -785,7 +787,7 @@ def create_commercial_router(
         project_code: str,
         contract_id: str,
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         identifier = _parse_identifier(contract_id)
@@ -837,23 +839,23 @@ def create_commercial_router(
             updated = _contract_row(connection, identifier, int(project["id"]))
             if updated is None:
                 raise sqlite3.DatabaseError("transitioned contract is missing")
-            return _contract_response(connection, updated)
+            return _contract_response(connection, updated, principal=_)
 
     @router.get("/api/projects/{project_code}/payments")
     def get_payments(
         project_code: str,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         project = _project(connection, _normalize_project_path(project_code))
-        return _payment_overview(connection, project, _business_today(now))
+        return _payment_overview(connection, project, _business_today(now), principal=_)
 
     @router.put("/api/projects/{project_code}/payment-terms/{milestone}")
     async def put_payment_term(
         project_code: str,
         milestone: str,
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         normalized_milestone = _payment_milestone(milestone)
@@ -943,7 +945,7 @@ def create_commercial_router(
     async def create_receipt(
         project_code: str,
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         key = _read_idempotency_key(request)
@@ -1021,7 +1023,7 @@ def create_commercial_router(
         project_code: str,
         receipt_id: str,
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         identifier = _parse_identifier(receipt_id)
@@ -1073,7 +1075,7 @@ def create_commercial_router(
         project_code: str,
         receipt_id: str,
         request: Request,
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> dict[str, object]:
         identifier = _parse_identifier(receipt_id)
@@ -1287,7 +1289,13 @@ def _quote_response(
 def _contract_response(
     connection: sqlite3.Connection,
     row: sqlite3.Row,
+    *, principal: Principal | None = None,
 ) -> dict[str, object]:
+    scope, scope_ids = project_scope_sql(principal, "allocations.project_id")
+    restricted = connection.execute(
+        f"SELECT 1 FROM contract_project_allocations allocations WHERE allocations.contract_id = ? AND NOT ({scope}) LIMIT 1",
+        (row["id"], *scope_ids),
+    ).fetchone() is not None
     customer = connection.execute(
         "SELECT name FROM companies WHERE id = ?",
         (row["customer_company_id"],),
@@ -1295,15 +1303,15 @@ def _contract_response(
     if customer is None:
         raise sqlite3.DatabaseError("contract customer is missing")
     allocations = connection.execute(
-        """
+        f"""
         SELECT allocations.id, allocations.contract_id,
                projects.project_code, allocations.amount_cents
         FROM contract_project_allocations AS allocations
         JOIN projects ON projects.id = allocations.project_id
-        WHERE allocations.contract_id = ?
+        WHERE allocations.contract_id = ? AND ({scope})
         ORDER BY allocations.id
         """,
-        (row["id"],),
+        (row["id"], *scope_ids),
     ).fetchall()
     documents = connection.execute(
         """
@@ -1312,7 +1320,7 @@ def _contract_response(
         """,
         (row["id"],),
     ).fetchall()
-    return {
+    result = {
         "id": row["id"],
         "contract_no": row["contract_no"],
         "title": row["title"],
@@ -1337,6 +1345,13 @@ def _contract_response(
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+    if restricted:
+        result.update(restricted=True, visibility="allocation_summary",
+            contract_no="跨项目合同（仅分摊）", title="跨项目合同（仅分摊）",
+            customer_company_id=None, customer_company_name=None, signed_on=None,
+            total_amount_cents=None, final_delivery_on=None, notes=None,
+            document_version_ids=[], created_at=None, updated_at=None)
+    return result
 
 
 def _payment_overview(
@@ -1345,6 +1360,7 @@ def _payment_overview(
     today: str,
     *,
     include_receipts: bool = True,
+    principal: Principal | None = None,
 ) -> dict[str, object]:
     project_id = int(project["id"])
     contract_rows = connection.execute(
@@ -1404,7 +1420,7 @@ def _payment_overview(
     )
     received_amount = sum(received_by_milestone.values())
     unallocated_received = received_amount - allocated_received
-    return {
+    result = {
         "contracted_amount_cents": contracted_amount,
         "receivable_amount_cents": receivable_amount,
         "received_amount_cents": received_amount,
@@ -1424,6 +1440,9 @@ def _payment_overview(
             for row in receipt_rows
         ],
     }
+    if not has_permission(principal, "contracts.view"):
+        result.update(contracted_amount_cents=None, contract_collection_basis_points=None)
+    return result
 
 
 def _payment_term_response(

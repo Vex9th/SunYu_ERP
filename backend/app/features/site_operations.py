@@ -17,7 +17,11 @@ from fastapi.responses import JSONResponse
 from backend.app.core.config import Settings
 from backend.app.core.database import transaction, transaction_immediate
 from backend.app.core.storage_paths import normalize_project_code, project_code_identity
-from backend.app.features.api_common import ApiError, ApiErrorRoute
+from backend.app.features.api_common import (
+    ApiError,
+    ApiErrorRoute,
+    account_idempotency_scope,
+)
 from backend.app.features.auth import require_authenticated_session
 
 logger = logging.getLogger(__name__)
@@ -101,9 +105,10 @@ def create_site_operations_router(
     now = clock or _utc_now
 
     def require_session(
-        request: Request, settings: Settings = settings_dependency
+        request: Request, settings: Settings = settings_dependency,
+        connection: sqlite3.Connection = connection_dependency,
     ) -> None:
-        require_authenticated_session(request, settings.session_secret)
+        require_authenticated_session(request, settings.session_secret, connection)
 
     authentication_dependency = Depends(require_session)
 
@@ -1317,6 +1322,7 @@ def _reimbursed_total(connection: sqlite3.Connection, advance_id: int) -> int:
 def _restore_idempotency(
     connection: sqlite3.Connection, scope: str, key: str, request_hash: str
 ) -> dict[str, object] | None:
+    scope = account_idempotency_scope(connection, scope)
     row = connection.execute(
         "SELECT request_sha256, response_json FROM idempotency_requests WHERE scope = ? AND idempotency_key = ?",
         (scope, key),
@@ -1346,6 +1352,7 @@ def _save_idempotency(
     response_status: int,
     resource_type: str,
 ) -> None:
+    scope = account_idempotency_scope(connection, scope)
     connection.execute(
         """
         INSERT INTO idempotency_requests

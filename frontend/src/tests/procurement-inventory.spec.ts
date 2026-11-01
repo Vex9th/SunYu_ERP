@@ -27,6 +27,13 @@ async function createDraftOrder(
   return (await repository.getProjectWorkspace(projectCode)).data.purchase_orders[0]!
 }
 
+async function prepareDraftList(repository: MockProcurementRepository, project: string) {
+  const material = (await repository.getProjectWorkspace(project)).data.procurement_lists[0]!.lines[0]!
+  await repository.createProcurementList(project, { name: '未引用草稿', notes: null })
+  const list = (await repository.getProjectWorkspace(project)).data.procurement_lists[0]!
+  await repository.createProcurementLine(project, list.id, { ...material })
+}
+
 afterEach(() => {
   resetDemoBusinessContext()
   document.body.innerHTML = ''
@@ -44,7 +51,7 @@ describe('MockProcurementRepository', () => {
 
     expect(result.source).toBe('demo')
     expect(result.data.project_code).toBe('SY-2026-001')
-    expect(result.data.procurement_lists[0]?.status).toBe('draft')
+    expect(result.data.procurement_lists[0]?.status).toBe('confirmed')
     expect(result.data.procurement_lists[0]?.lines[0]).toMatchObject({
       quantity: '12.500',
       unit_cost_cents: 128900,
@@ -62,9 +69,10 @@ describe('MockProcurementRepository', () => {
 
   it('只通过冻结动作确认或取消采购事实并保留 revision', async () => {
     const repository = new MockProcurementRepository()
+    const order = await createDraftOrder(repository, 'SY-2026-001', 'PO-FREEZE')
+    await prepareDraftList(repository, 'SY-2026-001')
     const before = await repository.getProjectWorkspace('SY-2026-001')
     const list = before.data.procurement_lists[0]!
-    const order = await createDraftOrder(repository, 'SY-2026-001', 'PO-FREEZE')
 
     await repository.confirmProcurementList('SY-2026-001', list.id, list.revision)
     await repository.confirmPurchaseOrder('SY-2026-001', order.id, order.revision)
@@ -428,6 +436,7 @@ describe('MockProcurementRepository', () => {
     })
     const lines = (await repository.getProjectWorkspace('SY-WEIGHTED')).data.procurement_lists[0]!.lines
     const procurementLine = lines[lines.length - 1]!
+    await repository.confirmProcurementLine('SY-WEIGHTED', list.id, procurementLine.id, procurementLine.revision)
     await repository.createPurchaseOrder('SY-WEIGHTED', {
       order_no: 'PO-WEIGHTED',
       supplier_company_id: 8,
@@ -496,6 +505,7 @@ describe('MockProcurementRepository', () => {
     const procurementLines = (await repository.getProjectWorkspace('SY-2026-001'))
       .data.procurement_lists[0]!.lines
     const procurementLine = procurementLines[procurementLines.length - 1]!
+    await repository.confirmProcurementLine('SY-2026-001', list.id, procurementLine.id, procurementLine.revision)
     await repository.createPurchaseOrder('SY-2026-001', {
       order_no: 'PO-2026-019',
       supplier_company_id: 9,
@@ -640,6 +650,7 @@ describe('MockProcurementRepository', () => {
     })
     const lines = (await repository.getProjectWorkspace('SY-2026-001')).data.procurement_lists[0]!.lines
     const secondLine = lines[lines.length - 1]!
+    await repository.confirmProcurementLine('SY-2026-001', list.id, secondLine.id, secondLine.revision)
     await repository.createPurchaseOrder('SY-2026-001', {
       order_no: 'PO-SECOND-SOURCE',
       supplier_company_id: 8,
@@ -761,6 +772,7 @@ describe('MockProcurementRepository', () => {
 
   it('采购清单确认与采购行编辑使用 revision 并保持失败原子性', async () => {
     const repository = new MockProcurementRepository()
+    await prepareDraftList(repository, 'SY-2026-001')
     const before = await repository.getProjectWorkspace('SY-2026-001')
     const list = before.data.procurement_lists[0]!
     const line = list.lines[0]!
@@ -783,7 +795,7 @@ describe('MockProcurementRepository', () => {
       quantity: '13.000',
       quoted_unit_price_cents: 160000,
       revision: line.revision + 1,
-      order_status: 'partial',
+      order_status: 'not_ordered',
     })
     const editedList = edited.data.procurement_lists[0]!
     const snapshot = await repository.getProjectWorkspace('SY-2026-001')
@@ -807,7 +819,7 @@ describe('MockProcurementRepository', () => {
       confirmedLine.id,
       confirmedLine.revision,
       { ...confirmedLine, quantity: '14.000' },
-    )).rejects.toThrow('已确认采购清单不能编辑')
+    )).rejects.toThrow('此项已确认，请先撤回确认后编辑')
     expect(await repository.getProjectWorkspace('SY-2026-001')).toEqual(confirmed)
   })
 

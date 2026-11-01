@@ -15,9 +15,10 @@ from openpyxl import load_workbook
 from backend.app.core.config import Settings
 from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
-from backend.app.core.security import SESSION_COOKIE_NAME, create_session_token
+from backend.app.core.security import SESSION_COOKIE_NAME, hash_account_password
 from backend.app.core.storage_paths import project_code_identity
 from backend.app.features import procurement
+from backend.app.features.auth import _new_session
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 NOW = datetime(2026, 8, 29, 1, 30, tzinfo=timezone.utc)
@@ -36,13 +37,32 @@ class ProcurementHarness:
         with TestClient(self.app) as client:
             client.cookies.set(
                 SESSION_COOKIE_NAME,
-                create_session_token(self.settings.session_secret),
+                _owner_session(self.database_path, self.settings.session_secret),
             )
             yield client
 
 
 def test_procurement_router_factory_exists() -> None:
     assert callable(procurement.create_procurement_router)
+
+
+def _owner_session(database_path: Path, secret: str) -> str:
+    connection = connect_database(database_path)
+    try:
+        owner = connection.execute("SELECT id FROM accounts WHERE is_owner = 1").fetchone()
+        if owner is None:
+            cursor = connection.execute(
+                """INSERT INTO accounts (username, username_key, display_name, password_hash,
+                   is_owner, created_at, updated_at) VALUES ('procurement-owner', 'procurement-owner',
+                   '采购测试主账号', ?, 1, ?, ?)""",
+                (hash_account_password("ProcurementTest123"), NOW.isoformat(), NOW.isoformat()),
+            )
+            identifier = int(cursor.lastrowid)
+        else:
+            identifier = int(owner["id"])
+        return _new_session(connection, secret, identifier)
+    finally:
+        connection.close()
 
 
 def _build_harness(tmp_path: Path) -> ProcurementHarness:
@@ -276,8 +296,8 @@ def test_procurement_list_draft_crud_confirmation_and_revision_conflict(
             headers={"Idempotency-Key": "20000000-0000-4000-8000-000000000004"},
             json={**_line_payload(), "sequence_no": 2},
         )
-        assert immutable.status_code == 409
-        assert immutable.json()["detail"] == "Procurement list is not editable"
+        assert immutable.status_code == 201
+        assert immutable.json()["confirmation_status"] == "draft"
 
 
 def test_confirmed_procurement_list_can_only_be_revised_by_copying_a_new_draft(
@@ -662,9 +682,9 @@ def test_procurement_options_and_overview_cover_all_pages_with_bounded_queries(
                 )
                 connection.execute(
                     "INSERT INTO procurement_lines (procurement_list_id, sequence_no, category, name, "
-                    "quantity_milli, unit, unit_cost_cents, quoted_unit_price_cents, create_idempotency_key, create_request_hash, created_at, updated_at) "
+                    "quantity_milli, unit, unit_cost_cents, quoted_unit_price_cents, create_idempotency_key, create_request_hash, created_at, updated_at, confirmation_status, confirmed_at) "
                     "SELECT ?, sequence_no, category, ?, quantity_milli, unit, unit_cost_cents, "
-                    "quoted_unit_price_cents, ?, create_request_hash, created_at, updated_at FROM procurement_lines WHERE id = ?",
+                    "quoted_unit_price_cents, ?, create_request_hash, created_at, updated_at, confirmation_status, confirmed_at FROM procurement_lines WHERE id = ?",
                     (cursor.lastrowid, f"物料{index}", f"line-{index}", base["lines"][0]["id"]),
                 )
         statements: list[str] = []

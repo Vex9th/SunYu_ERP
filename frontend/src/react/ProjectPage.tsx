@@ -1,3 +1,6 @@
+import { useAccess } from './access/AccessProvider'
+import { ActivitySummary } from './activity/ActivitySummary'
+import { OperationHistory } from './activity/OperationHistory'
 import { RouterButton } from './RouterButton'
 import { lazy, Suspense, useEffect, useState } from 'react'
 import {
@@ -73,6 +76,7 @@ export default function ProjectPage() {
 }
 
 function ProjectWorkspace({ projectCode }: { projectCode: string }) {
+  const { can } = useAccess()
   const location = useLocation()
   const navigate = useNavigate()
   const activeTab = location.pathname.split('/')[3] ?? ''
@@ -92,7 +96,7 @@ function ProjectWorkspace({ projectCode }: { projectCode: string }) {
     return () => window.removeEventListener('project-data-changed', refresh)
   }, [projectCode, dashboard.reload])
   const companies = useLoad(
-    () => requestJson<CompanySummary[]>('/api/companies'),
+    () => can('companies.view') ? requestJson<CompanySummary[]>('/api/companies') : Promise.resolve([]),
     [],
   )
   const [action, setAction] = useState<'edit' | 'close' | 'restore' | null>(
@@ -101,11 +105,13 @@ function ProjectWorkspace({ projectCode }: { projectCode: string }) {
   const data = dashboard.data
   const readonly = data?.project.status === 'archived'
   const base = `/projects/${encodeURIComponent(projectCode)}`
+  const tabPermissions: Record<string, string[]> = { '': ['projects.view'], stages: ['project_stages.view'], documents: ['documents.view'], commercial: ['quotes.view', 'contracts.view', 'customer_receipts.view'], procurement: ['procurement.lines.view', 'procurement.orders.view'], workforce: ['workforce.view', 'dispatches.view', 'site_reports.view', 'material_advances.view'], delivery: ['documents.view', 'engineering_changes.view', 'acceptance.view', 'warranty.view', 'after_sales.view', 'customer_invoices.view'] }
+  const allowedTab = (key: string) => tabPermissions[key]?.some(permission => can(permission, data?.project.id)) ?? false
   return (
     <div className={styles.stack}>
       <ErrorNotice error={dashboard.error} retry={dashboard.reload} />
       {!data && dashboard.loading && <LoadingBlock />}
-      {data && (
+      {data && can('projects.view', data.project.id) && (
         <>
           <section className={styles.projectContext}>
             <div className={styles.toolbar}>
@@ -122,7 +128,7 @@ function ProjectWorkspace({ projectCode }: { projectCode: string }) {
                   </div>
                   <div className={styles.projectMeta}>
                     <span>{data.project.project_code}</span>
-                    <span>{data.company.name}</span>
+                    <span>{data.project.company_name}</span>
                     <span>
                       创建于 {formatChineseDateTime(data.project.created_at)}
                     </span>
@@ -130,12 +136,14 @@ function ProjectWorkspace({ projectCode }: { projectCode: string }) {
                 </div>
               </div>
               <Space wrap>
+                <OperationHistory resourceType="project" resourceId={data.project.id} />
+                <ActivitySummary summary={data.project.activity_summary} />
                 <RefreshButton
                   label="刷新概况"
                   loading={dashboard.loading}
                   onClick={dashboard.reload}
                 />
-                {!readonly && (
+                {!readonly && can('projects.edit', data.project.id) && (
                   <Button
                     icon={<EditOutlined />}
                     onClick={() => setAction('edit')}
@@ -143,14 +151,14 @@ function ProjectWorkspace({ projectCode }: { projectCode: string }) {
                     编辑项目
                   </Button>
                 )}
-                {readonly ? (
+                {readonly && can('projects.restore', data.project.id) ? (
                   <Button
                     icon={<UndoOutlined />}
                     onClick={() => setAction('restore')}
                   >
                     恢复项目
                   </Button>
-                ) : (
+                ) : !readonly && can('projects.close', data.project.id) && (
                   <Dropdown
                     trigger={['click']}
                     menu={{
@@ -180,36 +188,37 @@ function ProjectWorkspace({ projectCode }: { projectCode: string }) {
               className={styles.projectTabs}
               activeKey={activeTab}
               onChange={(key) => navigate(key ? `${base}/${key}` : base)}
-              items={tabs}
+              items={tabs.filter(tab => allowedTab(tab.key))}
             />
           </section>
           <Suspense fallback={<LoadingBlock />}>
+            {!allowedTab(activeTab) && <Alert type="warning" showIcon title="无权查看此模块，请联系主账号调整工作组权限" />}
             {activeTab === '' && <ProjectOverview data={data} />}
-            {activeTab === 'stages' && (
-              <ProjectStages projectCode={projectCode} category={data.project.project_category} readonly={readonly} />
+            {activeTab === 'stages' && allowedTab('stages') && (
+              <ProjectStages projectId={data.project.id} projectCode={projectCode} category={data.project.project_category} readonly={readonly} />
             )}
-            {activeTab === 'documents' && (
+            {activeTab === 'documents' && allowedTab('documents') && (
               <ProjectDocuments projectCode={projectCode} readonly={readonly} />
             )}
-            {activeTab === 'commercial' && (
+            {activeTab === 'commercial' && allowedTab('commercial') && (
               <ProjectCommercial
                 projectCode={projectCode}
                 readonly={readonly}
               />
             )}
-            {activeTab === 'procurement' && (
+            {activeTab === 'procurement' && allowedTab('procurement') && (
               <ProcurementWorkspace
                 projectCode={projectCode}
                 readonly={readonly}
               />
             )}
-            {activeTab === 'workforce' && (
+            {activeTab === 'workforce' && allowedTab('workforce') && (
               <WorkforceWorkspace
                 projectCode={projectCode}
                 readonly={readonly}
               />
             )}
-            {activeTab === 'delivery' && (
+            {activeTab === 'delivery' && allowedTab('delivery') && (
               <DeliveryWorkspace
                 projectCode={projectCode}
                 readonly={readonly}
@@ -399,6 +408,8 @@ function ProjectWorkspace({ projectCode }: { projectCode: string }) {
 }
 
 function ProjectOverview({ data }: { data: ProjectDashboard }) {
+  const { can } = useAccess()
+  const money = (value: number | null | undefined, permission: string) => can(permission, data.project.id) ? formatMoney(value ?? null) : '无权限'
   const base = `/projects/${encodeURIComponent(data.project.project_code)}`
   const remaining = data.stages.filter(
     (stage) => !['completed', 'skipped'].includes(stage.status),
@@ -411,7 +422,7 @@ function ProjectOverview({ data }: { data: ProjectDashboard }) {
   const archived = data.project.status === 'archived'
   return (
     <div className={styles.stack}>
-      <div className={styles.currentProgress}>
+      {can('project_stages.view', data.project.id) && <div className={styles.currentProgress}>
         <div>
           <span className={styles.subtle}>
             {archived ? '归档项目' : '当前阶段'} · {complete} /{' '}
@@ -430,14 +441,14 @@ function ProjectOverview({ data }: { data: ProjectDashboard }) {
                 : '查看阶段计划，安排接下来的工作'}
           </p>
         </div>
-        <RouterButton to={`${base}/stages`} type="primary" icon={<ArrowRightOutlined />}>
+        <RouterButton disabled={!can('project_stages.view')} to={`${base}/stages`} type="primary" icon={<ArrowRightOutlined />}>
           {archived
             ? '查看阶段记录'
             : current?.status === 'blocked'
               ? '处理阶段阻塞'
               : '查看并更新进度'}
         </RouterButton>
-      </div>
+      </div>}
       {data.todos.length > 0 && (
         <Section title={`项目待办 · ${data.todos.length} 项`}>
           <div className={styles.attentionList}>
@@ -465,26 +476,30 @@ function ProjectOverview({ data }: { data: ProjectDashboard }) {
       <div className={styles.taskGrid}>
         {[
           {
+            permission: 'procurement.lines.view',
             to: 'procurement?section=lists',
             title: '采购与到货',
             note: '物料清单、采购单、付款',
           },
           {
+            permission: 'workforce.view',
             to: 'workforce?section=labor',
             title: '施工与上工',
             note: '人员安排、每日上工记录',
           },
           {
+            permission: 'customer_receipts.view',
             to: 'commercial?section=receivables',
             title: '合同与收款',
             note: '收款计划、实际到账',
           },
           {
+            permission: 'acceptance.view',
             to: 'delivery?section=acceptance',
             title: '验收与售后',
             note: '交付记录、发票、质保',
           },
-        ].map((item) => (
+        ].filter(item => can(item.permission, data.project.id)).map((item) => (
           <Link
             key={item.to}
             className={styles.taskLink}
@@ -501,33 +516,33 @@ function ProjectOverview({ data }: { data: ProjectDashboard }) {
       <div className={styles.metrics}>
         <DataValue
           label="合同金额"
-          value={formatMoney(data.profit.contracted_amount_cents)}
-          note={`已到账 ${formatMoney(data.receivables.received_amount_cents)}`}
+          value={money(data.profit?.contracted_amount_cents, 'contracts.view')}
+          note={`已到账 ${money(data.receivables.received_amount_cents, 'customer_receipts.view')}`}
         />
         <DataValue
           label="待收款"
           value={
-            <Link to={`${base}/commercial?section=receivables`}>
-              {formatMoney(data.receivables.outstanding_receivable_cents)}
-            </Link>
+            can('customer_receipts.view', data.project.id) ? <Link to={`${base}/commercial?section=receivables`}>
+              {money(data.receivables.outstanding_receivable_cents, 'customer_receipts.view')}
+            </Link> : '无权限'
           }
         />
         <DataValue
           label="实际成本"
-          value={formatMoney(data.costs.total_cents)}
+          value={money(data.costs.total_cents, 'sensitive.profit_summary')}
           note={
-            data.costs.completeness === 'complete'
+            can('sensitive.profit_summary', data.project.id) ? (data.costs.completeness === 'complete'
               ? '成本记录完整'
-              : '部分成本尚未记录'
+              : '部分成本尚未记录') : undefined
           }
         />
         <DataValue
           label="实际利润"
-          value={formatMoney(data.profit.actual_profit_cents)}
-          note={`利润率 ${formatBasisPoints(data.profit.margin_basis_points)}`}
+          value={money(data.profit?.actual_profit_cents, 'sensitive.profit_summary')}
+          note={can('sensitive.profit_summary') ? `利润率 ${formatBasisPoints(data.profit?.margin_basis_points)}` : undefined}
         />
       </div>
-      <Section title="成本明细">
+      {can('sensitive.profit_summary', data.project.id) && <Section title="成本明细">
         <Descriptions
           column={{ xs: 1, sm: 2, xl: 3 }}
           items={[
@@ -563,11 +578,11 @@ function ProjectOverview({ data }: { data: ProjectDashboard }) {
             },
           ]}
         />
-      </Section>
+      </Section>}
       <Section
         title="项目资料与联系信息"
         extra={
-          <Link to={`${base}/documents`}>
+          can('documents.view') && <Link to={`${base}/documents`}>
             查看 {data.documents.document_count} 份文件 <ArrowRightOutlined />
           </Link>
         }
@@ -575,7 +590,7 @@ function ProjectOverview({ data }: { data: ProjectDashboard }) {
         <p style={{ marginTop: 0 }}>
           {data.project.description || '尚未填写项目说明，可在上方编辑项目。'}
         </p>
-        {data.contacts.length ? (
+        {!can('companies.view') || !data.company ? <span className={styles.subtle}>无权查看客户公司与联系人</span> : data.contacts.length ? (
           <div className={styles.contactList}>
             {data.contacts.map((contact) => (
               <div className={styles.contactItem} key={contact.id}>
@@ -599,7 +614,7 @@ function ProjectOverview({ data }: { data: ProjectDashboard }) {
             </Link>
           </Space>
         )}
-        <Collapse
+        {can('companies.view') && data.company && <Collapse
           ghost
           style={{ marginTop: 14 }}
           items={[
@@ -633,19 +648,19 @@ function ProjectOverview({ data }: { data: ProjectDashboard }) {
                     {
                       key: 'bank',
                       label: '开户银行',
-                      children: data.company.bank_name || '—',
+                      children: can('sensitive.company_banking') ? data.company.bank_name || '—' : '无权限',
                     },
                     {
                       key: 'account',
                       label: '银行账号',
-                      children: data.company.bank_account || '—',
+                      children: can('sensitive.company_banking') ? data.company.bank_account || '—' : '无权限',
                     },
                   ]}
                 />
               ),
             },
           ]}
-        />
+        />}
       </Section>
     </div>
   )

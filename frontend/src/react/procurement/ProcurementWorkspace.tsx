@@ -15,20 +15,33 @@ import PurchaseOrderNumberField from './PurchaseOrderNumberField'
 import PurchaseOrderTaxFields from './PurchaseOrderTaxFields'
 import PurchaseOrderPriceFields from './PurchaseOrderPriceFields'
 import { calculatePurchaseTax, purchaseUnitPrices, taxRateToBps, taxRateToInput } from './purchaseTax'
+import { registerAccountCleanup } from '../../api'
+import { useAccess } from '../access/useAccess'
+import { OperationHistory } from '../activity/OperationHistory'
+import { ActivitySummary } from '../activity/ActivitySummary'
 import styles from './ProcurementWorkspace.module.css'
 
 const defaultRepository = createHttpProcurementRepository()
 const sections = ['lists', 'orders', 'import', 'quotes']
-type DialogKind = 'list' | 'edit-list' | 'line' | 'edit-line' | 'order' | 'edit-order' | 'receipt' | 'payment' | 'invoice' | 'cancel-order' | 'reverse-receipt' | 'reverse-payment' | 'reverse-invoice' | 'quote'
+const sectionPermissions: Record<string, string> = { lists: 'procurement.lines.view', orders: 'procurement.orders.view', import: 'procurement.lines.import', quotes: 'procurement.lines.view' }
+type DialogKind = 'list' | 'edit-list' | 'line' | 'edit-line' | 'order' | 'edit-order' | 'receipt' | 'payment' | 'invoice' | 'cancel-order' | 'reverse-receipt' | 'reverse-payment' | 'reverse-invoice' | 'quote' | 'reopen-line'
 interface Dialog { kind: DialogKind; list?: ProcurementListDetailDto; line?: ProcurementLineDto; order?: PurchaseOrderRecordDto; record?: GoodsReceiptDto | SupplierPaymentDto | SupplierInvoiceDto }
 interface ImportSession { file: File; name: string; preview: ProcurementImportPreviewDto | null }
 const imports = new Map<string, ImportSession>()
 const quoteDownloadOwners = new Map<string, () => boolean>()
-const titles: Record<DialogKind, string> = { list: '新建采购清单', 'edit-list': '编辑采购清单', line: '添加采购物料', 'edit-line': '编辑采购物料', order: '新建采购单', 'edit-order': '编辑采购单', receipt: '登记到货', payment: '登记供应商付款', invoice: '登记进项发票', 'cancel-order': '取消采购单', 'reverse-receipt': '冲销到货记录', 'reverse-payment': '冲销付款记录', 'reverse-invoice': '冲销进项发票', quote: '生成客户报价单' }
+registerAccountCleanup(() => { imports.clear(); quoteDownloadOwners.clear() })
+const titles: Record<DialogKind, string> = { list: '新建采购清单', 'edit-list': '编辑采购清单', line: '添加采购物料', 'edit-line': '编辑采购物料', order: '新建采购单', 'edit-order': '编辑采购单', receipt: '登记到货', payment: '登记供应商付款', invoice: '登记进项发票', 'cancel-order': '取消采购单', 'reverse-receipt': '冲销到货记录', 'reverse-payment': '冲销付款记录', 'reverse-invoice': '冲销进项发票', quote: '生成客户报价单', 'reopen-line': '撤回当前物料确认' }
 const orderLabels: Record<string, string> = { draft: '草稿', confirmed: '已确认', partially_received: '部分到货', received: '已全部到货', cancelled: '已取消' }
+const dialogPermissions: Record<DialogKind, string> = {
+  list: 'procurement.lines.create', 'edit-list': 'procurement.lines.edit', line: 'procurement.lines.create', 'edit-line': 'procurement.lines.edit', 'reopen-line': 'procurement.lines.reopen',
+  order: 'procurement.orders.create', 'edit-order': 'procurement.orders.edit', receipt: 'procurement.receipts.register', payment: 'procurement.payments.register', invoice: 'procurement.invoices.register',
+  'cancel-order': 'procurement.orders.cancel', 'reverse-receipt': 'procurement.receipts.reverse', 'reverse-payment': 'procurement.payments.reverse', 'reverse-invoice': 'procurement.invoices.reverse', quote: 'procurement.lines.export',
+}
+const priceDialogs = new Set<DialogKind>(['line', 'edit-line', 'order', 'edit-order', 'payment', 'invoice', 'quote'])
 function statusTag(status: string) { return <Tag color={status === 'draft' ? 'default' : status === 'cancelled' ? 'red' : 'blue'}>{orderLabels[status] ?? status}</Tag> }
 
 export default function ProcurementWorkspace({ projectCode, readonly = false, repository = defaultRepository, customerCompany }: { projectCode: string; readonly?: boolean; repository?: ProcurementHttpRepository; customerCompany?: Customer }) {
+  const access = useAccess()
   const data = useProcurementData(repository, projectCode, customerCompany)
   const [tab, setTab] = useWorkspaceTab('section', sections, 'lists')
   const [selectedOrderValue, setSelectedOrderValue] = useWorkspaceValue('order', '')
@@ -44,14 +57,15 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
   const [, setImportVersion] = useState(0)
   const [form] = Form.useForm()
   const [confirm, confirmContext] = Modal.useModal()
-  const scope = mutationScope(repository, 'procurement', projectCode)
-  const context = useRef({ scope, mounted: true, detailSequence: 0, readonly })
-  context.current.scope = scope; context.current.readonly = readonly
+  const scope = mutationScope(repository, 'procurement', `${access.namespace}:${projectCode}`)
+  const context = useRef({ scope, mounted: true, detailSequence: 0, readonly, can: access.can })
+  context.current.scope = scope; context.current.readonly = readonly; context.current.can = access.can
   const importSession = imports.get(scope)
   const isCurrent = () => context.current.mounted && context.current.scope === scope
-  const canAct = () => isCurrent() && !context.current.readonly
+  const canAct = (permission?: string) => isCurrent() && !context.current.readonly && (!permission || (context.current.can(permission) && (permission !== 'procurement.lines.export' || context.current.can('sensitive.procurement_prices'))))
 
   async function loadOrder(id: number) {
+    if (!access.can('procurement.orders.view')) return
     requestedOrderId.current = id
     const sequence = ++context.current.detailSequence
     setDetailLoading(true); setDetailError('')
@@ -70,13 +84,14 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
   const locked = Boolean(actions.pending)
   const listById = new Map(data.catalog.lists.map(list => [list.id, list]))
   const lines = data.catalog.lines.flatMap(line => { const list = listById.get(line.procurement_list_id); return list ? [{ list, line }] : [] })
-  const availableLines = lines.filter(({ list }) => list.status === 'confirmed')
-  const confirmedLists = data.catalog.lists.filter((list) => list.status === 'confirmed')
+  const availableLines = lines.filter(({ list, line }) => list.status !== 'superseded' && line.confirmation_status === 'confirmed')
+  const orderLines = availableLines.filter(({ line }) => line.ordered_quantity != null)
+  const confirmedLists = data.catalog.lists.filter(list => list.status !== 'superseded' && availableLines.some(item => item.list.id === list.id))
   const lineLabel = (id: number) => { const item = lines.find(({ line }) => line.id === id)?.line; return item ? `${item.name}${item.model ? ` · ${item.model}` : ''}` : `采购物料 #${id}` }
 
   useEffect(() => {
     context.current.mounted = true; context.current.detailSequence++
-    const downloadOwner = () => isCurrent()
+    const downloadOwner = () => isCurrent() && context.current.can('procurement.lines.export') && context.current.can('sensitive.procurement_prices')
     quoteDownloadOwners.set(scope, downloadOwner)
     setDialog(null); setOrder(null); setDrawer(false); setDetailError(''); setFiles([]); setSelectedListId(null)
     requestedOrderId.current = null
@@ -85,6 +100,11 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
       if (quoteDownloadOwners.get(scope) === downloadOwner) quoteDownloadOwners.delete(scope)
     }
   }, [scope])
+
+  useEffect(() => {
+    if (!access.can(sectionPermissions[tab]!)) { const visible = sections.find(section => access.can(sectionPermissions[section]!)); if (visible) setTab(visible) }
+    if (!access.can('procurement.orders.view')) { setOrder(null); setDrawer(false); setDetailError('') }
+  }, [access.accessRevision, access.namespace])
 
   useEffect(() => {
     const id = Number(selectedOrderValue)
@@ -98,7 +118,8 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
   }, [scope, selectedOrderValue, tab])
 
   function open(next: Dialog) {
-    if (!canAct() || locked) return
+    if (!canAct(dialogPermissions[next.kind]) || (priceDialogs.has(next.kind) && !context.current.can('sensitive.procurement_prices')) || locked) return
+    if (next.kind === 'order' && next.line && next.line.ordered_quantity == null) return
     actions.setError(''); setFiles([]); form.resetFields()
     const today = localISODate()
     let values: FormValues = { number_mode: 'auto', order_no: '', ordered_on: today, received_on: today, paid_on: today, invoiced_on: today, document_version_ids: [], payment_method: '银行转账', lines: [] }
@@ -108,17 +129,17 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
     if (next.kind === 'order' && !next.line) values.lines = [{ quantity: '', cost: '', overage_reason: '' }]
     if (next.kind === 'edit-order' && next.order) values = { ...values, ...next.order, tax_rate: taxRateToInput(next.order.tax_rate_bps), lines: next.order.lines.map((line) => ({ procurement_line_id: line.procurement_line_id, quantity: line.quantity, cost: centsToYuan(line.unit_cost_cents), gross_cost: line.gross_unit_cost_cents == null ? '' : centsToYuan(line.gross_unit_cost_cents), price_basis: line.gross_unit_cost_cents == null ? 'net' : 'gross', overage_reason: line.overage_reason ?? '' })) }
     if (next.kind === 'receipt' && next.order) values.lines = next.order.lines.map((line) => ({ purchase_order_line_id: line.id, quantity: '0' }))
-    if (next.kind === 'quote') values = { ...values, list_id: next.list?.id, title: next.list ? `${next.list.name} 报价单` : '' }
+    if (next.kind === 'quote') values = { ...values, list_id: next.list?.id, procurement_line_ids: availableLines.filter(item => item.list.id === next.list?.id).map(item => item.line.id), title: next.list ? `${next.list.name} 报价单` : '' }
     form.setFieldsValue(values); setDialog(next)
   }
   async function openOrder(item: PurchaseOrderRecordDto) { setSelectedOrderValue(String(item.id)) }
 
-  async function confirmList(list: ProcurementListDetailDto) {
-    if (!canAct() || locked || list.status !== 'draft') return
-    const approved = await confirm.confirm({ title: '确认并锁定采购清单？', content: `${list.name} · ${list.lines.length} 项 · 成本 ${formatMoney(list.cost_total_cents)}。确认后不能编辑原清单，可复制为新草稿。`, okText: '确认并锁定', cancelText: '返回检查' })
-    if (!approved || !canAct()) return
-    const input = { expected_revision: list.revision }
-    await actions.run('清单确认', () => repository.confirmProcurementList(projectCode, list.id, input))
+  async function confirmLine(list: ProcurementListDetailDto, line: ProcurementLineDto) {
+    if (!canAct('procurement.lines.confirm') || locked || line.confirmation_status !== 'draft' || line.edit_block_reason) return
+    const approved = await confirm.confirm({ title: `确认 ${line.name}？`, content: `仅确认当前物料，数量 ${line.quantity} ${line.unit}，成本 ${formatMoney(line.cost_total_cents)}。其他物料仍可独立维护。`, okText: '确认当前项', cancelText: '返回检查' })
+    if (!approved || !canAct('procurement.lines.confirm')) return
+    const input = { expected_revision: line.revision }
+    await actions.run('物料确认', () => repository.confirmProcurementLine(projectCode, list.id, line.id, input), () => repository.discardConfirmProcurementLine(projectCode, list.id, line.id, input))
   }
   async function copyList(list: ProcurementListDetailDto) {
     if (!canAct() || locked) return
@@ -126,12 +147,12 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
     await actions.run('复制清单', () => repository.copyProcurementListAsDraft(projectCode, list.id, input), () => repository.discardCopyProcurementListAsDraft(projectCode, list.id, input))
   }
   async function deleteLine(list: ProcurementListDetailDto, line: ProcurementLineDto) {
-    if (!canAct() || locked || list.status !== 'draft') return
+    if (!canAct('procurement.lines.delete') || locked || line.confirmation_status !== 'draft' || line.edit_block_reason) return
     const approved = await confirm.confirm({ title: `删除 ${line.name}？`, content: '删除此草稿物料行后无法恢复。', okText: '删除', cancelText: '取消', okButtonProps: { danger: true } })
-    if (approved && canAct()) await actions.run('删除物料', () => repository.deleteProcurementLine(projectCode, list.id, line.id))
+    if (approved && canAct()) await actions.run('删除物料', () => repository.deleteProcurementLine(projectCode, list.id, line.id, line.revision))
   }
   async function confirmOrder() {
-    if (!order || order.status !== 'draft' || !canAct() || locked) return
+    if (!order || order.status !== 'draft' || !canAct('procurement.orders.confirm') || locked) return
     const selected = order
     const approved = await confirm.confirm({ title: `确认采购单 ${selected.order_no}？`, content: `供应商 ${selected.supplier_company_name ?? ''}，金额 ${formatMoney(selected.ordered_amount_cents)}。确认后可登记到货和付款。`, okText: '确认采购单', cancelText: '返回检查' })
     if (!approved || !canAct()) return
@@ -156,9 +177,10 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
       const item = lines.find(({ line }) => line.id === id)
       if (seen.has(id)) throw new Error('同一物料不能重复添加')
       seen.add(id)
-      if (dialog?.kind !== 'edit-order' && (!item || item.list.status !== 'confirmed')) throw new Error('请选择已确认清单中的物料')
+      if (dialog?.kind !== 'edit-order' && (!item || item.line.confirmation_status !== 'confirmed' || item.list.status === 'superseded')) throw new Error('请选择已确认的物料')
       const quantity = positiveQuantity(draft.quantity)
       const overage = optional(draft.overage_reason)
+      if (dialog?.kind === 'order' && item?.line.ordered_quantity == null) throw new Error('当前物料的已采购数量不可读取，无法建立采购单')
       const capacity = dialog?.kind === 'edit-order' ? item?.line.quantity : item ? remainingQuantity(item.line.quantity, item.line.ordered_quantity) : undefined
       if (capacity && quantityMilli(quantity) > quantityMilli(capacity) && !overage) throw new Error(`${lineLabel(id)}超出采购数量，请填写超采原因`)
       const prices = purchaseUnitPrices(draft, taxRate)
@@ -169,7 +191,7 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
   }
 
   async function submit(values: FormValues) {
-    if (!dialog || !canAct() || locked) return
+    if (!dialog || !canAct(dialogPermissions[dialog.kind]) || (priceDialogs.has(dialog.kind) && !context.current.can('sensitive.procurement_prices')) || locked) return
     const currentDialog = dialog
     const selected = currentDialog.order
     try {
@@ -185,13 +207,18 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
         await actions.run('采购清单', () => repository.updateProcurementList(projectCode, list.id, input))
       } else if (currentDialog.kind === 'line' || currentDialog.kind === 'edit-line') {
         const list = data.lists.find((entry) => entry.id === Number(values.list_id))
-        if (!list || list.status !== 'draft') throw new Error('请选择草稿采购清单')
+        if (!list || list.status === 'superseded') throw new Error('请选择未被替代的采购清单')
         const input = procurementLineInput(values)
         if (currentDialog.kind === 'edit-line' && currentDialog.line) {
           const id = currentDialog.line.id
           const update = { ...input, expected_revision: currentDialog.line.revision }
           await actions.run('采购物料', () => repository.updateProcurementLine(projectCode, list.id, id, update))
         } else await actions.run('采购物料', () => repository.createProcurementLine(projectCode, list.id, input), () => repository.discardCreateProcurementLine(projectCode, list.id, input))
+      } else if (currentDialog.kind === 'reopen-line' && currentDialog.list && currentDialog.line) {
+        const { list, line } = currentDialog
+        if (!line.can_reopen) throw new Error(line.edit_block_reason ?? '此项不能撤回确认')
+        const input = { expected_revision: line.revision, reason: required(values.reason, '撤回原因') }
+        await actions.run('撤回物料确认', () => repository.reopenProcurementLine(projectCode, list.id, line.id, input), () => repository.discardReopenProcurementLine(projectCode, list.id, line.id, input))
       } else if (currentDialog.kind === 'order' || currentDialog.kind === 'edit-order') {
         const input = orderInput(values)
         if (currentDialog.kind === 'edit-order' && selected) {
@@ -235,8 +262,10 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
         if (currentDialog.kind === 'reverse-invoice') await actions.run('进项发票冲销', () => repository.reverseSupplierInvoice(projectCode, record.id, input), () => repository.discardReverseSupplierInvoice(projectCode, record.id, input))
       } else if (currentDialog.kind === 'quote') {
         const list = confirmedLists.find((entry) => entry.id === Number(values.list_id))
-        if (!list || !data.customer) throw new Error('请选择已确认清单，并确保项目已绑定客户')
-        const input = { title: required(values.title, '报价标题'), customer_company_id: data.customer.id, notes: optional(values.notes) }
+        if (!list || !data.customer) throw new Error('请选择含已确认项的清单，并确保项目已绑定客户')
+        const selectedIds = (values.procurement_line_ids ?? []) as number[]
+        if (!selectedIds.length || selectedIds.some(id => !availableLines.some(item => item.line.id === id && item.list.id === list.id))) throw new Error('请至少选择一项已确认物料')
+        const input = { title: required(values.title, '报价标题'), customer_company_id: data.customer.id, notes: optional(values.notes), procurement_line_ids: selectedIds }
         let exportId: number | null = null
         await actions.run('客户报价单', async () => {
           // 每次主动重试捕获当前实例；导航或重新挂载不接管进行中的自动下载。
@@ -252,7 +281,7 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
   }
 
   async function previewImport(file: File) {
-    if (!canAct() || locked) return
+    if (!canAct('procurement.lines.import') || locked) return
     if (!/\.xlsx$/i.test(file.name)) { actions.setError('请选择 .xlsx 采购清单文件'); return }
     const previous = imports.get(scope)
     if (previous) repository.discardPreviewProcurementImport(projectCode, previous.file)
@@ -262,7 +291,7 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
   }
   async function confirmImport() {
     const session = imports.get(scope)
-    if (!canAct() || locked || !session?.preview || session.preview.errors.length) return
+    if (!canAct('procurement.lines.import') || locked || !session?.preview || session.preview.errors.length) return
     try {
       const id = session.preview.id
       const input = { list_name: required(session.name, '导入后的清单名称'), expected_revision: session.preview.revision }
@@ -270,7 +299,7 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
     } catch (failure) { actions.setError(errorText(failure)) }
   }
   async function downloadQuote(item: QuoteExportDto) {
-    if (downloadBusy !== null) return
+    if (downloadBusy !== null || !context.current.can('procurement.lines.export') || !context.current.can('sensitive.procurement_prices')) return
     setDownloadBusy(item.id)
     try { const blob = await repository.downloadQuoteExport(projectCode, item.id); if (isCurrent()) downloadBlob(blob, `quote-export-${item.id}.xlsx`) }
     catch (failure) { if (isCurrent()) actions.setError(errorText(failure)) }
@@ -292,21 +321,21 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
     {inputErrors.map(([section, message]) => <Alert key={section} type="warning" showIcon title={`${section}：${message}`} action={<Button onClick={() => void refresh().catch(() => undefined)}>重新读取</Button>} />)}
     <div className={styles.summaryBar}>
       <div className={styles.metrics}>{[
-        ['采购承诺', data.overview?.procurement_committed_cents], ['已到货', data.overview?.procurement_received_cents], ['已付款', data.overview?.procurement_paid_cents], ['物料消耗', data.overview?.material_consumed_cents],
-      ].map(([label, value]) => <span key={String(label)}><span>{String(label)}</span><strong>{typeof value === 'number' ? formatMoney(value) : '—'}</strong></span>)}</div>
+        ['采购承诺', data.overview?.procurement_committed_cents, 'procurement.orders.view'], ['已到货', data.overview?.procurement_received_cents, 'procurement.receipts.view'], ['已付款', data.overview?.procurement_paid_cents, 'procurement.payments.view'], ['物料消耗', data.overview?.material_consumed_cents, 'inventory.view'],
+      ].filter(([, , permission]) => access.can(String(permission))).map(([label, value]) => <span key={String(label)}><span>{String(label)}</span><strong>{typeof value === 'number' ? formatMoney(value) : '—'}</strong></span>)}</div>
       <Button icon={<ReloadOutlined />} onClick={() => void refresh().catch(() => undefined)}>刷新</Button>
     </div>
     <Card className={styles.mainCard} styles={{ body: { padding: 16 } }}>
       <Tabs activeKey={tab} onChange={setTab} tabBarExtraContent={!readonly && <Space wrap>
-        {tab === 'lists' && <><Button disabled={locked} onClick={() => setTab('import')}>导入 Excel</Button><Button type="primary" icon={<PlusOutlined />} disabled={locked || Boolean(data.loading['采购清单'])} onClick={() => open({ kind: 'list' })}>新建清单</Button></>}
-        {tab === 'orders' && <Button type="primary" icon={<PlusOutlined />} disabled={locked || !availableLines.length} onClick={() => open({ kind: 'order' })}>新建采购单</Button>}
-        {tab === 'quotes' && <Button type="primary" disabled={locked || !confirmedLists.length || !data.customer} onClick={() => open({ kind: 'quote' })}>生成报价单</Button>}
+        {tab === 'lists' && <><Button disabled={locked || !access.can('procurement.lines.import')} onClick={() => setTab('import')}>导入 Excel</Button><Button type="primary" icon={<PlusOutlined />} disabled={locked || Boolean(data.loading['采购清单']) || !access.can('procurement.lines.create')} onClick={() => open({ kind: 'list' })}>新建清单</Button></>}
+        {tab === 'orders' && <Button type="primary" icon={<PlusOutlined />} disabled={locked || !orderLines.length || (!access.can('procurement.orders.create') || !access.can('sensitive.procurement_prices'))} onClick={() => open({ kind: 'order' })}>新建采购单</Button>}
+        {tab === 'quotes' && <Button type="primary" disabled={locked || !confirmedLists.length || !data.customer || (!access.can('procurement.lines.export') || !access.can('sensitive.procurement_prices'))} onClick={() => open({ kind: 'quote' })}>生成报价单</Button>}
       </Space>} items={[
         { key: 'lists', label: `采购清单 (${data.listPage.total})`, children: <>
           <ProcurementLists lists={data.lists} selectedId={selectedListId} onSelect={setSelectedListId} loading={Boolean(data.loading['采购清单'])} readonly={readonly} locked={locked}
             onCreate={() => open({ kind: 'list' })} onImport={() => setTab('import')}
             onAddLine={(list) => open({ kind: 'line', list })} onEditList={(list) => open({ kind: 'edit-list', list })}
-            onConfirmList={(list) => void confirmList(list)} onCopyList={(list) => void copyList(list)}
+            onConfirmLine={(list, line) => void confirmLine(list, line)} onReopenLine={(list, line) => open({ kind: 'reopen-line', list, line })} onCopyList={(list) => void copyList(list)}
             onQuote={(list) => open({ kind: 'quote', list })} quoteAvailable={Boolean(data.customer)}
             onEditLine={(list, line) => open({ kind: 'edit-line', list, line })} onDeleteLine={(list, line) => void deleteLine(list, line)}
             onOrderLine={(list, line) => open({ kind: 'order', list, line })} />
@@ -314,67 +343,70 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
         </> },
         { key: 'orders', label: `采购单 (${data.orders.total})`, children: <>
           <div className={styles.toolbar}><Typography.Text type="secondary">点击采购单号查看明细、确认订单或登记到货与付款。</Typography.Text></div>
-          <Table<PurchaseOrderRecordDto> rowKey="id" size="small" dataSource={data.orders.items} loading={data.loading['采购单']} scroll={{ x: 850 }} locale={{ emptyText: <Empty description={readonly ? '此项目没有采购单' : availableLines.length ? '还没有采购单，选择供应商和清单物料开始下单' : '先建立并确认采购清单，再创建采购单'}>{!readonly && <Button onClick={() => availableLines.length ? open({ kind: 'order' }) : setTab('lists')} disabled={locked}>{availableLines.length ? '创建第一张采购单' : '前往采购清单'}</Button>}</Empty> }} pagination={{ current: data.orders.page, pageSize: data.orders.page_size, total: data.orders.total, showSizeChanger: true, onChange: (page, size) => void data.loadOrders(size !== data.orders.page_size ? 1 : page, size).catch(() => undefined) }} columns={[
+          <Table<PurchaseOrderRecordDto> rowKey="id" size="small" dataSource={data.orders.items} loading={data.loading['采购单']} scroll={{ x: 850 }} locale={{ emptyText: <Empty description={readonly ? '此项目没有采购单' : orderLines.length ? '还没有采购单，选择供应商和清单物料开始下单' : '先确认需要采购的物料，再创建采购单'}>{!readonly && <Button onClick={() => orderLines.length ? open({ kind: 'order' }) : setTab('lists')} disabled={locked}>{orderLines.length ? '创建第一张采购单' : '前往采购清单'}</Button>}</Empty> }} pagination={{ current: data.orders.page, pageSize: data.orders.page_size, total: data.orders.total, showSizeChanger: true, onChange: (page, size) => void data.loadOrders(size !== data.orders.page_size ? 1 : page, size).catch(() => undefined) }} columns={[
             { title: '采购单号', dataIndex: 'order_no', render: (value: string, item) => <Button type="link" onClick={() => void openOrder(item)}>{value}</Button> }, { title: '供应商', dataIndex: 'supplier_company_name' }, { title: '状态', dataIndex: 'status', render: statusTag }, { title: '下单日期', dataIndex: 'ordered_on' }, { title: '预计到货', dataIndex: 'expected_delivery_on', render: (value: string | null) => value || '—' }, { title: '采购总额', dataIndex: 'ordered_amount_cents', align: 'right', render: formatMoney },
           ]} />
         </> },
         { key: 'import', label: 'Excel 导入', children: <Space orientation="vertical" style={{ width: '100%' }}>
           <div className={styles.toolbar}><Typography.Text type="secondary">下载模板填写物料 → 上传核对 → 确认生成草稿清单</Typography.Text><Button icon={<DownloadOutlined />} loading={downloadBusy === 'template'} onClick={() => void downloadTemplate()}>下载导入模板</Button></div>
-          {!readonly && <Upload.Dragger accept=".xlsx" maxCount={1} showUploadList={false} disabled={locked} beforeUpload={(file) => { void previewImport(file); return false }}><p className="ant-upload-drag-icon"><InboxOutlined /></p><p>点击或拖入 Excel 采购清单</p><Typography.Text type="secondary">支持 .xlsx 格式，导入前将显示逐行校验结果</Typography.Text></Upload.Dragger>}
+          {!readonly && <Upload.Dragger accept=".xlsx" maxCount={1} showUploadList={false} disabled={locked || !access.can('procurement.lines.import')} beforeUpload={(file) => { void previewImport(file); return false }}><p className="ant-upload-drag-icon"><InboxOutlined /></p><p>点击或拖入 Excel 采购清单</p><Typography.Text type="secondary">支持 .xlsx 格式，导入前将显示逐行校验结果</Typography.Text></Upload.Dragger>}
           {importSession && <>
             <Typography.Title level={5}>{importSession.file.name}</Typography.Title>
             {importSession.preview ? <>
               {importSession.preview.errors.length > 0 && <Alert type="error" showIcon title={`发现 ${importSession.preview.errors.length} 处错误，请修正 Excel 后重新上传`} description={<ul>{importSession.preview.errors.map((error, index) => <li key={index}>第 {error.row} 行，第 {error.column} 列 · {error.message}</li>)}</ul>} />}
               <Table<ProcurementLineInput> size="small" rowKey="previewKey" dataSource={importSession.preview.rows.map((row, index) => ({ ...row, previewKey: index }))} scroll={{ x: 800 }} pagination={{ pageSize: 20 }} columns={[{ title: '序号', dataIndex: 'sequence_no' }, { title: '名称', dataIndex: 'name' }, { title: '品牌', dataIndex: 'brand' }, { title: '型号', dataIndex: 'model' }, { title: '数量', dataIndex: 'quantity' }, { title: '单位', dataIndex: 'unit' }, { title: '成本价', dataIndex: 'unit_cost_cents', render: formatMoney }, { title: '报价', dataIndex: 'quoted_unit_price_cents', render: formatMoney }]} />
-              {!readonly && <div className={styles.importConfirm}><label htmlFor="procurement-import-name">导入后的清单名称</label><Input id="procurement-import-name" aria-label="导入后的清单名称" value={importSession.name} disabled={locked} onChange={(event) => { importSession.name = event.target.value; setImportVersion((value) => value + 1) }} /><Button type="primary" disabled={locked || !importSession.name.trim() || importSession.preview.errors.length > 0} onClick={() => void confirmImport()}>确认导入</Button></div>}
+              {!readonly && <div className={styles.importConfirm}><label htmlFor="procurement-import-name">导入后的清单名称</label><Input id="procurement-import-name" aria-label="导入后的清单名称" value={importSession.name} disabled={locked} onChange={(event) => { importSession.name = event.target.value; setImportVersion((value) => value + 1) }} /><Button type="primary" disabled={locked || !access.can('procurement.lines.import') || !importSession.name.trim() || importSession.preview.errors.length > 0} onClick={() => void confirmImport()}>确认导入</Button></div>}
             </> : !locked && !readonly && <Button onClick={() => void previewImport(importSession.file)}>重新预览</Button>}
             {!readonly && <Button disabled={locked} onClick={() => { repository.discardPreviewProcurementImport(projectCode, importSession.file); imports.delete(scope); setImportVersion((value) => value + 1) }}>清除预览</Button>}
           </>}
         </Space> },
         { key: 'quotes', label: '客户报价', children: <>
-          <div className={styles.toolbar}><Typography.Text type="secondary">报价客户：{data.customer?.name ?? '项目未绑定可用客户'} · 选择已确认的采购清单生成 Excel 报价，历史文件可随时下载。</Typography.Text></div>
-          <Table<QuoteExportDto> rowKey="id" size="small" dataSource={data.quotes.items} loading={data.loading['报价历史']} locale={{ emptyText: <Empty description={readonly ? '此项目没有报价文件' : !data.customer ? '请先在项目资料中绑定客户，再生成报价' : !confirmedLists.length ? '请先确认采购清单，再生成客户报价' : '还没有报价文件，选择清单后可生成并下载 Excel 报价'}>{!readonly && <Button disabled={locked || !data.customer} onClick={() => confirmedLists.length ? open({ kind: 'quote' }) : setTab('lists')}>{confirmedLists.length ? '创建第一份报价' : '前往采购清单'}</Button>}</Empty> }} pagination={{ current: data.quotes.page, pageSize: data.quotes.page_size, total: data.quotes.total, onChange: (page, size) => void data.loadQuotes(page, size).catch(() => undefined) }} columns={[
-            { title: '报价标题', dataIndex: 'title' }, { title: '客户', dataIndex: 'customer_company_name' }, { title: '生成时间', dataIndex: 'created_at', render: (value: string) => new Date(value).toLocaleString('zh-CN') }, { title: '文件', key: 'download', render: (_, item) => <Button type="link" icon={<DownloadOutlined />} loading={downloadBusy === item.id} disabled={downloadBusy !== null} onClick={() => void downloadQuote(item)}>下载报价</Button> },
+          <div className={styles.toolbar}><Typography.Text type="secondary">报价客户：{data.customer?.name ?? '项目未绑定可用客户'} · 选择已确认物料生成 Excel 报价，历史文件可随时下载。</Typography.Text></div>
+          <Table<QuoteExportDto> rowKey="id" size="small" dataSource={data.quotes.items} loading={data.loading['报价历史']} locale={{ emptyText: <Empty description={readonly ? '此项目没有报价文件' : !data.customer ? '请先在项目资料中绑定客户，再生成报价' : !confirmedLists.length ? '请先确认需要报价的物料' : '还没有报价文件，选择清单后可生成并下载 Excel 报价'}>{!readonly && <Button disabled={locked || !data.customer || (confirmedLists.length > 0 && (!access.can('procurement.lines.export') || !access.can('sensitive.procurement_prices')))} onClick={() => confirmedLists.length ? open({ kind: 'quote' }) : setTab('lists')}>{confirmedLists.length ? '创建第一份报价' : '前往采购清单'}</Button>}</Empty> }} pagination={{ current: data.quotes.page, pageSize: data.quotes.page_size, total: data.quotes.total, onChange: (page, size) => void data.loadQuotes(page, size).catch(() => undefined) }} columns={[
+            { title: '报价标题', dataIndex: 'title' }, { title: '客户', dataIndex: 'customer_company_name' }, { title: '生成时间', dataIndex: 'created_at', render: (value: string) => new Date(value).toLocaleString('zh-CN') }, { title: '文件', key: 'download', render: (_, item) => <Button type="link" icon={<DownloadOutlined />} loading={downloadBusy === item.id} disabled={downloadBusy !== null || (!access.can('procurement.lines.export') || !access.can('sensitive.procurement_prices'))} onClick={() => void downloadQuote(item)}>下载报价</Button> },
           ]} />
         </> },
-      ]} />
+      ].filter(item => access.can(sectionPermissions[item.key]!))} />
     </Card>
     <Drawer title={order ? `采购单 · ${order.order_no}` : '采购单详情'} open={drawer} size={1000} onClose={() => { setSelectedOrderValue(''); setDrawer(false); context.current.detailSequence++ }} loading={detailLoading}>
       {detailError && <Alert type="error" showIcon title={detailError} action={<Button onClick={() => requestedOrderId.current !== null && void loadOrder(requestedOrderId.current).catch(() => undefined)}>重试</Button>} />}
       {order && <Space orientation="vertical" style={{ width: '100%' }}>
-        <Descriptions bordered size="small" column={2} items={[{ key: 'supplier', label: '供应商', children: order.supplier_company_name }, { key: 'status', label: '状态', children: statusTag(order.status) }, { key: 'date', label: '下单 / 预计到货', children: `${order.ordered_on} / ${order.expected_delivery_on || '未填写'}` }, { key: 'amount', label: order.tax_rate_bps == null ? '采购总额' : '含税总额', children: formatMoney(order.ordered_amount_cents) }, { key: 'tax-rate', label: '采购税率', children: order.tax_rate_bps == null ? '未设置' : `${taxRateToInput(order.tax_rate_bps)}%` }, { key: 'net', label: order.tax_rate_bps == null ? '原采购金额' : '未税合计', children: formatMoney(order.net_amount_cents ?? order.ordered_amount_cents) }, { key: 'tax', label: '税额', children: order.tax_rate_bps == null ? '未设置' : formatMoney(order.tax_amount_cents ?? null) }, { key: 'paid', label: '已付款', children: formatMoney(order.paid_amount_cents ?? 0) }, { key: 'invoiced', label: '已开票', children: formatMoney(order.invoiced_amount_cents ?? 0) }, { key: 'unpaid', label: '未付款', children: formatMoney(Math.max(0, order.ordered_amount_cents - (order.paid_amount_cents ?? 0))) }, { key: 'files', label: '合同与附件', span: 2, children: <AttachmentLinks projectCode={projectCode} ids={order.document_version_ids} options={data.documents} /> }, { key: 'notes', label: '备注', span: 2, children: order.cancel_reason || order.notes || '—' }]} />
-        {!readonly && <Space wrap>{order.status === 'draft' && <><Button disabled={locked} onClick={() => open({ kind: 'edit-order', order })}>编辑采购单</Button><Button type="primary" disabled={locked} onClick={() => void confirmOrder()}>确认采购单</Button></>}
-          {['confirmed', 'partially_received'].includes(order.status) && <Button type="primary" disabled={locked} onClick={() => open({ kind: 'receipt', order })}>登记到货</Button>}
-          {['confirmed', 'partially_received', 'received'].includes(order.status) && <><Button disabled={locked} onClick={() => open({ kind: 'payment', order })}>登记付款</Button><Button disabled={locked} onClick={() => open({ kind: 'invoice', order })}>登记进项发票</Button></>}
-          {['draft', 'confirmed'].includes(order.status) && <Button danger disabled={locked} onClick={() => open({ kind: 'cancel-order', order })}>取消采购单</Button>}
+        <Space wrap><ActivitySummary summary={order.activity_summary} /><OperationHistory resourceType="purchase_order" resourceId={order.id} title="采购单操作记录" /></Space>
+        <Descriptions bordered size="small" column={2} items={[{ key: 'supplier', label: '供应商', children: order.supplier_company_name }, { key: 'status', label: '状态', children: statusTag(order.status) }, { key: 'date', label: '下单 / 预计到货', children: `${order.ordered_on} / ${order.expected_delivery_on || '未填写'}` }, { key: 'amount', label: order.tax_rate_bps == null ? '采购总额' : '含税总额', children: formatMoney(order.ordered_amount_cents) }, { key: 'tax-rate', label: '采购税率', children: order.tax_rate_bps == null ? '未设置' : `${taxRateToInput(order.tax_rate_bps)}%` }, { key: 'net', label: order.tax_rate_bps == null ? '原采购金额' : '未税合计', children: formatMoney(order.net_amount_cents ?? order.ordered_amount_cents) }, { key: 'tax', label: '税额', children: order.tax_rate_bps == null ? '未设置' : formatMoney(order.tax_amount_cents ?? null) }, { key: 'paid', label: '已付款', children: formatMoney(order.paid_amount_cents ?? 0) }, { key: 'invoiced', label: '已开票', children: formatMoney(order.invoiced_amount_cents ?? 0) }, { key: 'unpaid', label: '未付款', children: formatMoney(Math.max(0, order.ordered_amount_cents - (order.paid_amount_cents ?? 0))) }, { key: 'files', label: '合同与附件', span: 2, children: <AttachmentLinks projectCode={projectCode} ids={order.document_version_ids} options={data.documents} /> }, { key: 'notes', label: '备注', span: 2, children: order.cancel_reason || order.notes || '—' }].filter(item => !['paid','unpaid'].includes(item.key) || access.can('procurement.payments.view')).filter(item => item.key !== 'invoiced' || access.can('procurement.invoices.view'))} />
+        {!readonly && <Space wrap>{order.status === 'draft' && <><Button disabled={locked || (!access.can('procurement.orders.edit') || !access.can('sensitive.procurement_prices'))} onClick={() => open({ kind: 'edit-order', order })}>编辑采购单</Button><Button type="primary" disabled={locked || !access.can('procurement.orders.confirm')} onClick={() => void confirmOrder()}>确认采购单</Button></>}
+          {['confirmed', 'partially_received'].includes(order.status) && <Button type="primary" disabled={locked || !access.can('procurement.receipts.register')} onClick={() => open({ kind: 'receipt', order })}>登记到货</Button>}
+          {['confirmed', 'partially_received', 'received'].includes(order.status) && <><Button disabled={locked || (!access.can('procurement.payments.register') || !access.can('sensitive.procurement_prices'))} onClick={() => open({ kind: 'payment', order })}>登记付款</Button><Button disabled={locked || (!access.can('procurement.invoices.register') || !access.can('sensitive.procurement_prices'))} onClick={() => open({ kind: 'invoice', order })}>登记进项发票</Button></>}
+          {['draft', 'confirmed'].includes(order.status) && <Button danger disabled={locked || !access.can('procurement.orders.cancel')} onClick={() => open({ kind: 'cancel-order', order })}>取消采购单</Button>}
         </Space>}
         <Table size="small" rowKey="id" dataSource={order.lines} pagination={false} scroll={{ x: 960 }} columns={[{ title: '物料', dataIndex: 'procurement_line_id', render: lineLabel }, { title: '采购数量', dataIndex: 'quantity' }, { title: '到货数量', dataIndex: 'received_quantity' }, { title: order.tax_rate_bps == null ? '成本单价' : '未税成本单价', dataIndex: 'unit_cost_cents', render: formatMoney }, { title: '含税成本单价', key: 'gross_unit_cost', render: (_, line) => formatMoney(line.gross_unit_cost_cents ?? purchaseUnitPrices({ cost: centsToYuan(line.unit_cost_cents) }, order.tax_rate_bps ?? null).gross) }, { title: '税额', dataIndex: 'tax_amount_cents', render: (value: number | undefined) => order.tax_rate_bps == null ? '未设置' : formatMoney(value ?? null) }, { title: order.tax_rate_bps == null ? '金额' : '含税金额', dataIndex: 'line_amount_cents', render: formatMoney }, { title: '超采原因', dataIndex: 'overage_reason', render: (value: string | null) => value || '—' }]} />
         <Tabs items={[
-          { key: 'receipts', label: '到货历史', children: <Space orientation="vertical" style={{ width: '100%' }}>{!(order.goods_receipts?.length) && <Empty description="暂无到货记录" />}{order.goods_receipts?.map((receipt) => <Card key={receipt.id} size="small" title={`${receipt.received_on} · ${receipt.warehouse_name} · #${receipt.id}`} extra={<Space><Tag>{receipt.status === 'active' ? '有效' : '已冲销'}</Tag>{!readonly && receipt.status === 'active' && <Button size="small" danger disabled={locked} onClick={() => open({ kind: 'reverse-receipt', order, record: receipt })}>冲销</Button>}</Space>}>
+          { key: 'receipts', label: '到货历史', children: <Space orientation="vertical" style={{ width: '100%' }}>{!(order.goods_receipts?.length) && <Empty description="暂无到货记录" />}{order.goods_receipts?.map((receipt) => <Card key={receipt.id} size="small" title={`${receipt.received_on} · ${receipt.warehouse_name} · #${receipt.id}`} extra={<Space><Tag>{receipt.status === 'active' ? '有效' : '已冲销'}</Tag>{!readonly && receipt.status === 'active' && <Button size="small" danger disabled={locked || !access.can('procurement.receipts.reverse')} onClick={() => open({ kind: 'reverse-receipt', order, record: receipt })}>冲销</Button>}</Space>}>
+            <Space wrap><ActivitySummary summary={receipt.activity_summary} /><OperationHistory resourceType="goods_receipt" resourceId={receipt.id} title="到货操作记录" /></Space>
             {receipt.reversal_reason && <Alert type="warning" title={`冲销原因：${receipt.reversal_reason}`} />}
             <Table size="small" rowKey="id" dataSource={receipt.lines} pagination={false} columns={[{ title: '物料', dataIndex: 'material_name' }, { title: '型号', dataIndex: 'material_model' }, { title: '数量', key: 'quantity', render: (_, line) => `${line.quantity} ${line.unit}` }, { title: '到货价值', dataIndex: 'value_cents', render: formatMoney }]} />
           </Card>)}</Space> },
           { key: 'payments', label: '付款记录', children: <Table<SupplierPaymentDto> size="small" rowKey="id" dataSource={order.supplier_payments ?? []} expandable={{ expandedRowRender: (record) => <AllocationDetails allocations={record.allocations} label={(id) => { const line = order.lines.find((entry) => entry.id === id); return line ? lineLabel(line.procurement_line_id) : `采购单行 #${id}` }} /> }} columns={[
-            { title: '日期', dataIndex: 'paid_on' }, { title: '金额', dataIndex: 'amount_cents', render: formatMoney }, { title: '方式 / 参考号', key: 'method', render: (_, record) => `${record.payment_method} · ${record.reference_no || '无'}` }, { title: '状态 / 说明', key: 'status', render: (_, record) => `${record.status === 'active' ? '有效' : '已冲销'} · ${record.reversal_reason || record.notes || '—'}` }, ...(!readonly ? [{ title: '操作', key: 'reverse', render: (_: unknown, record: SupplierPaymentDto) => record.status === 'active' && <Button type="link" danger disabled={locked} onClick={() => open({ kind: 'reverse-payment', order, record })}>冲销</Button> }] : []),
+            { title: '操作记录', key: 'activity', render: (_, record) => <Space wrap><ActivitySummary summary={record.activity_summary} /><OperationHistory resourceType="supplier_payment" resourceId={record.id} title="付款操作记录" /></Space> }, { title: '日期', dataIndex: 'paid_on' }, { title: '金额', dataIndex: 'amount_cents', render: formatMoney }, { title: '方式 / 参考号', key: 'method', render: (_, record) => `${record.payment_method} · ${record.reference_no || '无'}` }, { title: '状态 / 说明', key: 'status', render: (_, record) => `${record.status === 'active' ? '有效' : '已冲销'} · ${record.reversal_reason || record.notes || '—'}` }, ...(!readonly ? [{ title: '操作', key: 'reverse', render: (_: unknown, record: SupplierPaymentDto) => record.status === 'active' && <Button type="link" danger disabled={locked || !access.can('procurement.payments.reverse')} onClick={() => open({ kind: 'reverse-payment', order, record })}>冲销</Button> }] : []),
           ]} /> },
           { key: 'invoices', label: '进项发票', children: <Table<SupplierInvoiceDto> size="small" rowKey="id" dataSource={order.supplier_invoices ?? []} expandable={{ expandedRowRender: (record) => <><AllocationDetails allocations={record.allocations} label={(id) => { const line = order.lines.find((entry) => entry.id === id); return line ? lineLabel(line.procurement_line_id) : `采购单行 #${id}` }} /><AttachmentLinks projectCode={projectCode} ids={record.document_version_ids} options={data.documents} /></> }} columns={[
-            { title: '发票号码', dataIndex: 'invoice_no' }, { title: '开票日期', dataIndex: 'invoiced_on' }, { title: '金额', dataIndex: 'amount_cents', render: formatMoney }, { title: '状态 / 说明', key: 'status', render: (_, record) => `${record.status === 'active' ? '有效' : '已冲销'} · ${record.reversal_reason || '—'}` }, ...(!readonly ? [{ title: '操作', key: 'reverse', render: (_: unknown, record: SupplierInvoiceDto) => record.status === 'active' && <Button type="link" danger disabled={locked} onClick={() => open({ kind: 'reverse-invoice', order, record })}>冲销</Button> }] : []),
+            { title: '操作记录', key: 'activity', render: (_, record) => <Space wrap><ActivitySummary summary={record.activity_summary} /><OperationHistory resourceType="supplier_invoice" resourceId={record.id} title="发票操作记录" /></Space> }, { title: '发票号码', dataIndex: 'invoice_no' }, { title: '开票日期', dataIndex: 'invoiced_on' }, { title: '金额', dataIndex: 'amount_cents', render: formatMoney }, { title: '状态 / 说明', key: 'status', render: (_, record) => `${record.status === 'active' ? '有效' : '已冲销'} · ${record.reversal_reason || '—'}` }, ...(!readonly ? [{ title: '操作', key: 'reverse', render: (_: unknown, record: SupplierInvoiceDto) => record.status === 'active' && <Button type="link" danger disabled={locked || !access.can('procurement.invoices.reverse')} onClick={() => open({ kind: 'reverse-invoice', order, record })}>冲销</Button> }] : []),
           ]} /> },
-        ]} />
+        ].filter(item => access.can(`procurement.${item.key}.view`))} />
       </Space>}
     </Drawer>
-    <FormModal title={dialog ? titles[dialog.kind] : ''} form={form} hasChanges={files.length > 0} open={dialog !== null} onClose={() => setDialog(null)} onSubmit={submit} busy={actions.busy} locked={locked || readonly} error={actions.error} width={dialog?.kind.includes('order') || dialog?.kind === 'receipt' ? 900 : 680}>
+    <FormModal title={dialog ? titles[dialog.kind] : ''} form={form} hasChanges={files.length > 0} open={dialog !== null} onClose={() => setDialog(null)} onSubmit={submit} busy={actions.busy} locked={locked || readonly || Boolean(dialog && !access.can(dialogPermissions[dialog.kind]))} error={actions.error} width={dialog?.kind.includes('order') || dialog?.kind === 'receipt' ? 900 : 680}>
       {(dialog?.kind === 'list' || dialog?.kind === 'edit-list') && <><TextField name="name" label="清单名称" required /><TextField name="notes" label="备注" type="textarea" /></>}
       {(dialog?.kind === 'line' || dialog?.kind === 'edit-line') && <>
-        <Form.Item name="list_id" label="采购清单" rules={[{ required: true }]}><Select disabled={Boolean(dialog.list) || dialog.kind === 'edit-line'} placeholder="请选择草稿清单" options={data.lists.filter((list) => list.status === 'draft').map((list) => ({ value: list.id, label: list.name }))} /></Form.Item>
+        <Form.Item name="list_id" label="采购清单" rules={[{ required: true }]}><Select disabled={Boolean(dialog.list) || dialog.kind === 'edit-line'} placeholder="请选择采购清单" options={data.lists.filter((list) => list.status !== 'superseded').map((list) => ({ value: list.id, label: list.name }))} /></Form.Item>
         <div className={styles.formGrid}><TextField name="sequence_no" label="序号" required /><TextField name="category" label="物料分类" required /><TextField name="name" label="物料名称" required /><TextField name="unit" label="计量单位" required /><TextField name="brand" label="品牌" /><TextField name="model" label="型号" /></div>
         <TextField name="specification" label="规格" /><div className={styles.formGrid}><TextField name="quantity" label="需求数量" required /><TextField name="cost" label="成本单价（元）" required /><TextField name="quoted_price" label="报价单价（元）" required /></div>
       </>}
       {(dialog?.kind === 'order' || dialog?.kind === 'edit-order') && <>
+        <Alert type="info" title={`已选择 ${receiptDrafts?.filter(line => line.procurement_line_id).length ?? 0} 项物料；待确认项不能下单`} />
         <div className={styles.orderHeader}><Form.Item name="supplier_company_id" label="供应商" rules={[{ required: true, message: '请选择供应商' }]}><Select placeholder="请明确选择供应商" showSearch optionFilterProp="label" options={data.companies.map((company) => ({ value: company.id, label: company.name }))} /></Form.Item><TextField name="ordered_on" label="下单日期" type="date" required /><TextField name="expected_delivery_on" label="预计到货日期" type="date" /></div>
         {dialog.kind === 'order' ? <PurchaseOrderNumberField form={form} projectCode={projectCode} repository={repository} disabled={locked || actions.busy} /> : <TextField name="order_no" label="采购单号" required />}
         <Form.List name="lines">{(fields, { add, remove }) => <Space orientation="vertical" style={{ width: '100%' }}>{fields.map((field) => <Card size="small" key={field.key} title={`物料 ${field.name + 1}`} extra={dialog.kind === 'order' && <Button size="small" type="text" danger icon={<MinusCircleOutlined />} onClick={() => remove(field.name)}>删除</Button>}>
-          <Form.Item name={[field.name, 'procurement_line_id']} label="采购物料" rules={[{ required: true, message: '请选择采购物料' }]}><Select disabled={dialog.kind === 'edit-order'} showSearch optionFilterProp="label" options={dialog.kind === 'edit-order' ? dialog.order?.lines.map((line) => ({ value: line.procurement_line_id, label: lineLabel(line.procurement_line_id) })) : availableLines.map(({ list, line }) => ({ value: line.id, label: `${line.name} · ${list.name} · ${quantityMilli(remainingQuantity(line.quantity, line.ordered_quantity)) === 0n ? "已满额，可补采" : `剩余 ${remainingQuantity(line.quantity, line.ordered_quantity)} ${line.unit}`}` }))} onChange={(id) => { const item = lines.find(({ line }) => line.id === id)?.line; if (item) { form.setFieldValue(['lines', field.name, 'price_basis'], 'net'); form.setFieldValue(['lines', field.name, 'cost'], centsToYuan(item.unit_cost_cents)); form.setFieldValue(['lines', field.name, 'quantity'], quantityMilli(remainingQuantity(item.quantity, item.ordered_quantity)) > 0n ? remainingQuantity(item.quantity, item.ordered_quantity) : '') } }} /></Form.Item>
+          <Form.Item name={[field.name, 'procurement_line_id']} label="采购物料" rules={[{ required: true, message: '请选择采购物料' }]}><Select disabled={dialog.kind === 'edit-order'} showSearch optionFilterProp="label" options={dialog.kind === 'edit-order' ? dialog.order?.lines.map((line) => ({ value: line.procurement_line_id, label: lineLabel(line.procurement_line_id) })) : orderLines.map(({ list, line }) => ({ value: line.id, label: `${line.name} · ${list.name} · ${quantityMilli(remainingQuantity(line.quantity, line.ordered_quantity)) === 0n ? "已满额，可补采" : `剩余 ${remainingQuantity(line.quantity, line.ordered_quantity)} ${line.unit}`}` }))} onChange={(id) => { const item = lines.find(({ line }) => line.id === id)?.line; if (item && item.ordered_quantity != null) { form.setFieldValue(['lines', field.name, 'price_basis'], 'net'); form.setFieldValue(['lines', field.name, 'cost'], centsToYuan(item.unit_cost_cents)); form.setFieldValue(['lines', field.name, 'quantity'], quantityMilli(remainingQuantity(item.quantity, item.ordered_quantity)) > 0n ? remainingQuantity(item.quantity, item.ordered_quantity) : '') } }} /></Form.Item>
           <PurchaseOrderPriceFields form={form} index={field.name} /><TextField name={[field.name, 'overage_reason']} label="超采原因（超出剩余数量时必填）" />
         </Card>)}{dialog.kind === 'order' && <Button block type="dashed" icon={<PlusOutlined />} onClick={() => add({ quantity: '', cost: '' })}>添加采购物料</Button>}</Space>}</Form.List>
         <PurchaseOrderTaxFields form={form} disabled={locked || actions.busy || readonly} />
@@ -389,10 +421,17 @@ export default function ProcurementWorkspace({ projectCode, readonly = false, re
       {dialog?.kind === 'payment' && <><Alert type="info" title={`采购总额 ${formatMoney(dialog.order?.ordered_amount_cents ?? 0)} · 未付金额 ${formatMoney(Math.max(0, (dialog.order?.ordered_amount_cents ?? 0) - (dialog.order?.paid_amount_cents ?? 0)))}`} /><div className={styles.formGrid}><TextField name="paid_on" label="付款日期" type="date" required /><TextField name="amount" label="付款金额（元）" required /><TextField name="payment_method" label="付款方式" required /><TextField name="reference_no" label="参考号" /></div><TextField name="notes" label="付款说明" type="textarea" /></>}
       {dialog?.kind === 'invoice' && <><TextField name="invoice_no" label="发票号码" required /><div className={styles.formGrid}><TextField name="invoiced_on" label="开票日期" type="date" required /><TextField name="amount" label="发票金额（元）" required /></div><AttachmentField files={files} onChange={setFiles} options={data.documents} disabled={locked} /></>}
       {(dialog?.kind === 'cancel-order' || dialog?.kind.startsWith('reverse-')) && <><Alert type="warning" title={dialog.kind === 'cancel-order' ? `取消采购单 ${dialog.order?.order_no}` : `冲销原记录 #${dialog.record?.id}，保留历史流水`} /><TextField name="reason" label={dialog.kind === 'cancel-order' ? '取消原因' : '冲销原因'} required type="textarea" /></>}
-      {dialog?.kind === 'quote' && <><Alert type="info" title={`报价客户：${data.customer?.name ?? '未绑定客户'}（随项目固定）`} /><Form.Item name="list_id" label="已确认采购清单" rules={[{ required: true, message: '请选择已确认采购清单' }]}><Select placeholder="请选择用于报价的清单" options={confirmedLists.map((list) => ({ value: list.id, label: list.name }))} onChange={(id) => {
+      {dialog?.kind === 'reopen-line' && <><Alert type="warning" title={`仅撤回 ${dialog.line?.name} 的确认，其他物料不受影响。撤回后可编辑并重新确认。`} /><TextField name="reason" label="撤回原因" required type="textarea" /></>}
+      {dialog?.kind === 'quote' && <><Alert type="info" title={`报价客户：${data.customer?.name ?? '未绑定客户'}（随项目固定）`} /><Form.Item name="list_id" label="含已确认项的清单" rules={[{ required: true, message: '请选择含已确认项的清单' }]}><Select placeholder="请选择用于报价的清单" options={confirmedLists.map((list) => ({ value: list.id, label: list.name }))} onChange={(id) => {
+        form.setFieldValue('procurement_line_ids', availableLines.filter(item => item.list.id === id).map(item => item.line.id))
         const selected = confirmedLists.find((list) => list.id === id)
         if (selected && (!form.isFieldTouched('title') || !form.getFieldValue('title'))) form.setFieldValue('title', `${selected.name} 报价单`)
-      }} /></Form.Item><TextField name="title" label="报价标题" required /><TextField name="notes" label="报价说明" type="textarea" /></>}
+      }} /></Form.Item><Form.Item noStyle shouldUpdate>{() => {
+        const listId = Number(form.getFieldValue('list_id'))
+        const selectedIds = (form.getFieldValue('procurement_line_ids') ?? []) as number[]
+        const choices = availableLines.filter(item => item.list.id === listId)
+        return <><Form.Item name="procurement_line_ids" label="纳入报价的物料" rules={[{ required: true, type: 'array', min: 1, message: '请至少选择一项物料' }]}><Select mode="multiple" optionFilterProp="label" options={choices.map(item => ({ value: item.line.id, label: `${item.line.name} · ${item.line.quantity} ${item.line.unit}` }))} /></Form.Item><Typography.Paragraph type="secondary">纳入 {selectedIds.length} 项已确认物料 · 报价金额 {formatMoney(choices.filter(item => selectedIds.includes(item.line.id)).reduce((sum, item) => sum + (item.line.quoted_total_cents ?? 0), 0))}；未确认项不纳入本次报价。</Typography.Paragraph></>
+      }}</Form.Item><TextField name="title" label="报价标题" required /><TextField name="notes" label="报价说明" type="textarea" /></>}
     </FormModal>
   </section>
 }

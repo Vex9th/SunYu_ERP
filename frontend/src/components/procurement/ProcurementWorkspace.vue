@@ -1231,7 +1231,7 @@ async function deleteLine(
   }
   if (!isCurrentAction(context)) return
   try {
-    await context.repository.deleteProcurementLine(context.projectCode, list.id, line.id)
+    await context.repository.deleteProcurementLine(context.projectCode, list.id, line.id, line.revision)
     if (!isCurrentAction(context)) return
     actionBusy.value = false
     await refreshAfterCommittedAction(

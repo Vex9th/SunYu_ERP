@@ -378,8 +378,9 @@ def create_system_router(
     def require_session(
         request: Request,
         settings: Settings = settings_dependency,
+        connection: sqlite3.Connection = connection_dependency,
     ) -> None:
-        require_authenticated_session(request, settings.session_secret)
+        require_authenticated_session(request, settings.session_secret, connection)
 
     authentication_dependency = Depends(require_session)
 
@@ -462,6 +463,7 @@ def create_system_router(
 
     @router.post("/backup-tasks", status_code=status.HTTP_202_ACCEPTED)
     def start_backup_task(
+        request: Request,
         _: None = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
         settings: Settings = settings_dependency,
@@ -483,6 +485,8 @@ def create_system_router(
             started_at = now().isoformat()
             try:
                 task_connection = connect_database(settings.data_dir / "iapm.sqlite")
+                from backend.app.features.operation_history import bind_backup_actor
+                bind_backup_actor(task_connection, request.state.principal, f'backup-task:{task_id}')
             except (OSError, sqlite3.Error) as failure:
                 logging.getLogger(__name__).error(
                     "backup task=%s stage=connection error=%s errno=%s",

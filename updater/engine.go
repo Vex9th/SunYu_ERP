@@ -77,10 +77,7 @@ func newEngine(root, id string) (*Engine, error) {
 	if err = os.MkdirAll(filepath.Join(root, ".updates"), 0700); err != nil {
 		return nil, err
 	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = platformProxy
-	transport.TLSHandshakeTimeout = 30 * time.Second
-	transport.ResponseHeaderTimeout = 30 * time.Second
+	transport := newUpdateTransport()
 	e := &Engine{root: root, work: filepath.Join(root, ".updates/work", id), status: Status{JobID: id}, client: &http.Client{Transport: transport, Timeout: 15 * time.Minute, CheckRedirect: func(r *http.Request, via []*http.Request) error {
 		if len(via) > 5 {
 			return errors.New("下载重定向过多")

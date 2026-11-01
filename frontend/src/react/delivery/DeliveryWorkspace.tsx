@@ -1,3 +1,6 @@
+import { useAccess } from '../access/AccessProvider'
+import { ActivitySummary } from '../activity/ActivitySummary'
+import { OperationHistory } from '../activity/OperationHistory'
 import {
   useEffect,
   useMemo,
@@ -219,10 +222,10 @@ const pagination = {
   showSizeChanger: true,
   showTotal: (total: number) => `共 ${total} 条`,
 }
-function repositoryFor(project: string) {
+function repositoryFor(project: string, can: (permission: string) => boolean) {
   let repository = repositories.get(project)
   if (!repository) {
-    repository = createHttpDeliveryRepository()
+    repository = createHttpDeliveryRepository(can)
     repositories.set(project, repository)
   }
   return repository
@@ -316,11 +319,12 @@ export default function DeliveryWorkspace({
   scope = 'all',
   repository: suppliedRepository,
 }: DeliveryWorkspaceProps) {
+  const { can, namespace, accessRevision } = useAccess()
   useSyncExternalStore(pendingRegistry.subscribe, pendingRegistry.getSnapshot)
   const priorPending = useRef(false)
   const repository = useMemo(
-    () => suppliedRepository ?? repositoryFor(projectCode),
-    [suppliedRepository, projectCode],
+    () => suppliedRepository ?? repositoryFor(`${namespace}:${accessRevision}:${projectCode}`, can),
+    [suppliedRepository, projectCode, namespace, accessRevision],
   )
   const [model, setModel] = useState<DeliveryDemoViewModel | null>(null)
   const [summary, setSummary] = useState<DeliverySummaryViewModel | null>(null)
@@ -335,14 +339,13 @@ export default function DeliveryWorkspace({
   const [busy, setBusy] = useState(false)
   const [editor, setEditor] = useState<Editor | null>(null)
   const [search, setSearch] = useWorkspaceValue('q', '')
+  const tabRead: Record<string, string> = { commissioning: 'engineering_changes.view', changes: 'engineering_changes.view', acceptance: 'acceptance.view', invoices: 'customer_invoices.view', 'after-sales': 'after_sales.view' }
+  const tabWrite: Record<string, string> = { commissioning: 'engineering_changes.manage', changes: 'engineering_changes.manage', acceptance: 'acceptance.manage', invoices: 'customer_invoices.register', 'after-sales': 'after_sales.manage' }
+  const allowedTabs = (scope === 'all' ? Object.keys(tabRead) : scope === 'commissioning' ? ['commissioning', 'changes'] : ['acceptance', 'invoices', 'after-sales']).filter(key => can(tabRead[key]!) || (key === 'acceptance' && can('warranty.view')))
   const [activeTab, setActiveTab] = useWorkspaceTab(
     'section',
-    scope === 'all'
-      ? ['commissioning', 'changes', 'acceptance', 'invoices', 'after-sales']
-      : scope === 'commissioning'
-        ? ['commissioning', 'changes']
-        : ['acceptance', 'invoices', 'after-sales'],
-    scope === 'delivery' ? 'acceptance' : 'commissioning',
+    allowedTabs,
+    allowedTabs[0] ?? 'acceptance',
   )
   const [statusFilters, setStatusFilters] = useState<Record<string, string>>({})
   const [modal, modalHolder] = Modal.useModal()
@@ -395,6 +398,7 @@ export default function DeliveryWorkspace({
     const version = generation.current
     setSummaryLoading(true)
     try {
+      if (!can('customer_receipts.view')) { setSummary(null); return }
       const result = await repository.getDeliverySummary(projectCode)
       if (
         current(projectCode, repository, version) &&
@@ -422,7 +426,7 @@ export default function DeliveryWorkspace({
     const version = generation.current
     try {
       const result =
-        (await repository.listDocumentVersionOptions?.(projectCode)) ?? []
+        (can('documents.view') ? await repository.listDocumentVersionOptions?.(projectCode) : []) ?? []
       if (
         current(projectCode, repository, version) &&
         sequence === documentSequence.current
@@ -474,7 +478,7 @@ export default function DeliveryWorkspace({
       void refresh().catch(() => undefined)
     priorPending.current = Boolean(pending)
   }, [pending])
-  const disabled = readonly || loading || !model || busy || Boolean(pending)
+  const disabled = readonly || !can(tabWrite[activeTab]!) || loading || !model || busy || Boolean(pending)
   const statusLabelsByTab: Record<string, Record<string, string>> = {
     commissioning: commissioningStatuses,
     changes: changeStatuses,
@@ -1298,6 +1302,7 @@ export default function DeliveryWorkspace({
                     编辑会签
                   </Button>
                 </Space>
+                {row && <Space><ActivitySummary summary={row.activity_summary} />{row.signoff_id && <OperationHistory resourceType="drawing_signoff" resourceId={row.signoff_id} />}</Space>}
                 {row?.confirmed_on && (
                   <Typography.Text type="secondary">
                     确认于 {row.confirmed_on}
@@ -1437,12 +1442,12 @@ export default function DeliveryWorkspace({
           {
             title: '合同增减',
             dataIndex: 'contract_delta_cents',
-            render: formatMoney,
+            render: value => can('contracts.view') ? formatMoney(value) : '无权限',
           },
           {
             title: '成本增减',
             dataIndex: 'estimated_cost_delta_cents',
-            render: formatMoney,
+            render: value => can('sensitive.profit_summary') ? formatMoney(value) : '无权限',
           },
           {
             title: '工期增减',
@@ -1645,7 +1650,7 @@ export default function DeliveryWorkspace({
         title="质保信息"
         extra={
           model?.warranty && (
-            <Button type="link" disabled={disabled} onClick={openWarranty}>
+            <Button type="link" disabled={readonly || !can('warranty.manage') || busy} onClick={openWarranty}>
               编辑质保
             </Button>
           )
@@ -1653,6 +1658,7 @@ export default function DeliveryWorkspace({
       >
         {model?.warranty ? (
           <Space orientation="vertical">
+            <Space><ActivitySummary summary={model.warranty.activity_summary} />{model.warranty.warranty_id && <OperationHistory resourceType="warranty" resourceId={model.warranty.warranty_id} />}</Space>
             <Tag color={statusColor(model.warranty.status)}>
               {warrantyStatuses[model.warranty.status]}
             </Tag>
@@ -1763,7 +1769,7 @@ export default function DeliveryWorkspace({
                 <Button
                   type="link"
                   danger
-                  disabled={disabled || row.status === 'void'}
+                  disabled={disabled || !can('customer_invoices.reverse') || row.status === 'void'}
                   onClick={() =>
                     withReason('作废发票', (reason) =>
                       repository.voidInvoice(
@@ -1925,10 +1931,10 @@ export default function DeliveryWorkspace({
     { key: 'after-sales', label: '售后', children: afterSalesContent },
   ].filter(
     (tab) =>
-      scope === 'all' ||
+      (can(tabRead[tab.key]!) || (tab.key === 'acceptance' && can('warranty.view'))) && (scope === 'all' ||
       (scope === 'commissioning'
         ? ['commissioning', 'changes'].includes(tab.key)
-        : ['acceptance', 'invoices', 'after-sales'].includes(tab.key)),
+        : ['acceptance', 'invoices', 'after-sales'].includes(tab.key))),
   )
   return (
     <Space

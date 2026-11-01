@@ -1,8 +1,8 @@
+import { render } from './access-fixtures'
 import {
   act,
   cleanup,
   fireEvent,
-  render,
   screen,
   waitFor,
 } from '@testing-library/react'

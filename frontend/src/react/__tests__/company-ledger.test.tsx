@@ -1,4 +1,5 @@
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { render } from './access-fixtures'
+import { act, cleanup, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { App, ConfigProvider } from 'antd'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'

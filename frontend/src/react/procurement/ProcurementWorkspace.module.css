@@ -78,3 +78,5 @@
 .priceHint { grid-column: 1 / -1; margin: -8px 0 16px; color: var(--text-secondary, #64748b); font-size: 12px; }
 .priceHint strong { color: var(--text-primary, #172b4d); font-weight: 500; }
 @media (max-width: 640px) { .orderPricing { grid-template-columns: 1fr; } }
+
+.blockReason { color: var(--ant-color-text-secondary); font-size: 12px; line-height: 1.5; margin-top: 4px; max-width: 260px; }

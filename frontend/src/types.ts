@@ -2,9 +2,30 @@ import type { ProjectCompletionCheck } from './domain/contracts'
 
 export type { ProjectCompletionCheck } from './domain/contracts'
 
+export interface AccountUser {
+  id: number
+  username: string
+  display_name: string
+  is_owner: boolean
+  group_id: number | null
+  group_name: string | null
+  revision: number
+}
+export interface ActivitySummaryData {
+  created_by: string | null
+  last_actor: string | null
+  last_action: string | null
+  last_at: string | null
+}
+export interface ActivityTracked { activity_summary?: ActivitySummaryData | null }
 export interface SessionState {
   authenticated: boolean
   password_configured: boolean
+  bootstrap_required?: boolean
+  user?: AccountUser | null
+  access_revision?: number
+  permissions?: string[]
+  project_ids?: number[] | null
 }
 
 export interface BackupRun {
@@ -51,7 +72,7 @@ export interface BackupCreated {
   warning?: string
 }
 
-export interface Company {
+export interface Company extends ActivityTracked {
   id: number
   name: string
   taxpayer_id: string | null
@@ -69,7 +90,7 @@ export interface CompanySummary extends Company {
   contact_count: number
 }
 
-export interface Contact {
+export interface Contact extends ActivityTracked {
   id: number
   company_id: number
   name: string
@@ -120,7 +141,7 @@ export type ProjectStatus = 'active' | 'archived'
 export type ProjectCategory = 'standard' | 'trade'
 export type ProjectFilter = ProjectStatus | 'all'
 
-export interface Project {
+export interface Project extends ActivityTracked {
   id: number
   project_code: string
   project_category?: ProjectCategory
@@ -160,7 +181,7 @@ export interface DocumentSummary {
 
 export interface ProjectDashboardData {
   project: Project
-  company: Company
+  company: Company | null
   contacts: Contact[]
   documents: DocumentSummary
   completion_check: ProjectCompletionCheck

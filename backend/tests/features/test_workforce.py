@@ -19,8 +19,8 @@ from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
 from backend.app.core.security import (
     SESSION_COOKIE_NAME,
-    create_session_token,
 )
+from backend.tests.account_support import owner_session_token
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 NOW = datetime(2026, 8, 29, 2, 30, tzinfo=timezone.utc)
@@ -44,7 +44,7 @@ class WorkforceHarness:
         if authenticated:
             client.cookies.set(
                 SESSION_COOKIE_NAME,
-                create_session_token(self.settings.session_secret),
+                owner_session_token(self.database_path, self.settings.session_secret),
             )
         return client
 
@@ -397,6 +397,11 @@ def test_workforce_audit_migration_preserves_existing_voided_labor(
             "021_workforce_audit_history",
             "022_supplier_invoice_active_number",
             "023_purchase_order_tax",
+            "024_purchase_order_gross_price",
+            "025_project_categories",
+            "026_accounts_access",
+            "027_procurement_line_confirmation",
+            "028_operation_history",
         ]
         preserved = connection.execute(
             "SELECT * FROM labor_entries WHERE id = 1"
@@ -1850,6 +1855,11 @@ def test_workforce_audit_migration_preserves_legacy_report_cycles_without_fake_s
             "021_workforce_audit_history",
             "022_supplier_invoice_active_number",
             "023_purchase_order_tax",
+            "024_purchase_order_gross_price",
+            "025_project_categories",
+            "026_accounts_access",
+            "027_procurement_line_confirmation",
+            "028_operation_history",
         ]
         confirmed_versions = connection.execute(
             "SELECT * FROM site_daily_report_versions WHERE report_id = 1"
@@ -1909,7 +1919,7 @@ def test_workforce_audit_migration_preserves_legacy_report_cycles_without_fake_s
     with TestClient(app) as client:
         client.cookies.set(
             SESSION_COOKIE_NAME,
-            create_session_token(settings.session_secret),
+            owner_session_token(database_path, settings.session_secret),
         )
         listed = client.get("/api/projects/P-001/site-daily-reports?page_size=20")
         confirmed_again = client.post(

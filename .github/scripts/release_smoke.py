@@ -20,10 +20,19 @@ def post(client: httpx.Client, path: str, payload: dict, expected: int = 201):
 
 
 def seed(client: httpx.Client) -> dict:
-    password = f"{secrets.randbelow(1000000):06d}"
-    # 已设置密码的数据库会立即失败，绝不复用或清空已有业务数据。
-    post(client, "/api/auth/setup", {"password": password}, 204)
-    post(client, "/api/auth/login", {"password": password}, 204)
+    response = client.get("/api/auth/session")
+    response.raise_for_status()
+    session = response.json()
+    username = "release_owner" if "bootstrap_required" in session else None
+    password = secrets.token_urlsafe(24) if username else f"{secrets.randbelow(1000000):06d}"
+    # 通过实际接口拒绝复用已有账号的库，兼容旧正式版合成升级夹具。
+    if username:
+        post(client, "/api/auth/bootstrap", {
+            "username": username, "password": password, "display_name": "发布验证主账号",
+        }, 200)
+    else:
+        post(client, "/api/auth/setup", {"password": password}, 204)
+    login(client, {"username": username, "password": password})
     company = post(client, "/api/companies", {
         "name": "发布验证供应商",
         **dict.fromkeys(("taxpayer_id", "registered_address", "registered_phone",
@@ -66,12 +75,45 @@ def seed(client: httpx.Client) -> dict:
         "received_on": "2026-10-12", "warehouse_name": "验证仓库", "notes": None,
         "lines": [{"purchase_order_line_id": order["lines"][0]["id"], "quantity": "1.000"}],
     })
-    return {"password": password, "company_id": company["id"], "order_id": order["id"],
+    return {"username": username, "password": password, "company_id": company["id"], "order_id": order["id"],
             "order_no": order["order_no"]}
 
 
+def login(client: httpx.Client, state: dict) -> None:
+    response = client.get("/api/auth/session")
+    response.raise_for_status()
+    session = response.json()
+    if session["authenticated"] and (
+        not state.get("username")
+        or (session.get("user") or {}).get("username") == state["username"]
+    ):
+        return
+    payload = {"password": state["password"]}
+    if state.get("username"):
+        payload["username"] = state["username"]
+    post(client, "/api/auth/login", payload, 204)
+
+
+def migrate_owner(client: httpx.Client, state: dict) -> None:
+    """仅由旧包升级夹具显式调用，验证旧 Cookie 不会自动获得主账号权限。"""
+    response = client.get("/api/auth/session")
+    response.raise_for_status()
+    session = response.json()
+    if not session.get("bootstrap_required"):
+        return
+    assert not session["authenticated"]
+    assert client.get("/api/accounts").status_code == 401
+    password = secrets.token_urlsafe(24)
+    username = "release_owner"
+    post(client, "/api/auth/bootstrap", {
+        "username": username, "password": password,
+        "display_name": "发布验证主账号", "legacy_password": state["password"],
+    }, 200)
+    state.update(username=username, password=password)
+
+
 def verify(client: httpx.Client, state: dict) -> None:
-    post(client, "/api/auth/login", {"password": state["password"]}, 204)
+    login(client, state)
     response = client.get(f"{PROJECT}/purchase-orders/{state['order_id']}")
     response.raise_for_status()
     order = response.json()

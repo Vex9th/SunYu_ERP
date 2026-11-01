@@ -273,6 +273,8 @@ async def read_multipart_batch(
         parsing = False
         payload_text, uploads = _multipart_parts(form, invalid)
         payload = _payload_object(payload_text, invalid)
+        from backend.app.features.access_policy import authorize_parsed_payload
+        authorize_parsed_payload(request, payload, has_uploads=bool(uploads))
         for upload in uploads:
             original_filename = normalize_upload_filename(
                 upload.filename,

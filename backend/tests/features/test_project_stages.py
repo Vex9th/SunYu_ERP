@@ -16,8 +16,9 @@ from fastapi.testclient import TestClient
 from backend.app.core.config import Settings
 from backend.app.core.database import connect_database
 from backend.app.core.migrations import apply_migrations
-from backend.app.core.security import SESSION_COOKIE_NAME, create_session_token
+from backend.app.core.security import SESSION_COOKIE_NAME
 from backend.app.core.storage_paths import project_code_identity
+from backend.tests.account_support import owner_session_token
 
 NOW = datetime(2026, 8, 29, 9, 30, tzinfo=timezone.utc)
 STAGE_CODES = [
@@ -41,6 +42,8 @@ STAGE_CODES = [
     "closeout",
 ]
 STAGE_RESPONSE_FIELDS = {
+    "id",
+    "project_id",
     "stage_code",
     "status",
     "status_reason",
@@ -78,7 +81,7 @@ class StageHarness:
         if authenticated:
             client.cookies.set(
                 SESSION_COOKIE_NAME,
-                create_session_token(self.settings.session_secret),
+                owner_session_token(self.database_path, self.settings.session_secret),
             )
         return client
 
@@ -537,6 +540,8 @@ def test_put_schedule_normalizes_fields_and_increments_revision(tmp_path: Path) 
 
     assert response.status_code == 200
     assert response.json() == {
+        "id": 1,
+        "project_id": 1,
         "stage_code": "planning",
         "status": "pending",
         "status_reason": None,

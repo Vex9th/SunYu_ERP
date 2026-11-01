@@ -1,3 +1,4 @@
+import { useAccess } from './access/AccessProvider'
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import {
   Alert,
@@ -13,7 +14,7 @@ import {
   Tag,
 } from 'antd'
 import { CloudDownloadOutlined, SaveOutlined } from '@ant-design/icons'
-import { ApiError, requestJson } from '../api'
+import { ApiError, requestJson, registerAccountCleanup, getAccountNamespace } from '../api'
 import type {
   BackupSettingsPayload,
   BackupSettingsResponse,
@@ -51,6 +52,7 @@ type SettingsOperation =
 let settingsOperation: SettingsOperation | null = null
 let settingsDraft: BackupSettingsPayload | null = null
 const operationListeners = new Set<() => void>()
+registerAccountCleanup(() => { settingsOperation = null; settingsDraft = null; sessionStorage.removeItem('sunyu-backup-task'); operationListeners.forEach(listener => listener()) })
 function subscribeOperation(listener: () => void) {
   operationListeners.add(listener)
   return () => {
@@ -69,17 +71,21 @@ async function runOperation(
   execute: () => Promise<SettingsOperationResult>,
 ) {
   if (settingsOperation) return
+  const namespace = getAccountNamespace()
   publishOperation({ kind, status: 'running' })
   try {
-    publishOperation({ kind, status: 'success', result: await execute() })
+    const result = await execute()
+    if (namespace === getAccountNamespace()) publishOperation({ kind, status: 'success', result })
   } catch (cause) {
-    publishOperation({ kind, status: 'failed', error: errorText(cause) })
+    if (namespace === getAccountNamespace()) publishOperation({ kind, status: 'failed', error: errorText(cause) })
   }
 }
 
 async function pollBackupTask(taskId: string): Promise<SettingsOperationResult> {
   let consecutiveFailures = 0
+  const namespace = getAccountNamespace()
   for (;;) {
+    if (namespace !== getAccountNamespace()) throw new Error('账号已切换，已停止查询原账号任务')
     try {
       const task = await requestJson<{
         status: string; phase: string; warning?: string; error_code?: string
@@ -113,6 +119,10 @@ async function pollBackupTask(taskId: string): Promise<SettingsOperationResult> 
 }
 
 export default function SettingsPage() {
+  const { user } = useAccess()
+  return user?.is_owner ? <OwnerSettings /> : <Alert type="info" showIcon title="系统设置仅供主账号管理" />
+}
+function OwnerSettings() {
   const overview = useLoad(
     () => requestJson<SystemOverview>('/api/system/overview'),
     [],

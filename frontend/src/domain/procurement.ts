@@ -1,4 +1,4 @@
-import type { DecimalString, ISODate, MoneyCents, Revision } from './contracts'
+import type { DecimalString, ISODate, ISODateTime, MoneyCents, Revision } from './contracts'
 
 export type ProcurementListStatus = 'draft' | 'confirmed' | 'superseded'
 export type PurchaseOrderStatus =
@@ -28,6 +28,8 @@ export interface ProcurementLineInput {
 }
 
 export interface ProcurementLine extends ProcurementLineInput {
+  confirmation_status: 'draft' | 'confirmed'
+  confirmed_at: ISODateTime | null
   id: number
   revision: Revision
   order_status: ProcurementOrderStatus

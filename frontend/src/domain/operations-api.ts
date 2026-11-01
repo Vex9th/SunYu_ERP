@@ -1,3 +1,4 @@
+import type { ActivityTracked } from '../types'
 import type {
   DecimalString,
   ISODate,
@@ -37,7 +38,7 @@ export interface ProcurementListUpdateInput extends ProcurementListInput {
   expected_revision: Revision
 }
 
-export interface ProcurementListSummaryDto {
+export interface ProcurementListSummaryDto extends ActivityTracked {
   id: number
   project_code: string
   name: string
@@ -45,6 +46,7 @@ export interface ProcurementListSummaryDto {
   status: ProcurementListStatus
   revision: Revision
   line_count: number
+  confirmed_line_count: number
   confirmed_at: ISODateTime | null
   created_at: ISODateTime
   updated_at: ISODateTime
@@ -67,7 +69,11 @@ export interface ProcurementLineUpdateInput extends ProcurementLineInput {
   expected_revision: Revision
 }
 
-export interface ProcurementLineDto extends ProcurementLineInput {
+export interface ProcurementLineDto extends ProcurementLineInput, ActivityTracked {
+  confirmation_status: 'draft' | 'confirmed'
+  confirmed_at: ISODateTime | null
+  can_reopen: boolean
+  edit_block_reason: string | null
   id: number
   procurement_list_id: number
   inventory_item_id: number | null
@@ -94,6 +100,11 @@ export interface ProcurementListDetailDto extends ProcurementListSummaryDto {
   cost_total_cents: MoneyCents
   quoted_total_cents: MoneyCents
   lines: ProcurementLineDto[]
+}
+
+export interface ReopenProcurementLineInput {
+  expected_revision: Revision
+  reason: string
 }
 
 export interface ConfirmRevisionInput {
@@ -129,7 +140,7 @@ export interface PurchaseOrderLineDto extends PurchaseOrderLineInput {
   line_amount_cents: MoneyCents
 }
 
-export interface PurchaseOrderDto extends Omit<PurchaseOrderInput, 'lines'> {
+export interface PurchaseOrderDto extends Omit<PurchaseOrderInput, 'lines'>, ActivityTracked {
   net_amount_cents?: MoneyCents
   tax_amount_cents?: MoneyCents
   id: number
@@ -153,7 +164,7 @@ export interface GoodsReceiptInput {
   notes: string | null
 }
 
-export interface GoodsReceiptDto {
+export interface GoodsReceiptDto extends ActivityTracked {
   id: number
   purchase_order_id: number
   received_on: ISODate
@@ -214,7 +225,7 @@ export interface InventoryItemUpdateInput {
   expected_revision: Revision
 }
 
-export interface InventoryItemDto {
+export interface InventoryItemDto extends ActivityTracked {
   id: number
   brand: string | null
   name: string
@@ -232,7 +243,7 @@ export interface InventoryItemDto {
 
 export type InventoryMovementType = 'opening' | 'goods_receipt' | 'adjustment' | 'project_issue' | 'reversal'
 
-export interface InventoryMovementDto {
+export interface InventoryMovementDto extends ActivityTracked {
   id: number
   inventory_item_id: number
   project_id: number | null
@@ -331,7 +342,7 @@ export interface WorkerUpdateInput extends WorkerInput {
   expected_revision: Revision
 }
 
-export interface WorkerDto extends WorkerInput {
+export interface WorkerDto extends WorkerInput, ActivityTracked {
   id: number
   status: WorkerStatus
   inactive_on: ISODate | null
@@ -361,7 +372,7 @@ export interface CrewAssignmentUpdateInput extends CrewAssignmentInput {
   expected_revision: Revision
 }
 
-export interface CrewAssignmentDto extends CrewAssignmentInput {
+export interface CrewAssignmentDto extends CrewAssignmentInput, ActivityTracked {
   id: number
   project_code: string
   worker_name: string
@@ -372,7 +383,7 @@ export interface CrewAssignmentDto extends CrewAssignmentInput {
   updated_at: ISODateTime
 }
 
-export interface LaborEntryDto {
+export interface LaborEntryDto extends ActivityTracked {
   id: number
   project_code: string
   assignment_id: number

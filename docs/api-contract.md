@@ -96,12 +96,13 @@
 | Method | Path | 请求 | 成功响应 |
 |---|---|---|---|
 | GET | `/api/health` | 无 | `{"status":"ok"}` |
-| GET | `/api/auth/session` | 无 | `{"authenticated": boolean, "password_configured": boolean}` |
-| POST | `/api/auth/setup` | `{"password":"123456"}` | `204`；只允许首次设置 |
-| POST | `/api/auth/login` | `{"password":"123456"}` | `204` 并写入 Session Cookie |
+| GET | `/api/auth/session` | 无 | 登录状态、初始化状态、当前用户、权限和项目范围 |
+| POST | `/api/auth/bootstrap` | `username`、`password`、`display_name`，旧库另需 `legacy_password` | `200` 会话；仅本机首次创建主账号 |
+| POST | `/api/auth/setup` | 已退役 | `410` |
+| POST | `/api/auth/login` | `username`、`password` | `204` 并写入 Session Cookie |
 | POST | `/api/auth/logout` | 无 | `204` 并清除 Cookie |
 
-密码必须恰好是 6 位 ASCII 数字。前端首次进入先请求 `/api/auth/session`：未设置密码时展示“创建本机密码”，已设置但未登录时展示“输入密码”。
+新账号密码为 8–128 字符，保留空白，不沿用共享六位口令会话。前端根据 `/api/auth/session` 的 `bootstrap_required` 显示主账号初始化或账号登录；原六位口令仅用于旧库首次初始化的身份验证。
 
 ### 3.2 公司与联系人
 
@@ -808,3 +809,33 @@ ProjectRepository / ProcurementRepository / WorkforceRepository
 3. 新状态、新字段和新错误码先更新本文和前端类型，再实现业务代码。
 4. OpenAPI 与本文冲突时，在同一变更内修正，禁止把兼容分支永久留在前端。
 5. 本文不承诺尚未标记“已实现”的接口已经可调用；Mock 只用于页面预览。
+
+### 采购逐项确认与报价快照（2026-10-31）
+
+- 采购明细新增 `confirmation_status: draft|confirmed`、`confirmed_at`、`can_reopen`、`edit_block_reason`；清单新增 `confirmed_line_count`，原 `line_count` 保留。头部 `status/confirmed_at` 仅汇总：非空且全部行确认才为 `confirmed`；`superseded` 仍只读。
+- `POST /api/projects/{project_code}/procurement-lists/{list_id}/lines/{line_id}/confirm` 接受 `{expected_revision}`；`/reopen` 接受 `{expected_revision, reason}`。两者要求 `Idempotency-Key`，响应为更新后的明细 DTO，含行 `revision` 和 `list_revision`。撤回原因不得为空；其他行的 revision 不变化。
+- `DELETE /api/projects/{project_code}/procurement-lists/{list_id}/lines/{line_id}?expected_revision=N` 必须提供当前行 revision。已确认行需先撤回；任何采购单历史引用（含草稿、取消或从草稿移除的引用）及库存历史引用均阻止撤回、编辑和删除，并返回 `PROCUREMENT_LINE_REFERENCED`。
+- 未被替代的清单始终可追加新行及维护名称/说明。原整单 `/confirm` 保留为事务性批量兼容接口，仅确认尚未确认的行，不允许部分提交。
+- `procurement-options.lines` 只返回已确认且清单未被替代的明细，增加 `confirmation_status`、`quoted_total_cents`。创建、修改和确认采购单均重新读取行确认状态；原价税、超采、付款、发票和库存核算规则保留。
+- `POST .../procurement-lists/{list_id}/quote-exports` 可附 `procurement_line_ids: number[]`；省略时纳入该清单全部已确认行。显式空数组、重复 ID 或未确认/其他清单行被拒绝；没有已确认项返回 `PROCUREMENT_LIST_NOT_QUOTABLE`。报价响应增加 `line_count`。
+- 报价生成在同一事务中保存客户名、物料身份、数量、报价单价快照；下载只读取该快照。修改客户名称或原清单后旧报价不变。迁移为旧报价回填现存锁定内容，不生成历史操作人。
+- 采购报价生成及下载同时要求 `procurement.lines.export` 与 `sensitive.procurement_prices`。下载工作簿成功生成后、响应流发送前记录 `quote_export` 的“请求下载报价”，不声称客户端接收完成；失败和权限拒绝不记下载请求。
+- 文件列表、搜索、分页总数与版本候选在查询阶段排除无权文件；详情及两种原件下载路径复用项目、分类和业务来源授权。进项发票与采购报价附件使用实际采购来源权限，存在客户发票或商业报价等其他来源时需同时满足各来源权限。通用上传仍按提交分类授权，分类不能通过文件资料更新接口修改。
+- 文件原件成功打开后、响应流发送前记录 `document_version` 的“请求下载文件”；权限拒绝、缺失文件和审计写入失败不发送文件。
+
+### 账号、工作组与数据范围
+
+- `GET /api/auth/session` 返回 `bootstrap_required`、`user`、`permissions`、`project_ids` 和 `access_revision`。旧共享口令 Cookie 不再作为业务身份；旧库须在服务本机通过原口令初始化主账号（`POST /api/auth/bootstrap`），不重建业务数据。
+- `POST /api/auth/login` 接收 `username`、`password`，使用服务端可撤销会话；禁用账号和重置密码立即使已有会话失效。账号密码保留输入中的空白，长度 8–128 字符。
+- 主账号使用 `/api/accounts`、`/api/workgroups` 和 `/api/permissions/catalog` 管理成员与权限；成员 `group_id` 只能是一个组或为空。`PATCH /api/accounts/{id}` 转组，`PUT /api/workgroups/{id}/access` 设置项目与模块/动作权限，均要求 `expected_revision`。
+- 无工作组的账号无业务数据权限；旧项目初始由主账号管理，普通账号新建的项目自动加入其当前组。授权变化在下一请求生效，响应带 `X-Access-Revision`。接口、原件下载、导出、汇总和幂等回放均执行后端授权。
+- 共享公司、人员和物料目录按模块授权；项目流水、往来账、看板先过滤项目再汇总。跨项目合同的部分可见者只能读取本组项目分摊摘要，完整资料、附件和修改要求全部关联项目权限。
+- 隐藏金额/银行字段使用 `null` 和 `restricted_fields` 表明权限限制，不伪装成零。无银行资料权限编辑公司时可省略银行字段，保留原值。
+
+### 业务界面操作记录
+
+- `GET /api/operation-history/{resource_type}/{resource_id}?before_id=...&limit=20` 返回 `items` 和 `next_before_id`（最多 50 项）。`project_stage` 也接受 `项目ID:stage_code`。
+- 事件包含 `action`、`actor_name`、`group_name`、`occurred_at`、`summary`、`reason`、`changes`。备注名和工作组名为操作时快照；历史业务数据不补造操作人。
+- 写入与操作记录在同一事务提交；同一次保存的多条 SQL 合并为真实的修改前/后值。失败写入无事件，幂等重试不重复建单或记事件。凭据、原文件内容和内部路径不进入记录。
+- 业务响应带可选 `activity_summary`，包含 `created_by`、`last_actor`、`last_action`、`last_at`。采购单历史同时显示到货、付款、进项发票等子记录操作；记录列表、摘要和字段遵循同一权限范围。
+- 文件及报价原件在成功准备读取后记录“请求下载”，不把发出下载请求视为文件传输完成。账户切换或授权变化会清空前端旧身份缓存和待重试提交。

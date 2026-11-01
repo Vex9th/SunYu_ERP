@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Request, status
 
+from backend.app.core.access import Principal, has_permission, project_scope_sql
 from backend.app.core.config import Settings
 from backend.app.core.database import transaction
 from backend.app.features import commercial, project_stages
@@ -50,14 +51,15 @@ def create_dashboards_router(
     def require_session(
         request: Request,
         settings: Settings = settings_dependency,
-    ) -> None:
-        require_authenticated_session(request, settings.session_secret)
+        connection: sqlite3.Connection = connection_dependency,
+    ) -> Principal:
+        return require_authenticated_session(request, settings.session_secret, connection)
 
     authentication_dependency = Depends(require_session)
 
     @router.get("/api/dashboard")
     def get_global_dashboard(
-        _: None = authentication_dependency,
+        _: Principal = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
         settings: Settings = settings_dependency,
     ) -> dict[str, object]:
@@ -65,7 +67,7 @@ def create_dashboards_router(
         today = commercial._business_today(lambda: current_time)
         try:
             with transaction(connection):
-                return _global_dashboard(connection, settings, current_time, today)
+                return _global_dashboard(connection, settings, current_time, today, principal=_)
         except sqlite3.Error as failure:
             raise _database_error(failure) from None
 
@@ -77,6 +79,7 @@ def _global_dashboard(
     settings: Settings,
     current_time: datetime,
     today: str,
+    *, principal: Principal | None = None,
 ) -> dict[str, object]:
     project_rows: list[dict[str, object]] = []
     todos: list[dict[str, object]] = []
@@ -88,9 +91,9 @@ def _global_dashboard(
         "received_amount_cents": 0,
         "outstanding_receivable_cents": 0,
     }
-    for project in _active_projects(connection):
-        operating = build_project_operating_snapshot(connection, project, today=today, include_details=False)
-        final_delivery_on = _final_delivery_on(connection, int(project["id"]))
+    for project in _active_projects(connection, principal=principal):
+        operating = build_project_operating_snapshot(connection, project, today=today, include_details=False, principal=principal)
+        final_delivery_on = _final_delivery_on(connection, int(project["id"])) if has_permission(principal, "contracts.view") else None
         project_rows.append(_global_project_row(project, operating, final_delivery_on))
         project_todos = operating["todos"]
         if not isinstance(project_todos, list):
@@ -98,8 +101,14 @@ def _global_dashboard(
         todos.extend(project_todos)
         _accumulate_summary(summary, operating, final_delivery_on, today)
     summary["active_project_count"] = len(project_rows)
-    backup = _backup_health(connection, settings, current_time)
-    if backup["healthy"] is False:
+    if not has_permission(principal, "contracts.view"):
+        summary["contracted_amount_cents"] = None
+        summary["upcoming_delivery_count"] = None
+    if not has_permission(principal, "customer_receipts.view"):
+        for key in ("received_amount_cents", "outstanding_receivable_cents", "overdue_receivable_count"):
+            summary[key] = None
+    backup = _backup_health(connection, settings, current_time) if principal is None or principal.is_owner else None
+    if backup is not None and backup["healthy"] is False:
         todos.append(_backup_todo(backup))
     return {
         "generated_at": current_time.isoformat(),
@@ -150,7 +159,8 @@ def _accumulate_summary(
         "received_amount_cents",
         "outstanding_receivable_cents",
     ):
-        summary[field] += int(receivables[field])
+        if receivables[field] is not None:
+            summary[field] += int(receivables[field])
 
 
 def _backup_todo(backup: dict[str, object]) -> dict[str, object]:
@@ -167,88 +177,81 @@ def _backup_todo(backup: dict[str, object]) -> dict[str, object]:
 def build_project_operating_snapshot(
     connection: sqlite3.Connection,
     project: sqlite3.Row | dict[str, object],
-    *,
-    today: str,
-    include_details: bool = True,
+    *, today: str, include_details: bool = True, principal: Principal | None = None,
 ) -> dict[str, object]:
-    project_id = int(project["id"])
-    project_code = str(project["project_code"])
-    stages = project_stages._stage_list(
-        connection, project_id, str(project["project_category"])
-    )
+    project_id, project_code = int(project["id"]), str(project["project_code"])
+    stages = project_stages._stage_list(connection, project_id, str(project["project_category"])) if has_permission(principal, "project_stages.view") else []
     accepted_quote = None
-    contract_rows = []
-    if include_details:
+    if include_details and has_permission(principal, "quotes.view"):
         accepted_quote = connection.execute(
-            """
-            SELECT * FROM quotes
-            WHERE project_id = ? AND status = 'accepted'
-            ORDER BY version_number DESC, id DESC
-            LIMIT 1
-            """,
+            "SELECT * FROM quotes WHERE project_id = ? AND status = 'accepted' ORDER BY version_number DESC, id DESC LIMIT 1",
             (project_id,),
         ).fetchone()
+    contract_rows = []
+    if include_details and has_permission(principal, "contracts.view"):
         contract_rows = connection.execute(
-            """
-            SELECT contracts.*
-            FROM contracts
-            JOIN contract_project_allocations AS allocations
-                ON allocations.contract_id = contracts.id
-            WHERE allocations.project_id = ?
-            ORDER BY contracts.created_at DESC, contracts.id DESC
-            """,
-            (project_id,),
+            """SELECT contracts.* FROM contracts JOIN contract_project_allocations allocations
+               ON allocations.contract_id = contracts.id WHERE allocations.project_id = ?
+               ORDER BY contracts.created_at DESC, contracts.id DESC""", (project_id,),
         ).fetchall()
-    receivables = commercial._payment_overview(
-        connection,
-        project,  # type: ignore[arg-type]
-        today,
-        include_receipts=include_details,
-    )
+    if has_permission(principal, "customer_receipts.view"):
+        receivables = commercial._payment_overview(connection, project, today, include_receipts=include_details, principal=principal)
+    else:
+        receivables = {key: None for key in (
+            "contracted_amount_cents", "receivable_amount_cents", "received_amount_cents",
+            "allocated_received_amount_cents", "unallocated_received_amount_cents",
+            "outstanding_receivable_cents", "contract_collection_basis_points")}
+        receivables.update(terms=[], receipts=[], visible=False)
+        if has_permission(principal, "contracts.view"):
+            receivables["contracted_amount_cents"] = connection.execute(
+                """SELECT COALESCE(SUM(a.amount_cents), 0) FROM contract_project_allocations a
+                   JOIN contracts c ON c.id = a.contract_id WHERE a.project_id = ? AND c.status IN ('signed','completed')""",
+                (project_id,),
+            ).fetchone()[0]
+    if not has_permission(principal, "contracts.view"):
+        receivables.update(contracted_amount_cents=None, contract_collection_basis_points=None)
     costs = _project_costs(connection, project_id)
-    contracted_amount = int(receivables["contracted_amount_cents"])
-    actual_cost = int(costs["total_cents"])
-    actual_profit = contracted_amount - actual_cost
-    final_delivery_on = _final_delivery_on(connection, project_id)
-    todos = _project_todos(
-        stages,
-        receivables,
-        project_code=project_code,
-        final_delivery_on=final_delivery_on,
-        today=today,
-    )
+    for keys, fields in (
+        (("inventory.view", "sensitive.procurement_prices"), ("material_consumed_cents",)),
+        (("workforce.view", "sensitive.salary_costs"), ("labor_cents",)),
+        (("material_advances.view", "sensitive.procurement_prices"), ("field_material_cents",)),
+        (("procurement.orders.view", "sensitive.procurement_prices"), ("procurement_committed_cents",)),
+        (("procurement.receipts.view", "sensitive.procurement_prices"), ("procurement_received_cents",)),
+        (("procurement.payments.view",), ("procurement_paid_cents",)),
+    ):
+        if not all(has_permission(principal, key) for key in keys):
+            costs.update(dict.fromkeys(fields))
+    if any(costs[key] is None for key in ("material_consumed_cents", "labor_cents", "field_material_cents")):
+        costs.update(total_cents=None, completeness="restricted")
+    contracted_amount, actual_cost = receivables["contracted_amount_cents"], costs["total_cents"]
+    profit_visible = has_permission(principal, "sensitive.profit_summary") and contracted_amount is not None and actual_cost is not None
+    actual_profit = int(contracted_amount) - int(actual_cost) if profit_visible else None
+    final_delivery_on = _final_delivery_on(connection, project_id) if has_permission(principal, "contracts.view") else None
+    todos = _project_todos(stages, receivables, project_code=project_code, final_delivery_on=final_delivery_on, today=today)
     return {
         "stages": stages,
         "commercial": {
-            "accepted_quote": (
-                None
-                if accepted_quote is None
-                else commercial._quote_response(
-                    connection, accepted_quote, project_code
-                )
-            ),
-            "contracts": [
-                commercial._contract_response(connection, row) for row in contract_rows
-            ],
+            "accepted_quote": None if accepted_quote is None else commercial._quote_response(connection, accepted_quote, project_code),
+            "contracts": [commercial._contract_response(connection, row, principal=principal) for row in contract_rows],
         },
         "costs": costs,
         "profit": {
             "contracted_amount_cents": contracted_amount,
-            "actual_cost_cents": actual_cost,
+            "actual_cost_cents": actual_cost if profit_visible else None,
             "actual_profit_cents": actual_profit,
-            "margin_basis_points": commercial._basis_points(
-                actual_profit,
-                contracted_amount,
-            ),
+            "margin_basis_points": commercial._basis_points(actual_profit, contracted_amount) if profit_visible else None,
         },
         "receivables": receivables,
         "todos": todos,
     }
 
 
-def _active_projects(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+def _active_projects(connection: sqlite3.Connection, *, principal: Principal | None = None) -> list[sqlite3.Row]:
+    scope, scope_ids = project_scope_sql(principal, "projects.id")
+    if not has_permission(principal, "projects.view"):
+        return []
     return connection.execute(
-        """
+        f"""
         SELECT
             projects.id, projects.project_code, projects.project_category,
             projects.company_id,
@@ -258,9 +261,9 @@ def _active_projects(connection: sqlite3.Connection) -> list[sqlite3.Row]:
             projects.created_at, projects.updated_at
         FROM projects
         JOIN companies ON companies.id = projects.company_id
-        WHERE projects.status = 'active'
+        WHERE projects.status = 'active' AND ({scope})
         ORDER BY projects.created_at DESC, projects.id DESC
-        """
+        """, scope_ids,
     ).fetchall()
 
 

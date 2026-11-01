@@ -1,4 +1,5 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { render } from './access-fixtures'
+import { cleanup, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import ProjectCommercial, { businessFileError, validateAllocations } from '../project/ProjectCommercial'
 import { contract, installProjectDom, page, projectRepository } from './project-fixtures'

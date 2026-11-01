@@ -1,3 +1,4 @@
+import { registerAccountCleanup } from '../api'
 import {
   createContext,
   useContext,
@@ -15,6 +16,7 @@ type WorkspaceNavigation = {
 }
 const NavigationContext = createContext<WorkspaceNavigation | null>(null)
 const remembered = new Map<string, string>()
+registerAccountCleanup(() => remembered.clear())
 
 export function WorkspaceNavigationProvider({
   children,

@@ -19,7 +19,11 @@ from backend.app.core.storage_paths import (
     normalize_project_code,
     project_code_identity,
 )
-from backend.app.features.api_common import ApiError, ApiErrorRoute
+from backend.app.features.api_common import (
+    ApiError,
+    ApiErrorRoute,
+    account_idempotency_scope,
+)
 from backend.app.features.auth import require_authenticated_session
 
 logger = logging.getLogger(__name__)
@@ -112,8 +116,9 @@ def create_workforce_router(
     def require_session(
         request: Request,
         settings: Settings = settings_dependency,
+        connection: sqlite3.Connection = connection_dependency,
     ) -> None:
-        require_authenticated_session(request, settings.session_secret)
+        require_authenticated_session(request, settings.session_secret, connection)
 
     authentication_dependency = Depends(require_session)
 
@@ -1417,7 +1422,7 @@ def _idempotent_operation(
     request_hash = hashlib.sha256(request_body.encode("utf-8")).hexdigest()
     path = request.url.path.casefold()
     with transaction_immediate(connection):
-        scope = f"POST:{path}"
+        scope = account_idempotency_scope(connection, f"POST:{path}")
         previous = connection.execute(
             """
             SELECT request_sha256, response_json

@@ -4,11 +4,12 @@ import hashlib
 import json
 import sqlite3
 import zlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from typing import Any
+from uuid import uuid4
 from xml.etree import ElementTree
 from zipfile import (
     ZIP_DEFLATED,
@@ -40,6 +41,7 @@ from backend.app.features.api_common import (
 )
 from backend.app.features.auth import require_authenticated_session
 from backend.app.features.inventory import format_quantity, line_value, parse_quantity
+from backend.app.features.operation_history import append_operation_event
 from backend.app.features.purchase_order_tax import gross_line_value
 
 Clock = Callable[[], datetime]
@@ -99,8 +101,9 @@ def create_procurement_extensions_router(
     def require_session(
         request: Request,
         settings: Settings = settings_dependency,
+        connection: sqlite3.Connection = connection_dependency,
     ) -> None:
-        require_authenticated_session(request, settings.session_secret)
+        require_authenticated_session(request, settings.session_secret, connection)
 
     authentication_dependency = Depends(require_session)
 
@@ -1052,7 +1055,7 @@ def create_procurement_extensions_router(
         identifier = base._parse_identifier(list_id)
         key = base._validate_idempotency_key(idempotency_key)
         payload = await base._read_json(
-            request, _QUOTE_FIELDS, "Invalid quote export payload"
+            request, _QUOTE_FIELDS, "Invalid quote export payload", optional_fields={"procurement_line_ids"}
         )
         normalized = {
             "title": base._required_text(payload["title"], "Invalid quote export payload"),
@@ -1061,6 +1064,15 @@ def create_procurement_extensions_router(
             ),
             "notes": base._optional_text(payload["notes"], "Invalid quote export payload"),
         }
+        if "procurement_line_ids" in payload:
+            selected_ids = payload["procurement_line_ids"]
+            if not isinstance(selected_ids, list) or not selected_ids:
+                raise base._invalid_payload("Select at least one confirmed procurement line")
+            normalized["procurement_line_ids"] = sorted({
+                base._positive_integer(value, "Invalid procurement line selection") for value in selected_ids
+            })
+            if len(normalized["procurement_line_ids"]) != len(selected_ids):
+                raise base._invalid_payload("Duplicate procurement line selection")
         request_hash = base._request_hash(normalized)
         timestamp = base._timestamp(now)
         with transaction_immediate(connection):
@@ -1089,15 +1101,18 @@ def create_procurement_extensions_router(
             procurement_list = base._list_row(connection, identifier, int(project["id"]))
             if procurement_list is None:
                 raise base._not_found("Procurement list not found")
-            if procurement_list["status"] != "confirmed":
-                raise base._business_conflict(
-                    "Only a confirmed procurement list can be quoted",
-                    "PROCUREMENT_LIST_NOT_QUOTABLE",
-                )
-            if connection.execute(
-                "SELECT 1 FROM companies WHERE id = ?",
-                (normalized["customer_company_id"],),
-            ).fetchone() is None:
+            if procurement_list["status"] == "superseded":
+                raise base._business_conflict("Procurement list is superseded", "PROCUREMENT_LIST_NOT_QUOTABLE")
+            lines = [line for line in base._list_line_rows(connection, identifier) if line["confirmation_status"] == "confirmed"]
+            if "procurement_line_ids" in normalized:
+                selected = set(normalized["procurement_line_ids"])
+                lines = [line for line in lines if line["id"] in selected]
+                if len(lines) != len(selected):
+                    raise base._business_conflict("报价只能选择当前清单的已确认项", "PROCUREMENT_LINE_NOT_QUOTABLE")
+            if not lines:
+                raise base._business_conflict("清单没有已确认项，无法生成报价", "PROCUREMENT_LIST_NOT_QUOTABLE")
+            customer = connection.execute("SELECT name FROM companies WHERE id = ?", (normalized["customer_company_id"],)).fetchone()
+            if customer is None:
                 raise base._not_found("Company not found")
             storage_key = idempotency_storage_key(scope, key)
             cursor = connection.execute(
@@ -1105,8 +1120,8 @@ def create_procurement_extensions_router(
                 INSERT INTO quote_exports
                     (project_id, procurement_list_id, title, customer_company_id,
                      notes, document_version_id, idempotency_key, request_hash,
-                     created_at)
-                VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                     created_at, customer_company_name_snapshot)
+                VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
                 """,
                 (
                     project["id"],
@@ -1117,9 +1132,19 @@ def create_procurement_extensions_router(
                     storage_key,
                     request_hash,
                     timestamp,
+                    customer["name"],
                 ),
             )
             export_id = base._last_insert_id(cursor)
+            connection.executemany(
+                """INSERT INTO quote_export_lines
+                   (quote_export_id, procurement_line_id, sequence_no, category, name,
+                    specification, brand, model, quantity_milli, unit, quoted_unit_price_cents)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [(export_id, line["id"], line["sequence_no"], line["category"], line["name"],
+                  line["specification"], line["brand"], line["model"], line["quantity_milli"],
+                  line["unit"], line["quoted_unit_price_cents"]) for line in lines],
+            )
             export = _quote_row(connection, export_id, int(project["id"]))
             if export is None:
                 raise sqlite3.DatabaseError("created quote export is missing")
@@ -1154,7 +1179,8 @@ def create_procurement_extensions_router(
         )
         rows = connection.execute(
             """
-            SELECT exports.*, companies.name AS customer_company_name
+            SELECT exports.*, exports.customer_company_name_snapshot AS customer_company_name,
+                   (SELECT COUNT(*) FROM quote_export_lines WHERE quote_export_id = exports.id) AS line_count
             FROM quote_exports AS exports
             JOIN companies ON companies.id = exports.customer_company_id
             WHERE exports.project_id = ?
@@ -1175,6 +1201,7 @@ def create_procurement_extensions_router(
     def download_quote_export(
         project_code: str,
         export_id: str,
+        request: Request,
         _: None = authentication_dependency,
         connection: sqlite3.Connection = connection_dependency,
     ) -> StreamingResponse:
@@ -1185,8 +1212,21 @@ def create_procurement_extensions_router(
         if export is None:
             raise base._not_found("Quote export not found")
         content = _quote_workbook(connection, export)
+        stream = BytesIO(content)
+        try:
+            with transaction_immediate(connection):
+                append_operation_event(
+                    connection, principal=connection.principal,
+                    request_id=getattr(request.state, "operation_request_id", None) or uuid4().hex,
+                    action="procurement.lines.export", resource_type="quote_export", resource_id=export["id"],
+                    project_ids=(int(project["id"]),), summary="请求下载报价", reason=None,
+                    changes={}, occurred_at=base._timestamp(now),
+                )
+        except BaseException:
+            stream.close()
+            raise
         return StreamingResponse(
-            BytesIO(content),
+            _quote_download_chunks(stream),
             media_type=(
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             ),
@@ -1198,6 +1238,14 @@ def create_procurement_extensions_router(
         )
 
     return router
+
+
+def _quote_download_chunks(stream: BytesIO) -> Iterator[bytes]:
+    try:
+        while chunk := stream.read(64 * 1024):
+            yield chunk
+    finally:
+        stream.close()
 
 
 class _RequestBodyTooLarge(Exception):
@@ -2011,7 +2059,8 @@ def _quote_row(
 ) -> sqlite3.Row | None:
     return connection.execute(
         """
-        SELECT exports.*, companies.name AS customer_company_name
+        SELECT exports.*, exports.customer_company_name_snapshot AS customer_company_name,
+                   (SELECT COUNT(*) FROM quote_export_lines WHERE quote_export_id = exports.id) AS line_count
         FROM quote_exports AS exports
         JOIN companies ON companies.id = exports.customer_company_id
         WHERE exports.id = ? AND exports.project_id = ?
@@ -2028,6 +2077,7 @@ def _quote_response(row: sqlite3.Row, project_code: str) -> dict[str, object]:
         "title": row["title"],
         "customer_company_id": row["customer_company_id"],
         "customer_company_name": row["customer_company_name"],
+        "line_count": row["line_count"],
         "notes": row["notes"],
         "created_at": row["created_at"],
         "download_url": (
@@ -2041,10 +2091,10 @@ def _quote_workbook(connection: sqlite3.Connection, export: sqlite3.Row) -> byte
         """
         SELECT sequence_no, category, name, specification, brand, model,
                quantity_milli, unit, quoted_unit_price_cents
-        FROM procurement_lines
-        WHERE procurement_list_id = ? ORDER BY sequence_no, id
+        FROM quote_export_lines
+        WHERE quote_export_id = ? ORDER BY sequence_no, id
         """,
-        (export["procurement_list_id"],),
+        (export["id"],),
     ).fetchall()
     workbook = Workbook()
     worksheet = workbook.active

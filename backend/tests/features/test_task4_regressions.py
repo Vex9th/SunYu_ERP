@@ -109,8 +109,9 @@ def test_document_upload_does_not_block_event_loop(tmp_path, monkeypatch):
 
     import httpx
 
-    from backend.app.core.security import SESSION_COOKIE_NAME, create_session_token
+    from backend.app.core.security import SESSION_COOKIE_NAME
     from backend.app.features import documents
+    from backend.tests.account_support import owner_session_token
     from backend.tests.features.test_documents import _build_harness
     harness = _build_harness(tmp_path)
     entered, release = Event(), Event()
@@ -121,7 +122,7 @@ def test_document_upload_does_not_block_event_loop(tmp_path, monkeypatch):
         return original(*args, **kwargs)
     monkeypatch.setattr(documents, '_stage_upload', slow)
     async def run():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=harness.app), base_url='http://test', cookies={SESSION_COOKIE_NAME: create_session_token(harness.settings.session_secret)}) as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=harness.app), base_url='http://test', cookies={SESSION_COOKIE_NAME: owner_session_token(harness.database_path, harness.settings.session_secret)}) as client:
             task = asyncio.create_task(client.post('/api/projects/P-001/documents', headers={'Idempotency-Key': '10000000-0000-4000-8000-000000000001'}, data={'category': 'mechanical_design', 'title': 'large drawing'}, files={'file': ('drawing.dwg', b'x' * (2 * 1024 * 1024), 'application/acad')}))
             try:
                 assert await asyncio.to_thread(entered.wait, 1)
@@ -202,8 +203,9 @@ def test_workbook_parsing_does_not_block_event_loop(tmp_path, monkeypatch):
 
     import httpx
 
-    from backend.app.core.security import SESSION_COOKIE_NAME, create_session_token
+    from backend.app.core.security import SESSION_COOKIE_NAME
     from backend.app.features import procurement_extensions
+    from backend.tests.account_support import owner_session_token
     from backend.tests.features.test_procurement_extensions import (
         _build_harness,
         _workbook_bytes,
@@ -217,7 +219,7 @@ def test_workbook_parsing_does_not_block_event_loop(tmp_path, monkeypatch):
         return original(*args, **kwargs)
     monkeypatch.setattr(procurement_extensions, '_parse_import_workbook', slow)
     async def run():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=harness.app), base_url='http://test', cookies={SESSION_COOKIE_NAME: create_session_token(harness.settings.session_secret)}) as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=harness.app), base_url='http://test', cookies={SESSION_COOKIE_NAME: owner_session_token(harness.database_path, harness.settings.session_secret)}) as client:
             content = _workbook_bytes([['M-001', '名称', '规格', '个', 1, 2, '备注']])
             task = asyncio.create_task(client.post(f'/api/projects/{harness.project_code}/procurement-imports/preview', headers={'Idempotency-Key': '10000000-0000-4000-8000-000000000003'}, files={'file': ('import.xlsx', content, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')}))
             try:

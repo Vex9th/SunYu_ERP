@@ -32,6 +32,8 @@ export interface ProcurementRepository {
     expectedRevision: number,
     input: ProcurementLineInput,
   ): Promise<void>
+  confirmProcurementLine(projectCode: string, listId: number, lineId: number, expectedRevision: number): Promise<void>
+  reopenProcurementLine(projectCode: string, listId: number, lineId: number, expectedRevision: number, reason: string): Promise<void>
   confirmProcurementList(projectCode: string, listId: number, expectedRevision: number): Promise<void>
   createPurchaseOrder(projectCode: string, input: PurchaseOrderInput): Promise<void>
   updatePurchaseOrder(
@@ -64,6 +66,7 @@ export class MockProcurementRepository implements ProcurementRepository {
   private readonly inventoryOrigins = new Map<string, Set<number>>()
   private readonly inventoryMovements: InventoryMovement[] = initialInventoryMovements()
   private readonly issueUsageAllocations = new Map<number, Map<string, bigint>>()
+  private readonly historicalOrderLines = new Set<string>()
   private nextId = 1000
 
   async getProjectWorkspace(projectCode: string): Promise<RepositoryResult<ProjectProcurementWorkspace>> {
@@ -88,17 +91,20 @@ export class MockProcurementRepository implements ProcurementRepository {
   ): Promise<void> {
     validateProcurementLineInput(input)
     const list = required(this.workspace(projectCode).procurement_lists, listId, '采购清单')
-    if (list.status !== 'draft') throw new Error('已确认采购清单不能编辑')
+    if (list.status === 'superseded') throw new Error('清单已被替代，不能编辑')
     list.lines.push({
       ...clone(input),
       id: this.nextId++,
       revision: 1,
+      confirmation_status: 'draft',
+      confirmed_at: null,
       order_status: 'not_ordered',
       payment_status: 'unpaid',
       receipt_status: 'not_received',
       invoice_status: 'not_invoiced',
       usage_status: 'unused',
     })
+    list.status = 'draft'
     list.revision += 1
   }
 
@@ -113,7 +119,8 @@ export class MockProcurementRepository implements ProcurementRepository {
     const list = required(workspace.procurement_lists, listId, '采购清单')
     const line = required(list.lines, lineId, '采购行')
     assertRevision(line.revision, expectedRevision)
-    if (list.status !== 'draft') throw new Error('已确认采购清单不能编辑')
+    if (list.status === 'superseded' || line.confirmation_status !== 'draft') throw new Error('此项已确认，请先撤回确认后编辑')
+    this.requireUnreferencedLine(projectCode, lineId)
     validateProcurementLineInput(input)
     if (line.receipt_status !== 'not_received' && inventorySignature(line) !== inventorySignature(input)) {
       throw new Error('已有到货记录的采购行不能修改物料身份字段')
@@ -124,11 +131,42 @@ export class MockProcurementRepository implements ProcurementRepository {
     this.updateOrderStatuses(projectCode)
   }
 
+  private requireUnreferencedLine(projectCode: string, lineId: number): void {
+    const workspace = this.workspace(projectCode)
+    if (this.historicalOrderLines.has(`${projectCode}:${lineId}`) || workspace.purchase_orders.some(order => order.lines.some(line => line.procurement_line_id === lineId))) throw new Error('此物料已被采购单引用，不可撤回或修改')
+    for (const [key, origins] of this.inventoryOrigins) {
+      if (key.startsWith(`${projectCode}:`) && origins.has(lineId)) throw new Error('此物料已被库存历史引用，不可撤回或修改')
+    }
+  }
+
+  async confirmProcurementLine(projectCode: string, listId: number, lineId: number, expectedRevision: number): Promise<void> {
+    const list = required(this.workspace(projectCode).procurement_lists, listId, '采购清单')
+    const line = required(list.lines, lineId, '采购行')
+    assertRevision(line.revision, expectedRevision)
+    if (list.status === 'superseded' || line.confirmation_status !== 'draft') throw new Error('此项不能确认')
+    this.requireUnreferencedLine(projectCode, lineId)
+    line.confirmation_status = 'confirmed'; line.confirmed_at = new Date().toISOString(); line.revision++
+    list.status = list.lines.every(item => item.confirmation_status === 'confirmed') ? 'confirmed' : 'draft'; list.revision++
+  }
+
+  async reopenProcurementLine(projectCode: string, listId: number, lineId: number, expectedRevision: number, reason: string): Promise<void> {
+    const list = required(this.workspace(projectCode).procurement_lists, listId, '采购清单')
+    const line = required(list.lines, lineId, '采购行')
+    assertRevision(line.revision, expectedRevision)
+    if (!reason.trim()) throw new Error('请填写撤回原因')
+    if (list.status === 'superseded' || line.confirmation_status !== 'confirmed') throw new Error('此项未确认，不能撤回')
+    this.requireUnreferencedLine(projectCode, lineId)
+    line.confirmation_status = 'draft'; line.confirmed_at = null; line.revision++
+    list.status = 'draft'; list.revision++
+  }
+
   async confirmProcurementList(projectCode: string, listId: number, expectedRevision: number): Promise<void> {
     const list = required(this.workspace(projectCode).procurement_lists, listId, '采购清单')
     assertRevision(list.revision, expectedRevision)
     if (list.status !== 'draft') throw new Error('只有草稿采购清单可以确认')
     if (list.lines.length === 0) throw new Error('采购清单至少需要一条明细')
+    for (const line of list.lines.filter(item => item.confirmation_status === 'draft')) this.requireUnreferencedLine(projectCode, line.id)
+    for (const line of list.lines.filter(item => item.confirmation_status === 'draft')) { line.confirmation_status = 'confirmed'; line.confirmed_at = new Date().toISOString(); line.revision++ }
     list.status = 'confirmed'
     list.revision += 1
   }
@@ -146,6 +184,7 @@ export class MockProcurementRepository implements ProcurementRepository {
       lines: input.lines.map((line) => ({ ...line, id: stagedNextId++ })),
     }
     workspace.purchase_orders.unshift(order)
+    for (const line of order.lines) this.historicalOrderLines.add(`${projectCode}:${line.procurement_line_id}`)
     this.nextId = stagedNextId
     this.updateOrderStatuses(projectCode)
   }
@@ -181,6 +220,7 @@ export class MockProcurementRepository implements ProcurementRepository {
       const oldLine = order.lines[index]
       return { ...clone(line), id: oldLine?.procurement_line_id === line.procurement_line_id ? oldLine.id : stagedNextId++ }
     })
+    for (const line of [...order.lines, ...stagedLines]) this.historicalOrderLines.add(`${projectCode}:${line.procurement_line_id}`)
     Object.assign(order, clone(input), { lines: stagedLines })
     order.revision += 1
     this.nextId = stagedNextId
@@ -191,6 +231,9 @@ export class MockProcurementRepository implements ProcurementRepository {
     const order = required(this.workspace(projectCode).purchase_orders, orderId, '采购单')
     assertRevision(order.revision, expectedRevision)
     if (order.status !== 'draft') throw new Error('只有草稿采购单可以确认')
+    for (const line of order.lines) {
+      if (findProcurementLine(this.workspace(projectCode), line.procurement_line_id).confirmation_status !== 'confirmed') throw new Error('采购物料尚未确认')
+    }
     order.status = 'confirmed'
     order.revision += 1
   }
@@ -652,6 +695,8 @@ function initialWorkspace(projectCode: string): ProjectProcurementWorkspace {
     unit_cost_cents: 128900,
     quoted_unit_price_cents: 158000,
     revision: 2,
+    confirmation_status: 'confirmed' as const,
+    confirmed_at: '2026-08-22T00:00:00+08:00',
     order_status: 'partial' as const,
     payment_status: 'partial' as const,
     receipt_status: 'partial' as const,
@@ -662,7 +707,7 @@ function initialWorkspace(projectCode: string): ProjectProcurementWorkspace {
     id: 11,
     name: '装配线电气采购清单',
     notes: 'P1 契约演示',
-    status: 'draft',
+    status: 'confirmed',
     revision: 3,
     lines: [line],
   }
@@ -861,6 +906,7 @@ function validatePurchaseOrderInput(
   const groupedLines = new Map<number, { quantityMilli: bigint; lines: PurchaseOrderInput['lines'] }>()
   for (const line of input.lines) {
     const procurementLine = findProcurementLine(workspace, line.procurement_line_id)
+    if (procurementLine.confirmation_status !== 'confirmed') throw new Error('采购物料尚未确认')
     const quantityMilli = decimalToMilli(line.quantity)
     if (quantityMilli <= 0n) throw new Error('采购数量必须大于零')
     assertMoneyCents(line.unit_cost_cents)

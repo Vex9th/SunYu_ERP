@@ -3,6 +3,7 @@ import {
   ArrowRightOutlined,
   LockOutlined,
   SafetyCertificateOutlined,
+  UserOutlined,
 } from '@ant-design/icons'
 import { ErrorNotice } from './shared'
 import styles from './Workspace.module.css'
@@ -19,16 +20,20 @@ export function Brand() {
   )
 }
 
+export interface AuthCredentials { username: string; password: string; display_name?: string; legacy_password?: string }
+
 export function AuthPage({
   passwordConfigured,
+  bootstrapRequired = !passwordConfigured,
   busy,
   error,
   onSubmit,
 }: {
   passwordConfigured: boolean
+  bootstrapRequired?: boolean
   busy: boolean
   error: string | null
-  onSubmit: (password: string) => unknown
+  onSubmit: (credentials: AuthCredentials) => unknown
 }) {
   return (
     <main className={styles.auth}>
@@ -64,44 +69,41 @@ export function AuthPage({
       <section className={styles.authFormSide}>
         <div className={styles.authForm}>
           <div className={styles.eyebrow}>欢迎使用 SUNYU</div>
-          <h2>{passwordConfigured ? '回到你的工作台' : '开始管理你的项目'}</h2>
+          <h2>{bootstrapRequired ? '创建本机主账号' : '回到你的工作台'}</h2>
           <p>
-            {passwordConfigured
-              ? '输入本机访问密码，继续处理项目。'
-              : '为当前主机设置一个 6 位数字访问密码。'}
+            {bootstrapRequired ? (passwordConfigured ? '本机需要升级为独立账号登录。请验证原共享密码，创建主账号；原有业务资料会保留。' : '首次使用请在服务本机创建主账号，之后可为同事分配工作组和权限。') : '输入登录名和账号密码，继续处理获准项目。'}
           </p>
           <Space orientation="vertical" size={20} style={{ width: '100%' }}>
             <ErrorNotice error={error} />
             <Form
-              key={String(passwordConfigured)}
+              key={String(bootstrapRequired)}
               layout="vertical"
-              onFinish={(values: { password: string }) =>
-                void onSubmit(values.password)
-              }
+              onFinish={(values: AuthCredentials & { confirm?: string }) => { const { confirm: _confirm, ...credentials } = values; void onSubmit(credentials) }}
               disabled={busy}
               requiredMark={false}
             >
+              <Form.Item name="username" label="登录名" rules={[{ required: true, whitespace: true, message: '请输入登录名' }]}><Input prefix={<UserOutlined />} autoComplete="username" size="large" maxLength={64} autoFocus /></Form.Item>
+              {bootstrapRequired && <Form.Item name="display_name" label="备注名" rules={[{ required: true, whitespace: true, message: '请输入备注名' }]}><Input maxLength={100} size="large" /></Form.Item>}
+              {bootstrapRequired && passwordConfigured && <Form.Item name="legacy_password" label="原共享密码" rules={[{ required: true, message: '请输入原共享密码' }]}><Input.Password autoComplete="off" inputMode="numeric" maxLength={6} size="large" /></Form.Item>}
               <Form.Item
                 name="password"
-                label="访问密码"
+                label="账号密码"
                 rules={[
-                  { required: true, message: '请输入访问密码' },
-                  { pattern: /^[0-9]{6}$/, message: '密码必须是 6 位数字' },
+                  { required: true, message: '请输入账号密码' },
+                  ...(bootstrapRequired ? [{ min: 8, max: 128, message: '密码为 8～128 个字符' }] : []),
                 ]}
               >
                 <Input.Password
                   prefix={<LockOutlined />}
-                  placeholder="输入 6 位数字"
+                  placeholder="输入账号密码"
                   autoComplete={
-                    passwordConfigured ? 'current-password' : 'new-password'
+                    bootstrapRequired ? 'new-password' : 'current-password'
                   }
-                  inputMode="numeric"
-                  maxLength={6}
+                  maxLength={128}
                   size="large"
-                  autoFocus
                 />
               </Form.Item>
-              {!passwordConfigured && (
+              {bootstrapRequired && (
                 <Form.Item
                   name="confirm"
                   label="再次输入密码"
@@ -118,10 +120,9 @@ export function AuthPage({
                 >
                   <Input.Password
                     prefix={<LockOutlined />}
-                    placeholder="再次输入 6 位数字"
+                    placeholder="再次输入账号密码"
                     autoComplete="new-password"
-                    inputMode="numeric"
-                    maxLength={6}
+                    maxLength={128}
                     size="large"
                   />
                 </Form.Item>
@@ -133,12 +134,12 @@ export function AuthPage({
                 size="large"
                 loading={busy}
                 aria-label={
-                  passwordConfigured ? '进入工作台' : '创建密码并进入'
+                  bootstrapRequired ? '创建主账号并进入' : '进入工作台'
                 }
                 icon={<ArrowRightOutlined aria-hidden />}
                 iconPlacement="end"
               >
-                {passwordConfigured ? '进入工作台' : '创建密码并进入'}
+                {bootstrapRequired ? '创建主账号并进入' : '进入工作台'}
               </Button>
             </Form>
           </Space>

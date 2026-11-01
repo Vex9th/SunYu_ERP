@@ -1,5 +1,6 @@
+import { render } from './access-fixtures'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import InventoryWorkspace from '../inventory/InventoryWorkspace'
 import type { InventoryHttpRepository } from '../../repositories/inventory.live'
 

@@ -1,3 +1,4 @@
+import { useAccess } from './access/AccessProvider'
 import { RouterButton } from './RouterButton'
 import { useEffect, useState } from 'react'
 import {
@@ -38,6 +39,7 @@ import styles from './Workspace.module.css'
 const posts = createRetriablePostSender()
 
 export default function ProjectsPage() {
+  const { can } = useAccess()
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
   const [status, setStatus] = useWorkspaceTab(
@@ -53,17 +55,17 @@ export default function ProjectsPage() {
   const pageSize = [10, 20, 50].includes(Number(pageSizeValue))
     ? Number(pageSizeValue)
     : 10
-  const [creating, setCreating] = useState(params.get('create') === '1')
+  const [creating, setCreating] = useState(can('projects.create') && params.get('create') === '1')
   const projects = useLoad(
     () => requestJson<ProjectSummary[]>(`/api/projects?status=${status}`),
     [status],
   )
   const companies = useLoad(
-    () => requestJson<CompanySummary[]>('/api/companies'),
+    () => can('companies.view') ? requestJson<CompanySummary[]>('/api/companies') : Promise.resolve([]),
     [],
   )
   useEffect(() => {
-    if (params.get('create') === '1') setCreating(true)
+    if (can('projects.create') && params.get('create') === '1') setCreating(true)
   }, [params])
   const filtered = (projects.data ?? []).filter(
     (project) =>
@@ -87,7 +89,7 @@ export default function ProjectsPage() {
             <Button
               type="primary"
               icon={<PlusOutlined />}
-              onClick={() => setCreating(true)}
+              disabled={!can('projects.create')} onClick={() => setCreating(true)}
             >
               新建项目
             </Button>
@@ -188,7 +190,7 @@ export default function ProjectsPage() {
                     查看进行中项目
                   </Button>
                 ) : (
-                  <Button type="primary" onClick={() => setCreating(true)}>
+                  <Button type="primary" disabled={!can('projects.create')} onClick={() => setCreating(true)}>
                     新建项目
                   </Button>
                 )}
@@ -254,7 +256,7 @@ export default function ProjectsPage() {
           ]}
         />
       </Section>
-      {creating && (
+      {creating && can('projects.create') && (
         <EntityEditor
           title="新建项目"
           cacheKey="create-project"

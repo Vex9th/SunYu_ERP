@@ -6,6 +6,14 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
+class BusinessConnection(sqlite3.Connection):
+    """请求身份仅保存在各自连接上，避免并发请求串用身份。"""
+
+    principal = None
+    before_transaction = None
+    before_commit = None
+
+
 def connect_database(database_path: str | Path) -> sqlite3.Connection:
     """Open a configured file database; the caller owns the returned connection."""
     connection = sqlite3.connect(
@@ -13,6 +21,7 @@ def connect_database(database_path: str | Path) -> sqlite3.Connection:
         timeout=5.0,
         isolation_level=None,
         check_same_thread=False,
+        factory=BusinessConnection,
     )
     try:
         connection.row_factory = sqlite3.Row
@@ -51,7 +60,13 @@ def _transaction(
 
     connection.execute(begin_statement)
     try:
+        validator = getattr(connection, "before_transaction", None)
+        if validator is not None:
+            validator()
         yield connection
+        recorder = getattr(connection, "before_commit", None)
+        if recorder is not None:
+            recorder()
         connection.commit()
     except BaseException:
         connection.rollback()

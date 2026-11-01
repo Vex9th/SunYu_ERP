@@ -57,7 +57,16 @@ class ApiErrorRoute(APIRoute):
 
 
 def idempotency_scope(request: Request) -> str:
-    return f"{request.method.upper()}:{request.url.path}"
+    scope = f"{request.method.upper()}:{request.url.path}"
+    principal = getattr(request.state, 'principal', None)
+    return f"user:{principal.user_id}:{scope}" if principal is not None else scope
+
+
+def account_idempotency_scope(connection: sqlite3.Connection, scope: str) -> str:
+    principal = getattr(connection, 'principal', None)
+    if principal is None or scope.startswith(f'user:{principal.user_id}:'):
+        return scope
+    return f'user:{principal.user_id}:{scope}'
 
 
 def idempotency_storage_key(scope: str, key: str) -> str:
@@ -71,6 +80,7 @@ def restore_idempotent_response(
     key: str,
     request_hash: str,
 ) -> dict[str, object] | None:
+    scope = account_idempotency_scope(connection, scope)
     row = connection.execute(
         """
         SELECT request_sha256, response_json
@@ -106,6 +116,7 @@ def save_idempotent_response(
     resource_id: int,
     created_at: str,
 ) -> None:
+    scope = account_idempotency_scope(connection, scope)
     connection.execute(
         """
         INSERT INTO idempotency_requests
