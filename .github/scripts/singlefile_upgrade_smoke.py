@@ -268,17 +268,15 @@ class Harness:
         self.document_path = (f"/api/projects/RELEASE-SMOKE/documents/{document['id']}"
                               f"/versions/{document['versions'][0]['id']}/download")
         self.attachment = self.client.get(self.document_path).content
-        self.cookie = dict(self.client.cookies)
         (self.root / ".updates").mkdir(exist_ok=True)
         (self.root / ".updates/customer-note.txt").write_text("preserve unknown file")
         self.checked("official 1.2.4 starts in a Chinese/space path and seeds verified business data and API attachment")
 
     def preserved(self) -> None:
         assert (self.root / "config.json").read_bytes() == self.config
-        self.client.cookies.update(self.cookie)
+        # 同一 HTTP 客户端在服务重启后保留原 Cookie 域与路径，避免创建同名无域 Cookie。
         BUSINESS["migrate_owner"](self.client, self.state)
         BUSINESS["login"](self.client, self.state)
-        self.cookie = dict(self.client.cookies)
         assert self.client.get("/api/auth/session").json()["authenticated"]
         response = self.client.get(self.document_path)
         assert response.status_code == 200 and response.content == self.attachment

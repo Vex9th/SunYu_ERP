@@ -16,6 +16,18 @@ def test_release_business_smoke_survives_restart_and_refuses_existing_data(tmp_p
     with TestClient(create_app(config_path=config), base_url="http://127.0.0.1", client=("127.0.0.1", 50000)) as client:
         state = script["seed"](client)
         script["verify"](client, state)
+        # 成品升级验证复用浏览器会话，不能把有域名的 Cookie 复制成无域名 Cookie。
+        helpers = runpy.run_path(str(Path(__file__).parents[2] / ".github/scripts/singlefile_upgrade_smoke.py"))
+        harness = object.__new__(helpers["Harness"])
+        harness.root, harness.client, harness.state = tmp_path, client, state
+        harness.config = config.read_bytes()
+        harness.cookie = dict(client.cookies)
+        harness.document_path = "/api/health"
+        harness.attachment = client.get(harness.document_path).content
+        (tmp_path / ".updates").mkdir(exist_ok=True)
+        (tmp_path / ".updates/customer-note.txt").write_text("preserve unknown file")
+        harness.preserved()
+        assert len([cookie for cookie in client.cookies.jar if cookie.name == "sunyu_session"]) == 1
         with pytest.raises(AssertionError, match="409"):
             script["seed"](client)
     with TestClient(create_app(config_path=config), base_url="http://127.0.0.1", client=("127.0.0.1", 50000)) as restarted:
