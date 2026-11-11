@@ -232,9 +232,9 @@ export interface InventoryItemDto extends ActivityTracked {
   model: string | null
   specification: string | null
   unit: string
-  quantity: DecimalString
-  average_unit_cost_cents: MoneyCents
-  inventory_value_cents: MoneyCents
+  quantity: DecimalString | null
+  average_unit_cost_cents: MoneyCents | null
+  inventory_value_cents: MoneyCents | null
   notes: string | null
   revision: Revision
   created_at: ISODateTime

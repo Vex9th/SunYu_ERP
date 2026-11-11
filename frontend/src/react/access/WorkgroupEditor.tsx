@@ -3,7 +3,7 @@ import { Alert, Button, Checkbox, Divider, Form, Input, Popconfirm, Select, Spac
 import { requestJson } from '../../api'
 import type { ProjectSummary } from '../../types'
 import { OperationHistory } from '../activity/OperationHistory'
-import { selectPermission, type PermissionDefinition, type Workgroup } from './access'
+import { completePermissions, selectPermission, type PermissionDefinition, type Workgroup } from './access'
 export function WorkgroupEditor({
   group,
   catalog,
@@ -21,6 +21,14 @@ export function WorkgroupEditor({
   const [projectIds, setProjectIds] = useState(group.project_ids)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [success, setSuccess] = useState('')
+  const completeKeys = completePermissions(keys, catalog)
+  const missingKeys = completeKeys.filter(key => !keys.includes(key))
+  function select(key: string, checked: boolean) {
+    setKeys(current => selectPermission(current, key, checked, catalog))
+    setError('')
+    setSuccess('')
+  }
   useEffect(() => {
     setName(group.name)
     setEnabled(group.enabled)
@@ -30,8 +38,13 @@ export function WorkgroupEditor({
   }, [group])
   async function save(mode: 'profile' | 'access' | 'archive') {
     if (busy) return
+    if (mode === 'access' && missingKeys.length) {
+      setError('请先补齐所需权限，或取消依赖这些权限的操作')
+      return
+    }
     setBusy(true)
     setError('')
+    setSuccess('')
     try {
       await requestJson(`/api/workgroups/${group.id}${mode === 'access' ? '/access' : ''}`, {
         method: mode === 'access' ? 'PUT' : mode === 'archive' ? 'DELETE' : 'PATCH',
@@ -47,6 +60,7 @@ export function WorkgroupEditor({
         }
       })
       await onSaved()
+      setSuccess(mode === 'access' ? '项目与权限已保存' : mode === 'profile' ? '名称与状态已保存' : '工作组已归档')
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '保存失败，请重试')
     } finally {
@@ -65,6 +79,7 @@ export function WorkgroupEditor({
       <OperationHistory resourceType="workgroup" resourceId={group.id} />
     </div>
     {error && <Alert showIcon type="error" title={error} />}
+    {success && <Alert showIcon type="success" title={success} />}
     <Form layout="vertical" disabled={busy}>
       <Space wrap align="end">
         <Form.Item label="工作组名称" style={{
@@ -87,25 +102,28 @@ export function WorkgroupEditor({
       <Typography.Title level={5}>可见项目</Typography.Title>
       <Select aria-label="可见项目" mode="multiple" style={{
         width: '100%'
-      }} disabled={busy} placeholder="未选择项目时无法访问项目业务" value={projectIds} optionFilterProp="label" onChange={setProjectIds} options={projects.map(project => ({
+      }} disabled={busy} placeholder="未选择项目时无法访问项目业务" value={projectIds} optionFilterProp="label" onChange={ids => { setProjectIds(ids); setSuccess('') }} options={projects.map(project => ({
         value: project.id,
         label: `${project.project_code} · ${project.name}`
       }))} />
+      {completeKeys.includes('projects.view') && !projectIds.length && <Alert type="warning" showIcon title="尚未选择可见项目，成员将无法访问项目及采购等项目业务。" style={{ marginTop: 8 }} />}
     </div>
     <div>
       <Typography.Title level={5}>可见内容</Typography.Title>
-      <Space wrap>{catalog.filter(item => item.key.endsWith('.view') || item.module === '敏感数据').map(item => <Checkbox key={item.key} disabled={busy} checked={keys.includes(item.key)} onChange={event => setKeys(current => selectPermission(current, item.key, event.target.checked, catalog))}>{item.label}</Checkbox>)}</Space>
+      <Space wrap>{catalog.filter(item => item.key.endsWith('.view') || item.module === '敏感数据').map(item => <Checkbox key={item.key} disabled={busy} checked={keys.includes(item.key)} onChange={event => select(item.key, event.target.checked)}>{item.label}</Checkbox>)}</Space>
     </div>
     <div>
       <Typography.Title level={5}>允许操作</Typography.Title>
-      <Typography.Paragraph type="secondary">勾选操作会自动补充必要的查看权限；取消查看权限也会移除依赖它的操作。</Typography.Paragraph>{modules.map(module => {
+      <Typography.Paragraph type="secondary">勾选操作会联动项目入口、选料、供应商及必要的价格查看权限，请核对后保存。取消必要的查看权限会同时取消依赖操作。项目库存管理用于领用与冲销；新增物料、修改库存或调整数量需勾选“管理共享库存”。</Typography.Paragraph>
+      {missingKeys.length > 0 && <Alert type="warning" showIcon title="部分操作缺少必要权限" description={`缺少：${missingKeys.map(key => catalog.find(item => item.key === key)?.label ?? key).join('、')}。补齐后请核对勾选项，再保存项目与权限。`} action={<Button onClick={() => { setKeys(completeKeys); setError(''); setSuccess('') }}>补齐所需权限</Button>} style={{ marginBottom: 16 }} />}
+      {modules.map(module => {
         const actions = catalog.filter(item => item.module === module && !item.key.endsWith('.view') && item.module !== '敏感数据')
         return actions.length ? <div key={module} style={{
           marginBottom: 14
         }}>
           <Typography.Text strong>{module}</Typography.Text>
           <div>
-            <Space wrap>{actions.map(item => <Checkbox key={item.key} disabled={busy} checked={keys.includes(item.key)} onChange={event => setKeys(current => selectPermission(current, item.key, event.target.checked, catalog))}>{item.label}</Checkbox>)}</Space>
+            <Space wrap>{actions.map(item => <Checkbox key={item.key} disabled={busy} checked={keys.includes(item.key)} onChange={event => select(item.key, event.target.checked)}>{item.label}</Checkbox>)}</Space>
           </div>
         </div> : null
       })}</div>

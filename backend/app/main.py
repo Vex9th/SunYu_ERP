@@ -9,6 +9,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse, Response
 from starlette.types import Scope
@@ -47,6 +48,7 @@ from backend.app.features.system import (
     BackupJobResult,
     BackupPruner,
     BackupScheduler,
+    BackupTaskManager,
     SettingsStore,
     create_system_router,
     recover_interrupted_backups,
@@ -92,6 +94,7 @@ def _is_frontend_navigation(_path: str, scope: Scope) -> bool:
                 "/projects",
                 "/inventory",
                 "/settings",
+                "/accounts",
             }
             or url_path.startswith("/projects/")
         )
@@ -116,6 +119,7 @@ def create_app(
     )
 
     updates = update_manager or UpdateManager(selected_config_path.parent)
+    backup_tasks = BackupTaskManager()
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> Iterator[None]:
@@ -166,17 +170,26 @@ def create_app(
         application.state.backup_scheduler = scheduler
         lifespan_failure: BaseException | None = None
         try:
+            backup_tasks.start()
             scheduler.start()
             yield
         except BaseException as failure:
             lifespan_failure = failure
             raise
         finally:
-            _cleanup_preserving_primary(
-                scheduler.stop,
-                primary=lifespan_failure,
-                label="backup scheduler stop",
-            )
+            try:
+                await run_in_threadpool(
+                    _cleanup_preserving_primary,
+                    backup_tasks.stop,
+                    primary=lifespan_failure,
+                    label="manual backup tasks stop",
+                )
+            finally:
+                _cleanup_preserving_primary(
+                    scheduler.stop,
+                    primary=lifespan_failure,
+                    label="backup scheduler stop",
+                )
 
     application = FastAPI(title="SunYu ERP", lifespan=lifespan)
     application.state.updates = updates
@@ -274,6 +287,7 @@ def create_app(
             get_scheduler_snapshot,
             backup_creator=backup_creator,
             backup_pruner=backup_pruner,
+            task_manager=backup_tasks,
         )
     )
 

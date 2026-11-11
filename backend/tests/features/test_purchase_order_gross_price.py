@@ -77,7 +77,7 @@ def test_gross_quote_is_authoritative_on_create_reload_and_edit(
             "amount_cents": gross,
             "allocations": [
                 {
-                    "purchase_order_line_id": order["lines"][0]["id"],
+                    "purchase_order_line_id": confirmed.json()["lines"][0]["id"],
                     "amount_cents": gross,
                 }
             ],

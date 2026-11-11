@@ -1,4 +1,6 @@
-import { render } from './access-fixtures'
+import { render, ownerSession } from './access-fixtures'
+import { AccessProvider } from '../access/AccessProvider'
+import type { InventoryItemDto } from '../../domain/operations-api'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import InventoryWorkspace from '../inventory/InventoryWorkspace'
@@ -16,6 +18,22 @@ function repository() {
   return { listInventoryItems: vi.fn(async () => ({ source: 'live', data: { items: [item], page: 1, page_size: 20, total: 1 } })), createInventoryItem: vi.fn(async () => ({ source: 'live', data: item })), discardCreateInventoryItem: vi.fn(() => true) } as unknown as InventoryHttpRepository
 }
 describe('React 库存工作区', () => {
+  it('无共享库存权限时隐藏余额且仍能按项目领用，不使用受限的库存筛选', async () => {
+    const repo = repository()
+    const restricted: InventoryItemDto = { ...item, quantity: null, average_unit_cost_cents: null, inventory_value_cents: null }
+    repo.listInventoryItems = vi.fn<InventoryHttpRepository['listInventoryItems']>(async () => ({ source: 'live', data: { items: [restricted], page: 1, page_size: 20, total: 1 } }))
+    repo.listIssueProjects = async () => ({ source: 'live', data: [{ project_code: 'SY-001', name: '现场改造' }] })
+    const session = { ...ownerSession, user: { ...ownerSession.user!, is_owner: false, group_id: 1 }, permissions: ['inventory.view', 'inventory.manage'], project_ids: [1] }
+    render(<AccessProvider session={session} refresh={async () => undefined}><InventoryWorkspace repository={repo} /></AccessProvider>)
+    await screen.findByRole('button', { name: '网线' })
+    expect((screen.getByRole('combobox', { name: '库存状态' }) as HTMLInputElement).disabled).toBe(true)
+    expect(screen.queryByText('暂无库存')).toBeNull()
+    expect(screen.getAllByText('无权限').length).toBeGreaterThan(0)
+    fireEvent.click(screen.getByRole('button', { name: '项目领用' }))
+    const dialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(repo.listInventoryItems).toHaveBeenLastCalledWith({ page: 1, page_size: 200, status: 'all' }))
+    expect(within(dialog).getByText('可用数量无权限查看，提交时校验库存')).toBeTruthy()
+  })
   it('清空搜索立即重新读取全部匹配范围，不遗留上一关键词过滤', async () => {
     const repo = repository()
     render(<InventoryWorkspace repository={repo} />)

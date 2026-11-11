@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, current_thread
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -69,6 +69,48 @@ class BackupJobResult:
     path: Path
     warning: str | None = None
     cleanup_error_code: str | None = None
+
+
+class BackupTaskManager:
+    """手动备份归应用生命周期所有，正常退出前等待文件与任务状态落盘。"""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._workers: set[Thread] = set()
+        self._stopping = False
+
+    def start(self) -> None:
+        with self._lock:
+            if self._workers:
+                raise RuntimeError("manual backups are still running")
+            self._stopping = False
+
+    def submit(self, target: Callable[[], None], *, name: str) -> None:
+        def execute() -> None:
+            try:
+                target()
+            finally:
+                with self._lock:
+                    self._workers.discard(current_thread())
+
+        with self._lock:
+            if self._stopping:
+                raise RuntimeError("manual backups are shutting down")
+            worker = Thread(target=execute, name=name, daemon=False)
+            self._workers.add(worker)
+            try:
+                worker.start()
+            except BaseException:
+                self._workers.discard(worker)
+                raise
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stopping = True
+            workers = tuple(self._workers)
+        # 不持有锁等待；工作线程需要这些锁完成状态记录和连接关闭。
+        for worker in workers:
+            worker.join()
 
 
 class BackupScheduler:
@@ -342,6 +384,7 @@ def create_system_router(
     backup_creator: BackupCreator = create_backup,
     backup_pruner: BackupPruner = prune_backups,
     clock: Clock | None = None,
+    task_manager: BackupTaskManager | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/system", tags=["system"])
     connection_dependency = Depends(get_connection)
@@ -349,6 +392,7 @@ def create_system_router(
     scheduler_snapshot_dependency = Depends(get_scheduler_snapshot)
     payload_dependency = Depends(_read_backup_settings_update)
     now = clock or _utc_now
+    tasks = task_manager or BackupTaskManager()
     live_tasks: set[str] = set()
     unrecorded_success: dict[str, dict[str, object]] = {}
 
@@ -487,6 +531,7 @@ def create_system_router(
                 task_connection = connect_database(settings.data_dir / "iapm.sqlite")
                 from backend.app.features.operation_history import bind_backup_actor
                 bind_backup_actor(task_connection, request.state.principal, f'backup-task:{task_id}')
+                task_connection.backup_task_id = task_id
             except (OSError, sqlite3.Error) as failure:
                 logging.getLogger(__name__).error(
                     "backup task=%s stage=connection error=%s errno=%s",
@@ -569,9 +614,8 @@ def create_system_router(
                     with _TASK_SUBMISSION_LOCK:
                         live_tasks.discard(task_id)
 
-        worker = Thread(target=execute, name=f"backup-{task_id[:8]}", daemon=True)
         try:
-            worker.start()
+            tasks.submit(execute, name=f"backup-{task_id[:8]}")
         except RuntimeError:
             with _TASK_SUBMISSION_LOCK:
                 live_tasks.discard(task_id)

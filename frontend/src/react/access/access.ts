@@ -21,24 +21,35 @@ export interface PermissionDefinition {
   label: string
   module: string
   dependencies: string[]
+  workflow_dependencies?: string[]
+}
+function dependencies(item: PermissionDefinition | undefined): string[] {
+  return item ? [...item.dependencies, ...(item.workflow_dependencies ?? [])] : []
+}
+export function completePermissions(keys: string[], catalog: PermissionDefinition[]): string[] {
+  return keys.reduce((result, key) => selectPermission(result, key, true, catalog), keys)
 }
 export function selectPermission(keys: string[], key: string, checked: boolean, catalog: PermissionDefinition[]): string[] {
   const selected = new Set(keys)
   const definitions = new Map(catalog.map(item => [item.key, item]))
   if (checked) {
+    const visited = new Set<string>()
     const add = (value: string) => {
-      if (selected.has(value)) return
+      if (visited.has(value)) return
+      visited.add(value)
       selected.add(value)
-      definitions.get(value)?.dependencies.forEach(add)
+      dependencies(definitions.get(value)).forEach(add)
     }
     add(key)
   } else {
     selected.delete(key)
+    const removed = new Set([key])
     let changed = true
     while (changed) {
       changed = false
-      for (const value of selected) if (definitions.get(value)?.dependencies.some(dependency => !selected.has(dependency))) {
+      for (const value of selected) if (dependencies(definitions.get(value)).some(dependency => removed.has(dependency))) {
         selected.delete(value)
+        removed.add(value)
         changed = true
       }
     }

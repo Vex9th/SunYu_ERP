@@ -12,7 +12,7 @@ from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.routing import request_response
 
-from backend.app.core.access import require_permission, require_principal
+from backend.app.core.access import Principal, require_permission, require_principal
 from backend.app.core.database import connect_database
 from backend.app.core.storage_paths import normalize_project_code, project_code_identity
 from backend.app.features.operation_catalog import RESOURCE_TABLES, RESOURCE_VIEWS
@@ -797,17 +797,43 @@ def protect_application_routes(router):
         route.app = request_response(factory())
 
 
+# 仅这些端点通过有大小限制的 multipart 解析器读取表单，随后校验实际字段权限。
+# 其他端点直接读取 JSON，授权时也不能被伪造的 multipart 请求头跳过。
+_MULTIPART_ENDPOINTS = frozenset(
+    {
+        "create_document",
+        "add_document_version",
+        "create_quote",
+        "create_contract",
+        "create_purchase_order",
+        "create_supplier_invoice",
+        "preview_procurement_import",
+        "put_signoff",
+        "create_commissioning",
+        "create_change",
+        "complete_acceptance",
+        "create_invoice",
+    }
+)
+
+
 def secure_route_handler(original, policy):
     async def secured(request):
         settings = request.app.state.settings.get()
         connection = connect_database(settings.data_dir / "iapm.sqlite")
         try:
             payload = {}
+            multipart = (
+                request.scope["endpoint"].__name__ in _MULTIPART_ENDPOINTS
+                and request.headers.get("content-type", "").casefold().startswith(
+                    "multipart/form-data"
+                )
+            )
             if request.method not in {
                 "GET",
                 "HEAD",
                 "OPTIONS",
-            } and "application/json" in request.headers.get("content-type", ""):
+            } and not multipart:
                 try:
                     payload = await request.json()
                 except (ValueError, UnicodeError):
@@ -854,6 +880,14 @@ def secure_route_handler(original, policy):
                     body, status_code=response.status_code, headers=headers
                 )
             return response
+        except HTTPException as failure:
+            principal = getattr(request.state, "principal", None)
+            if isinstance(principal, Principal):
+                failure.headers = {
+                    **(failure.headers or {}),
+                    "X-Access-Revision": str(principal.access_revision),
+                }
+            raise
         finally:
             connection.close()
 

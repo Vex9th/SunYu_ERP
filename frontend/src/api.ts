@@ -16,7 +16,12 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 let accountNamespace = 'anonymous'
 let accountEpoch = 0
 let knownAccessRevision: string | null = null
-export function setKnownAccessRevision(revision: number | undefined) { knownAccessRevision = revision === undefined ? null : String(revision) }
+const refreshedDeniedPaths = new Set<string>()
+function rememberAccessRevision(revision: string | null) {
+  if (revision !== knownAccessRevision) refreshedDeniedPaths.clear()
+  knownAccessRevision = revision
+}
+export function setKnownAccessRevision(revision: number | undefined) { rememberAccessRevision(revision === undefined ? null : String(revision)) }
 const accountCleanup = new Set<() => void>()
 const activeRequests = new Set<AbortController>()
 const accessObservers = new Set<() => void>()
@@ -28,7 +33,8 @@ export function setAccountNamespace(userId: number | null) {
   if (next === accountNamespace) return
   accountNamespace = next
   accountEpoch += 1
-  knownAccessRevision = null
+  rememberAccessRevision(null)
+  refreshedDeniedPaths.clear()
   activeRequests.forEach(controller => controller.abort())
   accountCleanup.forEach(cleanup => cleanup())
 }
@@ -161,9 +167,13 @@ async function sendRequest<T>(
     }
     if (requestEpoch !== accountEpoch) throw accountChanged()
     const accessRevision = response.headers.get('X-Access-Revision')
-    if (accessRevision && knownAccessRevision && accessRevision !== knownAccessRevision && isProtectedApiPath(path)) { knownAccessRevision = accessRevision; accessObservers.forEach(notify => notify()) }
+    if (accessRevision && knownAccessRevision && accessRevision !== knownAccessRevision && isProtectedApiPath(path)) {
+      rememberAccessRevision(accessRevision)
+      accessObservers.forEach(notify => notify())
+    }
     if (!response.ok) {
       const error = await responseError(response)
+      if (requestEpoch !== accountEpoch) throw accountChanged()
       if (
         response.status === 401
         && isProtectedApiPath(path)
@@ -171,7 +181,11 @@ async function sendRequest<T>(
       ) {
         sessionObserver.notify({ message: error.message, path })
       }
-      if (response.status === 403 && isProtectedApiPath(path)) accessObservers.forEach(notify => notify())
+      // 403 也可能只是访问了未授权项目。旧服务或代理缺少版本头时仅刷新一次，避免反复卸载页面。
+      if (response.status === 403 && !accessRevision && isProtectedApiPath(path) && !refreshedDeniedPaths.has(path)) {
+        refreshedDeniedPaths.add(path)
+        accessObservers.forEach(notify => notify())
+      }
       throw error
     }
     // 超时与调用方取消必须覆盖正文读取，而不只是等待响应头。
@@ -179,6 +193,7 @@ async function sendRequest<T>(
     if (requestEpoch !== accountEpoch) throw accountChanged()
     return result
   } catch (error) {
+    if (requestEpoch !== accountEpoch) throw accountChanged()
     if (timedOut) throw new ApiError('请求超时，请重试', 0, 'REQUEST_TIMEOUT')
     if (options.signal?.aborted) throw new ApiError('请求已取消', 0, 'REQUEST_ABORTED')
     throw error

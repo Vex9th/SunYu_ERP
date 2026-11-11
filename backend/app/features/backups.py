@@ -262,7 +262,10 @@ def _backup_database(
         destination = sqlite3.connect(target)
         _set_private_file_mode(target)
         connection.backup(destination)
-        _normalize_database_snapshot(destination, run_id)
+        _normalize_database_snapshot(
+            destination, run_id,
+            task_id=getattr(connection, "backup_task_id", None),
+        )
         destination.close()
         destination = None
         _require_single_database_file(target)
@@ -299,17 +302,42 @@ def _populate_and_verify_stage(
 def _normalize_database_snapshot(
     destination: sqlite3.Connection,
     run_id: int,
+    *,
+    task_id: str | None = None,
 ) -> None:
+    finished_at = datetime.now(timezone.utc).isoformat()
     cursor = destination.execute(
         """
         UPDATE backup_runs
         SET finished_at = ?, status = 'success', error_message = NULL
         WHERE id = ? AND status = 'running'
         """,
-        (datetime.now(timezone.utc).isoformat(), run_id),
+        (finished_at, run_id),
     )
     if cursor.rowcount != 1:
         raise RuntimeError("staged backup run was not normalized to success")
+    if task_id is not None:
+        cursor = destination.execute(
+            "UPDATE backup_tasks SET status='success', phase='finished', finished_at=?, "
+            "path=(SELECT target_path FROM backup_runs WHERE id=?), warning=NULL, error_code=NULL "
+            "WHERE id=? AND status='running'",
+            (finished_at, run_id, task_id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("staged backup task was not normalized to success")
+    # TEMP 审计触发器不会随 SQLite backup 复制；只继承本次开始事件的身份快照。
+    destination.execute(
+        """INSERT OR IGNORE INTO operation_events
+        (request_id,action,resource_type,resource_id,actor_kind,actor_id,actor_name,
+         group_id,group_name,summary,reason,changes_json,occurred_at)
+        SELECT request_id,'system.backup.success',resource_type,resource_id,
+               actor_kind,actor_id,actor_name,group_id,group_name,'备份完成',NULL,
+               json_object('status','success'),?
+        FROM operation_events
+        WHERE resource_type='backup_job' AND resource_id=? AND action='system.backup.running'
+        """,
+        (finished_at, str(run_id)),
+    )
     destination.commit()
     destination.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
     journal_mode = destination.execute("PRAGMA journal_mode=DELETE").fetchone()

@@ -21,4 +21,10 @@ describe('库存业务输入', () => {
     expect(movementLabel({ movement_type: 'reversal', source_type: 'goods_receipt_reversal' })).toBe('到货冲销')
     expect(movementLabel({ movement_type: 'reversal', source_type: 'inventory_issue_reversal' })).toBe('领用冲销')
   })
+  it('隐藏余额仍校验正数并交由后端判断库存是否充足', () => {
+    const items = [{ id: 1, name: '电缆', quantity: null }]
+    const input = { issued_on: '2026-11-11', lines: [{ inventory_item_id: 1, quantity: '2.001' }] }
+    expect(issueInput(input, items).lines[0]?.quantity).toBe('2.001')
+    expect(() => issueInput({ ...input, lines: [{ inventory_item_id: 1, quantity: '0' }] }, items)).toThrow()
+  })
 })

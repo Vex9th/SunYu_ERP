@@ -1,7 +1,10 @@
+import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -227,8 +230,18 @@ def test_banking_fields_are_redacted_in_records_and_history(business):
     assert "secret-account" not in history.text
 
 
-@pytest.mark.parametrize("multipart", [False, True])
-def test_contract_allocation_cannot_add_ungranted_project(business, multipart):
+@pytest.mark.parametrize(
+    "body_format",
+    [
+        "json",
+        "multipart",
+        "text/plain",
+        "application/vnd.api+json",
+        "Application/JSON",
+        None,
+    ],
+)
+def test_contract_allocation_cannot_add_ungranted_project(business, body_format):
     client, _, _ = member(
         business, ["projects.view", "contracts.view", "contracts.create"]
     )
@@ -246,18 +259,146 @@ def test_contract_allocation_cannot_add_ungranted_project(business, multipart):
             {"project_code": "TEST-2", "amount_cents": 9000},
         ],
     }
-    kwargs = (
-        {"json": payload}
-        if not multipart
-        else {"files": {"payload": (None, json.dumps(payload), "application/json")}}
-    )
+    headers = {"Idempotency-Key": str(uuid4())}
+    if body_format == "json":
+        kwargs = {"json": payload}
+    elif body_format == "multipart":
+        kwargs = {"files": {"payload": (None, json.dumps(payload), "application/json")}}
+    else:
+        kwargs = {"content": json.dumps(payload)}
+        if body_format is not None:
+            headers["Content-Type"] = body_format
     response = client.post(
         "/api/projects/TEST-1/contracts",
-        headers={"Idempotency-Key": str(uuid4())},
+        headers=headers,
         **kwargs,
     )
     assert response.status_code == 403, response.text
     assert business[2].execute("SELECT COUNT(*) FROM contracts").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "application/json",
+        "text/plain",
+        "application/vnd.api+json",
+        "Application/JSON",
+        "multipart/form-data; boundary=synthetic",
+        None,
+    ],
+)
+def test_quote_cancel_permission_is_enforced_for_every_json_body(
+    business, content_type
+):
+    owner, _, database = business
+    created = owner.post(
+        "/api/projects/TEST-1/quotes",
+        json={
+            "quote_date": "2026-11-11",
+            "amount_cents": 1000,
+            "valid_until": None,
+            "notes": None,
+            "document_version_ids": [],
+        },
+    )
+    assert created.status_code == 201, created.text
+    quote_id = created.json()["id"]
+    client, _, _ = member(business, ["projects.view", "quotes.view", "quotes.confirm"])
+    response = client.post(
+        f"/api/projects/TEST-1/quotes/{quote_id}/transition",
+        content=json.dumps(
+            {
+                "to_status": "withdrawn",
+                "expected_revision": 1,
+                "occurred_at": "2026-11-11T01:00:00+00:00",
+                "reason": "测试取消权限",
+            }
+        ),
+        headers={"Content-Type": content_type} if content_type else {},
+    )
+    assert response.status_code == 403, response.text
+    assert (
+        database.execute(
+            "SELECT status FROM quotes WHERE id=?", (quote_id,)
+        ).fetchone()[0]
+        == "draft"
+    )
+
+
+def test_permission_errors_report_current_access_revision(business):
+    owner, _, _ = business
+    client, _, group = member(business, ["projects.view"])
+    original_revision = str(client.get("/api/auth/session").json()["access_revision"])
+    denied_project = client.get("/api/projects/TEST-2")
+    assert denied_project.status_code == 403
+    assert denied_project.headers.get("X-Access-Revision") == original_revision
+    denied_owner_route = client.get("/api/accounts")
+    assert denied_owner_route.status_code == 403
+    assert denied_owner_route.headers.get("X-Access-Revision") == original_revision
+    current_group = next(
+        item
+        for item in owner.get("/api/workgroups").json()
+        if item["id"] == group["id"]
+    )
+    changed = owner.put(
+        f"/api/workgroups/{group['id']}/access",
+        json={
+            "permission_keys": ["projects.view"],
+            "project_ids": [2],
+            "expected_revision": current_group["revision"],
+        },
+    )
+    assert changed.status_code == 200, changed.text
+    current_revision = str(client.get("/api/auth/session").json()["access_revision"])
+    assert current_revision != original_revision
+    revoked_project = client.get("/api/projects/TEST-1")
+    assert revoked_project.status_code == 403
+    assert revoked_project.headers.get("X-Access-Revision") == current_revision
+
+
+def test_access_policy_preserves_bounded_multipart_uploads(business, monkeypatch):
+    owner, app, database = business
+    settings = replace(app.state.settings.get(), max_document_upload_mb=1)
+    monkeypatch.setattr(app.state.settings, "get", lambda: settings)
+    boundary = "bounded-access-upload"
+    prefix = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="category"\r\n\r\nother\r\n'
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="title"\r\n\r\nSynthetic\r\n'
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="large.txt"\r\n'
+        "Content-Type: text/plain\r\n\r\n"
+    ).encode()
+    chunks = [prefix, *([b"x" * (512 * 1024)] * 8), f"\r\n--{boundary}--\r\n".encode()]
+    received = 0
+
+    async def body():
+        nonlocal received
+        for chunk in chunks:
+            received += 1
+            yield chunk
+
+    async def upload():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, client=("127.0.0.1", 12345)),
+            base_url="http://127.0.0.1",
+            cookies=owner.cookies,
+        ) as client:
+            return await client.post(
+                "/api/projects/TEST-1/documents",
+                headers={
+                    "Idempotency-Key": str(uuid4()),
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                },
+                content=body(),
+            )
+
+    response = asyncio.run(upload())
+    assert response.status_code == 413, response.text
+    assert received < len(chunks)
+    assert database.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
 
 
 def test_customer_receipt_summary_does_not_use_same_id_goods_receipt(business):

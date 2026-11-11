@@ -1274,7 +1274,7 @@ def test_supplier_invoice_active_number_uniqueness_migrates_existing_history(
         )
     with harness.connection() as connection:
         # 仅升级当前 API 所需的独立结构，保留 022 发票约束待测。
-        for name in ("024_purchase_order_gross_price.sql", "026_accounts_access.sql", "027_procurement_line_confirmation.sql", "028_operation_history.sql"):
+        for name in ("024_purchase_order_gross_price.sql", "026_accounts_access.sql", "027_procurement_line_confirmation.sql", "028_operation_history.sql", "029_procurement_entity_ids.sql"):
             connection.executescript((PROJECT_ROOT / "backend/migrations" / name).read_text(encoding="utf-8"))
     invoice_payload: dict[str, object]
     with harness.client() as client:

@@ -17,6 +17,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 
 from backend.app.core.config import Settings
 from backend.app.core.database import transaction, transaction_immediate
+from backend.app.core.entity_ids import next_entity_id
 from backend.app.core.storage_paths import normalize_project_code, project_code_identity
 from backend.app.features import business_attachments
 from backend.app.features.api_common import (
@@ -329,15 +330,16 @@ def create_procurement_router(
                 cursor = connection.execute(
                     """
                     INSERT INTO procurement_lines
-                        (procurement_list_id, inventory_item_id, sequence_no,
+                        (id, procurement_list_id, inventory_item_id, sequence_no,
                          category, name, specification, brand, model,
                          quantity_milli, unit, unit_cost_cents,
                          quoted_unit_price_cents, revision,
                          create_idempotency_key, create_request_hash,
                          created_at, updated_at)
-                    VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                    VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
                     """,
                     (
+                        next_entity_id(connection, "procurement_lines"),
                         identifier,
                         normalized["sequence_no"],
                         normalized["category"],
@@ -748,15 +750,16 @@ def create_procurement_router(
                 connection.execute(
                     """
                     INSERT INTO procurement_lines
-                        (procurement_list_id, inventory_item_id, sequence_no,
+                        (id, procurement_list_id, inventory_item_id, sequence_no,
                          category, name, specification, brand, model,
                          quantity_milli, unit, unit_cost_cents,
                          quoted_unit_price_cents, revision,
                          create_idempotency_key, create_request_hash,
                          created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
                     """,
                     (
+                        next_entity_id(connection, "procurement_lines"),
                         copied_id,
                         line["inventory_item_id"],
                         line["sequence_no"],
@@ -973,12 +976,13 @@ def create_procurement_router(
                         connection.execute(
                             """
                             INSERT INTO purchase_order_lines
-                                (purchase_order_id, procurement_line_id,
+                                (id, purchase_order_id, procurement_line_id,
                                  quantity_milli, received_quantity_milli,
                                  unit_cost_cents, tax_amount_cents, gross_unit_cost_cents, overage_reason, created_at)
-                            VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
                             """,
                             (
+                                next_entity_id(connection, "purchase_order_lines"),
                                 order_id,
                                 line["procurement_line_id"],
                                 line["quantity_milli"],

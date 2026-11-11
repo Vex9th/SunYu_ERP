@@ -9,6 +9,9 @@ import {
   requestJson,
   requestVoid,
   subscribeProtectedSessionExpired,
+  subscribeAccessChanged,
+  setAccountNamespace,
+  setKnownAccessRevision,
   withQuery,
 } from '../api'
 
@@ -18,7 +21,82 @@ describe('API client', () => {
   })
 
   afterEach(() => {
+    setAccountNamespace(null)
+    setKnownAccessRevision(undefined)
     vi.useRealTimers()
+  })
+
+  it('无权对象的 403 使用相同权限版本，不触发整页刷新', async () => {
+    setAccountNamespace(1)
+    setKnownAccessRevision(10)
+    const changed = vi.fn()
+    const unsubscribe = subscribeAccessChanged(changed)
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ detail: 'Permission denied' }), {
+      status: 403, headers: { 'X-Access-Revision': '10' },
+    })))
+    try {
+      await expect(requestJson('/api/projects/OTHER/dashboard')).rejects.toMatchObject({ status: 403 })
+      expect(changed).not.toHaveBeenCalled()
+    } finally { unsubscribe() }
+  })
+
+  it('无版本头的重复 403 只刷新一次，避免拒绝页面不断重新挂载', async () => {
+    setAccountNamespace(1)
+    setKnownAccessRevision(10)
+    const changed = vi.fn()
+    const unsubscribe = subscribeAccessChanged(changed)
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ detail: 'Permission denied' }), { status: 403 })))
+    try {
+      for (let i = 0; i < 3; i++) {
+        await expect(requestJson('/api/projects/OTHER/dashboard')).rejects.toMatchObject({ status: 403 })
+        setKnownAccessRevision(10)
+      }
+      expect(changed).toHaveBeenCalledTimes(1)
+      setKnownAccessRevision(11)
+      await expect(requestJson('/api/projects/OTHER/dashboard')).rejects.toMatchObject({ status: 403 })
+      expect(changed).toHaveBeenCalledTimes(2)
+    } finally { unsubscribe() }
+  })
+
+  it.each([200, 403])('权限版本变化时 %s 响应触发一次会话刷新', async status => {
+    setAccountNamespace(1)
+    setKnownAccessRevision(10)
+    const changed = vi.fn()
+    const unsubscribe = subscribeAccessChanged(changed)
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ detail: 'Permission denied' }), {
+      status, headers: { 'X-Access-Revision': '11' },
+    })))
+    try {
+      for (let i = 0; i < 2; i++) {
+        await requestJson('/api/projects/OTHER/dashboard').catch(error => {
+          expect(error).toMatchObject({ status: 403 })
+        })
+      }
+      expect(changed).toHaveBeenCalledTimes(1)
+    } finally { unsubscribe() }
+  })
+
+  it.each([401, 403])('切换账号后到达的旧 %s 错误正文不影响新会话', async status => {
+    setAccountNamespace(1)
+    setKnownAccessRevision(10)
+    const expired = vi.fn(), changed = vi.fn()
+    const stopExpired = subscribeProtectedSessionExpired(expired)
+    const stopChanged = subscribeAccessChanged(changed)
+    let body!: ReadableStreamDefaultController<Uint8Array>
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) { body = controller },
+    }), { status })))
+    const result = requestJson('/api/projects').catch(error => error)
+    await Promise.resolve()
+    setAccountNamespace(2)
+    setKnownAccessRevision(20)
+    body.enqueue(new TextEncoder().encode(JSON.stringify({ detail: 'Authentication required' })))
+    body.close()
+    try {
+      expect(await result).toMatchObject({ errorCode: 'ACCOUNT_CHANGED' })
+      expect(expired).not.toHaveBeenCalled()
+      expect(changed).not.toHaveBeenCalled()
+    } finally { stopExpired(); stopChanged() }
   })
 
   it('本地接口超过请求时限后中止并返回可重试提示', async () => {

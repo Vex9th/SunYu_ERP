@@ -609,7 +609,7 @@ function issuePayload(): InventoryIssueInput {
     if (!item) throw new Error('库存物料已变化，请关闭后重试')
     const requested = quantityToMilli(quantity)
     if (requested <= 0n) throw new Error(`${item.name}的领用数量必须大于 0`)
-    if (requested > quantityToMilli(item.quantity)) throw new Error(`${item.name}的领用数量不能超过当前库存`)
+    if (item.quantity !== null && requested > quantityToMilli(item.quantity)) throw new Error(`${item.name}的领用数量不能超过当前库存`)
     return { inventory_item_id: item.id, procurement_line_id: null, quantity }
   })
   return {

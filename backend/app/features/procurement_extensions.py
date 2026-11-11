@@ -22,6 +22,7 @@ from zipfile import (
 from fastapi import APIRouter, Depends, Header, Request, status
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook, load_workbook
+from openpyxl.cell import Cell
 from openpyxl.utils.exceptions import InvalidFileException
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
@@ -30,8 +31,10 @@ from starlette.types import Message
 
 from backend.app.core.config import Settings
 from backend.app.core.database import transaction_immediate
+from backend.app.core.entity_ids import next_entity_id
 from backend.app.features import business_attachments
 from backend.app.features import procurement as base
+from backend.app.features.access_policy import authorize_parsed_payload
 from backend.app.features.api_common import (
     ApiError,
     ApiErrorRoute,
@@ -138,10 +141,12 @@ def create_procurement_extensions_router(
                     connection, scope=scope, key=key, request_hash=request_hash
                 )
                 if restored is not None:
+                    authorize_parsed_payload(request, restored)
                     return restored
                 _require_active_project(project)
                 _reject_confirmed_import(connection, int(project["id"]), digest)
             preview = _parse_import_workbook(content)
+            authorize_parsed_payload(request, preview)
             with transaction_immediate(connection):
                 project = base._project(
                     connection, base._normalize_project_path(project_code)
@@ -153,6 +158,7 @@ def create_procurement_extensions_router(
                     connection, scope=scope, key=key, request_hash=request_hash
                 )
                 if restored is not None:
+                    authorize_parsed_payload(request, restored)
                     return restored
                 _require_active_project(project)
                 _reject_confirmed_import(connection, int(project["id"]), digest)
@@ -266,6 +272,7 @@ def create_procurement_extensions_router(
                 connection, scope=scope, key=key, request_hash=request_hash
             )
             if restored is not None:
+                authorize_parsed_payload(request, restored)
                 return restored
             _require_active_project(project)
             import_row = _import_row(connection, identifier, int(project["id"]))
@@ -282,6 +289,8 @@ def create_procurement_extensions_router(
                     "Procurement import expired", "PROCUREMENT_IMPORT_EXPIRED"
                 )
             preview = _stored_preview(import_row)
+            # 上传后的预览可跨请求保存；确认时按当前权限校验实际入库字段。
+            authorize_parsed_payload(request, preview)
             errors = preview["errors"]
             rows = preview["rows"]
             if errors:
@@ -321,15 +330,16 @@ def create_procurement_extensions_router(
                 connection.execute(
                     """
                     INSERT INTO procurement_lines
-                        (procurement_list_id, inventory_item_id, sequence_no,
+                        (id, procurement_list_id, inventory_item_id, sequence_no,
                          category, name, specification, brand, model,
                          quantity_milli, unit, unit_cost_cents,
                          quoted_unit_price_cents, revision,
                          create_idempotency_key, create_request_hash,
                          created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
                     """,
                     (
+                        next_entity_id(connection, "procurement_lines"),
                         list_id,
                         inventory_item_id,
                         normalized_line["sequence_no"],
@@ -1684,11 +1694,12 @@ def _insert_order_lines(
         connection.execute(
             """
             INSERT INTO purchase_order_lines
-                (purchase_order_id, procurement_line_id, quantity_milli,
+                (id, purchase_order_id, procurement_line_id, quantity_milli,
                  received_quantity_milli, unit_cost_cents, tax_amount_cents, gross_unit_cost_cents, overage_reason, created_at)
-            VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
             """,
             (
+                next_entity_id(connection, "purchase_order_lines"),
                 order_id,
                 line["procurement_line_id"],
                 line["quantity_milli"],
@@ -2099,9 +2110,16 @@ def _quote_workbook(connection: sqlite3.Connection, export: sqlite3.Row) -> byte
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = "报价单"
-    worksheet.append(("标题", export["title"]))
-    worksheet.append(("客户公司", export["customer_company_name"]))
-    worksheet.append(("备注", export["notes"]))
+
+    def literal_text(value: str | None) -> Cell:
+        cell = Cell(worksheet, value=value)
+        # openpyxl 会将 = 开头的文本推断为公式；报价必须保留用户原文。
+        cell.data_type = "s"
+        return cell
+
+    worksheet.append(("标题", literal_text(export["title"])))
+    worksheet.append(("客户公司", literal_text(export["customer_company_name"])))
+    worksheet.append(("备注", literal_text(export["notes"])))
     worksheet.append((None,))
     worksheet.append(_CUSTOMER_QUOTE_HEADERS)
     for line in lines:
@@ -2111,13 +2129,13 @@ def _quote_workbook(connection: sqlite3.Connection, export: sqlite3.Row) -> byte
         worksheet.append(
             (
                 line["sequence_no"],
-                line["category"],
-                line["name"],
-                line["specification"],
-                line["brand"],
-                line["model"],
+                literal_text(line["category"]),
+                literal_text(line["name"]),
+                literal_text(line["specification"]),
+                literal_text(line["brand"]),
+                literal_text(line["model"]),
                 format_quantity(int(line["quantity_milli"])),
-                line["unit"],
+                literal_text(line["unit"]),
                 _cents_text(int(line["quoted_unit_price_cents"])),
                 _cents_text(quoted_total),
             )

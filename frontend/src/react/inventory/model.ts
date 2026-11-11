@@ -21,7 +21,7 @@ export function adjustmentInput(itemId: number, values: Values): InventoryAdjust
   if (cost !== null) checkValue(absolute, cost)
   return { item_id: itemId, quantity_delta: quantity, unit_cost_cents: cost, reason: required(values.reason, '调整原因'), occurred_on: required(values.occurred_on, '发生日期') }
 }
-export function issueInput(values: Values, items: Array<{ id: number; name: string; quantity: string }>): InventoryIssueInput {
+export function issueInput(values: Values, items: Array<{ id: number; name: string; quantity: string | null }>): InventoryIssueInput {
   const drafts = values.lines as Array<{ inventory_item_id: number; quantity: string }> | undefined
   if (!drafts?.length) throw new Error('请至少选择一项库存物料')
   const seen = new Set<number>()
@@ -30,7 +30,8 @@ export function issueInput(values: Values, items: Array<{ id: number; name: stri
     if (!item || seen.has(item.id)) throw new Error('物料不存在或重复选择，请检查领用明细')
     seen.add(item.id)
     const quantity = positiveQuantity(line.quantity)
-    if (quantityMilli(quantity) > quantityMilli(item.quantity)) throw new Error(`${item.name}的领用数量不能超过当前库存`)
+    // 无共享余额查看权限时由后端在事务内校验，不把隐藏数量当作零库存。
+    if (item.quantity !== null && quantityMilli(quantity) > quantityMilli(item.quantity)) throw new Error(`${item.name}的领用数量不能超过当前库存`)
     return { inventory_item_id: item.id, procurement_line_id: null, quantity }
   })
   return { issued_on: required(values.issued_on, '领用日期'), worker_id: typeof values.worker_id === 'number' ? values.worker_id : null, lines, notes: optional(values.notes) }

@@ -166,6 +166,38 @@ PERMISSIONS = (
 PERMISSION_BY_KEY = {permission.key: permission for permission in PERMISSIONS}
 PERMISSION_KEYS = frozenset(PERMISSION_BY_KEY)
 
+# 页面入口与表单选项的依赖。仅用于主账号配置时联动勾选，不改变旧组的实际权限。
+# 敏感字段必须由主账号看见新增勾选并保存，不能在登录或升级时静默授权。
+_WORKFLOW_DEPENDENCIES = {
+    **{
+        f"{module}.view": ("projects.view",)
+        for module in (
+            "project_stages", "documents", "contracts", "customer_receipts",
+            "customer_invoices", "procurement.lines", "procurement.orders",
+            "workforce", "dispatches", "site_reports", "acceptance", "warranty",
+            "after_sales", "engineering_changes", "quotes", "material_advances",
+        )
+    },
+    **{
+        f"procurement.{module}.view": ("procurement.orders.view",)
+        for module in ("receipts", "payments", "invoices")
+    },
+    **{
+        f"procurement.orders.{action}": (
+            "procurement.lines.view", "companies.view", "sensitive.procurement_prices",
+        )
+        for action in ("create", "edit")
+    },
+    **{
+        f"procurement.lines.{action}": ("sensitive.procurement_prices",)
+        for action in ("create", "edit", "import", "export")
+    },
+    "procurement.payments.register": ("sensitive.procurement_prices",),
+    "procurement.invoices.register": ("sensitive.procurement_prices",),
+    "inventory.manage": ("projects.view",),
+    "inventory.shared.manage": ("sensitive.procurement_prices",),
+}
+
 
 def permission_catalog() -> list[dict[str, object]]:
     return [
@@ -174,6 +206,7 @@ def permission_catalog() -> list[dict[str, object]]:
             "label": item.label,
             "module": item.module,
             "dependencies": list(item.dependencies),
+            "workflow_dependencies": list(_WORKFLOW_DEPENDENCIES.get(item.key, ())),
         }
         for item in PERMISSIONS
     ]

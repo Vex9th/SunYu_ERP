@@ -197,6 +197,11 @@ def test_create_app_serves_release_home_assets_and_keeps_api_priority(
     assert session.json() == {
         "authenticated": False,
         "password_configured": False,
+        "bootstrap_required": True,
+        "user": None,
+        "permissions": [],
+        "project_ids": [],
+        "access_revision": 0,
     }
 
 
@@ -245,6 +250,7 @@ def test_release_frontend_routes_fall_back_to_index_without_hiding_missing_api_o
         "/projects",
         "/inventory",
         "/settings",
+        "/accounts",
     ],
 )
 def test_release_top_level_frontend_routes_support_direct_html_navigation(
@@ -408,6 +414,7 @@ def test_lifespan_applies_migrations_and_closes_every_owned_connection(
         "026_accounts_access",
         "027_procurement_line_confirmation",
         "028_operation_history",
+        "029_procurement_entity_ids",
     }
 
 

@@ -16,6 +16,8 @@ import styles from './InventoryWorkspace.module.css'
 
 const defaultRepository = createHttpInventoryRepository()
 const emptyPage = <T,>(): PagedResult<T> => ({ items: [], page: 1, page_size: 20, total: 0 })
+const isOutOfStock = (item: InventoryItemDto) => item.quantity !== null && quantityMilli(item.quantity) === 0n
+const balanceText = (item: InventoryItemDto) => item.quantity === null ? '无权限' : `${item.quantity} ${item.unit}`
 const statusLabels = { all: '全部库存', in_stock: '有库存', out_of_stock: '零库存' }
 type Dialog = 'create' | 'edit' | 'adjust' | 'issue' | 'reverse-adjustment' | 'reverse-issue' | null
 
@@ -99,7 +101,7 @@ export default function InventoryWorkspace({ repository = defaultRepository }: {
     const sequence = ++context.current.items
     setOptionsLoading(true); setOptionsError('')
     try {
-      const result = await repository.listInventoryItems({ page: 1, page_size: 200, status: 'in_stock', ...(search ? { query: search } : {}) })
+      const result = await repository.listInventoryItems({ page: 1, page_size: 200, status: can('inventory.shared.view') ? 'in_stock' : 'all', ...(search ? { query: search } : {}) })
       if (sequence === context.current.items && context.current.repository === repository && context.current.mounted) {
         setIssueItems((previous) => [...new Map([...previous, ...result.data.items].map((item) => [item.id, item])).values()])
         setIssueCandidateIds(result.data.items.map((item) => item.id))
@@ -193,7 +195,7 @@ export default function InventoryWorkspace({ repository = defaultRepository }: {
       <div className={styles.toolbar}>
         <div><Typography.Title level={5}>{appliedQuery || status !== 'all' ? '筛选结果' : '当前库存'} <Typography.Text type="secondary">{page.total} 项</Typography.Text></Typography.Title><Typography.Text type="secondary">点击物料名称查看资料与出入库流水。</Typography.Text></div>
         <div className={styles.filters}>
-          <label className={styles.filterField}><span>库存状态</span><Select aria-label="库存状态" value={status} options={Object.entries(statusLabels).map(([value, label]) => ({ value, label }))} onChange={(value) => applyFilters(appliedQuery, value)} /></label>
+          <label className={styles.filterField}><span>库存状态</span><Select aria-label="库存状态" disabled={!can('inventory.shared.view')} value={status} options={Object.entries(statusLabels).map(([value, label]) => ({ value, label }))} onChange={(value) => applyFilters(appliedQuery, value)} /></label>
           <label className={styles.filterField} htmlFor="inventory-search"><span>物料搜索</span><Input id="inventory-search" prefix={<SearchOutlined />} placeholder="搜索品牌、名称、型号" value={query} onChange={(event) => {
             const next = event.target.value
             setQuery(next)
@@ -210,9 +212,9 @@ export default function InventoryWorkspace({ repository = defaultRepository }: {
       </div>}
       <Table<InventoryItemDto> size="small" rowKey="id" loading={loading} dataSource={page.items} scroll={{ x: 720 }} locale={{ emptyText: <Empty description={error ? '库存读取失败，请重新读取' : appliedQuery || status !== 'all' ? '没有符合当前条件的物料' : '尚未建立库存，先登记物料和期初数量'}>{!error && (appliedQuery || status !== 'all' ? <Button onClick={clearFilters}>清除筛选</Button> : <Button type="primary" disabled={Boolean(actions.pending) || !allowed('create')} onClick={() => open('create')}>登记第一项库存</Button>)}</Empty> }} pagination={{ current: page.page, pageSize: page.page_size, total: page.total, showSizeChanger: true, pageSizeOptions: [20, 50, 100], showTotal: (total) => `共 ${total} 项`, onChange: (number, size) => void loadList(size !== page.page_size ? 1 : number, size).catch(() => undefined) }} columns={[
         { title: '物料', key: 'name', width: 280, render: (_, item) => <><Button className={styles.materialLink} type="link" onClick={() => openDetail(item)}>{item.name}</Button><div className={styles.secondary}>{[item.brand, item.model, item.specification].filter(Boolean).join(' · ') || '暂无品牌、型号和规格说明'}</div></> },
-        { title: '可用数量', key: 'quantity', width: 140, align: 'right', render: (_, item) => <><strong className={styles.number}>{item.quantity} <small>{item.unit}</small></strong>{quantityMilli(item.quantity) === 0n && <div className={styles.secondary}>暂无库存</div>}</> },
+        { title: '可用数量', key: 'quantity', width: 140, align: 'right', render: (_, item) => <><strong className={styles.number}>{balanceText(item)}</strong>{isOutOfStock(item) && <div className={styles.secondary}>暂无库存</div>}</> },
         { title: '库存价值', key: 'value', width: 160, align: 'right', render: (_, item) => <><strong className={styles.number}>{formatMoney(item.inventory_value_cents)}</strong><div className={styles.secondary}>均价 {formatMoney(item.average_unit_cost_cents)} / {item.unit}</div></> },
-        { title: '操作', key: 'actions', fixed: 'right', width: 160, render: (_, item) => <Space size={4}><Button type="link" disabled={Boolean(actions.pending) || !allowed('adjust')} onClick={() => open('adjust', item)}>调整</Button><Button type="link" disabled={Boolean(actions.pending) || quantityMilli(item.quantity) === 0n || !allowed('issue')} onClick={() => open('issue', item)}>项目领用</Button></Space> },
+        { title: '操作', key: 'actions', fixed: 'right', width: 160, render: (_, item) => <Space size={4}><Button type="link" disabled={Boolean(actions.pending) || !allowed('adjust')} onClick={() => open('adjust', item)}>调整</Button><Button type="link" disabled={Boolean(actions.pending) || isOutOfStock(item) || !allowed('issue')} onClick={() => open('issue', item)}>项目领用</Button></Space> },
       ]} />
     </Card>
     <Drawer title={selected?.name ?? '物料详情'} open={drawer} size={900} onClose={() => { setDrawer(false); context.current.detail++ }} extra={<Button disabled={detailLoading || Boolean(actions.pending) || !allowed('edit')} onClick={() => selected && open('edit', selected)}>编辑资料</Button>}>
@@ -220,11 +222,11 @@ export default function InventoryWorkspace({ repository = defaultRepository }: {
         {detailError && <Alert type="warning" showIcon title={detailError} action={<Button onClick={() => selected && void loadDetail(selected, movements.page)}>重试</Button>} />}
         {selected && <><Space><ActivitySummary summary={selected.activity_summary} /><OperationHistory resourceType="inventory_item" resourceId={selected.id} /></Space>
           <div className={styles.detailSummary}>
-            <div><span>现存数量</span><strong>{selected.quantity} <small>{selected.unit}</small></strong></div>
+            <div><span>现存数量</span><strong>{balanceText(selected)}</strong></div>
             <div><span>库存价值</span><strong>{formatMoney(selected.inventory_value_cents)}</strong></div>
             <div><span>平均单价</span><strong>{formatMoney(selected.average_unit_cost_cents)} <small>/ {selected.unit}</small></strong></div>
           </div>
-          <div className={styles.detailActions}><Typography.Text type="secondary">出入库会同步更新数量和库存价值。</Typography.Text><Space><Button disabled={detailLoading || Boolean(actions.pending) || !allowed('adjust')} onClick={() => open('adjust', selected)}>调整库存</Button><Button type="primary" disabled={detailLoading || Boolean(actions.pending) || quantityMilli(selected.quantity) === 0n || !allowed('issue')} onClick={() => open('issue', selected)}>领用到项目</Button></Space></div>
+          <div className={styles.detailActions}><Typography.Text type="secondary">出入库会同步更新数量和库存价值。</Typography.Text><Space><Button disabled={detailLoading || Boolean(actions.pending) || !allowed('adjust')} onClick={() => open('adjust', selected)}>调整库存</Button><Button type="primary" disabled={detailLoading || Boolean(actions.pending) || isOutOfStock(selected) || !allowed('issue')} onClick={() => open('issue', selected)}>领用到项目</Button></Space></div>
           <Typography.Title level={5}>物料资料</Typography.Title>
           <Descriptions size="small" column={{ xs: 1, sm: 2 }} items={[
             { key: 'brand', label: '品牌', children: selected.brand || '—' }, { key: 'model', label: '型号', children: selected.model || '—' },
@@ -265,8 +267,8 @@ export default function InventoryWorkspace({ repository = defaultRepository }: {
           <Form.List name="lines">{(fields, { add, remove }) => <Space orientation="vertical" style={{ width: '100%' }}>{fields.map((field) => {
             const item = issueItems.find((entry) => entry.id === selectedIssueLines?.[field.name]?.inventory_item_id)
             return <div className={styles.issueRow} key={field.key}>
-              <Form.Item name={[field.name, 'inventory_item_id']} label="库存物料" rules={[{ required: true, message: '请选择物料' }]}><Select showSearch placeholder="搜索并选择库存物料" filterOption={false} loading={optionsLoading} onSearch={(value) => void loadIssueItems(value)} options={issueOptions.map((entry) => ({ value: entry.id, label: `${entry.name} · ${entry.model || ''} · 库存 ${entry.quantity} ${entry.unit}` }))} /></Form.Item>
-              <TextField name={[field.name, 'quantity']} label="领用数量" required placeholder="本次领用量" extra={item ? `可用 ${item.quantity} ${item.unit}` : '请先选择物料'} />
+              <Form.Item name={[field.name, 'inventory_item_id']} label="库存物料" rules={[{ required: true, message: '请选择物料' }]}><Select showSearch placeholder="搜索并选择库存物料" filterOption={false} loading={optionsLoading} onSearch={(value) => void loadIssueItems(value)} options={issueOptions.map((entry) => ({ value: entry.id, label: `${entry.name} · ${entry.model || ''} · 库存 ${balanceText(entry)}` }))} /></Form.Item>
+              <TextField name={[field.name, 'quantity']} label="领用数量" required placeholder="本次领用量" extra={item ? item.quantity === null ? '可用数量无权限查看，提交时校验库存' : `可用 ${item.quantity} ${item.unit}` : '请先选择物料'} />
               <Button aria-label="移除领用物料" icon={<MinusCircleOutlined />} onClick={() => remove(field.name)} />
             </div>
           })}<Button block type="dashed" icon={<PlusOutlined />} onClick={() => add({ quantity: '' })}>添加领用物料</Button></Space>}</Form.List>
