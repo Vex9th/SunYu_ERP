@@ -1,3 +1,4 @@
+import { createUuid } from '../uuid'
 import { createPlannedPostRequest, getAccountNamespace, registerAccountCleanup } from '../api'
 import type { CompanyDetail, CompanyPayload, ContactPayload, RevisionedContact } from '../types'
 
@@ -62,8 +63,8 @@ export function storePendingCreate(pending: PendingCreate): boolean {
   memory.set(key, pending)
   try { sessionStorage.setItem(key, JSON.stringify(pending)); return true } catch { return false }
 }
-export function prepareCompanyCreate(payload: CompanyPayload): PendingCompanyCreate { return { path: '/api/companies', payload: structuredClone(payload), idempotencyKey: crypto.randomUUID(), uncertain: true } }
-export function prepareContactCreate(companyId: number, payload: ContactPayload): PendingContactCreate { return { companyId, path: `/api/companies/${companyId}/contacts`, payload: structuredClone(payload), idempotencyKey: crypto.randomUUID(), uncertain: true } }
+export function prepareCompanyCreate(payload: CompanyPayload): PendingCompanyCreate { return { path: '/api/companies', payload: structuredClone(payload), idempotencyKey: createUuid(), uncertain: true } }
+export function prepareContactCreate(companyId: number, payload: ContactPayload): PendingContactCreate { return { companyId, path: `/api/companies/${companyId}/contacts`, payload: structuredClone(payload), idempotencyKey: createUuid(), uncertain: true } }
 export function sendPendingCreate(pending: PendingCreate): Promise<CompanyDetail | RevisionedContact> {
   const key = pendingStorageKey(pending.companyId)
   const existing = inFlight.get(key)

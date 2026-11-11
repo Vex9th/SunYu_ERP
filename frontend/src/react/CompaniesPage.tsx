@@ -519,6 +519,7 @@ function CompanyEditor({
   const mounted = useRef(true)
   const busyRef = useRef(false)
   const dirty = useRef(false)
+  const committed = useRef(false)
   const { modal } = App.useApp()
   useEffect(() => {
     mounted.current = true
@@ -527,7 +528,7 @@ function CompanyEditor({
     }
   }, [])
   const locked = busy || Boolean(pending) || Boolean(uncertainUpdate)
-  useUnsavedChanges(() => dirty.current || locked)
+  useUnsavedChanges(() => !committed.current && (dirty.current || locked))
   const path =
     target.kind === 'company'
       ? `/api/companies/${target.record?.id}`
@@ -616,6 +617,8 @@ function CompanyEditor({
             body: { ...Object.fromEntries(Object.entries(payload).filter(([key]) => can('sensitive.company_banking') || !['bank_name', 'bank_account'].includes(key))), expected_revision: revision },
           })
       if (create) clearPendingCreate(create.companyId)
+      // onSaved 会立即打开公司资料；先标记已提交，避免旧渲染的 busy/dirty 阻止跳转。
+      committed.current = true
       if (mounted.current) onSaved(result)
     } catch (cause) {
       if (create && !isUncertain(cause)) clearPendingCreate(create.companyId)

@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { createUuid } from '../uuid'
+
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessageBox } from 'element-plus'
 
@@ -480,7 +482,7 @@ async function saveCompany(): Promise<void> {
     ? restoredCreate ?? {
         path: '/api/companies',
         payload,
-        idempotencyKey: crypto.randomUUID(),
+        idempotencyKey: createUuid(),
         uncertain: true,
       }
     : null
@@ -744,7 +746,7 @@ async function saveContact(): Promise<void> {
         companyId,
         path: `/api/companies/${companyId}/contacts`,
         payload,
-        idempotencyKey: crypto.randomUUID(),
+        idempotencyKey: createUuid(),
         uncertain: true,
       }
     : null

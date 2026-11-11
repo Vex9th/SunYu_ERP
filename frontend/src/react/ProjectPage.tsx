@@ -246,6 +246,15 @@ function ProjectWorkspace({ projectCode }: { projectCode: string }) {
                 reason: '',
               }}
               onClose={() => setAction(null)}
+              onDiscard={(values) => {
+                if (action === 'close') return repository.discardCloseProject(projectCode, {
+                  closure_type: values.closure_type!, reason: values.reason.trim(), expected_revision: data.project.revision,
+                })
+                if (action === 'restore') return repository.discardRestoreProject(projectCode, {
+                  reason: values.reason.trim(), expected_revision: data.project.revision,
+                })
+                return true
+              }}
               onSubmit={async (values) => {
                 try {
                   if (action === 'edit')

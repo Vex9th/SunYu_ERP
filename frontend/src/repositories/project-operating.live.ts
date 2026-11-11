@@ -166,7 +166,9 @@ export interface ProjectOperatingRepository {
   getProjectDashboard(projectCode: string): Promise<ProjectDashboard>
   updateProject(projectCode: string, input: ProjectUpdateInput): Promise<ProjectDetail>
   closeProject(projectCode: string, input: ProjectCloseInput): Promise<ProjectDetail>
+  discardCloseProject(projectCode: string, input: ProjectCloseInput): boolean
   restoreProject(projectCode: string, input: ProjectRestoreInput): Promise<ProjectDetail>
+  discardRestoreProject(projectCode: string, input: ProjectRestoreInput): boolean
   listDocuments(
     projectCode: string,
     query?: DocumentListQuery,
@@ -222,8 +224,16 @@ class HttpProjectOperatingRepository implements ProjectOperatingRepository {
     return this.posts.send(`${projectPath(projectCode)}/close`, input)
   }
 
+  discardCloseProject(projectCode: string, input: ProjectCloseInput): boolean {
+    return this.posts.discard(`${projectPath(projectCode)}/close`, input)
+  }
+
   restoreProject(projectCode: string, input: ProjectRestoreInput): Promise<ProjectDetail> {
     return this.posts.send(`${projectPath(projectCode)}/restore`, input)
+  }
+
+  discardRestoreProject(projectCode: string, input: ProjectRestoreInput): boolean {
+    return this.posts.discard(`${projectPath(projectCode)}/restore`, input)
   }
 
   async listProjectStages(projectCode: string): Promise<RepositoryResult<ProjectStage[]>> {

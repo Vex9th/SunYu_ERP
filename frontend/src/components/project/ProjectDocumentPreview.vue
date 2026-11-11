@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { copyText as copyToClipboard } from '../../clipboard'
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 
 import type { DocumentDetail, DocumentSummary, DocumentVersion } from '../../domain/contracts'
@@ -378,7 +379,7 @@ async function downloadCurrent(): Promise<void> {
 async function copyText(): Promise<void> {
   if (!previewText.value) return
   try {
-    await navigator.clipboard.writeText(previewText.value)
+    await copyToClipboard(previewText.value)
     copyNotice.value = '纪要已复制'
     copyNoticeType.value = 'success'
   } catch {

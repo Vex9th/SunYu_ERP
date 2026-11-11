@@ -37,6 +37,12 @@ import {
 } from './shared'
 import styles from './Workspace.module.css'
 const posts = createRetriablePostSender()
+function createPayload(values: { project_code: string; name: string; company_id: number | undefined; description: string; project_category: string }) {
+  return {
+    project_code: values.project_code.trim(), name: values.name.trim(), company_id: values.company_id,
+    description: nullable(values.description), project_category: values.project_category ?? 'standard',
+  }
+}
 
 export default function ProjectsPage() {
   const { can } = useAccess()
@@ -275,15 +281,8 @@ export default function ProjectsPage() {
               setParams(next, { replace: true })
             }
           }}
-          onSubmit={async (values) => {
-            return posts.send<ProjectSummary>('/api/projects', {
-              project_code: values.project_code.trim(),
-              name: values.name.trim(),
-              company_id: values.company_id,
-              description: nullable(values.description),
-              project_category: values.project_category ?? 'standard',
-            })
-          }}
+          onSubmit={(values) => posts.send<ProjectSummary>('/api/projects', createPayload(values))}
+          onDiscard={(values) => posts.discard('/api/projects', createPayload(values))}
           onSaved={(result) =>
             navigate(
               `/projects/${encodeURIComponent((result as ProjectSummary).project_code)}`,

@@ -1,3 +1,4 @@
+import { createUuid } from '../uuid'
 import {
   ApiError,
   createRetriableMultipartPostSender,
@@ -257,7 +258,7 @@ class HttpDeliveryRepository implements DeliveryWorkspaceRepository {
     const current = this.signoffs.get(discipline)
     const path = `${projectPath(projectCode)}/drawing-signoffs/${discipline}`
     const payload = { ...input, expected_revision: input.expected_revision !== undefined ? input.expected_revision : current?.revision ?? null }
-    const uploadKey = files.length > 0 ? crypto.randomUUID() : null
+    const uploadKey = files.length > 0 ? createUuid() : null
     const data = await this.sendStableOperation(path, input, () => files.length > 0
       ? requestJson<DrawingSignoffDto>(path, {
         method: 'PUT',

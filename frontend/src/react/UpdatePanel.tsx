@@ -1,3 +1,4 @@
+import { createUuid } from '../uuid'
 import { useEffect, useRef, useState } from 'react'
 import { Alert, Button, Descriptions, Modal, Progress, Space, Tag } from 'antd'
 import { CloudDownloadOutlined, ReloadOutlined } from '@ant-design/icons'
@@ -219,7 +220,7 @@ export default function UpdatePanel({ installBlockedReason, onInstallBusyChange 
     setPaused(false)
     if (action === 'install') {
       setOriginalResultUnknown(false)
-      remember({ job_id: crypto.randomUUID(), previous_job_id: latestStatus.current?.job_id ?? '' })
+      remember({ job_id: createUuid(), previous_job_id: latestStatus.current?.job_id ?? '' })
       void submit(action, current)
     } else if (action === 'check') {
       setOriginalResultUnknown(false)

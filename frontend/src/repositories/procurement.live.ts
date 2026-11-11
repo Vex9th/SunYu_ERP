@@ -1,3 +1,4 @@
+import { createUuid } from '../uuid'
 import {
   ApiError,
   createRetriableMultipartPostSender,
@@ -386,7 +387,7 @@ class RetriableFileUploadSender {
       return Promise.reject(new Error('已有其他采购清单正在上传'))
     }
     if (!pending || pending.file !== file) {
-      pending = { file, idempotencyKey: crypto.randomUUID() }
+      pending = { file, idempotencyKey: createUuid() }
       this.pendingByPath.set(path, pending)
     }
     const form = new FormData()

@@ -1,3 +1,4 @@
+import { createUuid } from './uuid'
 export interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
   headers?: HeadersInit
@@ -278,7 +279,7 @@ export interface PlannedPostRequest<T> {
 export function createPlannedPostRequest<T>(
   path: string,
   body: unknown,
-  idempotencyKey = crypto.randomUUID(),
+  idempotencyKey = createUuid(),
 ): PlannedPostRequest<T> {
   const namespace = accountNamespace
   return {
@@ -331,7 +332,7 @@ export function createRetriablePostSender(): RetriablePostSender {
       if (!pending) {
         pending = {
           signature,
-          idempotencyKey: crypto.randomUUID(),
+          idempotencyKey: createUuid(),
         }
         pendingByPath.set(path, pending)
       }
@@ -404,7 +405,7 @@ export function createRetriableMultipartPostSender(): RetriableMultipartPostSend
       }
 
       if (!pending) {
-        pending = { signature, idempotencyKey: crypto.randomUUID() }
+        pending = { signature, idempotencyKey: createUuid() }
         pendingByPath.set(path, pending)
       }
 

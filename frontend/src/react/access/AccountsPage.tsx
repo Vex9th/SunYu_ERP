@@ -1,9 +1,9 @@
 import { useState } from 'react'
-import { Alert, Button, Col, Descriptions, Empty, Form, Input, List, Modal, Row, Select, Space, Table, Tabs, Tag } from 'antd'
+import { Alert, Button, Col, Descriptions, Empty, Form, Input, List, Row, Select, Space, Table, Tabs, Tag } from 'antd'
 import { PlusOutlined } from '@ant-design/icons'
 import { createRetriablePostSender, requestJson } from '../../api'
 import type { ProjectSummary } from '../../types'
-import { ErrorNotice, PageHeader, RefreshButton, Section, useLoad } from '../shared'
+import { EntityEditor, ErrorNotice, PageHeader, RefreshButton, Section, useLoad } from '../shared'
 import { OperationHistory } from '../activity/OperationHistory'
 import { useAccess } from './AccessProvider'
 import { WorkgroupEditor } from './WorkgroupEditor'
@@ -17,6 +17,15 @@ type Editor = {
   account: ManagedAccount
 } | {
   kind: 'group'
+}
+function accountWrite(editor: Editor, values: Record<string, unknown>) {
+  if (editor.kind === 'group') return { path: '/api/workgroups', method: 'POST' as const, body: { name: String(values.name).trim() } }
+  if (editor.kind === 'reset') return { path: `/api/accounts/${editor.account.id}/reset-password`, method: 'POST' as const,
+    body: { password: values.password, expected_revision: editor.account.revision } }
+  if (editor.account) return { path: `/api/accounts/${editor.account.id}`, method: 'PATCH' as const,
+    body: { display_name: String(values.display_name).trim(), group_id: values.group_id ?? null, expected_revision: editor.account.revision } }
+  return { path: '/api/accounts', method: 'POST' as const,
+    body: { username: String(values.username).trim(), display_name: String(values.display_name).trim(), password: values.password, group_id: values.group_id ?? null } }
 }
 export default function AccountsPage() {
   const {
@@ -57,43 +66,20 @@ function AccountAdministration() {
   const [editor, setEditor] = useState<Editor | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const [form] = Form.useForm()
   const group = load.data?.groups.find(item => item.id === selected) ?? load.data?.groups.find(item => !item.archived)
   function open(next: Editor) {
     setEditor(next)
     setError('')
-    form.resetFields()
-    if (next.kind === 'account' && next.account) form.setFieldsValue(next.account)
   }
   async function save(values: Record<string, unknown>) {
-    if (!editor || busy) return
+    if (!editor) throw new Error('请重新打开账号编辑器')
     setBusy(true)
     setError('')
     try {
-      if (editor.kind === 'group') await posts.send('/api/workgroups', {
-        name: String(values.name).trim()
-      }); else if (editor.kind === 'reset') await posts.send(`/api/accounts/${editor.account.id}/reset-password`, {
-        password: values.password,
-        expected_revision: editor.account.revision
-      }); else if (editor.account) await requestJson(`/api/accounts/${editor.account.id}`, {
-        method: 'PATCH',
-        body: {
-          display_name: String(values.display_name).trim(),
-          group_id: values.group_id ?? null,
-          expected_revision: editor.account.revision
-        }
-      }); else await posts.send('/api/accounts', {
-        username: String(values.username).trim(),
-        display_name: String(values.display_name).trim(),
-        password: values.password,
-        group_id: values.group_id ?? null
-      })
-      setEditor(null)
-      form.resetFields()
-      await load.reload()
-      await refreshSession()
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '保存失败，请重试')
+      const request = accountWrite(editor, values)
+      return request.method === 'POST'
+        ? await posts.send(request.path, request.body)
+        : await requestJson(request.path, request)
     } finally {
       setBusy(false)
     }
@@ -176,16 +162,17 @@ function AccountAdministration() {
         </Row>
       </Section>
     }]} />
-    <Modal open={Boolean(editor)} title={editor?.kind === 'group' ? '创建工作组' : editor?.kind === 'reset' ? `重置密码 · ${editor.account.display_name}` : editor?.account ? '备注与工作组' : '创建账号'} confirmLoading={busy} onOk={() => form.submit()} onCancel={() => {
-      if (!busy) setEditor(null)
-    }} cancelButtonProps={{
-      disabled: busy
-    }} mask={{
-      closable: !busy
-    }} destroyOnHidden>
-      {error && <Alert type="error" showIcon title={error} style={{
-        marginBottom: 16
-      }} />}<Form form={form} layout="vertical" disabled={busy} onFinish={save}>
+    {editor && <EntityEditor
+      key={`${editor.kind}:${editor.kind === 'group' ? 'new' : editor.account?.id ?? 'new'}`}
+      cacheKey={`account-admin:${editor.kind}:${editor.kind === 'group' ? 'new' : editor.account?.id ?? 'new'}`}
+      title={editor.kind === 'group' ? '创建工作组' : editor.kind === 'reset' ? `重置密码 · ${editor.account.display_name}` : editor.account ? '备注与工作组' : '创建账号'}
+      initialValues={{ name: '', username: '', display_name: editor.kind === 'account' ? editor.account?.display_name ?? '' : '', group_id: editor.kind === 'account' ? editor.account?.group_id ?? undefined : undefined, password: '' }}
+      recordRevision={editor.kind === 'group' ? undefined : editor.account?.revision}
+      onSubmit={save}
+      onDiscard={values => { const request = accountWrite(editor, values); return request.method !== 'POST' || posts.discard(request.path, request.body) }}
+      onClose={() => setEditor(null)}
+      onSaved={async () => { await load.reload(); await refreshSession() }}
+    >
         {editor?.kind === 'group' ? <Form.Item label="组名" name="name" rules={[{
           required: true,
           whitespace: true,
@@ -207,7 +194,7 @@ function AccountAdministration() {
               <Input maxLength={100} />
             </Form.Item>
             <Form.Item name="group_id" label="工作组">
-              <Select disabled={editor.account?.is_owner} allowClear placeholder="不分组（无业务权限）" options={load.data?.groups.filter(item => !item.archived).map(item => ({
+              <Select disabled={editor.account?.is_owner ? true : undefined} allowClear placeholder="不分组（无业务权限）" options={load.data?.groups.filter(item => !item.archived).map(item => ({
                 value: item.id,
                 label: `${item.name}${item.enabled ? '' : '（已停用）'}`
               }))} />
@@ -225,7 +212,6 @@ function AccountAdministration() {
               <Input.Password autoComplete="new-password" maxLength={128} />
             </Form.Item>{editor?.kind === 'reset' && <Alert type="warning" showIcon title="重置后该账号所有已登录会话立即失效。" />}</>}
         </>}
-      </Form>
-    </Modal>
+    </EntityEditor>}
   </Space>
 }

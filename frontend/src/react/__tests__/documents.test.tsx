@@ -12,6 +12,36 @@ beforeAll(installProjectDom)
 afterEach(() => { cleanup(); vi.restoreAllMocks() })
 function mount(repository: ReturnType<typeof projectRepository>, route = '/projects/SY-A/documents', readonly = false) { return render(<MemoryRouter initialEntries={[route]}><Routes><Route path="/projects/:projectCode/documents/:documentId?" element={<ProjectDocuments projectCode="SY-A" repository={repository} readonly={readonly} />} /></Routes></MemoryRouter>) }
 describe('React 项目文件', () => {
+  it('局域网 HTTP 无 Clipboard API 时仍能复制全文和版本链接，复制失败不隐藏正文', async () => {
+    const clipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+    const command = Object.getOwnPropertyDescriptor(document, 'execCommand')
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined })
+    const copied: string[] = []
+    const exec = vi.fn(() => { copied.push((document.activeElement as HTMLTextAreaElement).value); return true })
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: exec })
+    try {
+      mount(projectRepository(), '/projects/SY-A/documents/6?version=22')
+      const dialog = await screen.findByRole('dialog')
+      await within(dialog).findByText('会议记录：安装计划与验收计划。')
+      fireEvent.click(within(dialog).getByRole('button', { name: /复制全文$/ }))
+      await within(dialog).findByText('文档正文已复制')
+      fireEvent.click(within(dialog).getByRole('button', { name: /复制此版本链接$/ }))
+      await within(dialog).findByText('文档链接已复制')
+      expect(copied).toEqual(['会议记录：安装计划与验收计划。', documentVersionLink(window.location.origin, 'SY-A', 6, 22)])
+      exec.mockReturnValue(false)
+      fireEvent.click(within(dialog).getByRole('button', { name: /复制全文$/ }))
+      await within(dialog).findByText('复制失败，请手动选中文字或链接复制')
+      expect(dialog.querySelector('pre')?.textContent).toBe('会议记录：安装计划与验收计划。')
+      expect((within(dialog).getByLabelText('手动复制内容') as HTMLTextAreaElement).value).toBe('会议记录：安装计划与验收计划。')
+      expect(within(dialog).queryByText('文档链接已复制')).toBeNull()
+    } finally {
+      if (clipboard) Object.defineProperty(navigator, 'clipboard', clipboard)
+      else Reflect.deleteProperty(navigator, 'clipboard')
+      if (command) Object.defineProperty(document, 'execCommand', command)
+      else Reflect.deleteProperty(document, 'execCommand')
+    }
+  })
+
   it('会议纪要以真实文本文件创建，上传内容与标题完整保留', async () => {
     const repository = projectRepository(); mount(repository)
     await screen.findByText('现场会议纪要')

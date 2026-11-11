@@ -1,9 +1,10 @@
+import { registerAccountCleanup } from '../../api'
+import { createUuid } from '../../uuid'
 import { useAccess } from '../access/AccessProvider'
 import { ActivitySummary } from '../activity/ActivitySummary'
 import { OperationHistory } from '../activity/OperationHistory'
 import {
   useEffect,
-  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -87,13 +88,13 @@ type CreateKind =
   'commissioning' | 'change' | 'acceptance' | 'invoice' | 'after-sales'
 interface PendingCreate {
   kind: CreateKind | 'mutation'
-  snapshot: DeliveryDemoViewModel | null
   editor: Editor
   send: () => Promise<void>
   discard: () => boolean
   inFlight: boolean
 }
-const repositories = new Map<string, DeliveryWorkspaceRepository>()
+const repositories = new Map<string, { repository: DeliveryWorkspaceRepository; access: { can: (permission: string) => boolean } }>()
+registerAccountCleanup(() => repositories.clear())
 const pendingRegistry = createPendingRegistry<PendingCreate>()
 const disciplines = { mechanical: '机械图纸', electrical: '电气图纸' }
 const signoffs = {
@@ -222,14 +223,16 @@ const pagination = {
   showSizeChanger: true,
   showTotal: (total: number) => `共 ${total} 条`,
 }
+// 权限版本可以刷新，尚未确认的提交身份必须保留；读取能力使用最新回调。
 function repositoryFor(project: string, can: (permission: string) => boolean) {
-  let repository = repositories.get(project)
-  if (!repository) {
-    repository = createHttpDeliveryRepository(can)
-    repositories.set(project, repository)
-  }
+  const cached = repositories.get(project)
+  if (cached) { cached.access.can = can; return cached.repository }
+  const access = { can }
+  const repository = createHttpDeliveryRepository(permission => access.can(permission))
+  repositories.set(project, { repository, access })
   return repository
 }
+
 const pendingMap = (repository: DeliveryWorkspaceRepository) =>
   pendingRegistry.forOwner(repository)
 function statusColor(value: string) {
@@ -319,13 +322,10 @@ export default function DeliveryWorkspace({
   scope = 'all',
   repository: suppliedRepository,
 }: DeliveryWorkspaceProps) {
-  const { can, namespace, accessRevision } = useAccess()
+  const { can, namespace } = useAccess()
   useSyncExternalStore(pendingRegistry.subscribe, pendingRegistry.getSnapshot)
   const priorPending = useRef(false)
-  const repository = useMemo(
-    () => suppliedRepository ?? repositoryFor(`${namespace}:${accessRevision}:${projectCode}`, can),
-    [suppliedRepository, projectCode, namespace, accessRevision],
-  )
+  const repository = suppliedRepository ?? repositoryFor(`${namespace}:${projectCode}`, can)
   const [model, setModel] = useState<DeliveryDemoViewModel | null>(null)
   const [summary, setSummary] = useState<DeliverySummaryViewModel | null>(null)
   const [documents, setDocuments] = useState<DocumentVersionOption[]>([])
@@ -382,8 +382,10 @@ export default function DeliveryWorkspace({
       if (
         current(projectCode, repository, version) &&
         sequence === requestSequence.current
-      )
+      ) {
+        setModel(null)
         setError(errorText(failure))
+      }
       throw failure
     } finally {
       if (
@@ -455,11 +457,8 @@ export default function DeliveryWorkspace({
     setDocumentError('')
     setBusy(false)
     actionLock.current = false
-    const restored = pendingMap(repository).get(projectCode)
-    if (restored) {
-      setModel(restored.snapshot)
-      setLoading(false)
-    } else void refresh().catch(() => undefined)
+    // 权限刷新后从服务端重读，避免恢复旧快照中的已撤权字段。
+    void refresh().catch(() => undefined)
     void refreshSummary()
     void refreshDocuments()
     return () => {
@@ -473,6 +472,7 @@ export default function DeliveryWorkspace({
     if (readonly) setEditor(null)
   }, [readonly])
   const pending = pendingMap(repository).get(projectCode)
+  const canResume = (target: Editor) => (target.permissions ?? []).every(permission => can(permission))
   useEffect(() => {
     if (priorPending.current && !pending && !actionLock.current)
       void refresh().catch(() => undefined)
@@ -507,6 +507,7 @@ export default function DeliveryWorkspace({
     submit: Editor['submit'],
     attachments: boolean | string = false,
     extra?: Editor['extra'],
+    permission = tabWrite[activeTab]!,
   ) {
     if (disabled) return
     const draft = getEditorDraft(repository, projectCode)
@@ -517,7 +518,8 @@ export default function DeliveryWorkspace({
     }
     setFormError('')
     setEditor({
-      key: crypto.randomUUID(),
+      key: createUuid(),
+      permissions: [tabRead[activeTab]!, permission],
       title,
       submitLabel: title.startsWith('编辑')
         ? title.replace('编辑', '保存')
@@ -539,7 +541,6 @@ export default function DeliveryWorkspace({
   ) {
     const entry: PendingCreate = {
       kind,
-      snapshot: model,
       editor: submittingEditor.current!,
       send,
       discard,
@@ -565,7 +566,7 @@ export default function DeliveryWorkspace({
     }
   }
   async function save(values: Values, files: File[]) {
-    if (!editor || context.current.readonly || actionLock.current) return
+    if (!editor || loading || !model || !canResume(editor) || context.current.readonly || actionLock.current) return
     const version = generation.current
     const recoverable = pendingMap(repository).get(projectCode)
     if (recoverable?.inFlight) return
@@ -582,7 +583,6 @@ export default function DeliveryWorkspace({
     submittingEditor.current = submitted
     const submission: PendingCreate = recoverable ?? {
       kind: 'mutation',
-      snapshot: model,
       editor: submitted,
       send: () =>
         submitted.submit(structuredClone(submitted.initial), [
@@ -1021,6 +1021,7 @@ export default function DeliveryWorkspace({
       },
       warrantyFields(),
       (values) => repository.updateWarranty(projectCode, { ...warrantyInput(values), expected_revision: values.revision as number | null | undefined }),
+      false, undefined, 'warranty.manage',
     )
   }
   function openInvoice(row?: DemoInvoiceViewModel) {
@@ -1189,9 +1190,11 @@ export default function DeliveryWorkspace({
   function withReason(
     title: string,
     submit: (reason: string) => Promise<void>,
+    permission = tabWrite[activeTab]!,
   ) {
     open(title, {}, [area('reason', '原因', true)], (values) =>
       submit(textValue(values, 'reason')),
+      false, undefined, permission,
     )
   }
   const attachments = (ids: number[]) => (
@@ -1778,6 +1781,7 @@ export default function DeliveryWorkspace({
                         reason,
                         row.revision,
                       ),
+                      'customer_invoices.reverse',
                     )
                   }
                 >
@@ -1951,7 +1955,7 @@ export default function DeliveryWorkspace({
         <Button
           icon={<ReloadOutlined />}
           loading={loading}
-          disabled={busy || Boolean(editor) || Boolean(pending)}
+          disabled={busy || Boolean(editor) || Boolean(pending?.inFlight)}
           onClick={() => {
             void refresh().catch(() => undefined)
             void refreshSummary()
@@ -1986,7 +1990,7 @@ export default function DeliveryWorkspace({
           action={
             <Space>
               <Button
-                disabled={busy || pending.inFlight}
+                disabled={loading || !model || busy || pending.inFlight || !canResume(pending.editor)}
                 onClick={() => setEditor({ ...pending.editor, frozen: true })}
               >
                 恢复并重试
@@ -2032,7 +2036,7 @@ export default function DeliveryWorkspace({
       <ActionDrawer
         draftOwner={repository}
         draftKey={projectCode}
-        editor={editor}
+        editor={editor && canResume(editor) ? editor : null}
         busy={busy}
         error={formError}
         onClose={() => setEditor(null)}

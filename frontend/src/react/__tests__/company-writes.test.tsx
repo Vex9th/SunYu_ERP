@@ -8,6 +8,9 @@ import {
   within,
 } from '@testing-library/react'
 import { App, ConfigProvider } from 'antd'
+import { createMemoryRouter, RouterProvider } from 'react-router-dom'
+import { UnsavedChangesProvider } from '../unsavedChanges'
+import { WorkspaceNavigationProvider } from '../navigationState'
 import {
   afterEach,
   beforeAll,
@@ -118,6 +121,30 @@ afterEach(() => {
 })
 
 describe('公司与联系人创建恢复', () => {
+  it('公司保存成功后直接打开资料，不再误报未保存而阻止路由跳转', async () => {
+    let saved = false
+    const created = { ...company, name: 'HTTP 新公司', contacts: [] }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (path, options) => {
+      if (options?.method === 'POST') { saved = true; return json(created, 201) }
+      return json(String(path).endsWith('/1') ? created : saved ? [{ ...created, contact_count: 0 }] : [])
+    }))
+    const router = createMemoryRouter([{
+      path: '/companies',
+      element: <UnsavedChangesProvider><WorkspaceNavigationProvider><CompaniesPage /></WorkspaceNavigationProvider></UnsavedChangesProvider>,
+    }], { initialEntries: ['/companies?q=&company=&companyTab=profile'] })
+    render(<ConfigProvider button={{ autoInsertSpace: false }}><App><RouterProvider router={router} /></App></ConfigProvider>)
+    fireEvent.click(await screen.findByRole('button', { name: /新增公司/ }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.change(within(dialog).getByLabelText('公司名称'), { target: { value: 'HTTP 新公司' } })
+    const dirty = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(dirty)
+    expect(dirty.defaultPrevented).toBe(true)
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存' }))
+    await waitFor(() => expect(new URLSearchParams(router.state.location.search).get('company')).toBe('1'))
+    expect(screen.queryByText('离开并放弃未保存的修改？')).toBeNull()
+    expect(await screen.findByRole('dialog', { name: 'HTTP 新公司' })).toBeTruthy()
+  })
+
   it('恢复已持久化联系人原请求，固定公司与幂等键，不自动提交', async () => {
     sessionStorage.setItem(
       `${CONTACT_PENDING_PREFIX}2`,

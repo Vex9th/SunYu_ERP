@@ -1,3 +1,5 @@
+import { registerAccountCleanup } from '../../api'
+import { createUuid } from '../../uuid'
 import { useAccess } from '../access/AccessProvider'
 import { ActivitySummary } from '../activity/ActivitySummary'
 import { OperationHistory } from '../activity/OperationHistory'
@@ -100,12 +102,12 @@ const laborFormDrafts = new WeakMap<
   Map<string, { date: string; days: Map<string, LaborFormDraft> }>
 >()
 interface Pending {
-  snapshot: WorkforceDemoViewModel | null
   editor: Editor
   send: () => Promise<void>
   inFlight: boolean
 }
-const repositories = new Map<string, WorkforceWorkspaceRepository>()
+const repositories = new Map<string, { repository: WorkforceWorkspaceRepository; access: { can: (permission: string) => boolean } }>()
+registerAccountCleanup(() => repositories.clear())
 const pendingRegistry = createPendingRegistry<Pending>()
 const workerLabels = { active: '在职', inactive: '已停用' }
 const assignmentLabels = {
@@ -143,14 +145,16 @@ const dateField = (key: string, label: string, disabled = false): Field => ({
   required: true,
   disabled,
 })
+// 权限版本可以刷新，尚未确认的提交身份必须保留；读取能力使用最新回调。
 function repositoryFor(project: string, can: (permission: string) => boolean) {
-  let repository = repositories.get(project)
-  if (!repository) {
-    repository = createHttpWorkforceWorkspaceRepository(can)
-    repositories.set(project, repository)
-  }
+  const cached = repositories.get(project)
+  if (cached) { cached.access.can = can; return cached.repository }
+  const access = { can }
+  const repository = createHttpWorkforceWorkspaceRepository(permission => access.can(permission))
+  repositories.set(project, { repository, access })
   return repository
 }
+
 const pendingMap = (repository: WorkforceWorkspaceRepository) =>
   pendingRegistry.forOwner(repository)
 export function eligibleAssignments(
@@ -198,13 +202,10 @@ export default function WorkforceWorkspace({
   readonly = false,
   repository: suppliedRepository,
 }: WorkforceWorkspaceProps) {
-  const { can, namespace, accessRevision } = useAccess()
+  const { can, namespace } = useAccess()
   useSyncExternalStore(pendingRegistry.subscribe, pendingRegistry.getSnapshot)
   const priorPending = useRef(false)
-  const repository = useMemo(
-    () => suppliedRepository ?? repositoryFor(`${namespace}:${accessRevision}:${projectCode}`, can),
-    [suppliedRepository, projectCode, namespace, accessRevision],
-  )
+  const repository = suppliedRepository ?? repositoryFor(`${namespace}:${projectCode}`, can)
   const [model, setModel] = useState<WorkforceDemoViewModel | null>(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
@@ -264,8 +265,10 @@ export default function WorkforceWorkspace({
       if (
         current(projectCode, repository, version) &&
         sequence === requestSequence.current
-      )
+      ) {
+        setModel(null)
         setError(errorText(failure))
+      }
       throw failure
     } finally {
       if (
@@ -289,11 +292,8 @@ export default function WorkforceWorkspace({
     setHistory(null)
     setBusy(false)
     actionLock.current = false
-    const restored = pendingMap(repository).get(projectCode)
-    if (restored) {
-      setModel(restored.snapshot)
-      setLoading(false)
-    } else void refresh().catch(() => undefined)
+    // 权限刷新后重读模型，未确认请求保留但不恢复旧权限下的数据快照。
+    void refresh().catch(() => undefined)
     return () => {
       generation.current += 1
       requestSequence.current += 1
@@ -337,6 +337,12 @@ export default function WorkforceWorkspace({
     'labor_entries',
   )
   const pending = pendingMap(repository).get(projectCode)
+  const permissionsFor = (permission = tabWrite[activeTab]!) => [
+    tabRead[activeTab]!, permission,
+    ...(['labor', 'labor-history', 'people'].includes(activeTab) ? ['sensitive.salary_costs'] : []),
+    ...(activeTab === 'advances' && can('sensitive.procurement_prices') ? ['sensitive.procurement_prices'] : []),
+  ]
+  const canResume = (target: Editor) => (target.permissions ?? []).every(permission => can(permission))
   useEffect(() => {
     if (priorPending.current && !pending && !actionLock.current)
       void refresh().catch(() => undefined)
@@ -400,6 +406,7 @@ export default function WorkforceWorkspace({
       context.current.projectCode !== projectCode ||
       context.current.repository !== repository ||
       context.current.readonly ||
+      loading || !model || !canResume(submission.editor) ||
       actionLock.current ||
       submission?.inFlight
     )
@@ -472,9 +479,9 @@ export default function WorkforceWorkspace({
     )
       return Promise.resolve()
     const submission: Pending = {
-      snapshot: model,
       editor: {
-        key: crypto.randomUUID(),
+        key: createUuid(),
+        permissions: permissionsFor(),
         title,
         initial: {},
         fields: [],
@@ -492,6 +499,7 @@ export default function WorkforceWorkspace({
     fields: Field[],
     submit: Editor['submit'],
     extra?: Editor['extra'],
+    permission = tabWrite[activeTab]!,
   ) {
     if (mutationDisabled) return
     const draft = getEditorDraft(repository, projectCode)
@@ -502,7 +510,8 @@ export default function WorkforceWorkspace({
     }
     setFormError('')
     setEditor({
-      key: crypto.randomUUID(),
+      key: createUuid(),
+      permissions: permissionsFor(permission),
       title,
       submitLabel: title.startsWith('编辑')
         ? title.replace('编辑', '保存')
@@ -528,7 +537,6 @@ export default function WorkforceWorkspace({
     }
     const captured = structuredClone({ ...editor.initial, ...values })
     const submission: Pending = {
-      snapshot: model,
       editor: { ...editor, initial: captured, files },
       send: () => editor.submit(captured, files),
       inFlight: false,
@@ -540,9 +548,11 @@ export default function WorkforceWorkspace({
     title: string,
     submit: (reason: string) => Promise<void>,
     required = true,
+    permission = tabWrite[activeTab]!,
   ) {
     open(title, { reason: '' }, [{ ...reasonField, required }], (values) =>
       submit(textValue(values, 'reason')),
+      undefined, permission,
     )
   }
   function openWorker(worker?: DemoWorkerViewModel) {
@@ -901,6 +911,7 @@ export default function WorkforceWorkspace({
           )}
         </Form.List>
       ),
+      advance ? 'material_advances.edit' : 'material_advances.create',
     )
   }
   function reimburse(advance: DemoMaterialAdvanceViewModel) {
@@ -942,6 +953,7 @@ export default function WorkforceWorkspace({
           },
         )
       },
+      undefined, 'material_advances.reimburse',
     )
   }
   function updateBatch(change: Partial<LaborFormDraft>) {
@@ -1008,10 +1020,10 @@ export default function WorkforceWorkspace({
         ?.days.delete(input.work_date)
     }
     const submission: Pending = {
-      snapshot: model,
       editor: {
-        key: crypto.randomUUID(),
+        key: createUuid(),
         title: `${workDate} 上工记录`,
+        permissions: permissionsFor(),
         initial: {},
         fields: [],
         submit: send,
@@ -1973,6 +1985,7 @@ export default function WorkforceWorkspace({
                         reason,
                         row.revision,
                       ),
+                      true, 'material_advances.void',
                     )
                   }
                 >
@@ -2073,6 +2086,7 @@ export default function WorkforceWorkspace({
                               reason,
                               item.revision,
                             ),
+                            true, 'material_advances.reverse',
                           )
                         }
                       >
@@ -2109,7 +2123,7 @@ export default function WorkforceWorkspace({
         <Button
           icon={<ReloadOutlined />}
           loading={loading}
-          disabled={busy || Boolean(editor) || Boolean(pending)}
+          disabled={busy || Boolean(editor) || Boolean(pending?.inFlight)}
           onClick={() => void refresh().catch(() => undefined)}
         >
           刷新
@@ -2136,7 +2150,7 @@ export default function WorkforceWorkspace({
           title={`${pending.editor.title}：有一笔提交等待确认`}
           action={
             <Button
-              disabled={busy || pending.inFlight}
+              disabled={loading || !model || busy || pending.inFlight || !canResume(pending.editor)}
               onClick={() => setEditor({ ...pending.editor, frozen: true })}
             >
               恢复并重试
@@ -2187,7 +2201,7 @@ export default function WorkforceWorkspace({
       <ActionDrawer
         draftOwner={repository}
         draftKey={projectCode}
-        editor={editor ? { ...editor, fields: editor.fields.map(field => field.type === 'money' && !can(activeTab === 'advances' ? 'sensitive.procurement_prices' : 'sensitive.salary_costs') ? { ...field, visible: () => false } : field) } : null}
+        editor={editor && canResume(editor) ? { ...editor, fields: editor.fields.map(field => field.type === 'money' && !can(activeTab === 'advances' ? 'sensitive.procurement_prices' : 'sensitive.salary_costs') ? { ...field, visible: () => false } : field) } : null}
         busy={busy}
         error={formError}
         onClose={() => setEditor(null)}

@@ -238,6 +238,7 @@ export function AttachmentLinks({
 }
 
 export interface Editor {
+  permissions?: string[]
   key: string
   title: string
   initial: Values

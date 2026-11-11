@@ -249,6 +249,7 @@ type EditorValues = Record<string, unknown>
 interface EditorRequest {
   values: EditorValues
   run: () => Promise<unknown>
+  discard?: () => boolean
   busy: boolean
   completed?: boolean
   result?: unknown
@@ -278,6 +279,7 @@ export function EntityEditor<T extends EditorValues>({
   initialValues,
   recordRevision,
   onSubmit,
+  onDiscard,
   onSaved,
   onClose,
   children,
@@ -288,13 +290,14 @@ export function EntityEditor<T extends EditorValues>({
   initialValues: T
   recordRevision?: number
   onSubmit: (values: T) => Promise<unknown>
+  onDiscard?: (values: T) => boolean
   onSaved?: (result: unknown) => unknown
   onClose: () => void
   children: ReactNode
   width?: number
 }) {
-  const { namespace, accessRevision } = useAccess()
-  const cacheKey = `${namespace}:${accessRevision}:${resourceCacheKey}`
+  const { namespace } = useAccess()
+  const cacheKey = `${namespace}:${resourceCacheKey}`
   const [form] = Form.useForm<T>()
   const { message, modal } = App.useApp()
   const pending = useSyncExternalStore(
@@ -376,6 +379,7 @@ export function EntityEditor<T extends EditorValues>({
     const original = pendingEditors.get(cacheKey) ?? {
       values: payload,
       run: () => onSubmit(payload),
+      discard: onDiscard ? () => onDiscard(payload) : undefined,
       busy: false,
     }
     const namespace = getAccountNamespace()
@@ -484,7 +488,13 @@ export function EntityEditor<T extends EditorValues>({
                     okText: '确认放弃',
                     cancelText: '保留请求',
                     onOk: () => {
-                      if (!pendingEditors.get(cacheKey)?.busy) {
+                      const original = pendingEditors.get(cacheKey)
+                      if (original && !original.busy) {
+                        if (original.discard && !original.discard()) {
+                          pendingEditors.set(cacheKey, { ...original, error: '原请求尚不能放弃，请核对记录后重试' })
+                          notifyEditors()
+                          return
+                        }
                         pendingEditors.delete(cacheKey)
                         editorDrafts.delete(cacheKey)
                         notifyEditors()
