@@ -408,6 +408,7 @@ def test_unreadable_process_working_directory_cannot_mean_idle(tmp_path, monkeyp
     cleanup = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cleanup)
     monkeypatch.setattr(cleanup.sys, 'platform', 'linux')
+    monkeypatch.setattr(cleanup.os, 'geteuid', lambda: 501, raising=False)
     text = f'{os.getpid()} 0 python cleanup\n55 0 python -m pytest\n'
     monkeypatch.setattr(cleanup.subprocess, 'run', lambda *a, **kw:
                         subprocess.CompletedProcess(a, 0, text, ''))
@@ -419,6 +420,7 @@ def test_unreadable_process_working_directory_cannot_mean_idle(tmp_path, monkeyp
         raise AccessDenied('test account access denied')
     def process(pid):
         return SimpleNamespace(
+            uids=lambda: SimpleNamespace(effective=os.geteuid()),
             username=(denied if unreadable == 'owner' and pid == 55 else
                       lambda: '' if unreadable == 'empty_owner' and pid == 55 else 'current-account'),
             cwd=(lambda: '') if unreadable == 'empty_cwd' else denied,
@@ -445,6 +447,29 @@ def test_cwd_probe_skips_other_accounts_and_known_windows_system_pids(cleanup, t
     monkeypatch.setitem(sys.modules, 'psutil', dependency)
     monkeypatch.setattr(cleanup.sys, 'platform', 'win32')
     assert cleanup._cwd_processes(tmp_path, [{'pid': 0}, {'pid': 4}, {'pid': 55}], set()) == []
+
+
+def test_cwd_probe_uses_effective_account_for_privileged_helpers(cleanup, tmp_path, monkeypatch):
+    class AccessDenied(Exception):
+        pass
+
+    def denied():
+        raise AccessDenied('privileged helper cwd is protected')
+
+    def process(pid):
+        return SimpleNamespace(
+            # macOS 的提权辅助程序保留启动者的 real UID，但以其他 effective UID 运行。
+            username=lambda: 'ours',
+            uids=lambda: SimpleNamespace(effective=501 if pid == os.getpid() else 0),
+            cwd=denied,
+        )
+
+    monkeypatch.setattr(cleanup.sys, 'platform', 'darwin')
+    monkeypatch.setattr(cleanup.os, 'geteuid', lambda: 501, raising=False)
+    monkeypatch.setitem(sys.modules, 'psutil', SimpleNamespace(
+        Process=process, AccessDenied=AccessDenied, NoSuchProcess=ProcessLookupError,
+    ))
+    assert cleanup._cwd_processes(tmp_path, [{'pid': 703}], set()) == []
 
 
 def test_history_link_refuses_retry_without_overwriting_previous_result(cleanup, tmp_path):

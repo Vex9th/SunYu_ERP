@@ -138,6 +138,10 @@ def _cwd_processes(root: Path, rows: list[dict], ignored: set[int]) -> list[dict
             continue
         try:
             process = psutil.Process(pid)
+            # POSIX 提权辅助程序可能保留当前用户的 real UID，但以 root 身份运行。
+            # 其他有效账号仍由上层完整命令行匹配；本账号的 cwd 检查继续失败即停。
+            if sys.platform != 'win32' and process.uids().effective != os.geteuid():
+                continue
             account = process.username()
             if not account:
                 raise RuntimeError(f'Cannot identify account for PID {pid}')
